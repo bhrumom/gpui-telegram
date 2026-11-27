@@ -172,6 +172,9 @@ impl ComposerEditorState {
             ime.text_buffer.replace_range(s..e, "");
             ime.cursor_index = s;
             self.selection_anchor = None;
+        } else if let Some((s, e)) = atomic_reference_chip_span_before_cursor(&ime.text_buffer, cur) {
+            ime.text_buffer.replace_range(s..e, "");
+            ime.cursor_index = s;
         } else if cur > 0 {
             let prev = prev_char_boundary(&ime.text_buffer, cur);
             ime.text_buffer.replace_range(prev..cur, "");
@@ -279,5 +282,63 @@ pub fn detect_autocomplete_trigger(text: &str, cursor: usize) -> Option<(char, S
         Some((first, token.to_string(), token_start))
     } else {
         None
+    }
+}
+
+/// If the cursor sits immediately after a completed OpenBot structured reference chip
+/// `@[Display Name](kind:id)` (optionally followed by a single trailing space), returns
+/// `(start_byte, end_byte)` on valid UTF-8 boundaries so Backspace deletes the chip atomically.
+pub fn atomic_reference_chip_span_before_cursor(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let cur = clamp_char_boundary(text, cursor);
+    if cur == 0 {
+        return None;
+    }
+    let prefix = &text[..cur];
+    let chip_end = if let Some(without_space) = prefix.strip_suffix(' ') {
+        if without_space.ends_with(')') {
+            without_space.len()
+        } else {
+            return None;
+        }
+    } else if prefix.ends_with(')') {
+        prefix.len()
+    } else {
+        return None;
+    };
+    let before_close = &text[..chip_end - 1];
+    let lp_idx = before_close.rfind("](")?;
+    let target = &before_close[lp_idx + 2..];
+    if target.is_empty() || target.contains(')') || target.contains('\n') || !target.contains(':') {
+        return None;
+    }
+    let before_br = &text[..lp_idx];
+    let start_idx = before_br.rfind("@[")?;
+    let label = &before_br[start_idx + 2..];
+    if label.is_empty() || label.contains(']') || label.contains('\n') {
+        return None;
+    }
+    Some((start_idx, cur))
+}
+
+#[cfg(test)]
+mod atomic_chip_tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn backspace_deletes_openbot_reference_chip_atomically_including_cjk() {
+        let mut ime = ImeSafetyMachine::with_text("请让 @[小红书助手](agent:bot_1) 处理");
+        ime.cursor_index = "请让 @[小红书助手](agent:bot_1) ".len();
+        let mut ed = ComposerEditorState::new();
+        ed.backspace_or_delete_sel(&mut ime);
+        assert_eq!(ime.text(), "请让 处理");
+        assert_eq!(ime.cursor_index, "请让 ".len());
+    }
+
+    #[std::prelude::v1::test]
+    fn backspace_on_normal_text_removes_single_char() {
+        let mut ime = ImeSafetyMachine::with_text("hello (world)");
+        let mut ed = ComposerEditorState::new();
+        ed.backspace_or_delete_sel(&mut ime);
+        assert_eq!(ime.text(), "hello (world");
     }
 }

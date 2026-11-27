@@ -11,12 +11,13 @@ use gpui_telegram_proto::creations::{
 };
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
+use crate::theme::{IconName, TdesktopThemePalette};
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_shelf_header, cover_artwork_box, empty_state_card_shell,
-    filter_pill, format_duration_ms, format_duration_secs, hero_banner, rating_pill,
-    render_editable_field_box, review_status_badge, vertical_sub_tab_pill,
+    filter_pill, format_duration_ms, format_duration_secs, hero_banner,
+    openbot_marketplace_nav_item, openbot_marketplace_shell, openbot_page_header,
+    openbot_primary_cta_btn, openbot_secondary_btn, rating_pill, render_editable_field_box,
+    review_status_badge,
 };
 use crate::views::content_hub::music_player_bar::MUSIC_ACCENT;
 use crate::views::content_hub::{
@@ -127,6 +128,8 @@ fn render_square_album_card(
     pal: TdesktopThemePalette,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let card_hover = ob.bg_control_hover();
     let cid = item.creation_id.clone();
     let item_clone = item.clone();
     let item_play = item.clone();
@@ -134,13 +137,14 @@ fn render_square_album_card(
         .id(SharedString::from(format!("music-album-card-{cid}")))
         .cursor_pointer()
         .w(px(168.0))
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
+        .hover(move |s| s.bg(card_hover))
         .border_1()
         .border_color(if is_now_playing {
-            TdesktopThemePalette::rgba_with_alpha(MUSIC_ACCENT, 0.85)
+            ob.border_strong_hairline()
         } else {
-            pal.separator_rgba()
+            ob.frame_card_border()
         })
         .p(px(10.0))
         .flex()
@@ -166,13 +170,13 @@ fn render_square_album_card(
                 cx.notify();
             }),
         )
-        // Classic Apple Music 1:1 album square with floating play pill
+        // 1:1 album square with OpenBot monochrome floating quick-play button
         .child(
             div()
                 .relative()
                 .w(px(148.0))
                 .h(px(148.0))
-                .child(cover_artwork_box(&item.cover, 148.0, 148.0, 10.0, MUSIC_ACCENT))
+                .child(cover_artwork_box(&item.cover, 148.0, 148.0, 10.0, 0x4E3840))
                 .child(
                     div()
                         .id(SharedString::from(format!(
@@ -186,13 +190,14 @@ fn render_square_album_card(
                         .w(px(32.0))
                         .h(px(32.0))
                         .rounded(px(999.0))
-                        .bg(rgb(MUSIC_ACCENT))
+                        .bg(ob.surface_light())
+                        .hover(|s| s.opacity(0.84))
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_size(px(12.0))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xFFFFFF))
+                        .text_color(ob.text_on_light())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _, _, cx| {
@@ -215,9 +220,9 @@ fn render_square_album_card(
                             .px(px(6.0))
                             .py(px(1.0))
                             .rounded(px(999.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.55))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.62))
                             .text_size(px(10.0))
-                            .text_color(rgb(MUSIC_ACCENT))
+                            .text_color(rgb(0xFFFFFF))
                             .child("♥"),
                     )
                 }),
@@ -231,14 +236,14 @@ fn render_square_album_card(
                     div()
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.text_primary))
+                        .text_color(ob.text_primary())
                         .truncate()
                         .child(item.title.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(pal.text_secondary))
+                        .text_color(ob.text_muted())
                         .truncate()
                         .child(item.author_display_name.clone()),
                 )
@@ -259,6 +264,7 @@ fn render_music_album_detail(
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
     let pal = ws.palette;
+    let ob = pal.openbot_palette();
     let lang = ws.language_id.clone();
     let payload = extract_music_payload(&detail);
     let cid = detail.creation_id.clone();
@@ -287,7 +293,6 @@ fn render_music_album_detail(
         payload.artist.clone()
     };
 
-    // Active track lyrics for inline Apple Music Lyrics card
     let displayed_lyrics = ws
         .music_engine
         .current_track()
@@ -318,7 +323,7 @@ fn render_music_album_detail(
                 .items_center()
                 .justify_between()
                 .child(
-                    macos_secondary_pill_btn(
+                    openbot_secondary_btn(
                         "music-detail-back-btn",
                         tr_str(&lang, "← 返回音乐", "← Back to Music"),
                         pal,
@@ -337,7 +342,7 @@ fn render_music_album_detail(
                     el.child(review_status_badge(detail.review_status, &lang, pal))
                 }),
         )
-        // Apple Music Album Header
+        // Album Header
         .child(
             apple_grouped_card(pal)
                 .p(px(20.0))
@@ -345,7 +350,7 @@ fn render_music_album_detail(
                 .flex_wrap()
                 .items_center()
                 .gap(px(20.0))
-                .child(cover_artwork_box(&detail.cover, 160.0, 160.0, 12.0, MUSIC_ACCENT))
+                .child(cover_artwork_box(&detail.cover, 160.0, 160.0, 12.0, 0x4E3840))
                 .child(
                     div()
                         .flex_1()
@@ -356,15 +361,15 @@ fn render_music_album_detail(
                         .child(
                             div()
                                 .text_size(px(22.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(pal.text_primary))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
                                 .child(detail.title.clone()),
                         )
                         .child(
                             div()
-                                .text_size(px(15.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(MUSIC_ACCENT))
+                                .text_size(px(14.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_secondary())
                                 .child(artist),
                         )
                         .child(
@@ -377,7 +382,7 @@ fn render_music_album_detail(
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(format!(
                                             "{} · {} BPM · {} · {} {} · {}",
                                             payload.primary_genre,
@@ -394,7 +399,7 @@ fn render_music_album_detail(
                         .child(
                             div()
                                 .text_size(px(12.5))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_secondary())
                                 .child(detail.summary.clone()),
                         )
                         .child(
@@ -405,30 +410,24 @@ fn render_music_album_detail(
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div()
-                                        .id("music-detail-play-btn")
-                                        .cursor_pointer()
-                                        .px(px(20.0))
-                                        .py(px(8.0))
-                                        .rounded(px(999.0))
-                                        .bg(rgb(MUSIC_ACCENT))
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(ContentHubEvent::PlayMusicCreation {
-                                                    creation: detail_play.clone(),
-                                                    track_index: 0,
-                                                    shuffle: false,
-                                                });
-                                            }),
-                                        )
-                                        .child(tr_str(&lang, "▶ 播放", "▶ Play")),
+                                    openbot_primary_cta_btn(
+                                        "music-detail-play-btn",
+                                        tr_str(&lang, "▶ 播放", "▶ Play"),
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |_this, _, _, cx| {
+                                            cx.emit(ContentHubEvent::PlayMusicCreation {
+                                                creation: detail_play.clone(),
+                                                track_index: 0,
+                                                shuffle: false,
+                                            });
+                                        }),
+                                    ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "music-detail-shuffle-btn",
                                         tr_str(&lang, "⇄ 随机播放", "⇄ Shuffle"),
                                         pal,
@@ -445,7 +444,7 @@ fn render_music_album_detail(
                                     ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "music-detail-library-btn",
                                         if in_library {
                                             tr_str(&lang, "✓ 已在资料库", "✓ In Library")
@@ -468,7 +467,7 @@ fn render_music_album_detail(
                                     ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "music-detail-love-btn",
                                         if is_loved {
                                             tr_str(&lang, "♥ 已喜爱", "♥ Loved")
@@ -493,13 +492,13 @@ fn render_music_album_detail(
                         ),
                 ),
         )
-        // Tracklist Table (Apple Music style)
+        // Tracklist Table
         .child(
             apple_grouped_card(pal)
                 .p(px(16.0))
                 .flex()
                 .flex_col()
-                .gap(px(6.0))
+                .gap(px(4.0))
                 .child(apple_shelf_header(
                     tr_str(&lang, "曲目列表", "Tracks"),
                     Some(format!(
@@ -513,7 +512,7 @@ fn render_music_album_detail(
                     let is_active =
                         current_playing_track_id.as_deref() == Some(tr.track_id.as_str());
                     let detail_row = detail.clone();
-                    let hover_bg = pal.row_hover_rgba();
+                    let hover_bg = ob.bg_control_hover();
                     div()
                         .id(SharedString::from(format!("music-track-row-{idx}")))
                         .cursor_pointer()
@@ -521,7 +520,7 @@ fn render_music_album_detail(
                         .py(px(9.0))
                         .rounded(px(8.0))
                         .bg(if is_active {
-                            TdesktopThemePalette::rgba_with_alpha(MUSIC_ACCENT, 0.14)
+                            ob.bg_control_active()
                         } else {
                             rgba(0x00000000)
                         })
@@ -553,11 +552,11 @@ fn render_music_album_detail(
                                         .flex_shrink_0()
                                         .text_size(px(12.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(if is_active {
-                                            MUSIC_ACCENT
+                                        .text_color(if is_active {
+                                            ob.text_primary()
                                         } else {
-                                            pal.text_secondary
-                                        }))
+                                            ob.text_muted()
+                                        })
                                         .child(if is_active && is_playing_now {
                                             "♫".to_string()
                                         } else {
@@ -574,19 +573,19 @@ fn render_music_album_detail(
                                             div()
                                                 .truncate()
                                                 .text_size(px(13.0))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(if is_active {
-                                                    MUSIC_ACCENT
+                                                .font_weight(if is_active {
+                                                    FontWeight::SEMIBOLD
                                                 } else {
-                                                    pal.text_primary
-                                                }))
+                                                    FontWeight::MEDIUM
+                                                })
+                                                .text_color(ob.text_primary())
                                                 .child(tr.title.clone()),
                                         )
                                         .child(
                                             div()
                                                 .truncate()
                                                 .text_size(px(11.0))
-                                                .text_color(rgb(pal.text_secondary))
+                                                .text_color(ob.text_muted())
                                                 .child(format!(
                                                     "{} BPM · {} · {} notes",
                                                     tr.bpm,
@@ -600,19 +599,19 @@ fn render_music_album_detail(
                             div()
                                 .flex_shrink_0()
                                 .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_muted())
                                 .child(format_duration_secs(u64::from(tr.duration_secs))),
                         )
                 })),
         )
-        // Inline Apple Music Synced Lyrics card
+        // Inline Synced Lyrics card
         .when(!displayed_lyrics.is_empty(), |el| {
             el.child(
                 apple_grouped_card(pal)
                     .p(px(16.0))
                     .flex()
                     .flex_col()
-                    .gap(px(6.0))
+                    .gap(px(4.0))
                     .child(apple_shelf_header(
                         tr_str(&lang, "同步歌词", "Synced Lyrics"),
                         Some(format!(
@@ -626,17 +625,19 @@ fn render_music_album_detail(
                         let is_cur = current_playing_track_id.is_some()
                             && active_lyric_idx == Some(idx);
                         let ts_ms = u64::from(line.timestamp_ms);
+                        let hover_bg = ob.bg_control_hover();
                         div()
                             .id(SharedString::from(format!("music-detail-lyric-{idx}")))
                             .cursor_pointer()
                             .px(px(10.0))
-                            .py(px(5.0))
-                            .rounded(px(7.0))
+                            .py(px(6.0))
+                            .rounded(px(8.0))
                             .bg(if is_cur {
-                                TdesktopThemePalette::rgba_with_alpha(MUSIC_ACCENT, 0.16)
+                                ob.bg_control_active()
                             } else {
                                 rgba(0x00000000)
                             })
+                            .hover(move |s| s.bg(hover_bg))
                             .flex()
                             .items_center()
                             .gap(px(10.0))
@@ -651,23 +652,23 @@ fn render_music_album_detail(
                             .child(
                                 div()
                                     .w(px(38.0))
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_size(px(10.5))
+                                    .text_color(ob.text_muted())
                                     .child(format_duration_ms(ts_ms)),
                             )
                             .child(
                                 div()
                                     .text_size(px(if is_cur { 14.0 } else { 12.5 }))
                                     .font_weight(if is_cur {
-                                        FontWeight::BOLD
+                                        FontWeight::SEMIBOLD
                                     } else {
                                         FontWeight::NORMAL
                                     })
-                                    .text_color(rgb(if is_cur {
-                                        MUSIC_ACCENT
+                                    .text_color(if is_cur {
+                                        ob.text_primary()
                                     } else {
-                                        pal.text_primary
-                                    }))
+                                        ob.text_secondary()
+                                    })
                                     .child(line.text.clone()),
                             )
                     })),
@@ -738,530 +739,504 @@ pub fn render_music_hub_view(
         (CatalogSortMode::Newest, "music-sort-newest", "最新", "Newest"),
     ];
 
-    let radio_stations: &[(&str, &str, &str, Option<&str>, &str, &str)] = &[
+    let radio_stations: &[(&str, &str, &str, Option<&str>)] = &[
         (
             "station-all",
             "Creator Studio 精选电台",
             "Creator Studio Live Radio",
             None,
-            "#FA2D48",
-            "#5E17EB",
         ),
         (
             "station-electronic",
             "合成器与电子律动",
             "Synthwave & Electronic",
             Some("electronic"),
-            "#007AFF",
-            "#5856D6",
         ),
         (
             "station-chill",
             "静谧 Lo-Fi 专注电台",
             "Chill & Focus Beats",
             Some("chill"),
-            "#FF9500",
-            "#FA2D48",
         ),
         (
             "station-acoustic",
             "钢琴与原声创作",
             "Acoustic & Piano Works",
             Some("classical"),
-            "#30D158",
-            "#0A84FF",
         ),
     ];
 
-    div()
-        .id("apple-music-hub-root")
-        .size_full()
+    let ob = pal.openbot_palette();
+    let root_label = tr_str(&lang, "音乐", "Music");
+    let hover_crumb = ob.bg_control();
+    let text_pri = ob.text_primary();
+    let header = if let Some(ref detail) = selected_detail {
+        let parent_btn = div()
+            .id("music-header-parent-crumb")
+            .cursor_pointer()
+            .px(px(6.0))
+            .py(px(3.0))
+            .rounded(px(6.0))
+            .text_size(px(13.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ob.text_muted())
+            .hover(move |s| s.bg(hover_crumb).text_color(text_pri))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.selected_creation_id = None;
+                    this.selected_catalog_item = None;
+                    this.selected_detail_creation = None;
+                    cx.notify();
+                }),
+            )
+            .child(root_label);
+        openbot_page_header(detail.title.clone(), Some(parent_btn), None, pal)
+    } else {
+        let refresh_btn = openbot_secondary_btn(
+            "music-refresh-btn",
+            tr_str(&lang, "刷新", "Refresh"),
+            pal,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _, _, cx| {
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Music));
+            }),
+        )
+        .into_any_element();
+        openbot_page_header(root_label, None, Some(refresh_btn), pal)
+    };
+
+    let left_nav = div()
+        .w_full()
         .flex()
         .flex_col()
-        .overflow_hidden()
-        // Header + Sub-nav + Search
+        .gap(px(14.0))
+        .child(
+            render_editable_field_box(
+                "content-hub-catalog-search-input",
+                &search_field,
+                tr_str(&lang, "搜索专辑、艺人、曲风…", "Search Music…"),
+                search_focused,
+                false,
+                pal,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus_input(ContentHubInputTarget::CatalogSearch, cx);
+                }),
+            ),
+        )
         .child(
             div()
-                .flex_shrink_0()
-                .px(px(24.0))
-                .py(px(14.0))
-                .border_b_1()
-                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "浏览", "Browse")),
+                )
+                .children(MUSIC_SUB_TABS.iter().map(|&(slug, zh, en)| {
+                    let count = match slug {
+                        "library" => Some(library_music.len()),
+                        "home" | "new" => Some(filtered_music.len()),
+                        "radio" => Some(radio_stations.len()),
+                        _ => None,
+                    };
+                    openbot_marketplace_nav_item(
+                        SharedString::from(format!("music-tab-{slug}")),
+                        tr_str(&lang, zh, en),
+                        active_tab == slug,
+                        count,
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.active_sub_tab = slug.to_string();
+                            this.selected_creation_id = None;
+                            this.selected_catalog_item = None;
+                            this.selected_detail_creation = None;
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "曲风", "Genres")),
+                )
+                .child(
+                    openbot_marketplace_nav_item(
+                        "music-genre-all",
+                        tr_str(&lang, "全部曲风", "All Genres"),
+                        selected_genre.is_none(),
+                        Some(ws.music_catalog.len()),
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.selected_genre_filter = None;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .children(genres.iter().take(8).map(|g| {
+                    let g_val = g.clone();
+                    let active = selected_genre
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(&g_val));
+                    openbot_marketplace_nav_item(
+                        SharedString::from(format!("music-genre-{g_val}")),
+                        g_val.clone(),
+                        active,
+                        None,
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_genre_filter = Some(g_val.clone());
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "排序", "Sort")),
+                )
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(tg_icon(IconName::HubMusic, 22.0, MUSIC_ACCENT))
-                                .child(
-                                    div()
-                                        .text_size(px(22.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(tr_str(&lang, "音乐", "Music")),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(6.0))
-                                .children(MUSIC_SUB_TABS.iter().map(|&(slug, zh, en)| {
-                                    vertical_sub_tab_pill(
-                                        SharedString::from(format!("music-tab-{slug}")),
-                                        tr_str(&lang, zh, en),
-                                        active_tab == slug,
-                                        MUSIC_ACCENT,
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.active_sub_tab = slug.to_string();
-                                            this.selected_creation_id = None;
-                                            this.selected_catalog_item = None;
-                                            this.selected_detail_creation = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div().w(px(220.0)).max_w_full().child(
-                                        render_editable_field_box(
-                                            "content-hub-catalog-search-input",
-                                            &search_field,
-                                            tr_str(&lang, "搜索专辑、艺人、曲风…", "Search Music…"),
-                                            search_focused,
-                                            false,
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.focus_input(
-                                                    ContentHubInputTarget::CatalogSearch,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ),
-                                ),
-                        ),
-                )
-                .when(
-                    selected_detail.is_none() && active_tab != "radio",
-                    |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            filter_pill(
-                                                "music-genre-all",
-                                                tr_str(&lang, "全部曲风", "All Genres"),
-                                                selected_genre.is_none(),
-                                                pal,
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.selected_genre_filter = None;
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                        )
-                                        .children(genres.iter().take(6).map(|g| {
-                                            let g_val = g.clone();
-                                            let active = selected_genre
-                                                .as_deref()
-                                                .is_some_and(|s| s.eq_ignore_ascii_case(&g_val));
-                                            filter_pill(
-                                                SharedString::from(format!("music-genre-{g_val}")),
-                                                g_val.clone(),
-                                                active,
-                                                pal,
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.selected_genre_filter =
-                                                        Some(g_val.clone());
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .children(sort_options.iter().map(|&(mode, id, zh, en)| {
-                                            filter_pill(
-                                                id,
-                                                tr_str(&lang, zh, en),
-                                                sort_mode == mode,
-                                                pal,
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.sort_mode = mode;
-                                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                                        ContentHubSection::Music,
-                                                    ));
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        }))
-                                        .child(
-                                            macos_secondary_pill_btn(
-                                                "music-refresh-btn",
-                                                tr_str(&lang, "刷新", "Refresh"),
-                                                pal,
-                                            )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|_this, _, _, cx| {
-                                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                                        ContentHubSection::Music,
-                                                    ));
-                                                }),
-                                            ),
-                                        ),
-                                ),
-                        )
-                    },
-                ),
-        )
-        // Main Scrollable Body
-        .child(
-            div()
-                .id("apple-music-hub-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .overflow_y_scroll()
-                .p(px(24.0))
-                .flex()
-                .flex_col()
-                .gap(px(20.0))
-                .when_some(selected_detail.clone(), |el, detail| {
-                    el.child(render_music_album_detail(ws, detail, cx))
-                })
-                .when(selected_detail.is_none() && active_tab == "radio", |el| {
-                    el.child(hero_banner(
-                        "apple-music-radio-hero",
-                        tr_str(&lang, "APPLE MUSIC 电台", "APPLE MUSIC RADIO"),
-                        tr_str(&lang, "创作者精选无间断电台", "Live Creator Radio Stations"),
-                        tr_str(
-                            &lang,
-                            "点击任意电台即刻合成并随机播放在线公开曲库。",
-                            "Launch an instant synthesized mix built from published community tracks.",
-                        ),
-                        "#FA2D48",
-                        "#7C3AED",
-                        IconName::HubMusic,
-                        pal,
-                    ))
-                    .child(div().flex().flex_wrap().gap(px(14.0)).children(
-                        radio_stations.iter().map(|&(sid, zh, en, genre_opt, c1, c2)| {
-                            let gf = genre_opt.map(str::to_string);
-                            div()
-                                .id(SharedString::from(format!("music-radio-{sid}")))
-                                .cursor_pointer()
-                                .w(px(260.0))
-                                .max_w_full()
-                                .rounded(px(14.0))
-                                .p(px(18.0))
-                                .bg(linear_gradient(
-                                    135.0,
-                                    linear_color_stop(
-                                        rgb(crate::views::content_hub::apple_primitives::parse_hex_color(c1, MUSIC_ACCENT)),
-                                        0.0,
-                                    ),
-                                    linear_color_stop(
-                                        rgb(crate::views::content_hub::apple_primitives::parse_hex_color(c2, 0x1C1C1E)),
-                                        1.0,
-                                    ),
-                                ))
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.0))
+                        .gap(px(6.0))
+                        .px(px(4.0))
+                        .children(sort_options.iter().map(|&(mode, id, zh, en)| {
+                            filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |_this, _, _, cx| {
-                                        cx.emit(ContentHubEvent::PlayMusicRadio {
-                                            genre_filter: gf.clone(),
-                                        });
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.sort_mode = mode;
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::Music,
+                                        ));
+                                        cx.notify();
                                     }),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(TdesktopThemePalette::rgba_with_alpha(
-                                            0xFFFFFF, 0.80,
-                                        ))
-                                        .child("LIVE · RADIO"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(16.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .child(tr_str(&lang, zh, en)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .child(tr_str(&lang, "▶ 立即收听", "▶ Listen Now")),
-                                )
-                        }),
-                    ))
-                })
-                .when(
-                    selected_detail.is_none() && active_tab != "radio",
-                    |el| {
-                        let list = if active_tab == "library" {
-                            library_music.clone()
-                        } else {
-                            filtered_music.clone()
-                        };
-                        el.child(hero_banner(
-                            "apple-music-hero-banner",
-                            tr_str(&lang, "APPLE MUSIC · 无损合成", "APPLE MUSIC · SPATIAL SYNTH"),
-                            tr_str(&lang, "聆听社区原创专辑与精选榜单", "Top Picks & Original Albums"),
-                            tr_str(
-                                &lang,
-                                "内置纯 Rust 音频合成器、5-bit 波形进度条、同步歌词与待播队列。",
-                                "Pure-Rust WAV synthesis, interactive waveform scrubber, synced lyrics & Up Next queue.",
-                            ),
-                            "#FA2D48",
-                            "#A21CAF",
-                            IconName::HubMusic,
-                            pal,
-                        ))
-                        .child(apple_shelf_header(
-                            if active_tab == "library" {
-                                tr_str(&lang, "我的喜爱与资料库", "Loved & Library")
-                            } else if active_tab == "new" {
-                                tr_str(&lang, "最新上架专辑", "New Releases")
-                            } else {
-                                tr_str(&lang, "为你推荐", "Top Picks for You")
-                            },
-                            Some(format!("{} {}", list.len(), tr_str(&lang, "张专辑", "albums"))),
-                            pal,
-                        ))
-                        .when(list.is_empty(), |inner| {
-                            let cta = macos_secondary_pill_btn(
-                                "music-empty-refresh-btn",
-                                tr_str(&lang, "刷新曲库", "Refresh Music"),
-                                pal,
-                            )
+                        })),
+                ),
+        );
+
+    let body_scroll = div().id("apple-music-hub-scroll").child(
+        div()
+            .w_full()
+            .max_w(px(880.0))
+            .mx_auto()
+            .px(px(24.0))
+            .py(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(20.0))
+            .when_some(selected_detail.clone(), |el, detail| {
+                el.child(render_music_album_detail(ws, detail, cx))
+            })
+            .when(selected_detail.is_none() && active_tab == "radio", |el| {
+                let radio_hover = ob.bg_control_hover();
+                el.child(hero_banner(
+                    "apple-music-radio-hero",
+                    tr_str(&lang, "音乐电台", "MUSIC RADIO"),
+                    tr_str(&lang, "创作者精选无间断电台", "Live Creator Radio Stations"),
+                    tr_str(
+                        &lang,
+                        "点击任意电台即刻合成并随机播放在线公开曲库。",
+                        "Launch an instant synthesized mix built from published community tracks.",
+                    ),
+                    "#212121",
+                    "#1A1A1A",
+                    IconName::HubMusic,
+                    pal,
+                ))
+                .child(div().flex().flex_wrap().gap(px(14.0)).children(
+                    radio_stations.iter().map(|&(sid, zh, en, genre_opt)| {
+                        let gf = genre_opt.map(str::to_string);
+                        div()
+                            .id(SharedString::from(format!("music-radio-{sid}")))
+                            .cursor_pointer()
+                            .w(px(260.0))
+                            .max_w_full()
+                            .rounded(px(14.0))
+                            .p(px(18.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_strong_hairline())
+                            .hover(move |s| s.bg(radio_hover))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                        ContentHubSection::Music,
-                                    ));
+                                cx.listener(move |_this, _, _, cx| {
+                                    cx.emit(ContentHubEvent::PlayMusicRadio {
+                                        genre_filter: gf.clone(),
+                                    });
                                 }),
-                            );
-                            inner.child(empty_state_card_shell(
-                                IconName::HubMusic,
-                                tr_str(&lang, "暂无公开上架音乐", "No Published Music Yet"),
-                                tr_str(
-                                    &lang,
-                                    "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布音乐，审核上架后会展示在这里。",
-                                    "Chat with @CreatorStudioBot directly in Messages to compose and publish music. Published albums appear here.",
-                                ),
-                                cta,
-                                pal,
-                            ))
-                        })
-                        .when(!list.is_empty(), |inner| {
-                            inner
-                                .child(div().flex().flex_wrap().gap(px(14.0)).children(
-                                    list.iter().map(|item| {
-                                        let is_np = now_playing_cid.as_deref()
-                                            == Some(item.creation_id.as_str());
-                                        let is_loved = ws
-                                            .my_creation_states
-                                            .get(&item.creation_id)
-                                            .is_some_and(|st| st.favorite);
-                                        render_square_album_card(item, is_np, is_loved, pal, cx)
-                                    }),
-                                ))
-                                // Top Charts table below the album shelf
-                                .child(
-                                    apple_grouped_card(pal)
-                                        .p(px(16.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(6.0))
-                                        .child(apple_shelf_header(
-                                            tr_str(&lang, "热门排行榜", "Top Charts"),
-                                            Some(format!(
-                                                "Top {}",
-                                                list.len().min(10)
-                                            )),
-                                            pal,
-                                        ))
-                                        .children(list.iter().take(10).enumerate().map(
-                                            |(rank, item)| {
-                                                let item_play = item.clone();
-                                                let is_np = now_playing_cid.as_deref()
-                                                    == Some(item.creation_id.as_str());
-                                                let hover_bg = pal.row_hover_rgba();
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "music-chart-row-{rank}"
-                                                    )))
-                                                    .cursor_pointer()
-                                                    .px(px(10.0))
-                                                    .py(px(8.0))
-                                                    .rounded(px(8.0))
-                                                    .hover(move |s| s.bg(hover_bg))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .gap(px(10.0))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |_this, _, _, cx| {
-                                                            cx.emit(
-                                                                ContentHubEvent::PlayMusicCreation {
-                                                                    creation: catalog_item_to_music_creation(&item_play),
-                                                                    track_index: 0,
-                                                                    shuffle: false,
-                                                                },
-                                                            );
-                                                        }),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w(px(0.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(10.0))
-                                                            .child(
-                                                                div()
-                                                                    .w(px(22.0))
-                                                                    .flex_shrink_0()
-                                                                    .text_size(px(13.0))
-                                                                    .font_weight(FontWeight::BOLD)
-                                                                    .text_color(rgb(if rank < 3 {
-                                                                        MUSIC_ACCENT
-                                                                    } else {
-                                                                        pal.text_secondary
-                                                                    }))
-                                                                    .child(format!("{}", rank + 1)),
-                                                            )
-                                                            .child(cover_artwork_box(
-                                                                &item.cover,
-                                                                36.0,
-                                                                36.0,
-                                                                6.0,
-                                                                MUSIC_ACCENT,
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .min_w(px(0.0))
-                                                                    .flex()
-                                                                    .flex_col()
-                                                                    .child(
-                                                                        div()
-                                                                            .truncate()
-                                                                            .text_size(px(13.0))
-                                                                            .font_weight(
-                                                                                FontWeight::SEMIBOLD,
-                                                                            )
-                                                                            .text_color(rgb(
-                                                                                if is_np {
-                                                                                    MUSIC_ACCENT
-                                                                                } else {
-                                                                                    pal.text_primary
-                                                                                },
-                                                                            ))
-                                                                            .child(
-                                                                                item.title.clone(),
-                                                                            ),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .truncate()
-                                                                            .text_size(px(11.0))
-                                                                            .text_color(rgb(
-                                                                                pal.text_secondary,
-                                                                            ))
-                                                                            .child(
-                                                                                item.author_display_name
-                                                                                    .clone(),
-                                                                            ),
-                                                                    ),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_shrink_0()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(10.0))
-                                                            .child(rating_pill(
-                                                                item.rating_avg,
-                                                                item.rating_count,
-                                                                pal,
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.0))
-                                                                    .font_weight(FontWeight::BOLD)
-                                                                    .text_color(rgb(MUSIC_ACCENT))
-                                                                    .child(if is_np {
-                                                                        "♫"
-                                                                    } else {
-                                                                        "▶"
-                                                                    }),
-                                                            ),
-                                                    )
-                                            },
-                                        )),
-                                )
-                        })
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_muted())
+                                    .child("LIVE · RADIO"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
+                                    .child(tr_str(&lang, zh, en)),
+                            )
+                            .child(
+                                div()
+                                    .pt(px(4.0))
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_secondary())
+                                    .child(tr_str(&lang, "▶ 立即收听", "▶ Listen Now")),
+                            )
+                    }),
+                ))
+            })
+            .when(selected_detail.is_none() && active_tab != "radio", |el| {
+                let list = if active_tab == "library" {
+                    library_music.clone()
+                } else {
+                    filtered_music.clone()
+                };
+                el.child(hero_banner(
+                    "apple-music-hero-banner",
+                    tr_str(&lang, "音乐 · 原创合成", "MUSIC · SYNTH STUDIO"),
+                    tr_str(&lang, "聆听社区原创专辑与精选榜单", "Top Picks & Original Albums"),
+                    tr_str(
+                        &lang,
+                        "内置纯 Rust 音频合成器、波形进度条、同步歌词与待播队列。",
+                        "Pure-Rust WAV synthesis, interactive waveform scrubber, synced lyrics & Up Next queue.",
+                    ),
+                    "#212121",
+                    "#1A1A1A",
+                    IconName::HubMusic,
+                    pal,
+                ))
+                .child(apple_shelf_header(
+                    if active_tab == "library" {
+                        tr_str(&lang, "我的喜爱与资料库", "Loved & Library")
+                    } else if active_tab == "new" {
+                        tr_str(&lang, "最新上架专辑", "New Releases")
+                    } else {
+                        tr_str(&lang, "为你推荐", "Top Picks for You")
                     },
-                ),
-        )
+                    Some(format!(
+                        "{} {}",
+                        list.len(),
+                        tr_str(&lang, "张专辑", "albums")
+                    )),
+                    pal,
+                ))
+                .when(list.is_empty(), |inner| {
+                    let cta = openbot_secondary_btn(
+                        "music-empty-refresh-btn",
+                        tr_str(&lang, "刷新曲库", "Refresh Music"),
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _, _, cx| {
+                            cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Music));
+                        }),
+                    );
+                    inner.child(empty_state_card_shell(
+                        IconName::HubMusic,
+                        tr_str(&lang, "暂无公开上架音乐", "No Published Music Yet"),
+                        tr_str(
+                            &lang,
+                            "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布音乐，审核上架后会展示在这里。",
+                            "Chat with @CreatorStudioBot directly in Messages to compose and publish music. Published albums appear here.",
+                        ),
+                        cta,
+                        pal,
+                    ))
+                })
+                .when(!list.is_empty(), |inner| {
+                    inner
+                        .child(div().flex().flex_wrap().gap(px(14.0)).children(
+                            list.iter().map(|item| {
+                                let is_np = now_playing_cid.as_deref()
+                                    == Some(item.creation_id.as_str());
+                                let is_loved = ws
+                                    .my_creation_states
+                                    .get(&item.creation_id)
+                                    .is_some_and(|st| st.favorite);
+                                render_square_album_card(item, is_np, is_loved, pal, cx)
+                            }),
+                        ))
+                        // Top Charts table below the album shelf
+                        .child(
+                            apple_grouped_card(pal)
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(apple_shelf_header(
+                                    tr_str(&lang, "热门排行榜", "Top Charts"),
+                                    Some(format!("Top {}", list.len().min(10))),
+                                    pal,
+                                ))
+                                .children(list.iter().take(10).enumerate().map(|(rank, item)| {
+                                    let item_play = item.clone();
+                                    let is_np = now_playing_cid.as_deref()
+                                        == Some(item.creation_id.as_str());
+                                    let hover_bg = ob.bg_control_hover();
+                                    div()
+                                        .id(SharedString::from(format!("music-chart-row-{rank}")))
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(8.0))
+                                        .rounded(px(10.0))
+                                        .bg(if is_np {
+                                            ob.bg_control_active()
+                                        } else {
+                                            rgba(0x00000000)
+                                        })
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(10.0))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |_this, _, _, cx| {
+                                                cx.emit(ContentHubEvent::PlayMusicCreation {
+                                                    creation: catalog_item_to_music_creation(
+                                                        &item_play,
+                                                    ),
+                                                    track_index: 0,
+                                                    shuffle: false,
+                                                });
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(10.0))
+                                                .child(
+                                                    div()
+                                                        .w(px(22.0))
+                                                        .flex_shrink_0()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(if rank < 3 {
+                                                            ob.text_primary()
+                                                        } else {
+                                                            ob.text_muted()
+                                                        })
+                                                        .child(format!("{}", rank + 1)),
+                                                )
+                                                .child(cover_artwork_box(
+                                                    &item.cover,
+                                                    36.0,
+                                                    36.0,
+                                                    6.0,
+                                                    0x4E3840,
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .truncate()
+                                                                .text_size(px(13.0))
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(ob.text_primary())
+                                                                .child(item.title.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .truncate()
+                                                                .text_size(px(11.0))
+                                                                .text_color(ob.text_muted())
+                                                                .child(
+                                                                    item.author_display_name
+                                                                        .clone(),
+                                                                ),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(10.0))
+                                                .child(rating_pill(
+                                                    item.rating_avg,
+                                                    item.rating_count,
+                                                    pal,
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(ob.text_primary())
+                                                        .child(if is_np { "♫" } else { "▶" }),
+                                                ),
+                                        )
+                                })),
+                        )
+                })
+            }),
+    );
+
+    div()
+        .id("apple-music-hub-root")
+        .size_full()
+        .bg(ob.bg_canvas())
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(header)
+        .child(openbot_marketplace_shell(left_nav, body_scroll, pal))
         .into_any_element()
 }

@@ -142,15 +142,18 @@ fn render_post_card_inner(
         .child(body_section)
         .child(footer);
 
+    let ob = pal.openbot_palette();
+    let card_hover = ob.bg_control_hover();
+    let _ = hover_bg;
     div()
         .id(card_id)
         .w_full()
         .p(px(14.0))
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
         .border_1()
-        .border_color(pal.hairline_border_rgba())
-        .hover(move |s| s.border_color(hover_bg))
+        .border_color(ob.frame_card_border())
+        .hover(move |s| s.bg(card_hover))
         .flex()
         .gap(px(10.0))
         .when(density == FeedDensity::Classic, |row| {

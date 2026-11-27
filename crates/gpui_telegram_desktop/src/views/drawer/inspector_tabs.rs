@@ -285,6 +285,153 @@ pub enum InspectorAction {
     OpenBotCompanion(BotCompanionTab),
 }
 
+/// Summary of a published/user Book, Music, or Game creation produced by the active Bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotPublishedCreationSummary {
+    pub creation_id: String,
+    pub title: String,
+    pub kind_label: String,
+    pub status_label: String,
+    pub kind_code: &'static str,
+}
+
+/// Drill-down subpages inside the embedded OpenBot right `SidePanel` `Settings` pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenBotSettingsSubpage {
+    Creations,
+    BackupModels,
+    Instructions,
+    Memories,
+    Skills,
+    DataTables,
+    Routines,
+    Workflows,
+    Usage,
+    Permissions,
+    Folders,
+    Advanced,
+    SharedMedia,
+    ChannelMemories,
+    ChannelRoutines,
+    ChannelFolders,
+}
+
+impl OpenBotSettingsSubpage {
+    pub fn title(self, lang: &str) -> &'static str {
+        match self {
+            Self::Creations => tr_str(lang, "作品集", "Published Creations"),
+            Self::BackupModels => tr_str(lang, "备用模型", "Backup Models"),
+            Self::Instructions => tr_str(lang, "指令 (AGENTS.md)", "Instructions"),
+            Self::Memories => tr_str(lang, "记忆", "Memories"),
+            Self::Skills => tr_str(lang, "技能与 MCP", "Skills & MCP"),
+            Self::DataTables => tr_str(lang, "数据表", "Data Tables"),
+            Self::Routines => tr_str(lang, "自动化任务", "Routines"),
+            Self::Workflows => tr_str(lang, "工作流", "Workflows"),
+            Self::Usage => tr_str(lang, "用量", "Usage"),
+            Self::Permissions => tr_str(lang, "权限", "Permissions"),
+            Self::Folders => tr_str(lang, "文件夹", "Folders"),
+            Self::Advanced => tr_str(lang, "高级", "Advanced"),
+            Self::SharedMedia => tr_str(lang, "共享媒体与文件", "Shared Media & Files"),
+            Self::ChannelMemories => tr_str(lang, "频道记忆", "Channel Memories"),
+            Self::ChannelRoutines => tr_str(lang, "频道自动化任务", "Channel Routines"),
+            Self::ChannelFolders => tr_str(lang, "频道文件夹", "Channel Folders"),
+        }
+    }
+}
+
+/// Active inline IME text input inside the embedded OpenBot `Settings` pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenBotInspectorTextField {
+    BotName,
+    BotTitle,
+    BotDescription,
+    BotInstructions,
+    BotBackupModelDraft,
+    BotFolderDraft,
+    ChannelName,
+    ChannelTitle,
+    ChannelInstructions,
+    ChannelMemoryDraft,
+    ChannelFolderDraft,
+}
+
+/// Explicit inline confirmation guard for permission widening & destructive actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenBotConfirmGuard {
+    WidenPermissionsFull,
+    BotNewSession,
+    BotDeleteHistory,
+    BotDeleteAgent,
+    ChannelNewConversation,
+    ChannelCompactContext,
+    ChannelDeleteHistory,
+    ChannelRemoveMember { user_id: u64, name: String },
+}
+
+/// Group/Channel browser access policy matching OpenBot `ChannelBrowser`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChannelBrowserAccess {
+    #[default]
+    Everyone,
+    Member(u64),
+    None,
+}
+
+impl ChannelBrowserAccess {
+    pub fn as_policy_str(&self) -> String {
+        match self {
+            Self::Everyone => "everyone".to_string(),
+            Self::Member(uid) => format!("member:{uid}"),
+            Self::None => "none".to_string(),
+        }
+    }
+}
+
+/// Additive M4 actions emitted by embedded OpenBot Bot/Channel/Contact settings panes
+/// and drained directly by `AppShell` (`shell_bot_fusion.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenBotInspectorAction {
+    OpenSidePanelPane(crate::views::openbot::side_panel::SidePanelPaneKind),
+    OpenPublishedCreation {
+        creation_id: String,
+        kind_code: &'static str,
+    },
+    OpenContentHubCreations,
+    UpdateChatInfo {
+        title: String,
+        about: String,
+    },
+    PromoteChannelLead {
+        user_id: u64,
+        member_name: String,
+    },
+    RemoveChannelMember {
+        user_id: u64,
+        member_name: String,
+    },
+    CompactChannelContext,
+    StartNewChannelConversation,
+    DeleteChatHistory,
+    DeleteBot {
+        bot_id: u64,
+        bot_name: String,
+    },
+    SetChatBubbleColor(Option<String>),
+    SetBotBusyMode(String),
+    SetBotPermissions {
+        access: String,
+        computer_use: bool,
+        allow_automation: bool,
+    },
+    SetChannelBrowserPolicy(String),
+    SetChannelContextIsolation(bool),
+    SetChannelIcon {
+        icon_name: Option<String>,
+        hue: Option<u16>,
+    },
+    NotifyStatus(String),
+}
+
 /// Live AI provider & model catalog synchronized from Settings (`MagpieStateDto` + discovered subscriptions).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectorAiModelCatalog {

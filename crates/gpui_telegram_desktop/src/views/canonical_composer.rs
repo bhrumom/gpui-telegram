@@ -18,13 +18,14 @@ use crate::theme::TdesktopThemePalette;
 use crate::views::composer::attachments_drawer::ComposerAttachMiniApp;
 use crate::views::composer::bot_keyboard::BotKeyboardButton;
 use crate::views::composer::composer_ui::{
-    render_composer_context_banner, render_text_input_strip_with_full_options,
+    render_composer_context_banner, render_text_input_strip_openbot,
     render_voice_recording_strip, ComposerBarAction,
 };
 use crate::views::composer::editor_state::ComposerEditorState;
 use crate::views::composer::field_autocomplete::MentionRow;
 use crate::views::composer::popups_ui::{
     render_attachments_drawer_with_apps, render_formatting_toolbar, render_send_options_popup,
+    ComposerOpenBotAddAction,
 };
 use crate::views::stage::view::controls::history_view_bot_menu_button::HistoryViewBotMenuButtonViewControls;
 use crate::views::composer::selector_ui::render_tabbed_selector_popup;
@@ -39,6 +40,8 @@ pub const MAX_COMPOSER_HEIGHT: f32 = 192.0;
 pub const LINE_HEIGHT: f32 = 20.0;
 pub const ACTION_BTN_WIDTH: f32 = 44.0;
 pub const ACTION_BTN_HEIGHT: f32 = 46.0;
+pub const OPENBOT_COMPOSER_PILL_HEIGHT: f32 = 48.0;
+pub const OPENBOT_COMPOSER_EXPANDED_MIN_HEIGHT: f32 = 96.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HermesSlashOption {
@@ -239,6 +242,11 @@ pub struct CanonicalComposer {
     pub compose_placeholder_override: Option<String>,
     pub compose_send_disabled: bool,
     pub is_compose_isolated: bool,
+    // M3 OpenBot composer state (UI-F12 / UI-F13)
+    pub is_agent_busy: bool,
+    pub pending_openbot_add_action: Option<ComposerOpenBotAddAction>,
+    pub pending_stop_active_turn: bool,
+    pub pending_live_voice_start: bool,
 }
 
 impl CanonicalComposer {
@@ -307,7 +315,27 @@ impl CanonicalComposer {
             compose_placeholder_override: None,
             compose_send_disabled: false,
             is_compose_isolated: false,
+            is_agent_busy: false,
+            pending_openbot_add_action: None,
+            pending_stop_active_turn: false,
+            pending_live_voice_start: false,
         }
+    }
+
+    pub fn set_agent_busy(&mut self, busy: bool) {
+        self.is_agent_busy = busy;
+    }
+
+    pub fn take_openbot_add_action(&mut self) -> Option<ComposerOpenBotAddAction> {
+        self.pending_openbot_add_action.take()
+    }
+
+    pub fn take_stop_active_turn(&mut self) -> bool {
+        std::mem::take(&mut self.pending_stop_active_turn)
+    }
+
+    pub fn take_live_voice_start(&mut self) -> bool {
+        std::mem::take(&mut self.pending_live_voice_start)
     }
 
     /// Overrides the composer input placeholder (e.g. `"发消息给 A、B 和 C"` in `NewChatBar` compose mode).
@@ -868,17 +896,18 @@ impl Render for CanonicalComposer {
         };
 
         let is_apple = self.palette.is_apple_style();
+        let ob = self.palette.openbot_palette();
         let wrap_center = |child: AnyElement, align_end: bool| -> AnyElement {
             if is_apple {
                 div()
                     .w_full()
-                    .px(px(20.0))
+                    .px(px(16.0))
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(740.0))
+                            .max_w(px(760.0))
                             .when(align_end, |el| el.flex().justify_end())
                             .child(child),
                     )
@@ -921,7 +950,7 @@ impl Render for CanonicalComposer {
             .relative()
             .w_full()
             .flex_shrink_0()
-            .bg(rgb(self.palette.composer_bg))
+            .bg(if is_apple { ob.bg_canvas() } else { rgb(self.palette.composer_bg).into() })
             .flex()
             .flex_col()
             .when_some(ac_popup, |el, pop| el.child(wrap_center(pop, false)))
@@ -978,7 +1007,9 @@ impl Render for CanonicalComposer {
                 ))
             })
             .when_some(banner, |el, b| el.child(b))
-            .when_some(context_ref_strip, |el, strip| el.child(wrap_center(strip, false)))
+            .when_some((!is_apple).then_some(context_ref_strip).flatten(), |el, strip| {
+                el.child(wrap_center(strip, false))
+            })
             .when_some(
                 (!self.is_compose_isolated)
                     .then(|| self.active_send_as_label().map(str::to_string))
@@ -986,7 +1017,7 @@ impl Render for CanonicalComposer {
                 |el, label| {
                 let bg = self.palette.input_bg;
                 let border: Rgba = if is_apple {
-                    self.palette.separator_rgba()
+                    ob.border_hairline()
                 } else {
                     rgb(self.palette.border_fg).into()
                 };
@@ -1032,7 +1063,8 @@ impl Render for CanonicalComposer {
                     self.bot_menu_controls.refresh(label, should_be_small);
                 }
                 let show_web_menu = !self.is_compose_isolated && self.bot_menu_controls.is_active;
-                let show_slash_btn = !self.is_compose_isolated
+                let show_slash_btn = !is_apple
+                    && !self.is_compose_isolated
                     && (!self.bot_slash_commands.is_empty() || self.hermes_slash_enabled);
                 let bot_menu_view = if show_web_menu && show_slash_btn {
                     let menu_ent = self.ensure_bot_menu_entity(cx);
@@ -1069,7 +1101,7 @@ impl Render for CanonicalComposer {
                     .compose_placeholder_override
                     .as_deref()
                     .or(self.bot_keyboard.placeholder.as_deref());
-                render_text_input_strip_with_full_options(
+                render_text_input_strip_openbot(
                     &text,
                     cursor,
                     selection,
@@ -1081,6 +1113,7 @@ impl Render for CanonicalComposer {
                     self.is_emoji_picker_open,
                     !self.is_compose_isolated && self.bot_keyboard.has_markup(),
                     !self.is_compose_isolated && self.is_bot_keyboard_open,
+                    self.is_agent_busy,
                     self.calculate_content_height(),
                     self.is_overflow_scroll_active(),
                     bot_menu_view,

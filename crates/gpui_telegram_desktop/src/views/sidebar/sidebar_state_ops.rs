@@ -9,11 +9,13 @@ use crate::i18n::tr_str;
 use crate::views::chat_sidebar::{
     AddContactKind, BotGrokAvatarVisual, CategorizedSearchResult, ChatSidebar, ComposeDraftState,
     ComposeRecipientChip, CreationInputField, DialogDeliveryStatus, DialogItemModel,
-    PendingAddContactRequest, PendingCreateGroupRequest, SidebarCreationModal,
+    PendingAddContactRequest, PendingCreateGroupRequest, SidebarChatSortOrder,
+    SidebarCreationModal, SidebarListShowFilter,
 };
 use crate::views::nav_rail::{NavDestination, NavRail};
 use crate::views::sidebar::dialogs_row_view::{SidebarContextAction, SidebarDialogMeta};
 use crate::views::sidebar::gemini_unified_sidebar::UnifiedSidebarAction;
+use crate::views::sidebar::openbot_sidebar_chrome::SidebarFilterCounts;
 use crate::views::sidebar::suggestions::suggestion_manager::{
     SuggestionItem, SuggestionManager, SuggestionPriority,
 };
@@ -1008,12 +1010,81 @@ impl ChatSidebar {
         Some(local_id)
     }
 
+    fn is_dialog_working(&self, d: &DialogItemModel) -> bool {
+        d.typing_indicator.is_some()
+            || self.bot_grok_avatars.get(&d.id).is_some_and(|g| {
+                let st = g.execution_state.trim().to_ascii_lowercase();
+                matches!(
+                    st.as_str(),
+                    "working" | "thinking" | "tool" | "coding" | "writing" | "searching"
+                )
+            })
+    }
+
+    fn is_dialog_agent(&self, d: &DialogItemModel) -> bool {
+        let is_channel = self.channel_chat_ids.contains(&d.id) || d.folder == "Channels";
+        let is_group = !is_channel
+            && (self.group_chat_ids.contains(&d.id)
+                || d.folder == "Groups"
+                || d.folder == "Work");
+        !is_channel && !is_group && (self.bot_ids.contains(&d.id) || d.folder == "Bots")
+    }
+
+    fn is_dialog_channel_or_group(&self, d: &DialogItemModel) -> bool {
+        self.group_chat_ids.contains(&d.id)
+            || self.channel_chat_ids.contains(&d.id)
+            || d.folder == "Groups"
+            || d.folder == "Channels"
+            || d.folder == "Work"
+    }
+
+    /// Computes live counts shown inside OpenBot's `SidebarFilterMenu`.
+    pub fn filter_counts(&self) -> SidebarFilterCounts {
+        let mut counts = SidebarFilterCounts::default();
+        for d in &self.dialogs {
+            if self.archived_ids.contains(&d.id) {
+                continue;
+            }
+            counts.all += 1;
+            if self.is_dialog_agent(d) {
+                counts.agents += 1;
+            }
+            if self.is_dialog_channel_or_group(d) {
+                counts.channels += 1;
+            }
+            if d.unread_count > 0 || self.unread_marked_ids.contains(&d.id) {
+                counts.unread += 1;
+            }
+            if self.is_dialog_working(d) {
+                counts.working += 1;
+            }
+            if d.is_muted {
+                counts.muted += 1;
+            }
+        }
+        counts
+    }
+
+    /// Shows or hides a tab in OpenBot's `SidebarTabs` strip (`"All"` is always pinned visible).
+    pub fn toggle_tab_visibility(&mut self, tab_id: String) {
+        if tab_id == "All" {
+            return;
+        }
+        if !self.hidden_tab_ids.remove(&tab_id) {
+            self.hidden_tab_ids.insert(tab_id.clone());
+            if self.active_folder == tab_id {
+                self.active_folder = "All".to_string();
+            }
+        }
+    }
+
     pub fn filtered_dialogs(&self) -> Vec<&DialogItemModel> {
         let q = self.search_query.to_lowercase();
         let active_cf = self
             .custom_folders
             .iter()
             .find(|cf| cf.title == self.active_folder);
+        let filter = self.list_filter;
         let mut out: Vec<&DialogItemModel> = self
             .dialogs
             .iter()
@@ -1034,6 +1105,17 @@ impl ChatSidebar {
                     d.folder == self.active_folder
                 };
 
+                let matches_list_show = match filter.show {
+                    SidebarListShowFilter::All => true,
+                    SidebarListShowFilter::Agents => self.is_dialog_agent(d),
+                    SidebarListShowFilter::Channels => self.is_dialog_channel_or_group(d),
+                };
+                let matches_unread = !filter.unread_only
+                    || d.unread_count > 0
+                    || self.unread_marked_ids.contains(&d.id);
+                let matches_working = !filter.working_only || self.is_dialog_working(d);
+                let matches_muted = !filter.muted_only || d.is_muted;
+
                 let matches_search = if q.is_empty() {
                     true
                 } else {
@@ -1041,7 +1123,12 @@ impl ChatSidebar {
                         || d.last_message.to_lowercase().contains(&q)
                 };
 
-                matches_folder && matches_search
+                matches_folder
+                    && matches_list_show
+                    && matches_unread
+                    && matches_working
+                    && matches_muted
+                    && matches_search
             })
             .collect();
         if let Some(cf) = active_cf {
@@ -1051,6 +1138,26 @@ impl ChatSidebar {
                         .iter()
                         .position(|&pid| pid == d.id as i64)
                         .unwrap_or(usize::MAX)
+                });
+            }
+        }
+        match filter.sort_order {
+            SidebarChatSortOrder::Manual => {}
+            SidebarChatSortOrder::Recent => {
+                // Preserve live recent ordering (non-empty timestamps first)
+                out.sort_by_key(|d| d.timestamp.trim().is_empty());
+            }
+            SidebarChatSortOrder::UnreadFirst => {
+                out.sort_by_key(|d| {
+                    let unread = d.unread_count > 0 || self.unread_marked_ids.contains(&d.id);
+                    (!unread, std::cmp::Reverse(d.unread_count))
+                });
+            }
+            SidebarChatSortOrder::UnreadGroup => {
+                out.sort_by_key(|d| {
+                    let working = self.is_dialog_working(d);
+                    let unread = d.unread_count > 0 || self.unread_marked_ids.contains(&d.id);
+                    (!working, !unread)
                 });
             }
         }
@@ -1332,6 +1439,8 @@ impl ChatSidebar {
             is_verified: self.verified_ids.contains(&item.id),
             is_premium: self.premium_ids.contains(&item.id),
             is_bot,
+            is_group,
+            group_member_briefs: Vec::new(),
             fabushi_shape: fabushi_vis.as_ref().map(|(s, _)| s.clone()),
             fabushi_color: fabushi_vis.as_ref().map(|(_, c)| *c),
             grok_avatar,
@@ -1460,6 +1569,65 @@ impl ChatSidebar {
             UnifiedSidebarAction::SetHoverDialog(dialog_id) => {
                 if self.hovered_rail_dialog_id != dialog_id {
                     self.hovered_rail_dialog_id = dialog_id;
+                    cx.notify();
+                }
+            }
+            UnifiedSidebarAction::NavigateBack => {
+                self.pending_nav_back = true;
+                cx.notify();
+            }
+            UnifiedSidebarAction::NavigateForward => {
+                self.pending_nav_forward = true;
+                cx.notify();
+            }
+            UnifiedSidebarAction::ToggleOpenBotCompact => {
+                self.toggle_openbot_compact_from_user();
+                cx.notify();
+            }
+            UnifiedSidebarAction::OpenGlobalSearch => {
+                self.close_openbot_popovers();
+                if self.has_leading_app_sidebar && self.palette.is_apple_style() {
+                    self.pending_open_global_search = true;
+                } else {
+                    self.focus_search();
+                }
+                cx.notify();
+            }
+            UnifiedSidebarAction::ToggleFilterMenu => {
+                let next = !self.is_filter_menu_open;
+                self.close_openbot_popovers();
+                self.is_filter_menu_open = next;
+                cx.notify();
+            }
+            UnifiedSidebarAction::ToggleNewMenu => {
+                let next = !self.is_new_menu_open;
+                self.close_openbot_popovers();
+                self.is_new_menu_open = next;
+                cx.notify();
+            }
+            UnifiedSidebarAction::ToggleTabsEditMenu => {
+                let next = !self.is_tabs_edit_menu_open;
+                self.close_openbot_popovers();
+                self.is_tabs_edit_menu_open = next;
+                cx.notify();
+            }
+            UnifiedSidebarAction::CreateNewAgent => {
+                self.close_openbot_popovers();
+                self.pending_open_create_agent_studio = true;
+                cx.notify();
+            }
+            UnifiedSidebarAction::CreateNewGroup => {
+                self.close_openbot_popovers();
+                self.pending_open_new_group = true;
+                cx.notify();
+            }
+            UnifiedSidebarAction::CreateNewFolder => {
+                self.close_openbot_popovers();
+                self.pending_open_new_folder = true;
+                cx.notify();
+            }
+            UnifiedSidebarAction::CloseOpenBotPopovers => {
+                if self.close_openbot_popovers() {
                     cx.notify();
                 }
             }

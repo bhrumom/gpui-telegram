@@ -6,15 +6,23 @@ use gpui_telegram_proto::miniapp_contracts::{
     resolve_grok_persona_color, resolve_grok_persona_shape, FabushiBotSummaryDto,
 };
 
+use crate::components::avatar::{
+    render_channel_avatar, ChannelAgentBrief, ChannelAvatarLayout,
+};
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
 };
 use crate::i18n::{tr_fmt, tr_key_or, tr_str};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use super::openbot_stage_chrome::{
+    activity_str_to_openbot_mood, build_channel_avatar_inputs, openbot_stage_icon,
+    render_fabushi_plush_avatar, render_tab_concave_fillet, OpenBotStageIcon,
+};
 use super::rich_meta::resolve_image_source;
 
 pub const APPLE_STAGE_TOP_BAR_HEIGHT: f32 = 76.0;
 pub const APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT: f32 = 52.0;
+pub const OPENBOT_HEADER_HEIGHT: f32 = 38.0;
 
 #[derive(Debug, Clone)]
 pub enum TopBarUiAction {
@@ -45,6 +53,21 @@ pub enum TopBarUiAction {
     ExportChat,
     ToggleMuteChat,
     ToggleBotCompanion,
+    // Additive M3 OpenBot ConversationHeader actions (UI-F09)
+    OpenAssistantSettings,
+    OpenChannelSettings,
+    OpenContactProfile,
+    ToggleSidePanel,
+    NewThread,
+    SelectThread(Option<String>),
+    ToggleModelPicker,
+    SelectModel {
+        model_id: String,
+        thinking_level: Option<String>,
+    },
+    TogglePinnedMessagesPopover,
+    JumpPinnedMessage(u64),
+    UnpinMessage(u64),
 }
 
 fn format_ttl_badge(ttl_seconds: u32, lang_id: &str) -> String {
@@ -139,16 +162,14 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let is_apple = palette.is_apple_style();
-    let bar_h = px(palette.scaled_px(if is_apple {
-        APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT
+    let ob = palette.openbot_palette();
+    let bar_h = px(if is_apple {
+        OPENBOT_HEADER_HEIGHT
     } else {
-        54.0
-    }));
+        palette.scaled_px(54.0)
+    });
     let bar_bg: Rgba = if is_apple {
-        TdesktopThemePalette::rgba_with_alpha(
-            palette.topbar_bg,
-            if palette.mode.is_dark() { 0.88 } else { 0.90 },
-        )
+        ob.bg_canvas()
     } else {
         rgb(palette.topbar_bg).into()
     };
@@ -158,97 +179,146 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
         let a_cpy = on_action.clone();
         let a_del = on_action.clone();
         let a_clr = on_action.clone();
-        let pill_r = px(if is_apple { 999.0 } else { 6.0 });
+        let pill_r = px(if is_apple { 8.0 } else { 6.0 });
+        let primary_bg: Rgba = if is_apple {
+            ob.surface_light()
+        } else {
+            rgb(palette.accent).into()
+        };
+        let primary_fg: Rgba = if is_apple {
+            ob.text_on_light()
+        } else {
+            rgb(0xFFFFFF).into()
+        };
+        let secondary_bg: Rgba = if is_apple {
+            ob.bg_control()
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
+        };
+        let secondary_fg: Rgba = if is_apple {
+            ob.text_primary()
+        } else {
+            rgb(palette.accent).into()
+        };
+        let danger_bg: Rgba = if is_apple {
+            ob.rgba("--openbot-danger-soft")
+                .unwrap_or_else(|| TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.14))
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.16)
+        };
+        let danger_fg: Rgba = if is_apple {
+            ob.danger()
+        } else {
+            rgb(palette.danger).into()
+        };
+        let cancel_fg: Rgba = if is_apple {
+            ob.text_muted()
+        } else {
+            rgb(palette.accent).into()
+        };
+        let ctl_hover = ob.bg_control_hover();
         let left_controls = if selected_count == 0 {
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(tg_icon(IconName::SelectCheck, palette.scaled_px(16.0), palette.accent))
+                .child(openbot_stage_icon(
+                    OpenBotStageIcon::Check,
+                    14.0,
+                    if is_apple { ob.text_primary() } else { rgb(palette.accent).into() },
+                ))
                 .child(
                     div()
-                        .text_size(px(palette.scaled_px(13.0)))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.text_primary))
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if is_apple { ob.text_primary() } else { rgb(palette.text_primary).into() })
                         .child(tr_str(lang_id, "点击消息进行多选", "Click messages to select")),
                 )
         } else {
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(6.0))
                 .child(
                     div()
                         .id("ms-fwd-btn")
-                        .px(px(14.0))
-                        .py(px(6.0))
+                        .h(px(28.0))
+                        .px(px(12.0))
                         .rounded(pill_r)
-                        .bg(rgb(palette.accent))
+                        .bg(primary_bg)
                         .cursor_pointer()
+                        .hover(|s| s.opacity(0.88))
                         .on_click(cx.listener(move |this, _, _, cx| a_fwd(this, TopBarUiAction::ForwardSelected, cx)))
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
-                        .child(tg_icon(IconName::Forward, 14.0, 0xFFFFFF))
+                        .gap(px(5.0))
                         .child(
                             div()
-                                .text_size(px(palette.scaled_px(12.0)))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xFFFFFF))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(primary_fg)
                                 .child(format!("{} {}", tr_key_or(lang_id, "lng_context_forward_msg", "Forward"), count_str)),
                         ),
                 )
                 .child(
                     div()
                         .id("ms-copy-btn")
-                        .px(px(12.0))
-                        .py(px(6.0))
+                        .h(px(28.0))
+                        .px(px(10.0))
                         .rounded(pill_r)
-                        .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14))
+                        .bg(secondary_bg)
+                        .when(is_apple, |el| el.border_1().border_color(ob.border_hairline()))
                         .cursor_pointer()
+                        .hover(move |s| s.bg(ctl_hover))
                         .on_click(cx.listener(move |this, _, _, cx| a_cpy(this, TopBarUiAction::CopySelected, cx)))
                         .flex()
                         .items_center()
                         .gap(px(5.0))
-                        .child(tg_icon(IconName::Copy, 14.0, palette.accent))
+                        .child(openbot_stage_icon(OpenBotStageIcon::Copy, 13.0, secondary_fg))
                         .child(
                             div()
-                                .text_size(px(palette.scaled_px(12.0)))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(palette.accent))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(secondary_fg)
                                 .child(tr_key_or(lang_id, "lng_copy", "Copy")),
                         ),
                 )
                 .child(
                     div()
                         .id("ms-del-btn")
-                        .px(px(12.0))
-                        .py(px(6.0))
+                        .h(px(28.0))
+                        .px(px(10.0))
                         .rounded(pill_r)
-                        .bg(TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.16))
+                        .bg(danger_bg)
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| a_del(this, TopBarUiAction::DeleteSelected, cx)))
                         .flex()
                         .items_center()
                         .gap(px(5.0))
-                        .child(tg_icon(IconName::DeleteTrash, 14.0, palette.danger))
+                        .child(openbot_stage_icon(OpenBotStageIcon::Trash, 13.0, danger_fg))
                         .child(
                             div()
-                                .text_size(px(palette.scaled_px(12.0)))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(palette.danger))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(danger_fg)
                                 .child(tr_key_or(lang_id, "lng_context_delete_msg", "Delete")),
                         ),
                 )
         };
+        let cancel_hover = if is_apple { ob.hover() } else { rgb(palette.menu_hover_bg).into() };
         return div()
             .id("stage-multiselect-bar")
             .h(bar_h)
             .w_full()
-            .px(px(16.0))
+            .flex_shrink_0()
+            .px(px(12.0))
             .bg(bar_bg)
-            .when(!is_apple, |el| el.border_b_1().border_color(rgb(palette.border_fg)))
-            .when(is_apple, |el| el.border_b_1().border_color(palette.separator_rgba()))
+            .border_b_1()
+            .border_color(if is_apple {
+                ob.border_hairline()
+            } else {
+                rgb(palette.border_fg).into()
+            })
             .flex()
             .items_center()
             .justify_between()
@@ -257,15 +327,17 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
             .child(
                 div()
                     .id("ms-cancel-btn")
-                    .px(px(12.0))
-                    .py(px(6.0))
+                    .h(px(28.0))
+                    .px(px(10.0))
                     .rounded(pill_r)
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(palette.menu_hover_bg)))
+                    .hover(move |s| s.bg(cancel_hover))
                     .on_click(cx.listener(move |this, _, _, cx| a_clr(this, TopBarUiAction::ClearSelection, cx)))
-                    .text_size(px(palette.scaled_px(12.5)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(palette.accent))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cancel_fg)
                     .child(tr_key_or(lang_id, "lng_cancel", "Cancel")),
             )
             .into_any_element();
@@ -440,250 +512,36 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
     });
 
     let bar = if is_apple {
-        let apple_bar_h = px(palette.scaled_px(if has_chat {
-            APPLE_STAGE_TOP_BAR_HEIGHT
-        } else {
-            APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT
-        }));
-        let apple_bar_bg = linear_gradient(
-            180.0,
-            linear_color_stop(
-                TdesktopThemePalette::rgba_with_alpha(
-                    palette.stage_bg,
-                    if is_dark { 0.90 } else { 0.92 },
-                ),
-                0.0,
-            ),
-            linear_color_stop(
-                TdesktopThemePalette::rgba_with_alpha(
-                    palette.stage_bg,
-                    if is_dark { 0.55 } else { 0.62 },
-                ),
-                1.0,
-            ),
-        );
-        let glass_pill_bg = if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.88)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.88)
+        let props = OpenBotHeaderProps {
+            chat_id,
+            title,
+            subtitle,
+            initials,
+            avatar_url,
+            active_fabushi_bot,
+            is_bot_chat,
+            is_group_chat: is_group_chat || is_group_sub,
+            group_member_tiles,
+            group_member_briefs: &[],
+            bot_activity_state,
+            active_thread_id: None,
+            thread_tabs: &[],
+            active_model_label: "",
+            active_thinking_effort: "",
+            model_picker_open: false,
+            pinned_count: 0,
+            pinned_popover_open: false,
+            search_open,
+            more_menu_open,
+            side_panel_open: is_inspector_open || is_bot_companion_open,
+            right_panel_slot_open: false,
+            external_hosted: false,
+            available_width_px: 720.0,
+            is_isolated_lock: false,
+            message_ttl_seconds,
         };
-        let name_pill_bg = if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.90)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.88)
-        };
-        let name_pill_hover_bg = if is_dark {
-            TdesktopThemePalette::rgba_with_alpha(palette.menu_hover_bg, 0.96)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.98)
-        };
-        let glass_pill_border = if is_inspector_open {
-            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.55)
-        } else {
-            palette.hairline_border_rgba()
-        };
-        let right_pill_border = palette.hairline_border_rgba();
-        let pill_shadow = palette.popover_shadows();
-
-        let mut root = div()
-            .relative()
-            .h(apple_bar_h)
-            .w_full()
-            .when(has_chat, |el| el.bg(apple_bar_bg))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .window_control_area(WindowControlArea::Drag),
-            );
-
-        if has_chat {
-            let search_btn = top_icon_btn("tb-search", IconName::Search, search_open, palette, cx, move |this, cx| {
-                a_search(this, TopBarUiAction::ToggleSearch, cx);
-            });
-            let info_btn = top_icon_btn("tb-info", IconName::SidebarPanel, is_inspector_open, palette, cx, move |this, cx| {
-                a_insp2(this, TopBarUiAction::ToggleInspector, cx);
-            });
-            let more_btn = top_icon_btn("tb-more", IconName::MoreVertical, more_menu_open, palette, cx, move |this, cx| {
-                a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx);
-            });
-
-            let identity_pill = div()
-                .mt(px(palette.scaled_px(-4.0)))
-                .px(px(palette.scaled_px(10.0)))
-                .py(px(palette.scaled_px(2.5)))
-                .rounded_full()
-                .bg(name_pill_bg)
-                .hover(move |s| s.bg(name_pill_hover_bg))
-                .border_1()
-                .border_color(glass_pill_border)
-                .shadow(pill_shadow.clone())
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(4.0))
-                .max_w(px(palette.scaled_px(240.0)))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .text_size(px(palette.scaled_px(12.5)))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.text_primary))
-                        .truncate()
-                        .child(title.to_string()),
-                )
-                .child(
-                    div().flex_shrink_0().flex().items_center().child(tg_icon(
-                        IconName::ChevronRight,
-                        palette.scaled_px(10.5),
-                        palette.text_secondary,
-                    )),
-                )
-                .when_some(ttl_badge_el, |row, badge| row.child(badge));
-
-            let peer_header = div()
-                .id("topbar-peer-header")
-                .occlude()
-                .cursor_pointer()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .max_w(px(palette.scaled_px(260.0)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        a_insp1(this, TopBarUiAction::ToggleInspector, cx);
-                    }),
-                )
-                .when_some(avatar_el, |col, av| col.child(av))
-                .child(identity_pill)
-                .when(show_apple_subtitle, |col| {
-                    col.child(
-                        div()
-                            .mt(px(palette.scaled_px(2.0)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(4.0))
-                            .max_w(px(palette.scaled_px(220.0)))
-                            .overflow_hidden()
-                            .when(is_online && !is_typing_or_active_bot, |row| {
-                                row.child(
-                                    div()
-                                        .w(px(5.5))
-                                        .h(px(5.5))
-                                        .rounded_full()
-                                        .flex_shrink_0()
-                                        .bg(rgb(palette.online_dot_fg)),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .text_size(px(palette.scaled_px(10.5)))
-                                    .text_color(rgb(if is_typing_or_active_bot {
-                                        palette.accent
-                                    } else {
-                                        palette.text_secondary
-                                    }))
-                                    .truncate()
-                                    .child(subtitle.to_string()),
-                            ),
-                    )
-                });
-
-            let show_companion_btn = is_bot_chat || active_fabushi_bot.is_some();
-            let a_comp_apple = a_companion.clone();
-            let companion_pill = show_companion_btn.then(|| {
-                div()
-                    .id("tb-bot-companion")
-                    .cursor_pointer()
-                    .px(px(palette.scaled_px(9.0)))
-                    .py(px(palette.scaled_px(4.5)))
-                    .rounded_full()
-                    .bg(if is_bot_companion_open {
-                        rgb(palette.accent).into()
-                    } else {
-                        TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14)
-                    })
-                    .hover(|s| {
-                        s.bg(if is_bot_companion_open {
-                            rgb(palette.accent).into()
-                        } else {
-                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.24)
-                        })
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            a_comp_apple(this, TopBarUiAction::ToggleBotCompanion, cx);
-                        }),
-                    )
-                    .child(tg_icon(
-                        IconName::BotRobot,
-                        palette.scaled_px(12.5),
-                        if is_bot_companion_open {
-                            0xFFFFFF
-                        } else {
-                            palette.accent
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(palette.scaled_px(11.5)))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if is_bot_companion_open {
-                                0xFFFFFF
-                            } else {
-                                palette.accent
-                            }))
-                            .child(tr_str(lang_id, "工作台", "Workbench")),
-                    )
-            });
-
-            let right_actions_pill = div()
-                .id("topbar-right-actions-pill")
-                .absolute()
-                .top(px(palette.scaled_px(12.0)))
-                .right(px(14.0))
-                .occlude()
-                .px(px(4.0))
-                .py(px(3.0))
-                .rounded_full()
-                .bg(glass_pill_bg)
-                .border_1()
-                .border_color(right_pill_border)
-                .shadow(pill_shadow)
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .when_some(companion_pill, |row, btn| row.child(btn))
-                .child(search_btn)
-                .child(info_btn)
-                .child(more_btn);
-
-            root = root
-                .child(
-                    div()
-                        .w_full()
-                        .h_full()
-                        .px(px(16.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(peer_header),
-                )
-                .child(right_actions_pill);
-        }
-
-        root.into_any_element()
+        let _ = (show_apple_subtitle, is_online);
+        render_openbot_conversation_header(&props, palette, lang_id, cx, on_action)
     } else {
         div()
             .relative()
@@ -836,19 +694,127 @@ pub fn render_stage_search_bar<V: 'static>(
     };
 
     let is_apple = palette.is_apple_style();
-    let bar_bg: Rgba = if is_apple {
-        TdesktopThemePalette::rgba_with_alpha(
-            palette.topbar_bg,
-            if palette.mode.is_dark() { 0.90 } else { 0.92 },
-        )
-    } else {
-        rgb(palette.topbar_bg).into()
-    };
-    let div_col: Rgba = if is_apple {
-        palette.separator_rgba()
-    } else {
-        rgb(palette.border_fg).into()
-    };
+    if is_apple {
+        let ob = palette.openbot_palette();
+        let hover_bg = ob.hover();
+        return div()
+            .id("stage-in-chat-search-bar")
+            .absolute()
+            .top(px(12.0))
+            .right(px(16.0))
+            .w(px(308.0))
+            .h(px(34.0))
+            .px(px(10.0))
+            .rounded(px(12.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_strong_hairline())
+            .shadow(palette.popover_shadows())
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    a_focus(this, TopBarUiAction::FocusSearch, cx);
+                }),
+            )
+            .child(openbot_stage_icon(OpenBotStageIcon::Search, 14.0, ob.text_muted()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(13.0))
+                    .text_color(if search_query.is_empty() {
+                        ob.text_dim()
+                    } else {
+                        ob.text_primary()
+                    })
+                    .child(if search_query.is_empty() {
+                        tr_str(lang_id, "搜索消息…", "Find in chat…").to_string()
+                    } else {
+                        format!("{}|", search_query)
+                    }),
+            )
+            .when(!search_query.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(11.0))
+                        .text_color(ob.text_muted())
+                        .child(match_lbl),
+                )
+            })
+            .child(
+                div()
+                    .id("search-prev-btn")
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            a_prev(this, TopBarUiAction::SearchStep(-1), cx);
+                        }),
+                    )
+                    .child(openbot_stage_icon(OpenBotStageIcon::ChevronUp, 13.0, ob.text_muted())),
+            )
+            .child(
+                div()
+                    .id("search-next-btn")
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            a_next(this, TopBarUiAction::SearchStep(1), cx);
+                        }),
+                    )
+                    .child(openbot_stage_icon(OpenBotStageIcon::ChevronDown, 13.0, ob.text_muted())),
+            )
+            .child(
+                div()
+                    .id("search-close-btn")
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            a_close(this, TopBarUiAction::SearchClear, cx);
+                        }),
+                    )
+                    .child(openbot_stage_icon(OpenBotStageIcon::Close, 13.0, ob.text_muted())),
+            )
+            .into_any_element();
+    }
+
+    let bar_bg: Rgba = rgb(palette.topbar_bg).into();
+    let div_col: Rgba = rgb(palette.border_fg).into();
 
     div()
         .id("stage-in-chat-search-bar")
@@ -881,14 +847,10 @@ pub fn render_stage_search_bar<V: 'static>(
                         .flex_1()
                         .px(px(12.0))
                         .py(px(5.0))
-                        .rounded(px(if is_apple { 14.0 } else { 8.0 }))
+                        .rounded(px(8.0))
                         .bg(rgb(palette.input_bg))
                         .border_1()
-                        .border_color(if is_apple {
-                            TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.72)
-                        } else {
-                            rgb(palette.accent).into()
-                        })
+                        .border_color(rgb(palette.accent))
                         .text_size(px(13.0))
                         .text_color(if search_query.is_empty() {
                             rgb(palette.text_secondary)
@@ -1030,13 +992,14 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
     ];
 
     let is_apple = pal.is_apple_style();
+    let ob = pal.openbot_palette();
     let menu_bg: Rgba = if is_apple {
-        TdesktopThemePalette::rgba_with_alpha(pal.menu_bg, 0.96)
+        ob.bg_surface()
     } else {
         rgb(pal.menu_bg).into()
     };
     let menu_border: Rgba = if is_apple {
-        pal.separator_rgba()
+        ob.border_strong_hairline()
     } else {
         rgb(pal.border_fg).into()
     };
@@ -1044,9 +1007,9 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
     let mut dropdown = div()
         .id("topbar-more-dropdown")
         .absolute()
-        .top(px(if is_apple { 52.0 } else { 50.0 }))
+        .top(px(if is_apple { 8.0 } else { 50.0 }))
         .right(px(12.0))
-        .w(px(238.0))
+        .w(px(232.0))
         .p(px(6.0))
         .rounded(px(if is_apple { 14.0 } else { 12.0 }))
         .bg(menu_bg)
@@ -1133,8 +1096,8 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.accent))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if is_apple { ob.text_muted() } else { rgb(pal.accent).into() })
                         .child(ttl_badge),
                 ),
         )
@@ -1145,7 +1108,7 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
                     .px(px(6.0))
                     .py(px(4.0))
                     .rounded(px(8.0))
-                    .bg(rgb(pal.input_bg))
+                    .bg(if is_apple { ob.bg_canvas() } else { rgb(pal.input_bg).into() })
                     .flex()
                     .items_center()
                     .gap(px(4.0))
@@ -1158,16 +1121,22 @@ pub fn render_stage_more_menu_overlay<V: 'static>(
                             .flex_1()
                             .py(px(4.0))
                             .rounded(px(6.0))
-                            .bg(if is_sel { rgb(pal.accent) } else { rgb(pal.card_bg) })
+                            .bg(if is_sel {
+                                if is_apple { ob.surface_light() } else { rgb(pal.accent).into() }
+                            } else if is_apple {
+                                ob.bg_control()
+                            } else {
+                                rgb(pal.card_bg).into()
+                            })
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if is_sel {
-                                rgb(pal.active_button_fg)
+                                if is_apple { ob.text_on_light() } else { rgb(pal.active_button_fg).into() }
                             } else {
-                                rgb(pal.text_primary)
+                                rgb(pal.text_primary).into()
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1528,4 +1497,967 @@ pub fn render_scroll_to_bottom_fab<V: 'static>(
         fab.shadow_md()
     };
     fab.into_any_element()
+}
+
+/// Props for OpenBot `38px` `ConversationHeader` (`UI-F09`).
+pub struct OpenBotHeaderProps<'a> {
+    pub chat_id: Option<u64>,
+    pub title: &'a str,
+    pub subtitle: &'a str,
+    pub initials: &'a str,
+    pub avatar_url: Option<&'a str>,
+    pub active_fabushi_bot: Option<&'a FabushiBotSummaryDto>,
+    pub is_bot_chat: bool,
+    pub is_group_chat: bool,
+    pub group_member_tiles: Option<&'a [(String, u32)]>,
+    pub group_member_briefs: &'a [ChannelAgentBrief],
+    pub bot_activity_state: &'a str,
+    pub active_thread_id: Option<&'a str>,
+    pub thread_tabs: &'a [(String, String)],
+    pub active_model_label: &'a str,
+    pub active_thinking_effort: &'a str,
+    pub model_picker_open: bool,
+    pub pinned_count: usize,
+    pub pinned_popover_open: bool,
+    pub search_open: bool,
+    pub more_menu_open: bool,
+    pub side_panel_open: bool,
+    pub right_panel_slot_open: bool,
+    pub external_hosted: bool,
+    pub available_width_px: f32,
+    pub is_isolated_lock: bool,
+    pub message_ttl_seconds: u32,
+}
+
+fn openbot_header_icon_btn<V: 'static>(
+    id: impl Into<ElementId>,
+    icon: OpenBotStageIcon,
+    active: bool,
+    palette: &TdesktopThemePalette,
+    cx: &mut Context<V>,
+    on_click: impl Fn(&mut V, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let fg = if active { ob.text_primary() } else { ob.text_muted() };
+    let hover_bg = ob.hover();
+    let active_bg = ob.bg_control_active();
+    div()
+        .id(id)
+        .w(px(28.0))
+        .h(px(28.0))
+        .flex_shrink_0()
+        .rounded(px(6.0))
+        .when(active, |el| el.bg(active_bg))
+        .hover(move |s| s.bg(hover_bg))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                on_click(this, cx);
+            }),
+        )
+        .child(openbot_stage_icon(icon, 15.0, fg))
+        .into_any_element()
+}
+
+/// Renders OpenBot's exact `38px` non-overlapping `ConversationHeader` with Safari/Arc curved
+/// active `TabShape` (`#1a1a1a` dark / `#f5f5f6` light over `#0d0d0d` / `#e8e8eb` frame).
+pub fn render_openbot_conversation_header<V: 'static>(
+    props: &OpenBotHeaderProps<'_>,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
+    let has_chat = props.chat_id.is_some();
+    let is_bot = props.is_bot_chat || props.active_fabushi_bot.is_some();
+    let is_group = props.is_group_chat;
+    let is_human_dm = has_chat && !is_bot && !is_group;
+    let frame_bg = if props.external_hosted {
+        ob.bg_frame()
+    } else {
+        ob.bg_canvas()
+    };
+    let canvas_bg = ob.bg_canvas();
+    let tab_border = ob.border_hairline();
+
+    if !has_chat {
+        return div()
+            .id("openbot-conversation-header")
+            .h(px(OPENBOT_HEADER_HEIGHT))
+            .w_full()
+            .flex_shrink_0()
+            .bg(frame_bg)
+            .when(!props.external_hosted, |el| {
+                el.border_b_1().border_color(tab_border)
+            })
+            .window_control_area(WindowControlArea::Drag)
+            .into_any_element();
+    }
+
+    let (mood, activity) = activity_str_to_openbot_mood(props.bot_activity_state);
+    let sub_lower = props.subtitle.to_ascii_lowercase();
+    let is_online = sub_lower == "online" || props.subtitle == "在线";
+    let show_subtitle = !props.subtitle.trim().is_empty() && props.available_width_px >= 460.0;
+    let main_tab_active = props.active_thread_id.is_none();
+
+    let avatar_el: AnyElement = if is_group {
+        let (members, agents) = build_channel_avatar_inputs(
+            props.chat_id.unwrap_or(0),
+            props.group_member_tiles,
+            props.group_member_briefs,
+        );
+        let img_url = props.avatar_url.filter(|u| !u.trim().is_empty());
+        let size = if img_url.is_some() { 20.0 } else { 18.0 };
+        render_channel_avatar(
+            &members,
+            &agents,
+            ChannelAvatarLayout::Row,
+            None,
+            img_url,
+            false,
+            size,
+            None,
+            is_dark,
+            0.0,
+        )
+        .into_any_element()
+    } else if is_bot {
+        let fallback_seed = format!("bot_{}_{}", props.chat_id.unwrap_or(0), props.title);
+        render_fabushi_plush_avatar(
+            props.active_fabushi_bot,
+            &fallback_seed,
+            18.0,
+            mood,
+            activity,
+        )
+        .into_any_element()
+    } else {
+        let pid = props.chat_id.unwrap_or(0) as i64;
+        let (grad_top, grad_bot) = palette.peer_avatar_gradient(pid);
+        let img_src = props.avatar_url.and_then(|u| resolve_image_source(u, None));
+        div()
+            .relative()
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex_shrink_0()
+            .child(
+                div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(rgb(grad_top), 0.0),
+                        linear_color_stop(rgb(grad_bot), 1.0),
+                    ))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when_some(img_src, |el, src| {
+                        el.child(img(src).size_full().object_fit(ObjectFit::Cover))
+                    })
+                    .when(props.avatar_url.map_or(true, |u| u.trim().is_empty()), |el| {
+                        el.text_size(px(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xFFFFFF))
+                            .child(props.initials.to_string())
+                    }),
+            )
+            .when(is_online, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(px(-0.5))
+                        .right(px(-0.5))
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(ob.success())
+                        .border_1()
+                        .border_color(canvas_bg),
+                )
+            })
+            .into_any_element()
+    };
+
+    let a_title = on_action.clone();
+    let title_click_action = if !main_tab_active {
+        TopBarUiAction::SelectThread(None)
+    } else if is_bot {
+        TopBarUiAction::OpenAssistantSettings
+    } else if is_group {
+        TopBarUiAction::OpenChannelSettings
+    } else {
+        TopBarUiAction::OpenContactProfile
+    };
+    let hover_bg = ob.hover();
+    let title_inner = div()
+        .id("topbar-peer-header")
+        .relative()
+        .h(px(32.0))
+        .max_w(px(340.0))
+        .px(px(10.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .when(props.external_hosted && main_tab_active, |el| {
+            el.rounded_tl(px(8.0))
+                .rounded_tr(px(8.0))
+                .bg(canvas_bg)
+                .border_t_1()
+                .border_l_1()
+                .border_r_1()
+                .border_color(tab_border)
+                // 2px bottom seam bridge covers workspace-card top border seamlessly
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(-1.5))
+                        .h(px(2.5))
+                        .bg(canvas_bg),
+                )
+        })
+        .when(!props.external_hosted || !main_tab_active, |el| {
+            el.h(px(28.0))
+                .mb(px(4.0))
+                .rounded(px(6.0))
+                .hover(move |s| s.bg(hover_bg))
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                a_title(this, title_click_action.clone(), cx);
+            }),
+        )
+        .child(avatar_el)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(14.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ob.text_primary())
+                .child(props.title.to_string()),
+        )
+        .when(show_subtitle, |el| {
+            el.child(
+                div()
+                    .flex_shrink_0()
+                    .max_w(px(120.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.0))
+                    .text_color(ob.text_muted())
+                    .child(format!("· {}", props.subtitle)),
+            )
+        })
+        .when(props.is_isolated_lock, |el| {
+            el.child(openbot_stage_icon(OpenBotStageIcon::Lock, 12.0, ob.text_muted()))
+        })
+        .when(props.message_ttl_seconds > 0, |el| {
+            el.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded_full()
+                    .bg(ob.bg_control_active())
+                    .text_size(px(10.5))
+                    .text_color(ob.text_muted())
+                    .child(format_ttl_badge(props.message_ttl_seconds, lang_id)),
+            )
+        });
+
+    let title_tab = if props.external_hosted && main_tab_active {
+        div()
+            .flex()
+            .items_end()
+            .h_full()
+            .child(render_tab_concave_fillet(true, 8.0, canvas_bg, tab_border))
+            .child(title_inner)
+            .child(render_tab_concave_fillet(false, 8.0, canvas_bg, tab_border))
+            .into_any_element()
+    } else {
+        div().flex().items_end().h_full().child(title_inner).into_any_element()
+    };
+
+    let mut heading_group = div()
+        .id("conversation-heading-group")
+        .flex()
+        .items_end()
+        .h_full()
+        .gap(px(2.0))
+        .min_w(px(0.0))
+        .child(title_tab);
+
+    if is_bot {
+        for (tid, tlabel) in props.thread_tabs.iter().take(4) {
+            let is_sel = props.active_thread_id == Some(tid.as_str());
+            let tid_owned = tid.clone();
+            let a_sel = on_action.clone();
+            let tab_hover = ob.hover();
+            let tab_el = div()
+                .id(SharedString::from(format!("hdr-thread-tab-{}", tid)))
+                .h(px(if is_sel && props.external_hosted { 32.0 } else { 28.0 }))
+                .max_w(px(140.0))
+                .px(px(9.0))
+                .when(!is_sel || !props.external_hosted, |el| {
+                    el.mb(px(4.0)).rounded(px(6.0)).hover(move |s| s.bg(tab_hover))
+                })
+                .when(is_sel && props.external_hosted, |el| {
+                    el.rounded_tl(px(8.0))
+                        .rounded_tr(px(8.0))
+                        .bg(canvas_bg)
+                        .border_t_1()
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(tab_border)
+                })
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        a_sel(this, TopBarUiAction::SelectThread(Some(tid_owned.clone())), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(12.5))
+                        .text_color(if is_sel { ob.text_primary() } else { ob.text_muted() })
+                        .child(tlabel.clone()),
+                );
+            heading_group = heading_group.child(tab_el);
+        }
+        let a_new_thread = on_action.clone();
+        heading_group = heading_group.child(
+            div()
+                .mb(px(4.0))
+                .child(openbot_header_icon_btn(
+                    "hdr-new-thread-btn",
+                    OpenBotStageIcon::Plus,
+                    false,
+                    palette,
+                    cx,
+                    move |this, cx| a_new_thread(this, TopBarUiAction::NewThread, cx),
+                )),
+        );
+    }
+
+    let mut right_actions = div()
+        .id("conversation-header-actions")
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(4.0));
+
+    if is_bot && !is_group {
+        let model_lbl = if props.active_model_label.trim().is_empty() {
+            tr_str(lang_id, "默认模型", "Auto").to_string()
+        } else {
+            props.active_model_label.trim().to_string()
+        };
+        let show_model_text = props.available_width_px >= 420.0;
+        let show_effort = !props.active_thinking_effort.trim().is_empty()
+            && props.available_width_px >= 540.0;
+        let a_model = on_action.clone();
+        let pill_bg = if props.model_picker_open {
+            ob.bg_control_active()
+        } else {
+            ob.bg_surface()
+        };
+        let pill_hover = ob.bg_control_hover();
+        right_actions = right_actions.child(
+            div()
+                .id("hdr-model-picker-btn")
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded_full()
+                .bg(pill_bg)
+                .border_1()
+                .border_color(ob.border_hairline())
+                .hover(move |s| s.bg(pill_hover))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        a_model(this, TopBarUiAction::ToggleModelPicker, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(7.0))
+                        .h(px(7.0))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(ob.success()),
+                )
+                .when(show_model_text, |el| {
+                    el.child(
+                        div()
+                            .max_w(px(140.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_primary())
+                            .child(model_lbl),
+                    )
+                })
+                .when(show_effort, |el| {
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.5))
+                            .text_color(ob.text_muted())
+                            .child(format!("· {}", props.active_thinking_effort)),
+                    )
+                })
+                .child(openbot_stage_icon(
+                    OpenBotStageIcon::ChevronDown,
+                    12.0,
+                    ob.text_muted(),
+                )),
+        );
+    } else if is_human_dm && props.available_width_px >= 520.0 {
+        right_actions = right_actions.child(
+            div()
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(openbot_stage_icon(OpenBotStageIcon::Lock, 11.5, ob.text_dim()))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(ob.text_dim())
+                        .child(tr_str(lang_id, "私密", "Private")),
+                ),
+        );
+    }
+
+    let a_pin = on_action.clone();
+    let pin_hover = ob.hover();
+    let pin_active_bg = ob.bg_control_active();
+    right_actions = right_actions.child(
+        div()
+            .id("hdr-pinned-btn")
+            .relative()
+            .w(px(28.0))
+            .h(px(28.0))
+            .flex_shrink_0()
+            .rounded(px(6.0))
+            .when(props.pinned_popover_open, |el| el.bg(pin_active_bg))
+            .hover(move |s| s.bg(pin_hover))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    a_pin(this, TopBarUiAction::TogglePinnedMessagesPopover, cx);
+                }),
+            )
+            .child(openbot_stage_icon(
+                OpenBotStageIcon::Pin,
+                14.5,
+                if props.pinned_popover_open || props.pinned_count > 0 {
+                    ob.text_primary()
+                } else {
+                    ob.text_muted()
+                },
+            ))
+            .when(props.pinned_count > 0, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(4.0))
+                        .right(px(4.0))
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded_full()
+                        .bg(ob.text_primary()),
+                )
+            }),
+    );
+
+    let a_search = on_action.clone();
+    right_actions = right_actions.child(openbot_header_icon_btn(
+        "tb-search",
+        OpenBotStageIcon::Search,
+        props.search_open,
+        palette,
+        cx,
+        move |this, cx| a_search(this, TopBarUiAction::ToggleSearch, cx),
+    ));
+
+    let a_more = on_action.clone();
+    right_actions = right_actions.child(openbot_header_icon_btn(
+        "tb-more",
+        OpenBotStageIcon::MoreHorizontal,
+        props.more_menu_open,
+        palette,
+        cx,
+        move |this, cx| a_more(this, TopBarUiAction::ToggleTopMoreMenu, cx),
+    ));
+
+    if !props.right_panel_slot_open {
+        let a_side = on_action.clone();
+        right_actions = right_actions
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(20.0))
+                    .mx(px(2.0))
+                    .bg(ob.border_hairline()),
+            )
+            .child(openbot_header_icon_btn(
+                "hdr-side-panel-toggle",
+                OpenBotStageIcon::PanelRight,
+                props.side_panel_open,
+                palette,
+                cx,
+                move |this, cx| a_side(this, TopBarUiAction::ToggleSidePanel, cx),
+            ));
+    }
+
+    div()
+        .id("openbot-conversation-header")
+        .h(px(OPENBOT_HEADER_HEIGHT))
+        .w_full()
+        .flex_shrink_0()
+        .px(px(8.0))
+        .bg(frame_bg)
+        .when(!props.external_hosted, |el| {
+            el.border_b_1().border_color(tab_border)
+        })
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(heading_group)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(16.0))
+                .h_full()
+                .window_control_area(WindowControlArea::Drag),
+        )
+        .child(right_actions)
+        .into_any_element()
+}
+
+/// Renders the far-right `38px` top-chrome slot aligned over an open right `SidePanel` / `Inspector`.
+pub fn render_openbot_right_panel_top_slot<V: 'static>(
+    width_px: f32,
+    palette: &TdesktopThemePalette,
+    cx: &mut Context<V>,
+    on_toggle_side_panel: impl Fn(&mut V, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    div()
+        .id("openbot-right-panel-top-slot")
+        .w(px(width_px))
+        .h(px(OPENBOT_HEADER_HEIGHT))
+        .flex_shrink_0()
+        .bg(ob.bg_frame())
+        .px(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .window_control_area(WindowControlArea::Drag),
+        )
+        .child(openbot_header_icon_btn(
+            "hdr-side-panel-toggle-right",
+            OpenBotStageIcon::PanelRight,
+            true,
+            palette,
+            cx,
+            on_toggle_side_panel,
+        ))
+        .into_any_element()
+}
+
+/// Renders OpenBot's `420px`-max `PinnedMessages` popover anchored under the header `Pin` icon.
+pub fn render_openbot_pinned_messages_popover<V: 'static>(
+    entries: &[(u64, String, String)],
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let a_dismiss = on_action.clone();
+    let hover_bg = ob.hover();
+
+    let mut card = div()
+        .id("openbot-pinned-messages-popover")
+        .absolute()
+        .top(px(8.0))
+        .right(px(48.0))
+        .w(px(360.0))
+        .max_w(px(420.0))
+        .max_h(px(340.0))
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
+        .border_1()
+        .border_color(ob.border_strong_hairline())
+        .shadow(palette.popover_shadows())
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .px(px(12.0))
+                .py(px(10.0))
+                .border_b_1()
+                .border_color(ob.border_hairline())
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(openbot_stage_icon(OpenBotStageIcon::Pin, 14.0, ob.text_muted()))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
+                                .child(format!(
+                                    "{} ({})",
+                                    tr_str(lang_id, "置顶消息", "Pinned messages"),
+                                    entries.len()
+                                )),
+                        ),
+                ),
+        );
+
+    if entries.is_empty() {
+        card = card.child(
+            div()
+                .px(px(16.0))
+                .py(px(24.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(6.0))
+                .child(openbot_stage_icon(OpenBotStageIcon::Pin, 20.0, ob.text_dim()))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(ob.text_muted())
+                        .child(tr_str(lang_id, "暂无置顶消息", "No pinned messages yet")),
+                ),
+        );
+    } else {
+        let mut list = div()
+            .id("openbot-pinned-popover-scroll")
+            .flex_1()
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .p(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        for (msg_id, sender, snippet) in entries {
+            let id = *msg_id;
+            let a_jump = on_action.clone();
+            let a_unpin = on_action.clone();
+            let unpin_hover = ob.bg_control_active();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("pinned-pop-row-{}", id)))
+                    .w_full()
+                    .px(px(8.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
+                    .hover(move |s| s.bg(hover_bg))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            a_jump(this, TopBarUiAction::JumpPinnedMessage(id), cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
+                                    .child(sender.clone()),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_muted())
+                                    .child(snippet.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("pinned-pop-unpin-{}", id)))
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .flex_shrink_0()
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(unpin_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    a_unpin(this, TopBarUiAction::UnpinMessage(id), cx);
+                                }),
+                            )
+                            .child(openbot_stage_icon(OpenBotStageIcon::Close, 12.0, ob.text_muted())),
+                    ),
+            );
+        }
+        card = card.child(list);
+    }
+
+    div()
+        .id("openbot-pinned-popover-backdrop")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                a_dismiss(this, TopBarUiAction::TogglePinnedMessagesPopover, cx);
+            }),
+        )
+        .child(deferred(card).with_priority(42))
+        .into_any_element()
+}
+
+/// Renders OpenBot's `ProviderModelPicker` dropdown popover anchored under the header model pill.
+pub fn render_openbot_model_picker_popover<V: 'static>(
+    active_model: &str,
+    active_effort: &str,
+    models: &[String],
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let a_dismiss = on_action.clone();
+    let hover_bg = ob.hover();
+    let fallback_models: Vec<String> = if models.is_empty() {
+        vec![
+            "claude-sonnet-4-5".to_string(),
+            "gpt-5".to_string(),
+            "gemini-2.5-pro".to_string(),
+        ]
+    } else {
+        models.to_vec()
+    };
+    let efforts = [
+        ("low", tr_str(lang_id, "轻度", "Low")),
+        ("medium", tr_str(lang_id, "标准", "Medium")),
+        ("high", tr_str(lang_id, "深度", "High")),
+    ];
+
+    let mut list = div()
+        .id("openbot-model-picker-scroll")
+        .max_h(px(240.0))
+        .overflow_y_scroll()
+        .p(px(6.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0));
+    for m in fallback_models {
+        let is_sel = !active_model.is_empty() && active_model.eq_ignore_ascii_case(&m);
+        let m_clone = m.clone();
+        let effort_clone = (!active_effort.is_empty()).then(|| active_effort.to_string());
+        let a_sel = on_action.clone();
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("model-pick-{}", m)))
+                .h(px(30.0))
+                .px(px(8.0))
+                .rounded(px(8.0))
+                .when(is_sel, |el| el.bg(ob.bg_control_active()))
+                .hover(move |s| s.bg(hover_bg))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        a_sel(
+                            this,
+                            TopBarUiAction::SelectModel {
+                                model_id: m_clone.clone(),
+                                thinking_level: effort_clone.clone(),
+                            },
+                            cx,
+                        );
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(13.0))
+                        .text_color(ob.text_primary())
+                        .child(m),
+                )
+                .when(is_sel, |el| {
+                    el.child(openbot_stage_icon(OpenBotStageIcon::Check, 13.0, ob.text_primary()))
+                }),
+        );
+    }
+
+    let effort_row = div()
+        .px(px(8.0))
+        .py(px(8.0))
+        .border_t_1()
+        .border_color(ob.border_hairline())
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(ob.text_muted())
+                .child(tr_str(lang_id, "推理强度", "Effort")),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .children(efforts.into_iter().map(|(val, lbl)| {
+                    let is_sel = active_effort.eq_ignore_ascii_case(val);
+                    let model_id = active_model.to_string();
+                    let eff = val.to_string();
+                    let a_eff = on_action.clone();
+                    div()
+                        .id(SharedString::from(format!("model-effort-{}", val)))
+                        .px(px(7.0))
+                        .py(px(3.0))
+                        .rounded(px(6.0))
+                        .bg(if is_sel { ob.surface_light() } else { ob.bg_control() })
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if is_sel { ob.text_on_light() } else { ob.text_muted() })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_eff(
+                                    this,
+                                    TopBarUiAction::SelectModel {
+                                        model_id: model_id.clone(),
+                                        thinking_level: Some(eff.clone()),
+                                    },
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(lbl)
+                })),
+        );
+
+    let card = div()
+        .id("openbot-model-picker-popover")
+        .absolute()
+        .top(px(8.0))
+        .right(px(84.0))
+        .w(px(268.0))
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
+        .border_1()
+        .border_color(ob.border_strong_hairline())
+        .shadow(palette.popover_shadows())
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .flex()
+        .flex_col()
+        .child(list)
+        .child(effort_row);
+
+    div()
+        .id("openbot-model-picker-backdrop")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                a_dismiss(this, TopBarUiAction::ToggleModelPicker, cx);
+            }),
+        )
+        .child(deferred(card).with_priority(44))
+        .into_any_element()
 }

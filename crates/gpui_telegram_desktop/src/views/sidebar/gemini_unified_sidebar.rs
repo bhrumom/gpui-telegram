@@ -4,10 +4,17 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::chat_sidebar::{DialogItemModel, COLLAPSED_WIDTH};
+use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
+use crate::views::chat_sidebar::{
+    DialogItemModel, COLLAPSED_WIDTH, OPENBOT_SIDEBAR_COMPACT_WIDTH,
+};
 use crate::views::nav_rail::{NavDestination, NavRail};
-use crate::views::sidebar::dialogs_row_view::{render_dialog_avatar, SidebarDialogMeta};
+use crate::views::sidebar::dialogs_row_view::{
+    render_dialog_avatar, render_openbot_dialog_avatar_with_badge, SidebarDialogMeta,
+};
+use crate::views::sidebar::openbot_sidebar_chrome::{
+    openbot_vector_icon, OpenBotChromeIcon,
+};
 
 pub use super::gemini_expanded_sidebar::*;
 
@@ -91,6 +98,18 @@ pub enum UnifiedSidebarAction {
     OpenContacts,
     SetHover(Option<&'static str>),
     SetHoverDialog(Option<u64>),
+    // OpenBot `383a35d2` sidebar chrome actions (`UI-F05`..`UI-F06`)
+    NavigateBack,
+    NavigateForward,
+    ToggleOpenBotCompact,
+    OpenGlobalSearch,
+    ToggleFilterMenu,
+    ToggleNewMenu,
+    ToggleTabsEditMenu,
+    CreateNewAgent,
+    CreateNewGroup,
+    CreateNewFolder,
+    CloseOpenBotPopovers,
 }
 
 pub(super) fn format_compact_badge(count: u32) -> String {
@@ -223,6 +242,200 @@ fn render_collapsed_icon_btn<V: 'static>(
         .into_any_element()
 }
 
+/// Renders OpenBot's clean `88px` compact avatar-only sidebar: centered `32px` search button
+/// opening `GlobalSearch` (`Cmd+K`) + single centered column of `60x60px` avatar tiles (`48x48px`
+/// 3D plush/cluster avatars + felt status badges) with ZERO duplicate compose/contacts/browser/account footer!
+#[allow(clippy::too_many_arguments)]
+pub fn render_openbot_compact_sidebar<V: 'static>(
+    dialogs: &[(&DialogItemModel, SidebarDialogMeta)],
+    is_loading_dialogs: bool,
+    active_chat_id: Option<u64>,
+    hovered_dialog_id: Option<u64>,
+    external_topbar_hosted: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
+    let hover_bg = ob.hover();
+    let active_bg = if is_dark { ob.bg_surface() } else { rgb(0xE8E8EB) };
+    let border_col = if is_dark { ob.border_hairline() } else { ob.border() };
+    let muted = ob.text_muted();
+
+    let on_toggle = on_action.clone();
+    let on_search = on_action.clone();
+
+    div()
+        .id("unified-sidebar-collapsed")
+        .relative()
+        .w(px(OPENBOT_SIDEBAR_COMPACT_WIDTH))
+        .flex_shrink_0()
+        .h_full()
+        .bg(ob.bg_sidebar())
+        .border_r_1()
+        .border_color(border_col)
+        .flex()
+        .flex_col()
+        .items_center()
+        .pb(px(10.0))
+        .when(!external_topbar_hosted, |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .h(px(38.0))
+                    .flex_shrink_0()
+                    .pt(px(2.0))
+                    .px(px(12.0))
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("sidebar-expand-btn")
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover_bg))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    on_toggle(this, UnifiedSidebarAction::ToggleOpenBotCompact, cx);
+                                }),
+                            )
+                            .child(openbot_vector_icon(OpenBotChromeIcon::PanelLeft, 16.0, muted)),
+                    ),
+            )
+        })
+        .child(
+            div()
+                .w_full()
+                .px(px(12.0))
+                .pt(px(if external_topbar_hosted { 11.0 } else { 6.0 }))
+                .pb(px(6.0))
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .id("sidebar-compact-search-btn")
+                        .w_full()
+                        .h(px(32.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                on_search(this, UnifiedSidebarAction::OpenGlobalSearch, cx);
+                            }),
+                        )
+                        .child(tg_icon_rgba(IconName::Search, 16.0, muted)),
+                ),
+        )
+        .child(
+            div()
+                .id("rail-dialogs-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_y_scroll()
+                .px(px(12.0))
+                .py(px(4.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.0))
+                .when(is_loading_dialogs && dialogs.is_empty(), |el| {
+                    let skel_col = ob.bg_control_hover();
+                    let fades: [f32; 5] = [0.95, 0.78, 0.62, 0.46, 0.30];
+                    el.child(
+                        div()
+                            .id("rail-dialogs-loading-skeleton")
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(10.0))
+                            .children(fades.into_iter().map(move |alpha| {
+                                div()
+                                    .w(px(48.0))
+                                    .h(px(48.0))
+                                    .rounded_full()
+                                    .bg(skel_col)
+                                    .opacity(alpha)
+                            })),
+                    )
+                })
+                .children(dialogs.iter().map(|(dialog, meta)| {
+                    let dialog_id = dialog.id;
+                    let is_active = active_chat_id == Some(dialog_id);
+                    let is_hovered = hovered_dialog_id == Some(dialog_id);
+                    let on_d_hover = on_action.clone();
+                    let on_d_click = on_action.clone();
+                    let tile_surface_hex = if is_active {
+                        if is_dark { 0x212121 } else { 0xE8E8EB }
+                    } else if is_dark {
+                        0x1A1A1A
+                    } else {
+                        0xF5F5F6
+                    };
+                    let avatar = render_openbot_dialog_avatar_with_badge(
+                        dialog,
+                        meta,
+                        palette,
+                        48.0,
+                        tile_surface_hex,
+                        is_active,
+                        lang_id,
+                    );
+
+                    div()
+                        .id(("rail-dialog-btn", dialog_id as usize))
+                        .relative()
+                        .w(px(60.0))
+                        .h(px(60.0))
+                        .p(px(6.0))
+                        .rounded(px(8.0))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(is_active, |el| el.bg(active_bg))
+                        .when(!is_active && is_hovered, |el| el.bg(hover_bg))
+                        .on_hover(cx.listener(move |this, hovered, _w, cx| {
+                            let next = if *hovered { Some(dialog_id) } else { None };
+                            on_d_hover(this, UnifiedSidebarAction::SetHoverDialog(next), cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _w, cx| {
+                                on_d_click(this, UnifiedSidebarAction::SelectDialog(dialog_id), cx);
+                            }),
+                        )
+                        .child(avatar)
+                        .when(is_hovered, |el| {
+                            el.child(render_floating_pill_tooltip_at(
+                                &dialog.peer_name,
+                                68.0,
+                                16.0,
+                                palette,
+                            ))
+                        })
+                })),
+        )
+        .into_any_element()
+}
+
 /// Renders the `64px` collapsed rail with expand toggle, new-chat/contacts shortcuts, scrollable chat avatars, add-friend & account triggers.
 #[allow(clippy::too_many_arguments)]
 pub fn render_collapsed_gemini_sidebar<V: 'static>(
@@ -239,6 +452,19 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let is_apple = palette.is_apple_style();
+    if is_apple && has_leading_app_sidebar {
+        return render_openbot_compact_sidebar(
+            dialogs,
+            is_loading_dialogs,
+            active_chat_id,
+            hovered_dialog_id,
+            false,
+            palette,
+            lang_id,
+            cx,
+            on_action,
+        );
+    }
     let toggle_hovered = hovered_item == Some("toggle");
     let compose_hovered = hovered_item == Some("compose");
     let account_hovered = hovered_item == Some("account");

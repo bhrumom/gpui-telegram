@@ -125,6 +125,10 @@ impl ConversationStage {
                 self.reaction_picker_msg_id = None;
                 self.hover_grace = None;
                 self.hover_grace_generation = self.hover_grace_generation.wrapping_add(1);
+            } else if self.pinned_popover_open {
+                self.pinned_popover_open = false;
+            } else if self.model_picker_open {
+                self.model_picker_open = false;
             } else if self.more_menu_open {
                 self.more_menu_open = false;
                 self.ttl_submenu_open = false;
@@ -351,6 +355,82 @@ impl ConversationStage {
                 self.ttl_submenu_open = false;
                 self.is_muted_chat = !self.is_muted_chat;
                 self.pending_toggle_mute = true;
+            }
+            TopBarUiAction::OpenAssistantSettings => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::OpenAssistantSettings);
+            }
+            TopBarUiAction::OpenChannelSettings => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::OpenChannelSettings);
+            }
+            TopBarUiAction::OpenContactProfile => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::OpenContactProfile);
+            }
+            TopBarUiAction::ToggleSidePanel => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::ToggleSidePanel);
+            }
+            TopBarUiAction::NewThread => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::NewThread);
+            }
+            TopBarUiAction::SelectThread(thread_id) => {
+                self.active_thread_id = thread_id;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+            }
+            TopBarUiAction::ToggleModelPicker => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = !self.model_picker_open;
+            }
+            TopBarUiAction::SelectModel {
+                model_id,
+                thinking_level,
+            } => {
+                if !model_id.trim().is_empty() {
+                    self.active_model_label = model_id.clone();
+                }
+                if let Some(ref effort) = thinking_level {
+                    self.active_thinking_effort = effort.clone();
+                }
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::SelectModel {
+                        model_id,
+                        thinking_level,
+                    });
+            }
+            TopBarUiAction::TogglePinnedMessagesPopover => {
+                self.more_menu_open = false;
+                self.model_picker_open = false;
+                self.pinned_popover_open = !self.pinned_popover_open;
+            }
+            TopBarUiAction::JumpPinnedMessage(msg_id) => {
+                self.pinned_popover_open = false;
+                self.jump_to_message(msg_id);
+            }
+            TopBarUiAction::UnpinMessage(msg_id) => {
+                self.toggle_pin_message(msg_id);
+                self.sync_pinned_tracker();
+                self.pending_pin_toggle = Some((msg_id, false));
             }
         }
     }
@@ -778,6 +858,46 @@ impl ConversationStage {
             BubbleUiAction::OpenContact(uid) => self.pending_open_profile_peer_id = Some(uid),
             BubbleUiAction::OpenWebUrl(url) => self.pending_open_url = Some(url),
             BubbleUiAction::OpenInstantView(url, title) => self.pending_iv_url = Some((url, title)),
+            BubbleUiAction::ToggleErrorDetails(msg_id) => {
+                if !self.expanded_error_msg_ids.insert(msg_id) {
+                    self.expanded_error_msg_ids.remove(&msg_id);
+                }
+                self.row_height_cache.mark_dirty();
+            }
+            BubbleUiAction::ToggleAgentSteps(msg_id) => {
+                if !self.expanded_steps_msg_ids.insert(msg_id) {
+                    self.expanded_steps_msg_ids.remove(&msg_id);
+                }
+                self.row_height_cache.mark_dirty();
+            }
+            BubbleUiAction::ToggleLongMessage(msg_id) => {
+                if !self.expanded_long_msg_ids.insert(msg_id) {
+                    self.expanded_long_msg_ids.remove(&msg_id);
+                }
+                self.row_height_cache.mark_dirty();
+            }
+            BubbleUiAction::CopyMessageText(msg_id) => {
+                if let Some(t) = self.copy_message_text(msg_id) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(t));
+                    let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string();
+                    self.show_toast_banner(msg, cx);
+                }
+            }
+            BubbleUiAction::CopyRawText(raw) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(raw));
+                let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Copied to clipboard").to_string();
+                self.show_toast_banner(msg, cx);
+            }
+            BubbleUiAction::OpenSenderDm {
+                user_id,
+                sender_name,
+            } => {
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::OpenSenderDm {
+                        user_id,
+                        sender_name,
+                    });
+            }
         }
         cx.notify();
     }

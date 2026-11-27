@@ -127,83 +127,100 @@ impl Default for ModalContainer {
     }
 }
 
-/// Calibrated macOS sheet backdrop scrim: crisp enough to separate modal sheets
-/// without muddying translucent vibrancy in Apple Light/Dark modes.
+/// Calibrated OpenBot modal sheet backdrop scrim (`0.56` dark / `0.28` light).
 pub(crate) fn macos_modal_backdrop_rgba(pal: TdesktopThemePalette) -> Rgba {
-    let alpha = if pal.mode.is_dark() { 0.48 } else { 0.28 };
+    let alpha = if pal.mode.is_dark() { 0.56 } else { 0.28 };
     TdesktopThemePalette::rgba_with_alpha(0x000000, alpha)
 }
 
-/// Canonical macOS floating modal card shell: `14px` corner radius, hairline translucent
-/// separator border, and two-layer ambient + contact popover shadows.
+/// Canonical OpenBot floating modal card shell: `16px` corner radius, `#161616`/`#ffffff`
+/// dialog surface, `1px` dialog ring border, and ambient + contact popover shadows.
 pub(crate) fn macos_modal_card(id: &'static str, pal: TdesktopThemePalette) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let card_bg = if ob.scheme.is_dark() {
+        rgb(0x161616)
+    } else {
+        ob.bg_surface()
+    };
+    let dialog_ring = ob
+        .rgba("--openbot-dialog-ring")
+        .unwrap_or_else(|| ob.border_strong_hairline());
     div()
         .id(id)
-        .rounded(px(pal.scaled_px(14.0)))
-        .bg(rgb(pal.modal_bg))
+        .rounded(px(pal.scaled_px(16.0)))
+        .bg(card_bg)
         .border_1()
-        .border_color(pal.separator_rgba())
+        .border_color(dialog_ring)
         .shadow(pal.popover_shadows())
 }
 
-/// Canonical macOS floating popover menu surface (`menu_bg`, `14px` radius, hairline border,
-/// and two-layer macOS popover shadows).
+/// Canonical OpenBot floating popover menu surface (`#212121`/`#ffffff`, `14px` radius,
+/// `1px` hairline ring border, and two-layer popover shadows).
 pub(crate) fn macos_popover_surface(id: &'static str, pal: TdesktopThemePalette) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     div()
         .id(id)
         .occlude()
         .rounded(px(pal.scaled_px(14.0)))
-        .bg(rgb(pal.menu_bg))
+        .bg(ob.bg_surface())
         .border_1()
-        .border_color(pal.separator_rgba())
+        .border_color(ob.border_strong_hairline())
         .shadow(pal.popover_shadows())
 }
 
-/// Crisp Apple-style primary accent pill CTA button (`#007AFF` / `#0A84FF`).
+/// OpenBot monochrome primary CTA button (`#f0f0f0`/`#141414` dark, `#1c1c1e`/`#ffffff` light).
 pub(crate) fn macos_primary_pill_btn(
     id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let hover_bg = rgb(if ob.scheme.is_dark() {
+        0xDCDCDC
+    } else {
+        0x2C2C2E
+    });
     div()
         .id(id)
         .cursor_pointer()
         .px(px(16.0))
         .py(px(8.0))
-        .rounded(px(10.0))
-        .bg(rgb(pal.accent))
-        .hover(move |s| s.bg(rgb(pal.accent_hover)))
+        .rounded(px(8.0))
+        .bg(ob.surface_light())
+        .hover(move |s| s.bg(hover_bg))
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(13.0))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(pal.active_button_fg))
+        .text_color(ob.text_on_light())
         .child(label)
 }
 
-/// Subtle Apple-style secondary pill button with hairline border.
+/// OpenBot subtle outline/secondary button with `1px` hairline border.
 pub(crate) fn macos_secondary_pill_btn(
     id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let hover_bg = ob.bg_control_hover();
     div()
         .id(id)
         .cursor_pointer()
         .px(px(14.0))
         .py(px(8.0))
-        .rounded(px(10.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(8.0))
+        .bg(ob.bg_control())
         .border_1()
-        .border_color(pal.separator_rgba())
-        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+        .border_color(ob.border_strong_hairline())
+        .hover(move |s| s.bg(hover_bg))
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(13.0))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(pal.text_primary))
+        .text_color(ob.text_primary())
         .child(label)
 }
 

@@ -7119,7 +7119,11 @@ fn body_iter7_reg_zorder_observers_passcode_unicode_and_ws(cx: &mut App) {
 
         // C1-I6-2: ComputerWorkbench (non-terminal tab) above ModalContainer & PublishReviewModal absorbs all text/IME/keys.
         s.open_publish_review_modal_for_creation(clean_book.clone(), cx);
-        s.show_remote_computer(cx);
+        s.open_remote_workbench_for_node("m5-iter7-node".to_string(), cx);
+        assert!(
+            s.overlays.computer_overlay.is_some(),
+            "C1-I6-2: open_remote_workbench_for_node must mount Z #15 ComputerWorkbench overlay"
+        );
         s.insert_committed_text("_CW_LEAK", cx);
         s.update_ime_marked_text("cw_ghost", cx);
         assert_eq!(
@@ -8050,7 +8054,15 @@ async fn body_iter8_reg_final_hardening_closure(mut app: AsyncApp) {
     // (b) PublishReviewModal (Z #14) behind ComputerTerminal (Z #15)
     shell.update(&mut app, |s, cx| {
         s.open_publish_review_modal_for_creation(clean_book.clone(), cx);
-        s.show_remote_computer(cx);
+        s.open_remote_workbench_for_node_with_tab(
+            "m5-iter8-node-a".to_string(),
+            WorkbenchTab::RemoteTerminal,
+            cx,
+        );
+        assert!(
+            s.overlays.computer_overlay.is_some(),
+            "R1-I7-3: open_remote_workbench_for_node_with_tab must mount Z #15 ComputerWorkbench overlay"
+        );
         if let Some(cw) = s.overlays.computer_overlay.clone() {
             cw.update(cx, |w, wcx| {
                 w.active_tab = WorkbenchTab::RemoteTerminal;
@@ -8708,7 +8720,15 @@ async fn body_iter8_reg_final_hardening_closure(mut app: AsyncApp) {
     // === 10. C2-I7-5 / C1-I7-5: Occluded Z #14 PublishReviewModal Close Preserves Z #15 ComputerTerminal IME ===
     shell.update(&mut app, |s, cx| {
         s.open_publish_review_modal_for_creation(clean_book.clone(), cx);
-        s.show_remote_computer(cx);
+        s.open_remote_workbench_for_node_with_tab(
+            "m5-iter8-node-b".to_string(),
+            WorkbenchTab::RemoteTerminal,
+            cx,
+        );
+        assert!(
+            s.overlays.computer_overlay.is_some(),
+            "C2-I7-5: open_remote_workbench_for_node_with_tab must mount Z #15 ComputerWorkbench overlay"
+        );
         if let Some(cw) = s.overlays.computer_overlay.clone() {
             cw.update(cx, |w, wcx| {
                 w.active_tab = WorkbenchTab::RemoteTerminal;
@@ -9847,7 +9867,15 @@ async fn body_iter9_reg_completeness_closure(mut app: AsyncApp) {
     // (6b-iii) Occluded Z #15 X-button close preserves ComputerWorkbench IME & clears pending_close_ime_clear
     shell.update(&mut app, |s, cx| {
         s.open_publish_review_modal_for_creation(e2e_pending_book.clone(), cx);
-        s.show_remote_computer(cx);
+        s.open_remote_workbench_for_node_with_tab(
+            "m5-iter9-node".to_string(),
+            WorkbenchTab::RemoteTerminal,
+            cx,
+        );
+        assert!(
+            s.overlays.computer_overlay.is_some(),
+            "C1-I8-6b: open_remote_workbench_for_node_with_tab must mount Z #15 ComputerWorkbench overlay"
+        );
         if let Some(cw) = s.overlays.computer_overlay.clone() {
             cw.update(cx, |w, wcx| {
                 w.active_tab = WorkbenchTab::RemoteTerminal;

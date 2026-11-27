@@ -13,6 +13,48 @@ use crate::views::stage::rich_meta::resolve_image_source;
 
 use super::workspace::CommunityWorkspace;
 
+/// Normalizes any `TdesktopThemePalette` onto OpenBot `383a35d2`'s monochrome surface hierarchy
+/// for `CommunityWorkspace` while preserving `pal.mode` (`Day`/`Night`/`Classic`/`Tinted`) intact.
+pub(crate) fn community_openbot_palette(pal: TdesktopThemePalette) -> TdesktopThemePalette {
+    let mut p = pal.with_openbot_chrome();
+    if p.mode.is_dark() {
+        p.stage_bg = 0x1A1A1A;
+        p.dialogs_bg = 0x1A1A1A;
+        p.card_bg = 0x212121;
+        p.input_bg = 0x212121;
+        p.modal_bg = 0x212121;
+        p.menu_bg = 0x212121;
+        p.service_pill_bg = 0x242424;
+        p.hover_bg = 0x242424;
+        p.dialogs_hover_bg = 0x242424;
+        p.dialogs_active_bg = 0x2A2A2A;
+        p.border_fg = 0x262626;
+        p.accent = 0xF0F0F0;
+        p.accent_hover = 0xDCDCDC;
+        p.active_button_fg = 0x141414;
+        p.unread_badge_bg = 0xF0F0F0;
+        p.unread_badge_fg = 0x141414;
+    } else {
+        p.stage_bg = 0xF5F5F6;
+        p.dialogs_bg = 0xF5F5F6;
+        p.card_bg = 0xFFFFFF;
+        p.input_bg = 0xFFFFFF;
+        p.modal_bg = 0xFFFFFF;
+        p.menu_bg = 0xFFFFFF;
+        p.service_pill_bg = 0xF0F0F2;
+        p.hover_bg = 0xF0F0F2;
+        p.dialogs_hover_bg = 0xF0F0F2;
+        p.dialogs_active_bg = 0xE8E8EB;
+        p.border_fg = 0xDCDCE0;
+        p.accent = 0x1C1C1E;
+        p.accent_hover = 0x3A3A3C;
+        p.active_button_fg = 0xFFFFFF;
+        p.unread_badge_bg = 0x1C1C1E;
+        p.unread_badge_fg = 0xFFFFFF;
+    }
+    p
+}
+
 /// Resolves a community media attachment or avatar reference into an HTTP(S)/file URL or local path.
 pub fn resolve_community_media_url(
     base_url: &str,
@@ -716,7 +758,7 @@ pub fn render_spoiler_veil<V: 'static>(
                 .bg(rgb(badge_col))
                 .text_size(px(10.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(0xFFFFFF))
+                .text_color(rgb(if is_nsfw { 0xFFFFFF } else { pal.active_button_fg }))
                 .child(if is_nsfw { "18+" } else { "SPOILER" }),
         )
         .child(

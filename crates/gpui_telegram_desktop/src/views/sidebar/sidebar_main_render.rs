@@ -10,26 +10,35 @@ use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{ChatSidebar, DialogItemModel};
 use crate::views::sidebar::dialogs_overlays::{
     render_dialog_context_menu, render_folder_tabs_strip, render_forum_topics_subtree,
+    render_openbot_sidebar_tabs, render_openbot_tabs_edit_popover,
 };
 use crate::views::sidebar::dialogs_renderer::{
-    render_archived_header_row, render_pinned_chats_grid, render_plus_dropdown,
+    render_archived_header_row, render_pinned_chats_grid_localized, render_plus_dropdown,
     render_stories_strip, render_suggestion_bar,
 };
-use crate::views::sidebar::dialogs_row_view::{render_dialog_row_item, SidebarDialogMeta};
+use crate::views::sidebar::dialogs_row_view::{
+    render_dialog_row_item_with_width, SidebarDialogMeta,
+};
 use crate::views::sidebar::gemini_unified_sidebar::{
     render_collapsed_gemini_sidebar, render_expanded_community_entry_pill,
     render_expanded_gemini_footer, render_expanded_gemini_search_bar,
-    render_expanded_gemini_top_bar, UnifiedNavSnapshot,
+    render_expanded_gemini_top_bar, render_openbot_compact_sidebar, UnifiedNavSnapshot,
+    UnifiedSidebarAction,
+};
+use crate::views::sidebar::openbot_sidebar_chrome::{
+    render_openbot_filter_menu_popover, render_openbot_new_menu_popover,
+    render_openbot_sidebar_search_row, render_openbot_sidebar_topbar,
 };
 use crate::views::sidebar::sidebar_search_view::{
     render_apps_catalog_section_with_recent, render_search_panel, render_search_results_list,
 };
 
+#[allow(clippy::too_many_arguments)]
 fn render_sidebar_dialog_row(
     item: &DialogItemModel,
     idx: usize,
     active_id: Option<u64>,
-    is_narrow: bool,
+    sidebar_width_px: f32,
     meta: &SidebarDialogMeta,
     palette: &TdesktopThemePalette,
     lang_id: &str,
@@ -37,22 +46,23 @@ fn render_sidebar_dialog_row(
 ) -> AnyElement {
     let did = item.id;
     let is_sel = active_id == Some(did);
-    render_dialog_row_item(
+    render_dialog_row_item_with_width(
         item,
         idx,
         is_sel,
-        is_narrow,
+        sidebar_width_px,
         meta,
         palette,
         lang_id,
         cx,
         move |this, cx| {
-            this.context_menu = None;
+            this.close_openbot_popovers();
             this.search_focused = false;
             this.select_dialog_from_user(did);
             cx.notify();
         },
         move |this, pos, cx| {
+            this.close_openbot_popovers();
             this.context_menu = Some((did, pos));
             cx.notify();
         },
@@ -61,7 +71,7 @@ fn render_sidebar_dialog_row(
             cx.notify();
         },
         move |this, uri, cx| {
-            this.context_menu = None;
+            this.close_openbot_popovers();
             this.search_focused = false;
             this.pending_launch_dialog_miniapp = Some((did, uri));
             cx.notify();
@@ -93,7 +103,14 @@ impl Render for ChatSidebar {
         let tertiary_val = self.creation_tertiary_input.clone();
         let active_search_cat = self.active_search_category.clone();
         let active_search_tag = self.active_search_tag.clone();
-        let is_narrow = self.width < 252.0;
+        let is_apple = palette.is_apple_style();
+        let is_openbot = is_apple && self.has_leading_app_sidebar;
+        let ob = palette.openbot_palette();
+        let sidebar_width_px = self.rendered_sidebar_width();
+
+        if is_openbot && self.is_sidebar_closed {
+            return div().w(px(0.0)).h_full().overflow_hidden().into_any_element();
+        }
 
         let total_dialog_unread: u32 = self.total_unread_badge();
         let nav_snapshot = UnifiedNavSnapshot::from_rail_and_unread(
@@ -103,6 +120,65 @@ impl Render for ChatSidebar {
         );
         if self.is_collapsed {
             let rail_dialogs = self.collapsed_rail_dialogs();
+            if is_openbot {
+                let resize_hover = ob.border_strong_hairline();
+                let compact_el = render_openbot_compact_sidebar(
+                    &rail_dialogs,
+                    self.is_loading_dialogs,
+                    row_active_id,
+                    self.hovered_rail_dialog_id,
+                    self.external_topbar_hosted,
+                    &palette,
+                    &lang_id,
+                    cx,
+                    |this, action, cx| this.handle_unified_action(action, cx),
+                );
+                return div()
+                    .relative()
+                    .h_full()
+                    .flex_shrink_0()
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                        if this.is_resizing {
+                            if let Some(start_x) = this.resize_drag_start_x {
+                                let dx = f32::from(ev.position.x) - start_x;
+                                this.apply_openbot_drag_width(this.resize_start_width + dx);
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                        if this.is_resizing {
+                            this.is_resizing = false;
+                            this.resize_drag_start_x = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(compact_el)
+                    .child(
+                        div()
+                            .id("sidebar-compact-resize-handle")
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(4.0))
+                            .h_full()
+                            .cursor_col_resize()
+                            .hover(move |s| s.bg(resize_hover))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                if ev.click_count >= 2 {
+                                    this.reset_openbot_width();
+                                    this.is_resizing = false;
+                                    this.resize_drag_start_x = None;
+                                } else {
+                                    this.is_resizing = true;
+                                    this.resize_drag_start_x = Some(f32::from(ev.position.x));
+                                    this.resize_start_width = this.rendered_sidebar_width();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element();
+            }
             return render_collapsed_gemini_sidebar(
                 &nav_snapshot,
                 &rail_dialogs,
@@ -118,31 +194,69 @@ impl Render for ChatSidebar {
             );
         }
 
-        let categorized_results = if is_search_focused {
+        let use_inline_search =
+            is_search_focused && (!is_openbot || active_search_cat.eq_ignore_ascii_case("Apps"));
+
+        let categorized_results = if use_inline_search {
             self.categorized_search_results()
         } else {
             Vec::new()
         };
 
-        let top_bar = render_expanded_gemini_top_bar(
-            &nav_snapshot,
-            is_plus_open || creation_modal.is_some(),
-            self.hovered_rail_item,
-            self.has_leading_app_sidebar,
-            &palette,
-            &lang_id,
-            cx,
-            |this, action, cx| this.handle_unified_action(action, cx),
-        );
-        let search_bar = render_expanded_gemini_search_bar(
-            &query,
-            is_search_focused,
-            &palette,
-            &lang_id,
-            cx,
-            |this, action, cx| this.handle_unified_action(action, cx),
-        );
-        let community_pill = (!is_search_focused && !self.has_leading_app_sidebar).then(|| {
+        let top_bar: Option<AnyElement> = if is_openbot {
+            if self.external_topbar_hosted {
+                None
+            } else {
+                Some(render_openbot_sidebar_topbar(
+                    self.can_navigate_back,
+                    self.can_navigate_forward,
+                    false,
+                    false,
+                    &palette,
+                    cx,
+                    |this, cx| this.handle_unified_action(UnifiedSidebarAction::NavigateBack, cx),
+                    |this, cx| this.handle_unified_action(UnifiedSidebarAction::NavigateForward, cx),
+                    |this, cx| {
+                        this.handle_unified_action(UnifiedSidebarAction::ToggleOpenBotCompact, cx)
+                    },
+                ))
+            }
+        } else {
+            Some(render_expanded_gemini_top_bar(
+                &nav_snapshot,
+                is_plus_open || creation_modal.is_some(),
+                self.hovered_rail_item,
+                self.has_leading_app_sidebar,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            ))
+        };
+
+        let search_bar = if is_openbot {
+            render_openbot_sidebar_search_row(
+                self.external_topbar_hosted,
+                self.list_filter.is_active(),
+                self.is_filter_menu_open,
+                self.is_new_menu_open,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            )
+        } else {
+            render_expanded_gemini_search_bar(
+                &query,
+                is_search_focused,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            )
+        };
+
+        let community_pill = (!use_inline_search && !self.has_leading_app_sidebar).then(|| {
             render_expanded_community_entry_pill(
                 &nav_snapshot,
                 &palette,
@@ -151,14 +265,17 @@ impl Render for ChatSidebar {
                 |this, action, cx| this.handle_unified_action(action, cx),
             )
         });
-        let footer = render_expanded_gemini_footer(
-            &nav_snapshot,
-            self.has_leading_app_sidebar,
-            &palette,
-            &lang_id,
-            cx,
-            |this, action, cx| this.handle_unified_action(action, cx),
-        );
+        // Defect D2 fix: suppress duplicate bottom account/settings footer when PageRail is active.
+        let footer = (!self.has_leading_app_sidebar).then(|| {
+            render_expanded_gemini_footer(
+                &nav_snapshot,
+                self.has_leading_app_sidebar,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            )
+        });
 
         let plus_dropdown = if is_plus_open && !palette.is_apple_style() {
             Some(render_plus_dropdown(
@@ -191,7 +308,79 @@ impl Render for ChatSidebar {
             None
         };
 
-        let search_panel = if is_search_focused {
+        let openbot_new_menu = (is_openbot && self.is_new_menu_open).then(|| {
+            render_openbot_new_menu_popover(
+                self.external_topbar_hosted,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            )
+        });
+
+        let openbot_filter_menu = (is_openbot && self.is_filter_menu_open).then(|| {
+            let counts = self.filter_counts();
+            let filter_copy = self.list_filter;
+            render_openbot_filter_menu_popover(
+                &filter_copy,
+                counts,
+                self.external_topbar_hosted,
+                &palette,
+                &lang_id,
+                cx,
+                |this, show, cx| {
+                    this.list_filter.show = show;
+                    cx.notify();
+                },
+                |this, key, cx| {
+                    match key {
+                        "unread" => this.list_filter.unread_only = !this.list_filter.unread_only,
+                        "working" => {
+                            this.list_filter.working_only = !this.list_filter.working_only
+                        }
+                        "muted" => this.list_filter.muted_only = !this.list_filter.muted_only,
+                        _ => {}
+                    }
+                    cx.notify();
+                },
+                |this, order, cx| {
+                    this.list_filter.sort_order = order;
+                    cx.notify();
+                },
+                |this, cx| {
+                    this.list_filter.clear();
+                    this.is_filter_menu_open = false;
+                    cx.notify();
+                },
+                |this, cx| {
+                    this.is_filter_menu_open = false;
+                    cx.notify();
+                },
+            )
+        });
+
+        let openbot_tabs_edit_menu = (is_openbot && self.is_tabs_edit_menu_open).then(|| {
+            let folders_list = self.folders.clone();
+            let hidden = self.hidden_tab_ids.clone();
+            render_openbot_tabs_edit_popover(
+                &folders_list,
+                &hidden,
+                self.external_topbar_hosted,
+                &palette,
+                &lang_id,
+                cx,
+                |this, tab_id, cx| {
+                    this.toggle_tab_visibility(tab_id);
+                    cx.notify();
+                },
+                |this, cx| {
+                    this.is_tabs_edit_menu_open = false;
+                    cx.notify();
+                },
+            )
+        });
+
+        let search_panel = if use_inline_search {
             let peers_list = self.top_peers.entries.clone();
             let scope_ui = self.search_in_ui.clone();
             Some(render_search_panel(
@@ -252,24 +441,48 @@ impl Render for ChatSidebar {
             )
         };
 
-        let folder_tabs = if !is_search_focused && self.folders.len() > 1 {
-            let folders_list = self.folders.clone();
-            Some(render_folder_tabs_strip(
-                &folders_list,
-                &active_folder,
-                &palette,
-                &lang_id,
-                cx,
-                |this, fname, cx| {
-                    this.select_folder(fname);
-                    cx.notify();
-                },
-            ))
+        let folder_tabs = if !use_inline_search {
+            if is_openbot {
+                let folders_list = self.folders.clone();
+                let hidden = self.hidden_tab_ids.clone();
+                Some(render_openbot_sidebar_tabs(
+                    &folders_list,
+                    total_dialog_unread,
+                    &active_folder,
+                    &hidden,
+                    self.is_tabs_edit_menu_open,
+                    &palette,
+                    &lang_id,
+                    cx,
+                    |this, fname, cx| {
+                        this.select_folder(fname);
+                        cx.notify();
+                    },
+                    |this, cx| {
+                        this.handle_unified_action(UnifiedSidebarAction::ToggleTabsEditMenu, cx);
+                    },
+                ))
+            } else if self.folders.len() > 1 {
+                let folders_list = self.folders.clone();
+                Some(render_folder_tabs_strip(
+                    &folders_list,
+                    &active_folder,
+                    &palette,
+                    &lang_id,
+                    cx,
+                    |this, fname, cx| {
+                        this.select_folder(fname);
+                        cx.notify();
+                    },
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        let scroll_children: Vec<AnyElement> = if is_search_focused {
+        let scroll_children: Vec<AnyElement> = if use_inline_search {
             let q_lower = query.trim().to_lowercase();
             let show_apps_catalog = active_search_cat.eq_ignore_ascii_case("Apps")
                 || q_lower.contains("botfather")
@@ -395,18 +608,20 @@ impl Render for ChatSidebar {
 
             let mut scroll_sections: Vec<AnyElement> = Vec::new();
             if is_apple {
-                if let Some(pinned_grid) = render_pinned_chats_grid(
+                if let Some(pinned_grid) = render_pinned_chats_grid_localized(
                     &pinned_grid_items,
                     row_active_id,
                     &palette,
+                    &lang_id,
                     cx,
                     |this, did, cx| {
-                        this.context_menu = None;
+                        this.close_openbot_popovers();
                         this.search_focused = false;
                         this.select_dialog_from_user(did);
                         cx.notify();
                     },
                     |this, did, pos, cx| {
+                        this.close_openbot_popovers();
                         this.context_menu = Some((did, pos));
                         cx.notify();
                     },
@@ -414,16 +629,6 @@ impl Render for ChatSidebar {
                     scroll_sections.push(pinned_grid);
                 }
             }
-
-            let indented_separator = || -> AnyElement {
-                div()
-                    .ml(px(palette.scaled_px(72.0)))
-                    .mr(px(palette.scaled_px(10.0)))
-                    .h(px(1.0))
-                    .flex_shrink_0()
-                    .bg(palette.separator_rgba())
-                    .into_any_element()
-            };
 
             let render_pending_creation_standin =
                 |pending: &crate::views::chat_sidebar::PendingComposeCreation| -> AnyElement {
@@ -510,14 +715,6 @@ impl Render for ChatSidebar {
                 },
             ) {
                 list.push(arch_header);
-                if is_apple && !self.is_archived_expanded && !main_with_meta.is_empty() {
-                    let first_sel = main_with_meta
-                        .first()
-                        .is_some_and(|(d, _)| row_active_id == Some(d.id));
-                    if !first_sel {
-                        list.push(indented_separator());
-                    }
-                }
             }
             if self.is_archived_expanded {
                 for (idx, (item, meta)) in archived_with_meta.iter().enumerate() {
@@ -525,28 +722,12 @@ impl Render for ChatSidebar {
                         item,
                         idx,
                         row_active_id,
-                        is_narrow,
+                        sidebar_width_px,
                         meta,
                         &palette,
                         &lang_id,
                         cx,
                     ));
-                    if is_apple {
-                        let cur_sel = row_active_id == Some(item.id);
-                        let next_sel = archived_with_meta
-                            .get(idx + 1)
-                            .map(|(n, _)| row_active_id == Some(n.id))
-                            .or_else(|| {
-                                main_with_meta
-                                    .first()
-                                    .map(|(n, _)| row_active_id == Some(n.id))
-                            });
-                        if let Some(is_next_sel) = next_sel {
-                            if !cur_sel && !is_next_sel {
-                                list.push(indented_separator());
-                            }
-                        }
-                    }
                 }
             }
 
@@ -563,7 +744,7 @@ impl Render for ChatSidebar {
                     item,
                     idx,
                     row_active_id,
-                    is_narrow,
+                    sidebar_width_px,
                     meta,
                     &palette,
                     &lang_id,
@@ -582,14 +763,6 @@ impl Render for ChatSidebar {
                                 cx.notify();
                             },
                         ));
-                    }
-                } else if is_apple {
-                    let cur_sel = row_active_id == Some(item.id);
-                    if let Some((next_item, _)) = main_with_meta.get(idx + 1) {
-                        let next_sel = row_active_id == Some(next_item.id);
-                        if !cur_sel && !next_sel {
-                            list.push(indented_separator());
-                        }
                     }
                 }
             }
@@ -792,9 +965,25 @@ impl Render for ChatSidebar {
         };
 
         let _ = (contact_kind, active_field, &primary_val, &secondary_val, &tertiary_val);
-        let is_apple = palette.is_apple_style();
-        let accent = rgb(palette.accent);
-        let scaled_sidebar_width = palette.scaled_px(self.width).min(460.0);
+        let resize_hover = if is_apple {
+            ob.border_strong_hairline()
+        } else {
+            rgb(palette.accent)
+        };
+        let border_col = if is_apple {
+            if palette.mode.is_dark() {
+                ob.border_hairline()
+            } else {
+                ob.border()
+            }
+        } else {
+            rgb(palette.border_fg)
+        };
+        let scaled_sidebar_width = if is_openbot {
+            sidebar_width_px
+        } else {
+            palette.scaled_px(self.width).min(460.0)
+        };
         div()
             .relative()
             .w(px(scaled_sidebar_width))
@@ -802,23 +991,23 @@ impl Render for ChatSidebar {
             .h_full()
             .overflow_hidden()
             .bg(if is_apple {
-                palette.sidebar_bg_rgba()
+                ob.bg_sidebar()
             } else {
                 rgb(palette.dialogs_bg)
             })
             .border_r_1()
-            .border_color(if is_apple {
-                palette.separator_rgba()
-            } else {
-                rgb(palette.border_fg)
-            })
+            .border_color(border_col)
             .flex()
             .flex_col()
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _w, cx| {
                 if this.is_resizing {
                     if let Some(start_x) = this.resize_drag_start_x {
                         let dx = f32::from(ev.position.x) - start_x;
-                        this.set_width(this.resize_start_width + dx);
+                        if is_openbot {
+                            this.apply_openbot_drag_width(this.resize_start_width + dx);
+                        } else {
+                            this.set_width(this.resize_start_width + dx);
+                        }
                         cx.notify();
                     }
                 }
@@ -839,15 +1028,29 @@ impl Render for ChatSidebar {
                     .w(px(4.0))
                     .h_full()
                     .cursor_col_resize()
-                    .hover(move |s| s.bg(accent))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                        this.is_resizing = true;
-                        this.resize_drag_start_x = Some(f32::from(ev.position.x));
-                        this.resize_start_width = this.width;
+                    .hover(move |s| s.bg(resize_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        if ev.click_count >= 2 {
+                            if is_openbot {
+                                this.reset_openbot_width();
+                            } else {
+                                this.reset_width();
+                            }
+                            this.is_resizing = false;
+                            this.resize_drag_start_x = None;
+                        } else {
+                            this.is_resizing = true;
+                            this.resize_drag_start_x = Some(f32::from(ev.position.x));
+                            this.resize_start_width = if is_openbot {
+                                this.rendered_sidebar_width()
+                            } else {
+                                this.width
+                            };
+                        }
                         cx.notify();
                     })),
             )
-            .child(top_bar)
+            .when_some(top_bar, |el, bar| el.child(bar))
             .child(search_bar)
             .when_some(community_pill, |el, pill| el.child(pill))
             .when_some(search_panel, |el, panel| el.child(panel))
@@ -865,8 +1068,11 @@ impl Render for ChatSidebar {
                     .flex_col()
                     .children(scroll_children),
             )
-            .child(footer)
+            .when_some(footer, |el, f| el.child(f))
             .when_some(plus_dropdown, |el, panel| el.child(panel))
+            .when_some(openbot_new_menu, |el, panel| el.child(panel))
+            .when_some(openbot_filter_menu, |el, panel| el.child(panel))
+            .when_some(openbot_tabs_edit_menu, |el, panel| el.child(panel))
             .when_some(ctx_menu_overlay, |el, overlay| el.child(overlay))
             .into_any_element()
     }

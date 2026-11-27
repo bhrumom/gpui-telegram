@@ -9,7 +9,7 @@
 //! - TON Wallet & Telegram Stars, Export Chat Data, Keyboard Shortcuts, About
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_client::AccountSessionRecord;
@@ -143,7 +143,7 @@ impl MainMenuDrawer {
                 is_premium: false,
                 is_verified: false,
                 avatar_initials: "TG".to_string(),
-                avatar_color: 0x2AABEE,
+                avatar_color: 0x705083,
                 unread_chats: 0,
             })
     }
@@ -184,18 +184,32 @@ impl Render for MainMenuDrawer {
         let night = self.is_night_mode;
         let lang = self.language_id.clone();
         let palette = self.palette;
+        let ob = palette.openbot_palette();
 
-        let drawer_bg = rgb(palette.dialogs_bg);
-        let header_bg = if palette.mode.is_dark() {
-            rgb(palette.modal_bg)
-        } else {
-            rgb(palette.nav_rail_bg)
-        };
-        let row_hover = rgb(palette.dialogs_hover_bg);
-        let fg_primary = rgb(palette.text_primary);
-        let fg_muted = rgb(palette.text_secondary);
-        let icon_color = palette.icon_fg;
-        let divider_col = rgb(palette.border_fg);
+        let menu_surface = ob.bg_surface();
+        let header_bg = ob.bg_surface_raised();
+        let row_hover = ob.bg_control_hover();
+        let row_active = ob.bg_control_active();
+        let fg_primary = ob.text_primary();
+        let fg_secondary = ob.text_secondary();
+        let fg_muted = ob.text_muted();
+        let icon_color = ob.text_muted();
+        let divider_col = ob.border_hairline();
+        let ring_col = ob.border_strong_hairline();
+        let danger_col = ob.danger();
+        let danger_hover = ob.rgba("--openbot-danger-soft").unwrap_or_else(|| {
+            TdesktopThemePalette::rgba_with_alpha(
+                if ob.scheme.is_dark() { 0xFD2F3B } else { 0xE8222D },
+                0.14,
+            )
+        });
+        let primary_cta_bg = ob.surface_light();
+        let primary_cta_fg = ob.text_on_light();
+        let primary_cta_hover = rgb(if ob.scheme.is_dark() { 0xDCDCDC } else { 0x2C2C2E });
+        let backdrop_rgba = TdesktopThemePalette::rgba_with_alpha(
+            0x000000,
+            if ob.scheme.is_dark() { 0.42 } else { 0.18 },
+        );
         let avatar_bg = rgb(if active.avatar_color != 0 {
             active.avatar_color
         } else {
@@ -341,7 +355,7 @@ impl Render for MainMenuDrawer {
             .left_0()
             .size_full()
             .occlude()
-            .bg(rgba(0x00000080))
+            .bg(backdrop_rgba)
             .flex()
             .on_mouse_down(
                 MouseButton::Left,
@@ -354,19 +368,24 @@ impl Render for MainMenuDrawer {
             .child(
                 div()
                     .id("window-main-menu-panel")
-                    .w(px(276.0))
-                    .h_full()
-                    .bg(drawer_bg)
-                    .border_r_1()
-                    .border_color(divider_col)
-                    .shadow_lg()
+                    .absolute()
+                    .left(px(58.0))
+                    .top(px(46.0))
+                    .w(px(268.0))
+                    .max_h(px(640.0))
+                    .p(px(6.0))
+                    .rounded(px(14.0))
+                    .bg(menu_surface)
+                    .border_1()
+                    .border_color(ring_col)
+                    .shadow(palette.popover_shadows())
                     .flex()
                     .flex_col()
-                    .justify_between()
+                    .gap(px(4.0))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|_this, _event, _window, _cx| {
-                            // Stop propagation so clicking inside drawer keeps it open
+                        cx.listener(|_this, _event, _window, cx| {
+                            cx.stop_propagation();
                         }),
                     )
                     .child(
@@ -377,19 +396,20 @@ impl Render for MainMenuDrawer {
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
-                            // 1. Top User Cover (Telegram Desktop window_main_menu.cpp)
+                            .gap(px(2.0))
+                            // 1. Top User Card (OpenBot elevated monochrome header card)
                             .child(
                                 div()
                                     .w_full()
-                                    .px(px(18.0))
-                                    .pt(px(20.0))
-                                    .pb(px(14.0))
+                                    .px(px(10.0))
+                                    .py(px(10.0))
+                                    .rounded(px(10.0))
                                     .bg(header_bg)
-                                    .border_b_1()
+                                    .border_1()
                                     .border_color(divider_col)
                                     .flex()
                                     .flex_col()
-                                    .gap(px(12.0))
+                                    .gap(px(10.0))
                                     .child(
                                         div()
                                             .w_full()
@@ -398,15 +418,15 @@ impl Render for MainMenuDrawer {
                                             .justify_between()
                                             .child(
                                                 div()
-                                                    .w(px(50.0))
-                                                    .h(px(50.0))
+                                                    .w(px(40.0))
+                                                    .h(px(40.0))
                                                     .rounded_full()
                                                     .bg(avatar_bg)
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .text_size(px(18.0))
-                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_size(px(15.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(rgb(0xFFFFFF))
                                                     .child(active.avatar_initials.clone()),
                                             )
@@ -414,20 +434,20 @@ impl Render for MainMenuDrawer {
                                                 div()
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(8.0))
+                                                    .gap(px(6.0))
                                                     .child(
                                                         div()
                                                             .cursor_pointer()
                                                             .px(px(8.0))
                                                             .py(px(4.0))
                                                             .rounded_full()
-                                                            .bg(rgba(0xFFFFFF18))
-                                                            .hover(|s| s.bg(rgba(0xFFFFFF2E)))
+                                                            .bg(row_hover)
+                                                            .hover(move |s| s.bg(row_active))
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(4.0))
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(0xFFFFFF))
+                                                            .text_size(px(11.5))
+                                                            .text_color(fg_secondary)
                                                             .on_mouse_down(
                                                                 MouseButton::Left,
                                                                 cx.listener(|this, _e, _w, cx| {
@@ -436,10 +456,10 @@ impl Render for MainMenuDrawer {
                                                                     cx.notify();
                                                                 }),
                                                             )
-                                                            .child(tg_icon(
+                                                            .child(tg_icon_rgba(
                                                                 IconName::PremiumStar,
-                                                                13.0,
-                                                                0xFFFFFF,
+                                                                12.0,
+                                                                fg_secondary,
                                                             ))
                                                             .child(if active.emoji_status.is_empty() {
                                                                 tr_str(&lang, "设置状态", "Status")
@@ -451,11 +471,11 @@ impl Render for MainMenuDrawer {
                                                     .child(
                                                         div()
                                                             .cursor_pointer()
-                                                            .w(px(28.0))
-                                                            .h(px(28.0))
+                                                            .w(px(26.0))
+                                                            .h(px(26.0))
                                                             .rounded_full()
-                                                            .bg(rgba(0xFFFFFF18))
-                                                            .hover(|s| s.bg(rgba(0xFFFFFF2E)))
+                                                            .bg(row_hover)
+                                                            .hover(move |s| s.bg(row_active))
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
@@ -467,10 +487,10 @@ impl Render for MainMenuDrawer {
                                                                     cx.notify();
                                                                 }),
                                                             )
-                                                            .child(tg_icon(
+                                                            .child(tg_icon_rgba(
                                                                 IconName::Close,
-                                                                13.0,
-                                                                0xFFFFFF,
+                                                                12.0,
+                                                                fg_muted,
                                                             )),
                                                     ),
                                             ),
@@ -479,9 +499,11 @@ impl Render for MainMenuDrawer {
                                         el.child(
                                             div()
                                                 .w_full()
-                                                .p(px(6.0))
+                                                .p(px(4.0))
                                                 .rounded(px(8.0))
-                                                .bg(rgba(0x00000044))
+                                                .bg(ob.bg_control())
+                                                .border_1()
+                                                .border_color(divider_col)
                                                 .flex()
                                                 .items_center()
                                                 .justify_between()
@@ -492,15 +514,15 @@ impl Render for MainMenuDrawer {
                                                             let em_s = em.to_string();
                                                             div()
                                                                 .cursor_pointer()
-                                                                .w(px(28.0))
-                                                                .h(px(28.0))
+                                                                .w(px(26.0))
+                                                                .h(px(26.0))
                                                                 .rounded(px(6.0))
-                                                                .hover(|s| s.bg(rgb(palette.accent)))
+                                                                .hover(move |s| s.bg(row_active))
                                                                 .flex()
                                                                 .items_center()
                                                                 .justify_center()
-                                                                .text_size(px(14.0))
-                                                                .text_color(rgb(0xFFFFFF))
+                                                                .text_size(px(13.5))
+                                                                .text_color(fg_primary)
                                                                 .on_mouse_down(
                                                                     MouseButton::Left,
                                                                     cx.listener(move |this, _e, _w, cx| {
@@ -515,10 +537,10 @@ impl Render for MainMenuDrawer {
                                                                 )
                                                                 .when(!em.is_empty(), |c| c.child(em))
                                                                 .when(em.is_empty(), |c| {
-                                                                    c.child(tg_icon(
+                                                                    c.child(tg_icon_rgba(
                                                                         IconName::Close,
-                                                                        12.0,
-                                                                        0xFFFFFF,
+                                                                        11.0,
+                                                                        fg_muted,
                                                                     ))
                                                                 })
                                                         }),
@@ -529,6 +551,10 @@ impl Render for MainMenuDrawer {
                                         div()
                                             .cursor_pointer()
                                             .w_full()
+                                            .px(px(4.0))
+                                            .py(px(2.0))
+                                            .rounded(px(6.0))
+                                            .hover(move |s| s.bg(row_hover))
                                             .flex()
                                             .items_center()
                                             .justify_between()
@@ -543,7 +569,7 @@ impl Render for MainMenuDrawer {
                                                 div()
                                                     .flex()
                                                     .flex_col()
-                                                    .gap(px(2.0))
+                                                    .gap(px(1.0))
                                                     .child(
                                                         div()
                                                             .flex()
@@ -551,48 +577,48 @@ impl Render for MainMenuDrawer {
                                                             .gap(px(5.0))
                                                             .child(
                                                                 div()
-                                                                    .text_size(px(14.0))
+                                                                    .text_size(px(13.5))
                                                                     .font_weight(FontWeight::SEMIBOLD)
-                                                                    .text_color(rgb(0xFFFFFF))
+                                                                    .text_color(fg_primary)
                                                                     .child(active.display_name.clone()),
                                                             )
                                                             .when(active.is_verified, |el| {
-                                                                el.child(tg_icon(
+                                                                el.child(tg_icon_rgba(
                                                                     IconName::Verified,
-                                                                    14.0,
-                                                                    0xFFFFFF,
+                                                                    13.0,
+                                                                    fg_secondary,
                                                                 ))
                                                             })
                                                             .when(active.is_premium, |el| {
-                                                                el.child(tg_icon(
+                                                                el.child(tg_icon_rgba(
                                                                     IconName::PremiumStar,
-                                                                    13.0,
-                                                                    0xFFFFFF,
+                                                                    12.0,
+                                                                    fg_secondary,
                                                                 ))
                                                             })
                                                             .when(!active.emoji_status.is_empty(), |el| {
                                                                 el.child(
                                                                     div()
-                                                                        .text_size(px(13.0))
+                                                                        .text_size(px(12.5))
                                                                         .child(active.emoji_status.clone()),
                                                                 )
                                                             }),
                                                     )
                                                     .child(
                                                         div()
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(0xC2D1E0))
+                                                            .text_size(px(11.5))
+                                                            .text_color(fg_muted)
                                                             .child(subtitle_line),
                                                     ),
                                             )
-                                            .child(tg_icon(
+                                            .child(tg_icon_rgba(
                                                 if expanded {
                                                     IconName::ChevronDown
                                                 } else {
                                                     IconName::ChevronRight
                                                 },
-                                                14.0,
-                                                0xFFFFFF,
+                                                13.0,
+                                                fg_muted,
                                             )),
                                     ),
                             )
@@ -601,11 +627,12 @@ impl Render for MainMenuDrawer {
                                 el.child(
                                     div()
                                         .w_full()
-                                        .py(px(6.0))
+                                        .py(px(4.0))
                                         .border_b_1()
                                         .border_color(divider_col)
                                         .flex()
                                         .flex_col()
+                                        .gap(px(2.0))
                                         .children(accounts_list.into_iter().map(|acc| {
                                             let is_cur = acc.account_id == active.account_id;
                                             let acc_id = acc.account_id;
@@ -616,8 +643,11 @@ impl Render for MainMenuDrawer {
                                             };
                                             div()
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
+                                                .when(is_cur, |el| el.bg(row_active))
                                                 .hover(move |s| s.bg(row_hover))
                                                 .flex()
                                                 .items_center()
@@ -635,26 +665,26 @@ impl Render for MainMenuDrawer {
                                                     div()
                                                         .flex()
                                                         .items_center()
-                                                        .gap(px(12.0))
+                                                        .gap(px(10.0))
                                                         .child(
                                                             div()
-                                                                .w(px(26.0))
-                                                                .h(px(26.0))
+                                                                .w(px(22.0))
+                                                                .h(px(22.0))
                                                                 .rounded_full()
                                                                 .bg(rgb(acc_color))
                                                                 .flex()
                                                                 .items_center()
                                                                 .justify_center()
-                                                                .text_size(px(10.5))
-                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_size(px(10.0))
+                                                                .font_weight(FontWeight::SEMIBOLD)
                                                                 .text_color(rgb(0xFFFFFF))
                                                                 .child(acc.avatar_initials),
                                                         )
                                                         .child(
                                                             div()
-                                                                .text_size(px(13.5))
+                                                                .text_size(px(13.0))
                                                                 .font_weight(if is_cur {
-                                                                    FontWeight::SEMIBOLD
+                                                                    FontWeight::MEDIUM
                                                                 } else {
                                                                     FontWeight::NORMAL
                                                                 })
@@ -663,10 +693,10 @@ impl Render for MainMenuDrawer {
                                                         ),
                                                 )
                                                 .when(is_cur, |el| {
-                                                    el.child(tg_icon(
+                                                    el.child(tg_icon_rgba(
                                                         IconName::SelectCheck,
-                                                        14.0,
-                                                        palette.accent,
+                                                        13.0,
+                                                        fg_primary,
                                                     ))
                                                 })
                                                 .when(!is_cur && acc.unread_chats > 0, |el| {
@@ -676,13 +706,13 @@ impl Render for MainMenuDrawer {
                                                             .h(px(18.0))
                                                             .px(px(5.0))
                                                             .rounded_full()
-                                                            .bg(rgb(palette.unread_badge_bg))
+                                                            .bg(ob.unread_surface())
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
                                                             .text_size(px(10.5))
                                                             .font_weight(FontWeight::BOLD)
-                                                            .text_color(rgb(palette.unread_badge_fg))
+                                                            .text_color(ob.unread_text())
                                                             .child(format!("{}", acc.unread_chats)),
                                                     )
                                                 })
@@ -690,12 +720,14 @@ impl Render for MainMenuDrawer {
                                         .child(
                                             div()
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
                                                 .hover(move |s| s.bg(row_hover))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(12.0))
+                                                .gap(px(10.0))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(|this, _e, _w, cx| {
@@ -705,16 +737,16 @@ impl Render for MainMenuDrawer {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(tg_icon(
+                                                .child(tg_icon_rgba(
                                                     IconName::ContactsUsers,
-                                                    18.0,
-                                                    palette.accent,
+                                                    16.0,
+                                                    fg_muted,
                                                 ))
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.5))
+                                                        .text_size(px(13.0))
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(rgb(palette.accent))
+                                                        .text_color(fg_primary)
                                                         .child(tr_str(
                                                             &lang,
                                                             "+ 添加账号",
@@ -724,13 +756,14 @@ impl Render for MainMenuDrawer {
                                         ),
                                 )
                             })
-                            // 3. Native 40px Telegram Menu Rows
+                            // 3. OpenBot 32px ui-action-menu Rows
                             .child(
                                 div()
                                     .w_full()
-                                    .py(px(6.0))
+                                    .py(px(2.0))
                                     .flex()
                                     .flex_col()
+                                    .gap(px(2.0))
                                     .children(menu_rows.into_iter().map(|entry| match entry {
                                         MenuRowEntry::Divider => div()
                                             .w_full()
@@ -749,12 +782,14 @@ impl Render for MainMenuDrawer {
                                             div()
                                                 .id(id)
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
                                                 .hover(move |s| s.bg(row_hover))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(16.0))
+                                                .gap(px(10.0))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _e, _w, cx| {
@@ -767,11 +802,11 @@ impl Render for MainMenuDrawer {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(tg_icon(icon, 19.0, palette.accent))
+                                                .child(tg_icon_rgba(icon, 16.0, fg_primary))
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::MEDIUM)
                                                         .text_color(fg_primary)
                                                         .child(label),
                                                 )
@@ -781,12 +816,14 @@ impl Render for MainMenuDrawer {
                                             let label = tr_str(&lang, zh, en).to_string();
                                             div()
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
                                                 .hover(move |s| s.bg(row_hover))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(16.0))
+                                                .gap(px(10.0))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _e, _w, cx| {
@@ -795,10 +832,10 @@ impl Render for MainMenuDrawer {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(tg_icon(icon, 19.0, icon_color))
+                                                .child(tg_icon_rgba(icon, 16.0, icon_color))
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.5))
+                                                        .text_size(px(13.0))
                                                         .font_weight(FontWeight::MEDIUM)
                                                         .text_color(fg_primary)
                                                         .child(label),
@@ -806,12 +843,14 @@ impl Render for MainMenuDrawer {
                                                 .into_any_element()
                                         }
                                     }))
-                                    // Instant Night Mode Toggle Row (with native switch track)
+                                    // Instant Night Mode Toggle Row (OpenBot monochrome switch)
                                     .child(
                                         div()
                                             .cursor_pointer()
-                                            .h(px(40.0))
-                                            .px(px(18.0))
+                                            .h(px(32.0))
+                                            .flex_shrink_0()
+                                            .px(px(10.0))
+                                            .rounded(px(10.0))
                                             .hover(move |s| s.bg(row_hover))
                                             .flex()
                                             .items_center()
@@ -829,15 +868,15 @@ impl Render for MainMenuDrawer {
                                                 div()
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(16.0))
-                                                    .child(tg_icon(
+                                                    .gap(px(10.0))
+                                                    .child(tg_icon_rgba(
                                                         IconName::NightMoon,
-                                                        19.0,
+                                                        16.0,
                                                         icon_color,
                                                     ))
                                                     .child(
                                                         div()
-                                                            .text_size(px(13.5))
+                                                            .text_size(px(13.0))
                                                             .font_weight(FontWeight::MEDIUM)
                                                             .text_color(fg_primary)
                                                             .child(tr_str(
@@ -854,9 +893,9 @@ impl Render for MainMenuDrawer {
                                                     .rounded_full()
                                                     .p(px(2.0))
                                                     .bg(if night {
-                                                        rgb(palette.accent)
+                                                        primary_cta_bg
                                                     } else {
-                                                        rgb(palette.muted_badge_bg)
+                                                        row_active
                                                     })
                                                     .flex()
                                                     .items_center()
@@ -867,7 +906,11 @@ impl Render for MainMenuDrawer {
                                                             .w(px(14.0))
                                                             .h(px(14.0))
                                                             .rounded_full()
-                                                            .bg(rgb(0xFFFFFF)),
+                                                            .bg(if night {
+                                                                primary_cta_fg
+                                                            } else {
+                                                                fg_primary
+                                                            }),
                                                     ),
                                             ),
                                     )
@@ -885,12 +928,14 @@ impl Render for MainMenuDrawer {
                                             div()
                                                 .id(id)
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
                                                 .hover(move |s| s.bg(row_hover))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(16.0))
+                                                .gap(px(10.0))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _e, _w, cx| {
@@ -903,11 +948,11 @@ impl Render for MainMenuDrawer {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(tg_icon(icon, 19.0, palette.accent))
+                                                .child(tg_icon_rgba(icon, 16.0, fg_primary))
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::MEDIUM)
                                                         .text_color(fg_primary)
                                                         .child(label),
                                                 )
@@ -915,14 +960,20 @@ impl Render for MainMenuDrawer {
                                         }
                                         MenuRowEntry::Action { icon, zh, en, cmd } => {
                                             let label = tr_str(&lang, zh, en).to_string();
+                                            let is_danger = matches!(cmd, MainMenuCommand::Logout);
+                                            let row_fg = if is_danger { danger_col } else { fg_primary };
+                                            let row_icon = if is_danger { danger_col } else { icon_color };
+                                            let hover_bg = if is_danger { danger_hover } else { row_hover };
                                             div()
                                                 .cursor_pointer()
-                                                .h(px(40.0))
-                                                .px(px(18.0))
-                                                .hover(move |s| s.bg(row_hover))
+                                                .h(px(32.0))
+                                                .flex_shrink_0()
+                                                .px(px(10.0))
+                                                .rounded(px(10.0))
+                                                .hover(move |s| s.bg(hover_bg))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(16.0))
+                                                .gap(px(10.0))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _e, _w, cx| {
@@ -931,12 +982,12 @@ impl Render for MainMenuDrawer {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(tg_icon(icon, 19.0, icon_color))
+                                                .child(tg_icon_rgba(icon, 16.0, row_icon))
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.5))
+                                                        .text_size(px(13.0))
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(fg_primary)
+                                                        .text_color(row_fg)
                                                         .child(label),
                                                 )
                                                 .into_any_element()
@@ -955,20 +1006,19 @@ impl Render for MainMenuDrawer {
                             div()
                                 .id("main-menu-oneclick-update-pill")
                                 .cursor_pointer()
-                                .mx(px(14.0))
-                                .mt(px(6.0))
-                                .mb(px(2.0))
+                                .mx(px(4.0))
+                                .mt(px(2.0))
                                 .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(palette.accent))
-                                .hover(move |s| s.bg(rgb(palette.accent_hover)))
+                                .py(px(7.0))
+                                .rounded(px(10.0))
+                                .bg(primary_cta_bg)
+                                .hover(move |s| s.bg(primary_cta_hover))
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_size(px(12.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(palette.active_button_fg))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(primary_cta_fg)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _e, _w, cx| {
@@ -984,12 +1034,15 @@ impl Render for MainMenuDrawer {
                         div()
                             .cursor_pointer()
                             .w_full()
-                            .px(px(18.0))
-                            .py(px(12.0))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(10.0))
+                            .border_t_1()
+                            .border_color(divider_col)
                             .hover(move |s| s.bg(row_hover))
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(px(1.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _e, _w, cx| {
@@ -1000,14 +1053,14 @@ impl Render for MainMenuDrawer {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(palette.text_link))
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(fg_secondary)
                                     .child("Fabushi Desktop"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.5))
+                                    .text_size(px(11.0))
                                     .text_color(fg_muted)
                                     .child(concat!("Fabushi v", env!("CARGO_PKG_VERSION"))),
                             ),

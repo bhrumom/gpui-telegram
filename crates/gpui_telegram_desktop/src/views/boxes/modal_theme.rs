@@ -1,5 +1,8 @@
 use crate::i18n::tr_str;
-use crate::theme::{assets::{IconName, tg_icon}, TdesktopThemePalette};
+use crate::theme::{
+    assets::{IconName, tg_icon_rgba},
+    TdesktopThemePalette,
+};
 use crate::views::boxes::modal_types::ActiveTextField;
 use crate::views::modal_boxes_suite::ActiveModalDialog;
 use gpui::*;
@@ -8,21 +11,164 @@ pub type DialogMut<V> = fn(&mut V) -> &mut ActiveModalDialog;
 pub type DialogClose<V> = fn(&mut V);
 
 pub fn modal_card(width: f32, pal: TdesktopThemePalette) -> Div {
+    let ob = pal.openbot_palette();
+    let card_bg = if ob.scheme.is_dark() {
+        rgb(0x161616)
+    } else {
+        ob.bg_surface()
+    };
+    let dialog_ring = ob
+        .rgba("--openbot-dialog-ring")
+        .unwrap_or_else(|| ob.border_strong_hairline());
     div()
         .w(px(width))
         .max_h(px(620.0))
-        .rounded(px(14.0))
-        .bg(rgb(pal.modal_bg))
+        .rounded(px(16.0))
+        .bg(card_bg)
         .border_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(dialog_ring)
         .p(px(20.0))
-        .shadow_lg()
+        .shadow(pal.popover_shadows())
         .flex()
         .flex_col()
         .gap(px(12.0))
         .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
             cx.stop_propagation();
         })
+}
+
+/// OpenBot `ConfirmDialog` card shell (`460px` max-width, `16px` radius, `#161616`/`#ffffff`,
+/// `1px` dialog ring, `40px` circular icon badge, body slot, and `border-t` actions bar).
+pub fn openbot_confirm_dialog_shell<V: 'static>(
+    icon: IconName,
+    title: &str,
+    destructive: bool,
+    pal: TdesktopThemePalette,
+    body: AnyElement,
+    confirm_btn: AnyElement,
+    lang: &str,
+    on_close: DialogClose<V>,
+    cx: &mut Context<V>,
+) -> Div {
+    let ob = pal.openbot_palette();
+    let card_bg = if ob.scheme.is_dark() {
+        rgb(0x161616)
+    } else {
+        ob.bg_surface()
+    };
+    let dialog_ring = ob
+        .rgba("--openbot-dialog-ring")
+        .unwrap_or_else(|| ob.border_strong_hairline());
+    let badge_bg = if destructive {
+        ob.rgba("--openbot-danger-soft").unwrap_or_else(|| {
+            TdesktopThemePalette::rgba_with_alpha(
+                if ob.scheme.is_dark() { 0xFD2F3B } else { 0xE8222D },
+                if ob.scheme.is_dark() { 0.16 } else { 0.12 },
+            )
+        })
+    } else {
+        ob.bg_control_active()
+    };
+    let badge_icon_color = if destructive {
+        ob.danger()
+    } else {
+        ob.text_secondary()
+    };
+    let hover_close = ob.hover();
+
+    div()
+        .w_full()
+        .max_w(px(460.0))
+        .max_h(px(620.0))
+        .rounded(px(16.0))
+        .bg(card_bg)
+        .border_1()
+        .border_color(dialog_ring)
+        .shadow(pal.popover_shadows())
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .on_mouse_down(MouseButton::Left, |_e, _w, cx| {
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .w_full()
+                .px(px(24.0))
+                .pt(px(24.0))
+                .pb(px(18.0))
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .w(px(40.0))
+                                        .h(px(40.0))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(badge_bg)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(tg_icon_rgba(icon, 20.0, badge_icon_color)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
+                                        .child(title.to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .hover(move |s| s.bg(hover_close))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _e, _w, cx| {
+                                        on_close(this);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tg_icon_rgba(IconName::Close, 15.0, ob.text_muted())),
+                        ),
+                )
+                .child(body),
+        )
+        .child(
+            div()
+                .w_full()
+                .px(px(24.0))
+                .py(px(16.0))
+                .border_t_1()
+                .border_color(dialog_ring)
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(8.0))
+                .child(modal_footer_cancel(lang, pal, on_close, cx))
+                .child(confirm_btn),
+        )
 }
 
 pub fn modal_header<V: 'static>(
@@ -32,25 +178,37 @@ pub fn modal_header<V: 'static>(
     on_close: DialogClose<V>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
+    let ob = pal.openbot_palette();
+    let hover_close = ob.hover();
     div()
         .w_full()
         .flex()
         .items_center()
         .justify_between()
-        .pb(px(8.0))
+        .pb(px(10.0))
         .border_b_1()
-        .border_color(rgb(pal.border_fg))
+        .border_color(ob.border_hairline())
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .child(tg_icon(icon, 18.0, pal.accent))
+                .gap(px(10.0))
                 .child(
                     div()
-                        .text_size(px(16.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.text_primary))
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded_full()
+                        .bg(ob.bg_control_active())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(tg_icon_rgba(icon, 15.0, ob.text_primary())),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
                         .child(title.to_string()),
                 ),
         )
@@ -60,7 +218,7 @@ pub fn modal_header<V: 'static>(
                 .w(px(28.0))
                 .h(px(28.0))
                 .rounded_full()
-                .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+                .hover(move |s| s.bg(hover_close))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -71,7 +229,7 @@ pub fn modal_header<V: 'static>(
                         cx.notify();
                     }),
                 )
-                .child(tg_icon(IconName::Close, 15.0, pal.icon_fg)),
+                .child(tg_icon_rgba(IconName::Close, 15.0, ob.text_muted())),
         )
 }
 
@@ -85,40 +243,45 @@ pub fn modal_field<V: 'static>(
     access: DialogMut<V>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
+    let ob = pal.openbot_palette();
     let display = if value.is_empty() {
         placeholder.to_string()
     } else {
         value.to_string()
     };
     let text_col = if value.is_empty() {
-        pal.text_secondary
+        ob.text_muted()
     } else {
-        pal.text_primary
+        ob.text_primary()
     };
 
     div()
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(5.0))
         .child(
             div()
                 .text_size(px(12.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(pal.text_link))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ob.text_secondary())
                 .child(label.to_string()),
         )
         .child(
             div()
                 .cursor_pointer()
                 .w_full()
-                .px(px(10.0))
+                .px(px(11.0))
                 .py(px(8.0))
                 .rounded(px(8.0))
-                .bg(rgb(pal.input_bg))
+                .bg(ob.bg_control())
                 .border_1()
-                .border_color(rgb(if is_focused { pal.accent } else { pal.border_fg }))
+                .border_color(if is_focused {
+                    ob.text_muted()
+                } else {
+                    ob.border_strong_hairline()
+                })
                 .text_size(px(13.0))
-                .text_color(rgb(text_col))
+                .text_color(text_col)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _e, _w, cx| {
@@ -131,15 +294,22 @@ pub fn modal_field<V: 'static>(
 }
 
 pub fn modal_error_banner(err: Option<&String>, pal: TdesktopThemePalette) -> AnyElement {
+    let ob = pal.openbot_palette();
+    let err_bg = ob.rgba("--openbot-danger-soft").unwrap_or_else(|| {
+        TdesktopThemePalette::rgba_with_alpha(
+            if ob.scheme.is_dark() { 0xFD2F3B } else { 0xE8222D },
+            0.14,
+        )
+    });
     match err {
         Some(msg) => div()
             .w_full()
             .px(px(10.0))
             .py(px(7.0))
             .rounded(px(8.0))
-            .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
+            .bg(err_bg)
             .text_size(px(12.0))
-            .text_color(rgb(pal.danger))
+            .text_color(ob.danger())
             .child(msg.clone())
             .into_any_element(),
         None => div().into_any_element(),
@@ -152,16 +322,18 @@ pub fn modal_footer_cancel<V: 'static>(
     on_close: DialogClose<V>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
+    let ob = pal.openbot_palette();
+    let hover_bg = ob.hover();
+    let hover_fg = ob.text_primary();
     div()
         .cursor_pointer()
         .px(px(14.0))
         .py(px(7.0))
         .rounded(px(8.0))
-        .bg(rgb(pal.input_bg))
-        .hover(move |s| s.bg(rgb(pal.dialogs_hover_bg)))
+        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
         .text_size(px(13.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(pal.text_secondary))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ob.text_secondary())
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _e, _w, cx| {
@@ -179,24 +351,35 @@ pub fn modal_toggle_chip<V: 'static>(
     on_click: impl Fn(&mut V) + 'static,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
+    let ob = pal.openbot_palette();
+    let hover_bg = ob.bg_control_hover();
     div()
         .cursor_pointer()
         .px(px(10.0))
-        .py(px(6.0))
+        .py(px(7.0))
         .rounded(px(8.0))
         .bg(if active {
-            TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.22)
+            ob.bg_control_active()
         } else {
-            rgb(pal.input_bg)
+            ob.bg_control()
         })
+        .hover(move |s| s.bg(hover_bg))
         .border_1()
-        .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
+        .border_color(if active {
+            ob.border_strong_hairline()
+        } else {
+            ob.border_hairline()
+        })
         .flex()
         .items_center()
         .gap(px(6.0))
-        .text_size(px(12.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(if active { pal.text_primary } else { pal.text_secondary }))
+        .text_size(px(12.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(if active {
+            ob.text_primary()
+        } else {
+            ob.text_secondary()
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _e, _w, cx| {
@@ -204,10 +387,14 @@ pub fn modal_toggle_chip<V: 'static>(
                 cx.notify();
             }),
         )
-        .child(tg_icon(
+        .child(tg_icon_rgba(
             IconName::SelectCheck,
             13.0,
-            if active { pal.accent } else { pal.text_secondary },
+            if active {
+                ob.text_primary()
+            } else {
+                ob.text_dim()
+            },
         ))
         .child(label.to_string())
 }

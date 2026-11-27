@@ -6,13 +6,11 @@ use gpui::*;
 use gpui_telegram_proto::creations::{CreationKind, CreationReviewStatus, UserCreationDto};
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, cover_artwork_box, creation_kind_accent, creation_kind_label,
-    empty_state_card_shell, filter_pill, render_editable_field_box, review_status_badge,
+    empty_state_card_shell, filter_pill, openbot_page_header, openbot_primary_cta_btn,
+    openbot_secondary_btn, render_editable_field_box, review_status_badge,
 };
 use crate::views::content_hub::publish_review_modal::ReviewerAccessState;
 use crate::views::content_hub::{
@@ -29,6 +27,7 @@ fn render_creation_card(
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     let cid = item.creation_id.clone();
     let kind = item.kind;
     let status = item.review_status;
@@ -42,19 +41,21 @@ fn render_creation_card(
     let item_for_modal = item.clone();
     let card_id = SharedString::from(format!("creation-card-{cid}"));
     let border_col = if selected {
-        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.72)
+        ob.border_strong_hairline()
     } else {
-        pal.separator_rgba()
+        ob.frame_card_border()
     };
+    let danger_soft = gpui::Rgba { a: 0.14, ..ob.danger() };
+    let warn_soft = gpui::Rgba { a: 0.14, ..ob.warning() };
 
     div()
         .id(card_id)
         .w_full()
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
         .border_1()
         .border_color(border_col)
-        .p(px(14.0))
+        .p(px(16.0))
         .flex()
         .flex_col()
         .gap(px(10.0))
@@ -81,7 +82,7 @@ fn render_creation_card(
                                     div()
                                         .text_size(px(15.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_color(ob.text_primary())
                                         .child(if item.title.trim().is_empty() {
                                             tr_str(lang, "未命名作品", "Untitled Creation")
                                                 .to_string()
@@ -97,7 +98,7 @@ fn render_creation_card(
                                 .items_center()
                                 .gap(px(6.0))
                                 .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_muted())
                                 .child(creation_kind_label(kind, lang))
                                 .child("·")
                                 .child(format!("Rev #{}", item.cloud_revision))
@@ -108,10 +109,14 @@ fn render_creation_card(
                         .child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_secondary())
                                 .child(if item.summary.trim().is_empty() {
-                                    tr_str(lang, "暂无简介，点击编辑完善作品信息。", "No summary yet. Edit metadata before submitting.")
-                                        .to_string()
+                                    tr_str(
+                                        lang,
+                                        "暂无简介，点击编辑完善作品信息。",
+                                        "No summary yet. Edit metadata before submitting.",
+                                    )
+                                    .to_string()
                                 } else {
                                     item.summary.clone()
                                 }),
@@ -127,9 +132,9 @@ fn render_creation_card(
                                         .px(px(8.0))
                                         .py(px(4.0))
                                         .rounded(px(6.0))
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.12))
+                                        .bg(danger_soft)
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.danger))
+                                        .text_color(ob.danger())
                                         .child(format!(
                                             "{}: {}",
                                             tr_str(lang, "退回原因", "Rejection reason"),
@@ -147,33 +152,30 @@ fn render_creation_card(
                 .items_center()
                 .gap(px(8.0))
                 .child(
-                    div()
-                        .id(SharedString::from(format!("creation-open-{cid_open}")))
-                        .cursor_pointer()
-                        .px(px(10.0))
-                        .py(px(5.0))
-                        .rounded(px(8.0))
-                        .bg(pal.row_hover_rgba())
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(pal.text_primary))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.selected_creation_id = Some(cid_open.clone());
-                                this.selected_catalog_item =
-                                    this.find_catalog_item(&cid_open).cloned();
-                                this.selected_detail_creation =
-                                    this.find_my_creation(&cid_open).cloned();
-                                cx.emit(ContentHubEvent::OpenCreationDetail {
-                                    section: ContentHubSection::from_creation_kind(kind),
-                                    creation_id: cid_open.clone(),
-                                    action: Some("open".to_string()),
-                                });
-                                cx.notify();
-                            }),
-                        )
-                        .child(tr_str(lang, "预览", "Preview")),
+                    openbot_secondary_btn(
+                        SharedString::from(format!("creation-open-{cid_open}")),
+                        tr_str(lang, "预览", "Preview"),
+                        pal,
+                    )
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .text_size(px(12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_creation_id = Some(cid_open.clone());
+                            this.selected_catalog_item =
+                                this.find_catalog_item(&cid_open).cloned();
+                            this.selected_detail_creation =
+                                this.find_my_creation(&cid_open).cloned();
+                            cx.emit(ContentHubEvent::OpenCreationDetail {
+                                section: ContentHubSection::from_creation_kind(kind),
+                                creation_id: cid_open.clone(),
+                                action: Some("open".to_string()),
+                            });
+                            cx.notify();
+                        }),
+                    ),
                 )
                 .child(
                     div()
@@ -182,10 +184,11 @@ fn render_creation_card(
                         .px(px(11.0))
                         .py(px(5.0))
                         .rounded(px(8.0))
-                        .bg(rgb(pal.accent))
+                        .bg(ob.surface_light())
+                        .hover(|s| s.opacity(0.84))
                         .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.active_button_fg))
+                        .text_color(ob.text_on_light())
                         .flex()
                         .items_center()
                         .gap(px(5.0))
@@ -195,7 +198,7 @@ fn render_creation_card(
                                 this.open_publish_modal_for_creation(item_for_modal.clone(), cx);
                             }),
                         )
-                        .child(tg_icon(IconName::HubPublish, 13.0, pal.active_button_fg))
+                        .child(tg_icon_rgba(IconName::HubPublish, 13.0, ob.text_on_light()))
                         .child(tr_str(lang, "推送审核上架", "Submit for Review")),
                 )
                 .when(status == CreationReviewStatus::PendingReview, |el| {
@@ -206,9 +209,9 @@ fn render_creation_card(
                             .px(px(10.0))
                             .py(px(5.0))
                             .rounded(px(8.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(0xFF9F0A, 0.16))
+                            .bg(warn_soft)
                             .text_size(px(12.0))
-                            .text_color(rgb(0xFF9F0A))
+                            .text_color(ob.warning())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _, cx| {
@@ -222,46 +225,42 @@ fn render_creation_card(
                 })
                 .when(status == CreationReviewStatus::Published, |el| {
                     el.child(
-                        div()
-                            .id(SharedString::from(format!("creation-unpublish-{cid_unpublish}")))
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(5.0))
-                            .rounded(px(8.0))
-                            .bg(pal.row_hover_rgba())
-                            .text_size(px(12.0))
-                            .text_color(rgb(pal.text_secondary))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::UnpublishCreation {
-                                        creation_id: cid_unpublish.clone(),
-                                    });
-                                }),
-                            )
-                            .child(tr_str(lang, "下架", "Unpublish")),
-                    )
-                })
-                .child(
-                    div()
-                        .id(SharedString::from(format!("creation-bot-edit-{cid_bot}")))
-                        .cursor_pointer()
+                        openbot_secondary_btn(
+                            SharedString::from(format!("creation-unpublish-{cid_unpublish}")),
+                            tr_str(lang, "下架", "Unpublish"),
+                            pal,
+                        )
                         .px(px(10.0))
                         .py(px(5.0))
-                        .rounded(px(8.0))
-                        .bg(pal.row_hover_rgba())
                         .text_size(px(12.0))
-                        .text_color(rgb(pal.text_secondary))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::OpenCreatorBotWithCommand(format!(
-                                    "/editwork {} title=",
-                                    cid_bot
-                                )));
+                                cx.emit(ContentHubEvent::UnpublishCreation {
+                                    creation_id: cid_unpublish.clone(),
+                                });
                             }),
-                        )
-                        .child(tr_str(lang, "Bot 编辑", "Edit via Bot")),
+                        ),
+                    )
+                })
+                .child(
+                    openbot_secondary_btn(
+                        SharedString::from(format!("creation-bot-edit-{cid_bot}")),
+                        tr_str(lang, "Bot 编辑", "Edit via Bot"),
+                        pal,
+                    )
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .text_size(px(12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_this, _, _, cx| {
+                            cx.emit(ContentHubEvent::OpenCreatorBotWithCommand(format!(
+                                "/editwork {} title=",
+                                cid_bot
+                            )));
+                        }),
+                    ),
                 )
                 .child(
                     div()
@@ -270,9 +269,9 @@ fn render_creation_card(
                         .px(px(10.0))
                         .py(px(5.0))
                         .rounded(px(8.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.12))
+                        .bg(danger_soft)
                         .text_size(px(12.0))
-                        .text_color(rgb(pal.danger))
+                        .text_color(ob.danger())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _, _, cx| {
@@ -320,123 +319,114 @@ pub fn render_my_creations_view(
         (Some(CreationReviewStatus::Unpublished), "my-creations-status-unpublished", "已下架", "Unpublished"),
     ];
 
+    let ob = pal.openbot_palette();
+    let warn_soft = gpui::Rgba { a: 0.14, ..ob.warning() };
+    let warn_border = gpui::Rgba { a: 0.30, ..ob.warning() };
+    let header_actions = div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .when(reviewer_allowed, |el| {
+            let q_label = if review_queue_count > 0 {
+                format!(
+                    "{} ({})",
+                    tr_str(&lang, "审核队列", "Review Queue"),
+                    review_queue_count
+                )
+            } else {
+                tr_str(&lang, "审核队列", "Review Queue").to_string()
+            };
+            el.child(
+                div()
+                    .id("my-creations-open-review-queue")
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(8.0))
+                    .bg(warn_soft)
+                    .border_1()
+                    .border_color(warn_border)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ob.warning())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.open_reviewer_queue(cx);
+                        }),
+                    )
+                    .child(q_label),
+            )
+        })
+        .child(
+            openbot_secondary_btn(
+                "my-creations-refresh-btn",
+                if loading {
+                    tr_str(&lang, "同步中…", "Syncing…")
+                } else {
+                    tr_str(&lang, "云端同步", "Sync Cloud")
+                },
+                pal,
+            )
+            .py(px(4.0))
+            .text_size(px(12.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _, _, cx| {
+                    cx.emit(ContentHubEvent::RefreshMyCreations);
+                }),
+            ),
+        )
+        .into_any_element();
+
     div()
         .id("my-creations-workspace")
         .size_full()
+        .bg(ob.bg_canvas())
         .flex()
         .flex_col()
         .overflow_hidden()
+        .child(openbot_page_header(
+            format!("{} · Rev #{rev}", tr_str(&lang, "我的云端创作", "My Cloud Creations")),
+            None,
+            Some(header_actions),
+            pal,
+        ))
         .child(
             div()
                 .w_full()
                 .px(px(24.0))
-                .py(px(16.0))
+                .py(px(14.0))
                 .border_b_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .flex()
                 .flex_col()
-                .gap(px(12.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
-                        .gap(px(12.0))
+                        .gap(px(10.0))
                         .child(
                             div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(22.0))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(rgb(pal.text_primary))
-                                                .child(tr_str(&lang, "我的云端创作", "My Cloud Creations")),
-                                        )
-                                        .child(
-                                            div()
-                                                .px(px(8.0))
-                                                .py(px(2.0))
-                                                .rounded(px(999.0))
-                                                .bg(pal.row_hover_rgba())
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(pal.text_secondary))
-                                                .child(format!("Rev #{rev}")),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(pal.text_secondary))
-                                        .child(tr_str(
-                                            &lang,
-                                            "使用 @CreatorStudioBot 创作图书、音乐、游戏并一键推送审核上架",
-                                            "Create books, music & games with @CreatorStudioBot and submit to Apple Hub catalogs",
-                                        )),
-                                ),
+                                .text_size(px(12.5))
+                                .text_color(ob.text_muted())
+                                .child(tr_str(
+                                    &lang,
+                                    "使用 @CreatorStudioBot 创作图书、音乐、游戏并一键推送审核上架",
+                                    "Create books, music & games with @CreatorStudioBot and submit to catalogs",
+                                )),
                         )
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap(px(8.0))
-                                .when(reviewer_allowed, |el| {
-                                    let q_label = if review_queue_count > 0 {
-                                        format!(
-                                            "{} ({})",
-                                            tr_str(&lang, "审核队列", "Review Queue"),
-                                            review_queue_count
-                                        )
-                                    } else {
-                                        tr_str(&lang, "审核队列", "Review Queue").to_string()
-                                    };
-                                    el.child(
-                                        div()
-                                            .id("my-creations-open-review-queue")
-                                            .cursor_pointer()
-                                            .px(px(12.0))
-                                            .py(px(7.0))
-                                            .rounded(px(9.0))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(0xFF9F0A, 0.16))
-                                            .border_1()
-                                            .border_color(TdesktopThemePalette::rgba_with_alpha(0xFF9F0A, 0.35))
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xFF9F0A))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.open_reviewer_queue(cx);
-                                                }),
-                                            )
-                                            .child(q_label),
-                                    )
-                                })
                                 .child(
-                                    macos_secondary_pill_btn(
-                                        "my-creations-refresh-btn",
-                                        if loading {
-                                            tr_str(&lang, "同步中…", "Syncing…")
-                                        } else {
-                                            tr_str(&lang, "云端同步", "Sync Cloud")
-                                        },
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::RefreshMyCreations);
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    macos_primary_pill_btn(
+                                    openbot_primary_cta_btn(
                                         "my-creations-bot-book-btn",
                                         tr_str(&lang, "+ Bot 创作图书", "+ Book via Bot"),
                                         pal,
@@ -451,7 +441,7 @@ pub fn render_my_creations_view(
                                     ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "my-creations-bot-music-btn",
                                         tr_str(&lang, "+ 音乐", "+ Music"),
                                         pal,
@@ -466,7 +456,7 @@ pub fn render_my_creations_view(
                                     ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "my-creations-bot-game-btn",
                                         tr_str(&lang, "+ 游戏", "+ Game"),
                                         pal,
@@ -553,38 +543,45 @@ pub fn render_my_creations_view(
                 .flex_1()
                 .w_full()
                 .overflow_y_scroll()
-                .p(px(24.0))
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .when(filtered.is_empty(), |el| {
-                    let cta = macos_primary_pill_btn(
-                        "my-creations-empty-cta",
-                        tr_str(&lang, "打开 @CreatorStudioBot 开始创作", "Open @CreatorStudioBot"),
-                        pal,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _, _, cx| {
-                            cx.emit(ContentHubEvent::OpenCreatorBot(None));
-                        }),
-                    );
-                    el.child(empty_state_card_shell(
-                        IconName::HubSparkles,
-                        tr_str(&lang, "还没有匹配的云端作品", "No Cloud Creations Yet"),
-                        tr_str(
-                            &lang,
-                            "在聊天中通过 @CreatorStudioBot 使用 /newbook、/newmusic、/newgame 创作并保存到云端。",
-                            "Use /newbook, /newmusic, or /newgame with @CreatorStudioBot to save creations to your cloud library.",
-                        ),
-                        cta,
-                        pal,
-                    ))
-                })
-                .children(filtered.iter().map(|item| {
-                    let is_sel = selected_id.as_deref() == Some(item.creation_id.as_str());
-                    render_creation_card(item, is_sel, pal, &lang, cx)
-                })),
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(960.0))
+                        .mx_auto()
+                        .p(px(24.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .when(filtered.is_empty(), |el| {
+                            let cta = openbot_primary_cta_btn(
+                                "my-creations-empty-cta",
+                                tr_str(&lang, "打开 @CreatorStudioBot 开始创作", "Open @CreatorStudioBot"),
+                                pal,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_this, _, _, cx| {
+                                    cx.emit(ContentHubEvent::OpenCreatorBot(None));
+                                }),
+                            );
+                            el.child(empty_state_card_shell(
+                                IconName::HubSparkles,
+                                tr_str(&lang, "还没有匹配的云端作品", "No Cloud Creations Yet"),
+                                tr_str(
+                                    &lang,
+                                    "在聊天中通过 @CreatorStudioBot 使用 /newbook、/newmusic、/newgame 创作并保存到云端。",
+                                    "Use /newbook, /newmusic, or /newgame with @CreatorStudioBot to save creations to your cloud library.",
+                                ),
+                                cta,
+                                pal,
+                            ))
+                        })
+                        .children(filtered.iter().map(|item| {
+                            let is_sel =
+                                selected_id.as_deref() == Some(item.creation_id.as_str());
+                            render_creation_card(item, is_sel, pal, &lang, cx)
+                        })),
+                ),
         )
         .into_any_element()
 }
@@ -618,23 +615,25 @@ pub fn render_quick_creations_drawer(
         (Some(CreationKind::App), "quick-drawer-kind-app"),
     ];
 
+    let ob = pal.openbot_palette();
+    let hover_ctrl = ob.bg_control_hover();
     div()
         .id("quick-creations-drawer")
         .w(px(QUICK_DRAWER_WIDTH))
         .h_full()
         .flex_shrink_0()
-        .bg(pal.sidebar_bg_rgba())
+        .bg(ob.bg_sidebar())
         .border_r_1()
-        .border_color(pal.separator_rgba())
+        .border_color(ob.border_hairline())
         .flex()
         .flex_col()
         .child(
             div()
                 .w_full()
-                .h(px(52.0))
+                .h(px(38.0))
                 .px(px(12.0))
                 .border_b_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .flex()
                 .items_center()
                 .justify_between()
@@ -643,12 +642,12 @@ pub fn render_quick_creations_drawer(
                         .flex()
                         .items_center()
                         .gap(px(6.0))
-                        .child(tg_icon(IconName::HubCreations, 15.0, pal.accent))
+                        .child(tg_icon_rgba(IconName::HubCreations, 14.0, ob.text_primary()))
                         .child(
                             div()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(pal.text_primary))
+                                .text_color(ob.text_primary())
                                 .child(tr_str(&lang, "我的云端作品", "Cloud Creations")),
                         ),
                 )
@@ -664,9 +663,10 @@ pub fn render_quick_creations_drawer(
                                 .px(px(7.0))
                                 .py(px(3.0))
                                 .rounded(px(6.0))
-                                .bg(pal.row_hover_rgba())
+                                .bg(ob.bg_control())
+                                .hover(move |s| s.bg(hover_ctrl))
                                 .text_size(px(11.0))
-                                .text_color(rgb(pal.accent))
+                                .text_color(ob.text_primary())
                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                     hub_open_full.update(cx, |_, hcx| {
                                         hcx.emit(ContentHubEvent::NavigateSection(
@@ -683,7 +683,7 @@ pub fn render_quick_creations_drawer(
                                 .w(px(24.0))
                                 .h(px(24.0))
                                 .rounded(px(6.0))
-                                .hover(move |s| s.bg(pal.row_hover_rgba()))
+                                .hover(move |s| s.bg(hover_ctrl))
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -693,7 +693,7 @@ pub fn render_quick_creations_drawer(
                                         hcx.notify();
                                     });
                                 })
-                                .child(tg_icon(IconName::Close, 13.0, pal.icon_fg)),
+                                .child(tg_icon_rgba(IconName::Close, 13.0, ob.text_muted())),
                         ),
                 ),
         )
@@ -704,7 +704,7 @@ pub fn render_quick_creations_drawer(
                 .flex_col()
                 .gap(px(8.0))
                 .border_b_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .child(
                     render_editable_field_box(
                         "quick-drawer-search-input",
@@ -757,7 +757,7 @@ pub fn render_quick_creations_drawer(
                         apple_grouped_card(pal).p(px(14.0)).child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_muted())
                                 .child(tr_str(
                                     &lang,
                                     "暂无云端作品，点击下方按钮通过 Bot 创作。",
@@ -813,41 +813,34 @@ pub fn render_quick_creations_drawer(
                                             div()
                                                 .text_size(px(12.0))
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(pal.text_primary))
+                                                .text_color(ob.text_primary())
                                                 .child(item.title.clone()),
                                         )
                                         .child(review_status_badge(item.review_status, &lang, pal)),
                                 ),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "quick-drawer-publish-{}",
-                                            item.creation_id
-                                        )))
-                                        .cursor_pointer()
-                                        .px(px(8.0))
-                                        .py(px(3.0))
-                                        .rounded(px(6.0))
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.accent))
-                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                            hub_pub.update(cx, |h, hcx| {
-                                                h.open_publish_modal_for_creation(
-                                                    item_clone.clone(),
-                                                    hcx,
-                                                );
-                                            });
-                                        })
-                                        .child(tr_str(&lang, "推送审核", "Publish")),
-                                ),
+                            div().flex().items_center().justify_end().child(
+                                openbot_secondary_btn(
+                                    SharedString::from(format!(
+                                        "quick-drawer-publish-{}",
+                                        item.creation_id
+                                    )),
+                                    tr_str(&lang, "推送审核", "Publish"),
+                                    pal,
+                                )
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .text_size(px(11.0))
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    hub_pub.update(cx, |h, hcx| {
+                                        h.open_publish_modal_for_creation(
+                                            item_clone.clone(),
+                                            hcx,
+                                        );
+                                    });
+                                }),
+                            ),
                         )
                 })),
         )
@@ -855,9 +848,9 @@ pub fn render_quick_creations_drawer(
             div()
                 .p(px(10.0))
                 .border_t_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .child(
-                    macos_primary_pill_btn(
+                    openbot_primary_cta_btn(
                         "quick-drawer-bot-cta",
                         tr_str(&lang, "用 @CreatorStudioBot 创作", "Create with Bot"),
                         pal,

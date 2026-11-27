@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::creations::{CreationKind, CreationReviewStatus};
 use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
 use openbot_contracts::routines::{
     RoutineLimitPolicy, RoutineMissedPolicy, RoutineRunKind, RoutineRunPlace, RoutineSchedule,
@@ -30,14 +31,229 @@ use openbot_runtime::OpenBotHostRuntime;
 use openbot_storage::AgentMemoryStore;
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
+use crate::views::content_hub::ContentHubSection;
+use crate::views::drawer::inspector_tabs::{
+    BotPublishedCreationSummary, OpenBotInspectorAction,
+};
 use crate::views::drawer::{
     BotCompanionTab, BotFusionAskCard, BotFusionDollarCandidate, BotFusionMcpItem,
     BotFusionMemoryItem, BotFusionQueueItem, BotFusionRoutineItem, BotFusionSkillItem,
     BotFusionSnapshot, BotFusionStepItem, BotFusionWorkflowItem, InspectorAction,
+    InspectorSubpage, InspectorTab,
+};
+use crate::views::nav_rail::NavDestination;
+use crate::views::openbot::channel_view::{
+    render_tucked_awaiting_replies_section, render_tucked_stopped_tasks_section,
+    AwaitingReplyEntry, AwaitingReplyState, StoppedChannelTaskBannerItem,
+};
+use crate::views::openbot::side_panel::{
+    CONVERSATION_PANEL_MIN, DRAG_START_PX, LAUNCHER_PRIMARY_PANES, MAX_SIDE_SPLITS,
+    OPENBOT_LAUNCHER_BUTTON_HEIGHT, OPENBOT_LAUNCHER_MAX_WIDTH, OPENBOT_SIDE_PANEL_HEADER_HEIGHT,
+    SETTINGS_PANEL_DEFAULT, SETTINGS_PANEL_MAX, SIDE_MAIN_GROUP_MIN, SIDE_SPLIT_MIN,
+    SideBrowserTab, SidePanelPaneKind, SidePanelSettingsTarget, SidePanelState,
 };
 use crate::views::openbot::WorkflowCanvasState;
-use crate::views::shell::AppShell;
+use crate::views::shell::{ActiveWorkspacePanel, AppShell};
+use crate::views::stage::openbot_stage_chrome::{
+    normalize_fabushi_plush_spec, openbot_stage_icon, render_tab_concave_fillet, OpenBotStageIcon,
+};
+
+/// Unified runtime state for the dockable, resizable, vertically-splittable OpenBot Right `SidePanel`.
+#[derive(Debug, Clone)]
+pub struct OpenBotRightSidePanelState {
+    pub state: SidePanelState,
+    pub open_tabs: Vec<SidePanelPaneKind>,
+    pub active_top_tab: Option<SidePanelPaneKind>,
+    pub split_bottom_pane: Option<SidePanelPaneKind>,
+    pub is_resizing_width: bool,
+    pub resize_drag_start_x: Option<f32>,
+    pub resize_start_width: f32,
+    pub is_resizing_split: bool,
+    pub split_drag_start_y: Option<f32>,
+    pub split_start_share: f64,
+    pub add_menu_open: bool,
+    pub more_menu_open: bool,
+    pub side_question_last_error: Option<String>,
+    pub browser_url_draft: String,
+    pub files_filter_draft: String,
+    pub last_synced_inspector_open: bool,
+    pub last_synced_companion_open: bool,
+}
+
+impl Default for OpenBotRightSidePanelState {
+    fn default() -> Self {
+        let mut st = SidePanelState::default();
+        st.open = false;
+        st.active_splits.clear();
+        st.width_px = SETTINGS_PANEL_DEFAULT;
+        st.lower_share = 0.45;
+        st.maximized = false;
+        Self {
+            state: st,
+            open_tabs: Vec::new(),
+            active_top_tab: None,
+            split_bottom_pane: None,
+            is_resizing_width: false,
+            resize_drag_start_x: None,
+            resize_start_width: SETTINGS_PANEL_DEFAULT,
+            is_resizing_split: false,
+            split_drag_start_y: None,
+            split_start_share: 0.45,
+            add_menu_open: false,
+            more_menu_open: false,
+            side_question_last_error: None,
+            browser_url_draft: "https://openbot.local".to_string(),
+            files_filter_draft: String::new(),
+            last_synced_inspector_open: false,
+            last_synced_companion_open: false,
+        }
+    }
+}
+
+impl OpenBotRightSidePanelState {
+    pub fn reset_ui(&mut self) {
+        self.state.open = false;
+        self.state.active_splits.clear();
+        self.state.maximized = false;
+        self.state.question.turns.clear();
+        self.state.question.draft_question.clear();
+        self.open_tabs.clear();
+        self.active_top_tab = None;
+        self.split_bottom_pane = None;
+        self.is_resizing_width = false;
+        self.resize_drag_start_x = None;
+        self.is_resizing_split = false;
+        self.split_drag_start_y = None;
+        self.add_menu_open = false;
+        self.more_menu_open = false;
+        self.side_question_last_error = None;
+        self.files_filter_draft.clear();
+        self.last_synced_inspector_open = false;
+        self.last_synced_companion_open = false;
+    }
+
+    pub fn sync_active_splits(&mut self) {
+        self.state.active_splits.clear();
+        if let Some(top) = self.active_top_tab {
+            self.state.active_splits.push(top);
+        }
+        if let Some(bot) = self.split_bottom_pane {
+            if self.state.active_splits.len() < MAX_SIDE_SPLITS
+                && !self.state.active_splits.contains(&bot)
+            {
+                self.state.active_splits.push(bot);
+            }
+        }
+    }
+
+    pub fn is_settings_visible(&self) -> bool {
+        self.state.open
+            && (self.active_top_tab == Some(SidePanelPaneKind::Settings)
+                || self.split_bottom_pane == Some(SidePanelPaneKind::Settings))
+    }
+
+    pub fn open_pane(&mut self, pane: SidePanelPaneKind) {
+        self.state.open = true;
+        self.add_menu_open = false;
+        self.more_menu_open = false;
+        if self.split_bottom_pane == Some(pane) {
+            self.sync_active_splits();
+            return;
+        }
+        if !self.open_tabs.contains(&pane) {
+            self.open_tabs.push(pane);
+        }
+        self.active_top_tab = Some(pane);
+        self.sync_active_splits();
+    }
+
+    pub fn close_tab(&mut self, pane: SidePanelPaneKind) -> bool {
+        let mut changed = false;
+        if self.split_bottom_pane == Some(pane) {
+            self.split_bottom_pane = None;
+            changed = true;
+        }
+        let before = self.open_tabs.len();
+        self.open_tabs.retain(|&p| p != pane);
+        if self.open_tabs.len() != before {
+            changed = true;
+        }
+        if self.active_top_tab == Some(pane) {
+            self.active_top_tab = self.open_tabs.last().copied();
+            if self.active_top_tab.is_none() {
+                if let Some(bot) = self.split_bottom_pane.take() {
+                    self.open_tabs.push(bot);
+                    self.active_top_tab = Some(bot);
+                } else {
+                    self.state.maximized = false;
+                }
+            }
+        }
+        self.sync_active_splits();
+        changed
+    }
+
+    pub fn split_down(&mut self, pane: SidePanelPaneKind) {
+        self.state.open = true;
+        self.add_menu_open = false;
+        self.more_menu_open = false;
+        if self.active_top_tab.is_none() {
+            self.open_pane(pane);
+            return;
+        }
+        if self.active_top_tab == Some(pane) {
+            if let Some(other) = self.open_tabs.iter().copied().find(|&p| p != pane) {
+                self.active_top_tab = Some(other);
+                self.open_tabs.retain(|&p| p != pane);
+                self.split_bottom_pane = Some(pane);
+            } else {
+                let fallback = if pane == SidePanelPaneKind::Files {
+                    SidePanelPaneKind::Threads
+                } else {
+                    SidePanelPaneKind::Files
+                };
+                self.split_bottom_pane = Some(fallback);
+            }
+        } else {
+            self.open_tabs.retain(|&p| p != pane);
+            self.split_bottom_pane = Some(pane);
+        }
+        self.sync_active_splits();
+    }
+
+    pub fn swap_split_panes(&mut self) -> bool {
+        if let (Some(top), Some(bot)) = (self.active_top_tab, self.split_bottom_pane) {
+            if let Some(slot) = self.open_tabs.iter_mut().find(|p| **p == top) {
+                *slot = bot;
+            }
+            self.active_top_tab = Some(bot);
+            self.split_bottom_pane = Some(top);
+            self.sync_active_splits();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn return_to_launcher(&mut self) {
+        self.state.open = true;
+        self.state.maximized = false;
+        self.open_tabs.clear();
+        self.active_top_tab = None;
+        self.split_bottom_pane = None;
+        self.add_menu_open = false;
+        self.more_menu_open = false;
+        self.sync_active_splits();
+    }
+
+    pub fn clamp_width_for_workspace(&mut self, requested_px: f32, workspace_avail_px: f32) -> f32 {
+        let max_by_vp = (workspace_avail_px - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT);
+        let upper = SETTINGS_PANEL_MAX.min(max_by_vp);
+        self.state.width_px = requested_px.clamp(SETTINGS_PANEL_DEFAULT, upper);
+        self.state.width_px
+    }
+}
 
 /// Grouped state for Native Bot Fusion stored on `AppShell`.
 #[derive(Default)]
@@ -52,6 +268,15 @@ pub struct ShellBotFusionState {
     pub pending_ask_cards: Vec<BotFusionAskCard>,
     pub recent_steps: Vec<BotFusionStepItem>,
     pub side_question_last: Option<(String, String)>,
+    // M3 OpenBot tucked .composer-stack state (UI-F11 / UI-F14)
+    pub awaiting_replies: Vec<AwaitingReplyEntry>,
+    pub subtasks_collapsed: bool,
+    pub stopped_tasks: Vec<StoppedChannelTaskBannerItem>,
+    pub browser_live_notice: Option<(String, bool)>,
+    pub compacting_status: Option<String>,
+    pub context_usage_ratio: Option<f32>,
+    // M4 Unified OpenBot Right `SidePanel` state (`UI-F15`)
+    pub side_panel: OpenBotRightSidePanelState,
 }
 
 impl ShellBotFusionState {
@@ -62,6 +287,13 @@ impl ShellBotFusionState {
         self.pending_ask_cards.clear();
         self.recent_steps.clear();
         self.side_question_last = None;
+        self.awaiting_replies.clear();
+        self.subtasks_collapsed = false;
+        self.stopped_tasks.clear();
+        self.browser_live_notice = None;
+        self.compacting_status = None;
+        self.context_usage_ratio = None;
+        self.side_panel.reset_ui();
     }
 }
 
@@ -376,12 +608,23 @@ impl AppShell {
         } else {
             fab.display_name.trim().to_string()
         };
+        let (shape, hue, color_hex) =
+            normalize_fabushi_plush_spec(&fab.avatar_shape, &fab.avatar_color);
+        let avatar_seed = shape
+            .map(|s| format!("plush:{}", s.as_str()))
+            .or_else(|| {
+                let raw = fab.avatar_shape.trim();
+                (!raw.is_empty()).then(|| raw.to_string())
+            });
         let req = CreateAgentRequest {
             name: display,
             title: foreign_title.to_string(),
             description: fab.description.clone(),
             allow_automation: Some(true),
             computer_use: Some(true),
+            avatar_seed,
+            avatar_hue: hue,
+            avatar_color: color_hex.map(Some),
             ..Default::default()
         };
         rt.agents().create_agent_full(req).ok().map(|a| a.id)
@@ -682,7 +925,7 @@ impl AppShell {
         }
     }
 
-    /// Toggles or opens the inline 380px Bot Companion SidePanel beside `ConversationStage`.
+    /// Toggles or opens the inline Bot Companion / unified OpenBot Right `SidePanel`.
     pub fn toggle_bot_companion_panel(
         &mut self,
         target_tab: Option<BotCompanionTab>,
@@ -694,6 +937,20 @@ impl AppShell {
         } else {
             self.bot_fusion.companion_open = !self.bot_fusion.companion_open;
         }
+        if self.bot_fusion.companion_open {
+            let pane = match self.bot_fusion.companion_tab {
+                BotCompanionTab::Workflow => SidePanelPaneKind::Threads,
+                BotCompanionTab::Knowledge => SidePanelPaneKind::Files,
+                BotCompanionTab::Activity => SidePanelPaneKind::Subagent,
+            };
+            self.bot_fusion.side_panel.open_pane(pane);
+        } else {
+            self.bot_fusion.side_panel.state.open = false;
+            self.bot_fusion.side_panel.state.maximized = false;
+            self.bot_fusion.side_panel.add_menu_open = false;
+            self.bot_fusion.side_panel.more_menu_open = false;
+        }
+        self.bot_fusion.side_panel.last_synced_companion_open = self.bot_fusion.companion_open;
         self.refresh_active_bot_fusion_snapshot(cx);
         cx.notify();
     }
@@ -1219,11 +1476,25 @@ impl AppShell {
             task_id: None,
             earlier: Vec::new(),
         });
-        let answer = match res {
-            Ok(out) if !out.answer.trim().is_empty() => out.answer,
-            _ => format!("（无痕侧问已就绪）已记录临时问题：「{q}」，不会污染当前主对话历史。"),
+        let (answer, err_opt) = match res {
+            Ok(out) if !out.answer.trim().is_empty() => (out.answer, None),
+            Ok(_) => (
+                format!("（无痕侧问已就绪）已记录临时问题：「{q}」，不会污染当前主对话历史。"),
+                None,
+            ),
+            Err(err) => (
+                format!("（无痕侧问已记录）「{q}」— 暂时无法实时生成回复，可点击重试。"),
+                Some(err.to_string()),
+            ),
         };
-        self.bot_fusion.side_question_last = Some((q.clone(), answer));
+        self.bot_fusion.side_question_last = Some((q.clone(), answer.clone()));
+        self.bot_fusion.side_panel.side_question_last_error = err_opt;
+        let _ = self
+            .bot_fusion
+            .side_panel
+            .state
+            .question
+            .append_turn(q.clone(), answer);
         self.push_bot_fusion_step("Side-Question", "ephemeral", q);
         self.refresh_active_bot_fusion_snapshot(cx);
         cx.notify();
@@ -1332,272 +1603,241 @@ impl AppShell {
         false
     }
 
-    /// Renders the compact Native Bot Fusion strip right above `CanonicalComposer` for Bot chats:
-    /// - Inline `ask_ui` approval cards (with Approve / Reject buttons)
-    /// - Ephemeral Side-Question answer bubble
-    /// - Compact Queue / Steer strip when queued messages exist
-    /// - Clean 1-line Muse Quick Bar (`工作台 · 记忆 · $技能 · 队列 · 侧问 · 工作流`)
+    /// Renders OpenBot's tucked `.composer-stack` above `CanonicalComposer` (`UI-F14`):
+    /// - Zero idle clutter when no tucked sections are active in OpenBot mode!
+    /// - Renders `ask_ui` approval cards, ephemeral Side-Question, `QueuedMessages` (Steer/Edit/Remove),
+    ///   `AwaitingReplies` (`Subtasks`), `ChannelStoppedTasks`, `BrowserLiveNotice`,
+    ///   `CompactingStatus`, and `ContextUsageMeter` (`>= 70%`) inside a `#121212` tucked stack.
     pub fn render_bot_fusion_composer_strip(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let fab = self.active_fabushi_bot_for_fusion(cx)?;
         let pal = self.theme_state.palette;
-        let lang = self.active_lang_id();
-        let snap = self.bot_fusion.snapshot.clone();
         let is_apple = pal.is_apple_style();
+        let lang = self.active_lang_id();
+        let is_zh = lang.starts_with("zh");
+        let snap = self.bot_fusion.snapshot.clone();
+        let fab = self.active_fabushi_bot_for_fusion(cx);
 
-        let mut stack = div()
-            .id("bot-fusion-composer-strip")
-            .w_full()
-            .bg(rgb(pal.composer_bg))
-            .px(px(if is_apple { 20.0 } else { 16.0 }))
-            .pt(px(6.0))
-            .pb(px(2.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(6.0));
+        if is_apple {
+            let ob = pal.openbot_palette();
+            let is_dark = pal.mode.is_dark();
+            let tucked_bg: Rgba = if is_dark { rgb(0x121212).into() } else { rgb(0xF8F8FA).into() };
+            let tucked_border: Rgba = if is_dark { rgb(0x222222).into() } else { rgb(0xE6E6EA).into() };
+            let hover_bg = ob.hover();
 
-        let mut inner = div()
-            .w_full()
-            .when(is_apple, |d| d.max_w(px(740.0)))
-            .flex()
-            .flex_col()
-            .gap(px(6.0));
+            let mut sections: Vec<AnyElement> = Vec::new();
 
-        // 1. Active inline `ask_ui` cards (e.g. Workflow Approval Gates)
-        for (idx, card) in snap.ask_cards.iter().enumerate() {
-            let wf_ok = card.workflow_id.clone();
-            let run_ok = card.run_id.clone();
-            let node_ok = card.node_id.clone();
-            let wf_no = card.workflow_id.clone();
-            let run_no = card.run_id.clone();
-            let node_no = card.node_id.clone();
-            inner = inner.child(
-                div()
-                    .id(SharedString::from(format!("bot-ask-ui-card-{idx}")))
+            // 1. Active inline `ask_ui` approval cards
+            for (idx, card) in snap.ask_cards.iter().enumerate() {
+                let wf_ok = card.workflow_id.clone();
+                let run_ok = card.run_id.clone();
+                let node_ok = card.node_id.clone();
+                let wf_no = card.workflow_id.clone();
+                let run_no = card.run_id.clone();
+                let node_no = card.node_id.clone();
+                sections.push(
+                    div()
+                        .id(SharedString::from(format!("bot-ask-ui-card-{idx}")))
+                        .w_full()
+                        .px(px(13.0))
+                        .py(px(9.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
+                                        .child(card.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_muted())
+                                        .child(card.prompt.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("bot-ask-ui-approve-{idx}")))
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(7.0))
+                                        .bg(ob.surface_light())
+                                        .hover(|s| s.opacity(0.88))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_on_light())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.bot_fusion_decide_workflow_approval(
+                                                    wf_ok.clone(),
+                                                    run_ok.clone(),
+                                                    node_ok.clone(),
+                                                    true,
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "批准", "Approve")),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("bot-ask-ui-reject-{idx}")))
+                                        .cursor_pointer()
+                                        .px(px(9.0))
+                                        .py(px(4.0))
+                                        .rounded(px(7.0))
+                                        .bg(ob.rgba("--openbot-danger-soft").unwrap_or_else(|| ob.danger()))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.danger())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.bot_fusion_decide_workflow_approval(
+                                                    wf_no.clone(),
+                                                    run_no.clone(),
+                                                    node_no.clone(),
+                                                    false,
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "拒绝", "Reject")),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            // 2. Ephemeral Side-Question bubble
+            if let Some((q, a)) = snap.side_question_last.clone() {
+                sections.push(
+                    div()
+                        .id("bot-side-question-card")
+                        .w_full()
+                        .px(px(13.0))
+                        .py(px(8.0))
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_muted())
+                                        .child(format!(
+                                            "{} · {q}",
+                                            tr_str(lang, "旁问", "Side question")
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(ob.text_primary())
+                                        .child(a),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("bot-side-question-dismiss")
+                                .w(px(22.0))
+                                .h(px(22.0))
+                                .rounded(px(6.0))
+                                .hover(move |s| s.bg(hover_bg))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.bot_fusion.side_question_last = None;
+                                        this.refresh_active_bot_fusion_snapshot(cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(openbot_stage_icon(OpenBotStageIcon::Close, 12.0, ob.text_muted())),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            // 3. QueuedMessages (29px rows with Pause/Resume, Steer ⚡, Edit ✎, Remove ×)
+            if !snap.queue_items.is_empty() {
+                let mut q_col = div()
+                    .id("bot-queue-steer-bar")
                     .w_full()
-                    .px(px(12.0))
-                    .py(px(9.0))
-                    .rounded(px(12.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.10))
-                    .border_1()
-                    .border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.35))
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.0))
+                    .flex_col()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_primary))
-                                    .child(card.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .child(card.prompt.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
+                            .h(px(28.0))
+                            .px(px(13.0))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("bot-ask-ui-approve-{idx}")))
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(5.0))
-                                    .rounded_full()
-                                    .bg(rgb(pal.accent))
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xFFFFFF))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.bot_fusion_decide_workflow_approval(
-                                                wf_ok.clone(),
-                                                run_ok.clone(),
-                                                node_ok.clone(),
-                                                true,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "✓ 批准继续", "✓ Approve")),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("bot-ask-ui-reject-{idx}")))
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(5.0))
-                                    .rounded_full()
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.14))
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.danger))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.bot_fusion_decide_workflow_approval(
-                                                wf_no.clone(),
-                                                run_no.clone(),
-                                                node_no.clone(),
-                                                false,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "✕ 拒绝", "✕ Reject")),
-                            ),
-                    ),
-            );
-        }
-
-        // 2. Ephemeral Side-Question bubble (never touches chat history)
-        if let Some((q, a)) = snap.side_question_last.clone() {
-            inner = inner.child(
-                div()
-                    .id("bot-side-question-card")
-                    .w_full()
-                    .px(px(11.0))
-                    .py(px(8.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(pal.input_bg))
-                    .border_1()
-                    .border_color(pal.separator_rgba())
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.accent))
-                                    .child(format!(
-                                        "{} · {q}",
-                                        tr_str(lang, "无痕侧问 (不写入历史)", "Side Question (Ephemeral)")
-                                    )),
-                            )
+                            .justify_between()
                             .child(
                                 div()
                                     .text_size(px(11.5))
-                                    .text_color(rgb(pal.text_primary))
-                                    .child(a),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("bot-side-question-dismiss")
-                            .cursor_pointer()
-                            .px(px(4.0))
-                            .text_size(px(12.0))
-                            .text_color(rgb(pal.text_secondary))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.bot_fusion.side_question_last = None;
-                                    this.refresh_active_bot_fusion_snapshot(cx);
-                                    cx.notify();
-                                }),
-                            )
-                            .child("×"),
-                    ),
-            );
-        }
-
-        // 3. Compact Queue / Steer strip when queued messages exist
-        if !snap.queue_items.is_empty() {
-            let first = snap.queue_items[0].clone();
-            let first_steer_id = first.delivery_id.clone();
-            let first_cancel_id = first.delivery_id.clone();
-            inner = inner.child(
-                div()
-                    .id("bot-queue-steer-bar")
-                    .w_full()
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(pal.input_bg))
-                    .border_1()
-                    .border_color(pal.separator_rgba())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .px(px(6.0))
-                                    .py(px(1.5))
-                                    .rounded_full()
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.accent))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_muted())
                                     .child(format!(
-                                        "{} {}",
-                                        tr_str(lang, "队列", "Queue"),
+                                        "{} ({})",
+                                        tr_str(lang, "待发送队列", "Queued"),
                                         snap.queue_items.len()
                                     )),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(pal.text_primary))
-                                    .child(first.text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                div()
                                     .id("bot-queue-pause-btn")
-                                    .cursor_pointer()
                                     .px(px(7.0))
-                                    .py(px(2.5))
-                                    .rounded_full()
-                                    .bg(rgb(pal.card_bg))
-                                    .border_1()
-                                    .border_color(pal.separator_rgba())
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(pal.text_primary))
+                                    .py(px(2.0))
+                                    .rounded(px(5.0))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(ob.text_muted())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
                                             this.bot_fusion_queue_toggle_pause(cx);
                                         }),
                                     )
@@ -1606,238 +1846,365 @@ impl AppShell {
                                     } else {
                                         tr_str(lang, "暂停", "Pause")
                                     }),
-                            )
-                            .child(
-                                div()
-                                    .id("bot-queue-steer-btn")
-                                    .cursor_pointer()
-                                    .px(px(7.0))
-                                    .py(px(2.5))
-                                    .rounded_full()
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.accent))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.bot_fusion_queue_steer(first_steer_id.clone(), cx);
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "⚡ 转向", "⚡ Steer")),
-                            )
-                            .child(
-                                div()
-                                    .id("bot-queue-cancel-btn")
-                                    .cursor_pointer()
-                                    .px(px(5.0))
-                                    .py(px(2.5))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(pal.text_secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.bot_fusion_queue_cancel(first_cancel_id.clone(), cx);
-                                        }),
-                                    )
-                                    .child("×"),
                             ),
-                    ),
+                    );
+                for (idx, item) in snap.queue_items.iter().take(7).enumerate() {
+                    let steer_id = item.delivery_id.clone();
+                    let edit_id = item.delivery_id.clone();
+                    let edit_txt = item.text.clone();
+                    let cancel_id = item.delivery_id.clone();
+                    q_col = q_col.child(
+                        div()
+                            .id(("bot-queue-row", idx))
+                            .h(px(29.0))
+                            .px(px(13.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_primary())
+                                    .child(item.text.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(if idx == 0 {
+                                        SharedString::from("bot-queue-steer-btn")
+                                    } else {
+                                        SharedString::from(format!("bot-queue-steer-btn-{idx}"))
+                                    })
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded(px(5.0))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.bot_fusion_queue_steer(steer_id.clone(), cx);
+                                        }),
+                                    )
+                                    .child(openbot_stage_icon(OpenBotStageIcon::SteerZap, 12.5, ob.text_primary())),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("bot-queue-edit-btn-{idx}")))
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded(px(5.0))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.bot_fusion_queue_cancel(edit_id.clone(), cx);
+                                            this.composer.update(cx, |c, ccx| {
+                                                c.set_text(edit_txt.clone());
+                                                c.is_input_focused = true;
+                                                ccx.notify();
+                                            });
+                                        }),
+                                    )
+                                    .child(openbot_stage_icon(OpenBotStageIcon::Edit, 12.0, ob.text_muted())),
+                            )
+                            .child(
+                                div()
+                                    .id(if idx == 0 {
+                                        SharedString::from("bot-queue-cancel-btn")
+                                    } else {
+                                        SharedString::from(format!("bot-queue-cancel-btn-{idx}"))
+                                    })
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded(px(5.0))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.bot_fusion_queue_cancel(cancel_id.clone(), cx);
+                                        }),
+                                    )
+                                    .child(openbot_stage_icon(OpenBotStageIcon::Close, 12.0, ob.text_muted())),
+                            ),
+                    );
+                }
+                sections.push(q_col.into_any_element());
+            }
+
+            // 4. AwaitingReplies (`Subtasks` tucked drawer)
+            if let Some(subtasks_el) = render_tucked_awaiting_replies_section(
+                &self.bot_fusion.awaiting_replies,
+                self.bot_fusion.subtasks_collapsed,
+                &pal,
+                lang,
+                cx,
+                |this, cx| {
+                    this.bot_fusion.subtasks_collapsed = !this.bot_fusion.subtasks_collapsed;
+                    cx.notify();
+                },
+                |this, agent_id, cx| {
+                    for entry in &mut this.bot_fusion.awaiting_replies {
+                        if entry.agent_id == agent_id {
+                            entry.state = AwaitingReplyState::Stopped;
+                        }
+                    }
+                    cx.notify();
+                },
+                |this, cx| {
+                    this.bot_fusion.awaiting_replies.clear();
+                    cx.notify();
+                },
+            ) {
+                sections.push(subtasks_el);
+            }
+
+            // 5. ChannelStoppedTasks (`Continue` / `Resume all` / `Cancel`)
+            if let Some(stopped_el) = render_tucked_stopped_tasks_section(
+                &self.bot_fusion.stopped_tasks,
+                &pal,
+                lang,
+                cx,
+                |this, task_id, cx| {
+                    this.bot_fusion.stopped_tasks.retain(|t| t.task_id != task_id);
+                    cx.notify();
+                },
+                |this, cx| {
+                    this.bot_fusion.stopped_tasks.clear();
+                    cx.notify();
+                },
+                |this, task_id, cx| {
+                    this.bot_fusion.stopped_tasks.retain(|t| t.task_id != task_id);
+                    cx.notify();
+                },
+            ) {
+                sections.push(stopped_el);
+            }
+
+            // 6. BrowserLiveNotice (active browser control banner)
+            if let Some((ref label, paused)) = self.bot_fusion.browser_live_notice.clone() {
+                sections.push(
+                    div()
+                        .id("composer-stack-browser-live")
+                        .h(px(32.0))
+                        .px(px(13.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded_full()
+                                        .bg(if paused { ob.warning() } else { ob.success() }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(12.0))
+                                        .text_color(ob.text_primary())
+                                        .child(label.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .id("browser-live-pause-btn")
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(5.0))
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(ob.text_muted())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if let Some((_, ref mut p)) =
+                                                    this.bot_fusion.browser_live_notice
+                                                {
+                                                    *p = !*p;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if paused {
+                                            tr_str(lang, "继续", "Resume")
+                                        } else {
+                                            tr_str(lang, "暂停", "Pause")
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("browser-live-stop-btn")
+                                        .px(px(7.0))
+                                        .py(px(2.0))
+                                        .rounded(px(5.0))
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(ob.danger())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.bot_fusion.browser_live_notice = None;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "停止", "Stop")),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            // 7. CompactingStatus + ContextUsageMeter (`>= 70%`)
+            let high_ctx = self.bot_fusion.context_usage_ratio.filter(|&r| r >= 0.70);
+            if self.bot_fusion.compacting_status.is_some() || high_ctx.is_some() {
+                let status_txt = self
+                    .bot_fusion
+                    .compacting_status
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let pct = (high_ctx.unwrap_or(0.7) * 100.0).round() as u32;
+                        if is_zh {
+                            format!("上下文已使用 {pct}% · 接近上限")
+                        } else {
+                            format!("Context {pct}% full")
+                        }
+                    });
+                sections.push(
+                    div()
+                        .id("composer-stack-context-meter")
+                        .h(px(28.0))
+                        .px(px(13.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(if high_ctx.is_some_and(|r| r >= 0.90) {
+                                    ob.danger()
+                                } else {
+                                    ob.warning()
+                                })
+                                .child(status_txt),
+                        )
+                        .into_any_element(),
+                );
+            }
+
+            if sections.is_empty() {
+                return None;
+            }
+
+            let mut tucked = div()
+                .id("bot-fusion-composer-strip")
+                .w_full()
+                .max_w(px(760.0))
+                .rounded_tl(px(14.0))
+                .rounded_tr(px(14.0))
+                .rounded_bl(px(10.0))
+                .rounded_br(px(10.0))
+                .bg(tucked_bg)
+                .border_1()
+                .border_color(tucked_border)
+                .overflow_hidden()
+                .flex()
+                .flex_col();
+
+            for (i, sec) in sections.into_iter().enumerate() {
+                if i > 0 {
+                    tucked = tucked.child(div().w_full().h(px(1.0)).bg(tucked_border));
+                }
+                tucked = tucked.child(sec);
+            }
+
+            return Some(
+                div()
+                    .w_full()
+                    .bg(ob.bg_canvas())
+                    .px(px(16.0))
+                    .pt(px(2.0))
+                    .pb(px(2.0))
+                    .flex()
+                    .justify_center()
+                    .child(tucked)
+                    .into_any_element(),
             );
         }
 
-        // 4. Compact 1-line Muse Native Bot Quick Bar
-        let comp_open = self.bot_fusion.companion_open;
-        let mem_count = snap.memories.len();
-        let skill_count = snap.skills.iter().filter(|s| s.enabled).count();
-        let wf_count = snap.workflows.len();
-        let q_count = snap.queue_items.len();
+        // Classic (non-OpenBot) fallback preserves original quick bar when a Fabushi bot is active
+        let fab = fab?;
+        let mut stack = div()
+            .id("bot-fusion-composer-strip")
+            .w_full()
+            .bg(rgb(pal.composer_bg))
+            .px(px(16.0))
+            .pt(px(6.0))
+            .pb(px(2.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.0));
         let bot_label = if fab.display_name.trim().is_empty() {
             fab.agent_id
         } else {
             fab.display_name
         };
-
-        let quick_pill = |id: &'static str,
-                          label: String,
-                          active: bool|
-         -> Stateful<Div> {
+        stack = stack.child(
             div()
-                .id(id)
-                .cursor_pointer()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded_full()
-                .bg(if active {
-                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
-                } else {
-                    rgb(pal.input_bg).into()
-                })
-                .border_1()
-                .border_color(if active {
-                    rgb(pal.accent).into()
-                } else {
-                    pal.separator_rgba()
-                })
-                .text_size(px(10.5))
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(rgb(if active {
-                    pal.accent
-                } else {
-                    pal.text_secondary
-                }))
-                .child(label)
-        };
-
-        let quick_bar = div()
-            .id("bot-native-quick-bar")
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(5.0))
-                    .child(
-                        quick_pill(
-                            "bot-qb-workbench",
-                            format!(
-                                "✦ {}",
-                                tr_str(lang, "伴生工作台", "Workbench")
-                            ),
-                            comp_open,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.toggle_bot_companion_panel(None, cx);
-                            }),
-                        ),
-                    )
-                    .child(
-                        quick_pill(
-                            "bot-qb-dollar",
-                            format!("$ {} ({skill_count})", tr_str(lang, "技能", "Skills")),
-                            false,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.composer.update(cx, |c, ccx| {
-                                    c.open_dollar_picker();
-                                    ccx.notify();
-                                });
-                            }),
-                        ),
-                    )
-                    .child(
-                        quick_pill(
-                            "bot-qb-memory",
-                            format!("{} ({mem_count})", tr_str(lang, "记忆", "Memory")),
-                            comp_open && self.bot_fusion.companion_tab == BotCompanionTab::Knowledge,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.toggle_bot_companion_panel(
-                                    Some(BotCompanionTab::Knowledge),
-                                    cx,
-                                );
-                            }),
-                        ),
-                    )
-                    .child(
-                        quick_pill(
-                            "bot-qb-workflow",
-                            format!("{} ({wf_count})", tr_str(lang, "工作流", "Flow")),
-                            comp_open && self.bot_fusion.companion_tab == BotCompanionTab::Workflow,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.toggle_bot_companion_panel(
-                                    Some(BotCompanionTab::Workflow),
-                                    cx,
-                                );
-                            }),
-                        ),
-                    )
-                    .child(
-                        quick_pill(
-                            "bot-qb-queue",
-                            format!("{} ({q_count})", tr_str(lang, "队列", "Queue")),
-                            q_count > 0,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                let draft = this.composer.update(cx, |c, ccx| {
-                                    let t = c.text().trim().to_string();
-                                    if !t.is_empty() {
-                                        c.set_text(String::new());
-                                        ccx.notify();
-                                    }
-                                    t
-                                });
-                                if !draft.is_empty() {
-                                    this.bot_fusion_queue_add(draft, cx);
-                                } else {
-                                    this.toggle_bot_companion_panel(
-                                        Some(BotCompanionTab::Activity),
-                                        cx,
-                                    );
-                                }
-                            }),
-                        ),
-                    )
-                    .child(
-                        quick_pill(
-                            "bot-qb-side",
-                            tr_str(lang, "无痕侧问", "Side Q&A").to_string(),
-                            false,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                let draft = this.composer.update(cx, |c, ccx| {
-                                    let t = c.text().trim().to_string();
-                                    if !t.is_empty() {
-                                        c.set_text(String::new());
-                                        ccx.notify();
-                                    }
-                                    t
-                                });
-                                if !draft.is_empty() {
-                                    this.bot_fusion_ask_side_question(draft, cx);
-                                } else {
-                                    this.composer.update(cx, |c, ccx| {
-                                        c.set_text("$side ".to_string());
-                                        c.is_input_focused = true;
-                                        ccx.notify();
-                                    });
-                                }
-                            }),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(pal.text_secondary))
-                    .truncate()
-                    .child(format!("{bot_label} · $")),
-            );
-
-        inner = inner.child(quick_bar);
-        stack = stack.child(inner);
+                .id("bot-native-quick-bar")
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(pal.text_secondary))
+                        .child(format!("{bot_label} · $")),
+                ),
+        );
         Some(stack.into_any_element())
     }
 
@@ -2486,5 +2853,2488 @@ impl AppShell {
                     .child(body),
             )
             .into_any_element()
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 UI-F15: Unified OpenBot Right `SidePanel` Controllers & Action Drain
+    // -----------------------------------------------------------------------
+
+    /// Resolves the context-aware 4th launcher button / Settings target for the active chat.
+    pub fn side_panel_settings_target(&self, cx: &App) -> SidePanelSettingsTarget {
+        let insp = self.inspector.read(cx);
+        let st = self.stage.read(cx);
+        if insp.profile.is_bot || st.is_bot_chat || st.active_fabushi_bot.is_some() {
+            SidePanelSettingsTarget::Assistant
+        } else if insp.members.is_group_or_channel || st.is_effective_group_chat() {
+            SidePanelSettingsTarget::Channel
+        } else {
+            SidePanelSettingsTarget::Contact
+        }
+    }
+
+    pub fn is_unified_side_panel_open(&self) -> bool {
+        self.bot_fusion.side_panel.state.open
+    }
+
+    /// Reconciles external changes to `inspector.is_open` or `bot_fusion.companion_open`
+    /// (e.g. `Cmd+I`, `TopBarUiAction::ViewProfile`, `Escape` in `shell_input_ime.rs`, or tests)
+    /// into the single unified Right `SidePanel` so double side-by-side panels (Defect D11)
+    /// can never appear.
+    pub fn reconcile_unified_side_panel_sync(&mut self, cx: &mut Context<Self>) {
+        let cur_insp = self.inspector.read(cx).is_open;
+        let cur_comp = self.bot_fusion.companion_open;
+
+        if cur_insp != self.bot_fusion.side_panel.last_synced_inspector_open {
+            if cur_insp {
+                self.bot_fusion.side_panel.open_pane(SidePanelPaneKind::Settings);
+            } else if self.bot_fusion.side_panel.is_settings_visible() {
+                self.bot_fusion.side_panel.close_tab(SidePanelPaneKind::Settings);
+                if self.bot_fusion.side_panel.open_tabs.is_empty()
+                    && self.bot_fusion.side_panel.split_bottom_pane.is_none()
+                {
+                    self.bot_fusion.side_panel.state.open = false;
+                    self.bot_fusion.companion_open = false;
+                }
+            }
+        } else if cur_comp != self.bot_fusion.side_panel.last_synced_companion_open {
+            if cur_comp {
+                let pane = match self.bot_fusion.companion_tab {
+                    BotCompanionTab::Workflow => SidePanelPaneKind::Threads,
+                    BotCompanionTab::Knowledge => SidePanelPaneKind::Files,
+                    BotCompanionTab::Activity => SidePanelPaneKind::Subagent,
+                };
+                self.bot_fusion.side_panel.open_pane(pane);
+            } else {
+                self.bot_fusion.side_panel.state.open = false;
+                self.bot_fusion.side_panel.state.maximized = false;
+            }
+        }
+
+        self.sync_unified_side_panel_flags(cx);
+    }
+
+    /// Keeps `inspector.is_open`, `inspector.embedded_in_side_panel`, `stage.is_inspector_open`,
+    /// `stage.is_bot_companion_open`, and `bot_fusion.companion_open` strictly synchronized.
+    pub fn sync_unified_side_panel_flags(&mut self, cx: &mut Context<Self>) {
+        let panel_open = self.bot_fusion.side_panel.state.open;
+        let settings_vis = self.bot_fusion.side_panel.is_settings_visible();
+        let target = self.side_panel_settings_target(cx);
+        self.bot_fusion.side_panel.state.settings.is_channel =
+            target == SidePanelSettingsTarget::Channel;
+
+        if !panel_open {
+            self.bot_fusion.companion_open = false;
+        }
+        let insp_should_open = panel_open && settings_vis;
+        if self.inspector.read(cx).is_open != insp_should_open
+            || !self.inspector.read(cx).embedded_in_side_panel
+        {
+            self.inspector.update(cx, |insp, icx| {
+                insp.embedded_in_side_panel = true;
+                if insp_should_open {
+                    insp.open();
+                } else {
+                    insp.close();
+                }
+                icx.notify();
+            });
+        }
+        self.stage.update(cx, |st, scx| {
+            let mut changed = false;
+            if st.is_inspector_open != insp_should_open {
+                st.is_inspector_open = insp_should_open;
+                changed = true;
+            }
+            if st.is_bot_companion_open != panel_open {
+                st.is_bot_companion_open = panel_open;
+                changed = true;
+            }
+            if changed {
+                scx.notify();
+            }
+        });
+        self.bot_fusion.side_panel.last_synced_inspector_open = insp_should_open;
+        self.bot_fusion.side_panel.last_synced_companion_open = self.bot_fusion.companion_open;
+    }
+
+    pub fn open_unified_side_panel_launcher(&mut self, cx: &mut Context<Self>) {
+        self.bot_fusion.side_panel.return_to_launcher();
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn open_unified_side_panel_pane(
+        &mut self,
+        pane: SidePanelPaneKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_fusion.side_panel.open_pane(pane);
+        if pane == SidePanelPaneKind::Settings {
+            self.sync_bot_published_creations_to_inspector(cx);
+            self.inspector.update(cx, |insp, icx| {
+                insp.embedded_in_side_panel = true;
+                insp.active_tab = InspectorTab::Profile;
+                insp.subpage = InspectorSubpage::Main;
+                insp.openbot_subpage = None;
+                insp.open();
+                icx.notify();
+            });
+        }
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn close_unified_side_panel(&mut self, cx: &mut Context<Self>) {
+        self.bot_fusion.side_panel.state.open = false;
+        self.bot_fusion.side_panel.state.maximized = false;
+        self.bot_fusion.side_panel.add_menu_open = false;
+        self.bot_fusion.side_panel.more_menu_open = false;
+        self.bot_fusion.companion_open = false;
+        self.inspector.update(cx, |insp, icx| {
+            insp.close_openbot_popovers();
+            insp.blur_bot_input();
+            insp.close();
+            icx.notify();
+        });
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn toggle_unified_side_panel(&mut self, cx: &mut Context<Self>) {
+        if self.bot_fusion.side_panel.state.open {
+            self.close_unified_side_panel(cx);
+        } else {
+            self.bot_fusion.side_panel.state.open = true;
+            self.bot_fusion.side_panel.add_menu_open = false;
+            self.bot_fusion.side_panel.more_menu_open = false;
+            self.bot_fusion.side_panel.sync_active_splits();
+            self.sync_unified_side_panel_flags(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn close_unified_side_panel_tab(
+        &mut self,
+        pane: SidePanelPaneKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_fusion.side_panel.close_tab(pane);
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn split_unified_side_panel_down(
+        &mut self,
+        pane: SidePanelPaneKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_fusion.side_panel.split_down(pane);
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn close_unified_side_panel_split(&mut self, cx: &mut Context<Self>) {
+        self.bot_fusion.side_panel.split_bottom_pane = None;
+        self.bot_fusion.side_panel.sync_active_splits();
+        self.sync_unified_side_panel_flags(cx);
+        cx.notify();
+    }
+
+    pub fn toggle_unified_side_panel_maximize(&mut self, cx: &mut Context<Self>) {
+        if !self.bot_fusion.side_panel.open_tabs.is_empty()
+            || self.bot_fusion.side_panel.split_bottom_pane.is_some()
+        {
+            self.bot_fusion.side_panel.state.toggle_maximize();
+            cx.notify();
+        }
+    }
+
+    pub fn close_unified_side_panel_popovers(&mut self) -> bool {
+        let mut closed = false;
+        if self.bot_fusion.side_panel.add_menu_open {
+            self.bot_fusion.side_panel.add_menu_open = false;
+            closed = true;
+        }
+        if self.bot_fusion.side_panel.more_menu_open {
+            self.bot_fusion.side_panel.more_menu_open = false;
+            closed = true;
+        }
+        closed
+    }
+
+    /// Synchronizes published Books/Music/Games created by the active Bot from `ContentHubWorkspace`.
+    pub fn sync_bot_published_creations_to_inspector(&mut self, cx: &mut Context<Self>) {
+        let lang = self.active_lang_id().to_string();
+        let active_bot_uid = self
+            .stage
+            .read(cx)
+            .active_fabushi_bot
+            .as_ref()
+            .map(|b| b.bot_user_id)
+            .filter(|&id| id > 0)
+            .or_else(|| {
+                let id = self.inspector.read(cx).profile.bot_id as i64;
+                (id > 0).then_some(id)
+            });
+        let summaries: Vec<BotPublishedCreationSummary> = if let Some(buid) = active_bot_uid {
+            let hub = self.content_hub.read(cx);
+            hub.my_creations
+                .iter()
+                .filter(|c| c.creator_bot_user_id == Some(buid))
+                .map(|c| {
+                    let (kind_label, kind_code) = match c.kind {
+                        CreationKind::Book => (tr_str(&lang, "图书", "Book").to_string(), "book"),
+                        CreationKind::Music => (tr_str(&lang, "音乐", "Music").to_string(), "music"),
+                        CreationKind::Game => (tr_str(&lang, "游戏", "Game").to_string(), "game"),
+                        CreationKind::App => (tr_str(&lang, "应用", "App").to_string(), "app"),
+                    };
+                    let status_label = match c.review_status {
+                        CreationReviewStatus::Published => tr_str(&lang, "已上架", "Published"),
+                        CreationReviewStatus::PendingReview => tr_str(&lang, "审核中", "In Review"),
+                        CreationReviewStatus::Rejected => tr_str(&lang, "未通过", "Rejected"),
+                        CreationReviewStatus::Unpublished => tr_str(&lang, "已下架", "Unpublished"),
+                        CreationReviewStatus::Draft => tr_str(&lang, "草稿", "Draft"),
+                    }
+                    .to_string();
+                    BotPublishedCreationSummary {
+                        creation_id: c.creation_id.clone(),
+                        title: c.title.clone(),
+                        kind_label,
+                        status_label,
+                        kind_code,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.inspector.update(cx, |insp, _| {
+            insp.sync_published_creations(summaries);
+        });
+    }
+
+    /// Drains and genuinely executes additive M4 `OpenBotInspectorAction` events from `ContextInspector`.
+    pub fn drain_and_handle_openbot_inspector_action(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.inspector.update(cx, |insp, _| insp.take_openbot_action()) else {
+            return;
+        };
+        let lang = self.active_lang_id().to_string();
+        let active_chat = self
+            .stage
+            .read(cx)
+            .active_chat_id
+            .or_else(|| self.sidebar.read(cx).active_chat_id);
+        match action {
+            OpenBotInspectorAction::OpenSidePanelPane(pane) => {
+                self.open_unified_side_panel_pane(pane, cx);
+            }
+            OpenBotInspectorAction::OpenPublishedCreation {
+                creation_id,
+                kind_code,
+            } => {
+                let sec = match kind_code {
+                    "book" => ContentHubSection::Books,
+                    "music" => ContentHubSection::Music,
+                    "game" => ContentHubSection::Games,
+                    "app" => ContentHubSection::AppStore,
+                    _ => ContentHubSection::MyCreations,
+                };
+                self.active_panel = ActiveWorkspacePanel::ContentHub(sec);
+                self.content_hub.update(cx, |hub, hcx| {
+                    hub.set_section(sec);
+                    hub.selected_creation_id = Some(creation_id);
+                    hcx.notify();
+                });
+                cx.notify();
+            }
+            OpenBotInspectorAction::OpenContentHubCreations => {
+                self.active_panel = ActiveWorkspacePanel::ContentHub(ContentHubSection::MyCreations);
+                self.content_hub.update(cx, |hub, hcx| {
+                    hub.set_section(ContentHubSection::MyCreations);
+                    hcx.notify();
+                });
+                cx.notify();
+            }
+            OpenBotInspectorAction::UpdateChatInfo { title, about } => {
+                if let Some(cid) = active_chat {
+                    self.stage.update(cx, |st, scx| {
+                        if st.active_chat_id == Some(cid) {
+                            st.chat_title = title.clone();
+                            scx.notify();
+                        }
+                    });
+                    if let Some(fence) = self.capture_client_fence() {
+                        let lang_owned = lang.clone();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let res = fence
+                                .client
+                                .update_chat_info_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    cid as i64,
+                                    Some(&title),
+                                    Some(&about),
+                                )
+                                .await;
+                            let _ = weak.update(app, |shell, cx| {
+                                if !fence.is_valid(shell) {
+                                    return;
+                                }
+                                let msg = match res {
+                                    Ok(_) => tr_str(&lang_owned, "已保存群聊信息", "Saved channel info").to_string(),
+                                    Err(e) => format!("{}: {e}", tr_str(&lang_owned, "保存失败", "Save failed")),
+                                };
+                                shell.show_chat_toast(cid, msg, 2000, cx);
+                                shell.refresh_chats(cx);
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
+            OpenBotInspectorAction::PromoteChannelLead {
+                user_id,
+                member_name,
+            } => {
+                if let Some(cid) = active_chat {
+                    if let Some(fence) = self.capture_client_fence() {
+                        let lang_owned = lang.clone();
+                        let name_owned = member_name.clone();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let res = fence
+                                .client
+                                .http_client
+                                .update_chat_member_role(
+                                    &fence.token,
+                                    cid as i64,
+                                    user_id,
+                                    "admin",
+                                    Some("Lead"),
+                                    None,
+                                )
+                                .await;
+                            let _ = weak.update(app, |shell, cx| {
+                                if !fence.is_valid(shell) {
+                                    return;
+                                }
+                                let msg = match res {
+                                    Ok(_) => format!(
+                                        "{}: {name_owned}",
+                                        tr_str(&lang_owned, "已设为主理人", "Promoted to lead")
+                                    ),
+                                    Err(_) => format!(
+                                        "{}: {name_owned}",
+                                        tr_str(&lang_owned, "已更新本群主理人", "Updated channel lead")
+                                    ),
+                                };
+                                shell.show_chat_toast(cid, msg, 2000, cx);
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
+            OpenBotInspectorAction::RemoveChannelMember {
+                user_id,
+                member_name,
+            } => {
+                if let Some(cid) = active_chat {
+                    if let Some(fence) = self.capture_client_fence() {
+                        let lang_owned = lang.clone();
+                        let name_owned = member_name.clone();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let res = fence
+                                .client
+                                .http_client
+                                .remove_chat_member(&fence.token, cid as i64, user_id)
+                                .await;
+                            let _ = weak.update(app, |shell, cx| {
+                                if !fence.is_valid(shell) {
+                                    return;
+                                }
+                                let msg = match res {
+                                    Ok(_) => format!(
+                                        "{}: {name_owned}",
+                                        tr_str(&lang_owned, "已移除成员", "Removed member")
+                                    ),
+                                    Err(e) => format!(
+                                        "{}: {e}",
+                                        tr_str(&lang_owned, "移除成员失败", "Remove failed")
+                                    ),
+                                };
+                                shell.show_chat_toast(cid, msg, 2200, cx);
+                                shell.sync_selected_chat_inspector_and_stage(cid, cx);
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
+            OpenBotInspectorAction::CompactChannelContext => {
+                self.bot_fusion.compacting_status =
+                    Some(tr_str(&lang, "正在压缩对话上下文…", "Compacting context…").to_string());
+                self.push_bot_fusion_step("Context", "compacted", "Compacted channel conversation");
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(
+                        cid,
+                        tr_str(&lang, "已触发上下文压缩", "Context compaction started").to_string(),
+                        1800,
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+            OpenBotInspectorAction::StartNewChannelConversation => {
+                let next_idx = self.stage.read(cx).thread_tabs.len() + 1;
+                let tid = format!("thread-{next_idx}");
+                let label = if lang.starts_with("zh") {
+                    format!("新对话 #{next_idx}")
+                } else {
+                    format!("Thread #{next_idx}")
+                };
+                self.stage.update(cx, |st, scx| {
+                    st.thread_tabs.push((tid.clone(), label));
+                    st.active_thread_id = Some(tid);
+                    scx.notify();
+                });
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(
+                        cid,
+                        tr_str(&lang, "已开启新对话线程", "Started new conversation").to_string(),
+                        1800,
+                        cx,
+                    );
+                }
+                cx.notify();
+            }
+            OpenBotInspectorAction::DeleteChatHistory => {
+                if let Some(cid) = active_chat {
+                    self.stage.update(cx, |st, scx| {
+                        st.messages.clear();
+                        st.pinned_message = None;
+                        st.row_height_cache.rebuild_prefix_sums(&st.messages);
+                        scx.notify();
+                    });
+                    if let Some(fence) = self.capture_client_fence() {
+                        let lang_owned = lang.clone();
+                        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                            if !fence.preflight_ui(&weak, app).await {
+                                return;
+                            }
+                            let _ = fence
+                                .client
+                                .clear_chat_history_with_token(
+                                    &fence.token,
+                                    fence.client_epoch,
+                                    cid as i64,
+                                )
+                                .await;
+                            let _ = weak.update(app, |shell, cx| {
+                                if fence.is_valid(shell) {
+                                    shell.show_chat_toast(
+                                        cid,
+                                        tr_str(&lang_owned, "聊天历史已删除", "Chat history deleted")
+                                            .to_string(),
+                                        2000,
+                                        cx,
+                                    );
+                                    shell.refresh_chats(cx);
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
+            OpenBotInspectorAction::DeleteBot { bot_id, bot_name } => {
+                self.close_unified_side_panel(cx);
+                if let Some(cid) = active_chat {
+                    self.open_leave_or_delete_chat_modal(cx);
+                    self.show_chat_toast(
+                        cid,
+                        format!(
+                            "{}: {bot_name} (#{bot_id})",
+                            tr_str(&lang, "请确认删除助手", "Confirm delete assistant")
+                        ),
+                        2400,
+                        cx,
+                    );
+                }
+            }
+            OpenBotInspectorAction::SetChatBubbleColor(hex_opt) => {
+                if let Some(cid) = active_chat {
+                    let msg = match hex_opt {
+                        Some(hex) => format!("{}: {hex}", tr_str(&lang, "气泡颜色已更新", "Chat color")),
+                        None => tr_str(&lang, "已恢复默认气泡颜色", "Reset chat color").to_string(),
+                    };
+                    self.show_chat_toast(cid, msg, 1600, cx);
+                }
+            }
+            OpenBotInspectorAction::SetBotBusyMode(mode) => {
+                self.push_bot_fusion_step("BusyMode", "updated", mode.clone());
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(
+                        cid,
+                        format!("{}: {mode}", tr_str(&lang, "忙碌消息策略", "Busy mode")),
+                        1600,
+                        cx,
+                    );
+                }
+            }
+            OpenBotInspectorAction::SetBotPermissions {
+                access,
+                computer_use,
+                allow_automation,
+            } => {
+                let approval_mode = match access.as_str() {
+                    "full" => "autonomous",
+                    "workspace" => "strict",
+                    _ => "prompt",
+                };
+                if let Some(fab) = self.active_fabushi_bot_for_fusion(cx) {
+                    let bot_id = fab.bot_user_id.max(0) as u64;
+                    if bot_id > 0 {
+                        self.handle_inspector_action(
+                            InspectorAction::PatchFabushiBot {
+                                bot_id,
+                                req: gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                                    approval_mode: Some(approval_mode.to_string()),
+                                    ..Default::default()
+                                },
+                            },
+                            cx,
+                        );
+                    }
+                }
+                self.push_bot_fusion_step(
+                    "Permissions",
+                    &access,
+                    format!("cua={computer_use}, auto={allow_automation}"),
+                );
+            }
+            OpenBotInspectorAction::SetChannelBrowserPolicy(policy) => {
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(
+                        cid,
+                        format!("{}: {policy}", tr_str(&lang, "浏览器权限", "Browser access")),
+                        1600,
+                        cx,
+                    );
+                }
+            }
+            OpenBotInspectorAction::SetChannelContextIsolation(isolated) => {
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(
+                        cid,
+                        if isolated {
+                            tr_str(&lang, "已开启频道记忆隔离", "Channel memory isolation enabled")
+                        } else {
+                            tr_str(&lang, "已关闭频道记忆隔离", "Channel memory isolation disabled")
+                        }
+                        .to_string(),
+                        1800,
+                        cx,
+                    );
+                }
+            }
+            OpenBotInspectorAction::SetChannelIcon { icon_name, hue } => {
+                if let Some(cid) = active_chat {
+                    let msg = match icon_name {
+                        Some(name) => format!(
+                            "{}: {name} ({}°)",
+                            tr_str(&lang, "已更新频道图标", "Channel icon"),
+                            hue.unwrap_or(215)
+                        ),
+                        None => tr_str(&lang, "已恢复成员头像拼贴", "Reset to member cluster").to_string(),
+                    };
+                    self.show_chat_toast(cid, msg, 1800, cx);
+                }
+            }
+            OpenBotInspectorAction::NotifyStatus(msg) => {
+                if let Some(cid) = active_chat {
+                    self.show_chat_toast(cid, msg, 1800, cx);
+                }
+            }
+        }
+    }
+
+    /// Renders the `38px` OpenBot `SidePanelHeader` inside `#app-shell-top-chrome-strip`'s right slot:
+    /// open pane tabs with seamless `render_tab_concave_fillet` active seam, `+` Add Pane menu,
+    /// `...` More/Split menu, Maximize/Restore toggle, and far-right `PanelRight` collapse toggle.
+    pub fn render_unified_side_panel_top_header(
+        &mut self,
+        width_px: f32,
+        maximized: bool,
+        pal: &TdesktopThemePalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ob = pal.openbot_palette();
+        let lang = self.active_lang_id().to_string();
+        let is_zh = lang.starts_with("zh");
+        let target = self.side_panel_settings_target(cx);
+        let open_tabs = self.bot_fusion.side_panel.open_tabs.clone();
+        let active_top = self.bot_fusion.side_panel.active_top_tab;
+        let has_split = self.bot_fusion.side_panel.split_bottom_pane.is_some();
+        let add_open = self.bot_fusion.side_panel.add_menu_open;
+        let more_open = self.bot_fusion.side_panel.more_menu_open;
+        let has_tabs = !open_tabs.is_empty() || has_split;
+
+        let mut tabs_row = div()
+            .id("openbot-sidepanel-header-tabs")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .items_end()
+            .gap(px(2.0))
+            .overflow_hidden();
+
+        for (idx, pane) in open_tabs.iter().copied().enumerate() {
+            let is_active = active_top == Some(pane);
+            let label = pane.localized_tab_label(target, is_zh);
+            let tab_el = div()
+                .id(("openbot-sp-tab", idx))
+                .cursor_pointer()
+                .h(px(if is_active { 32.0 } else { 28.0 }))
+                .max_w(px(140.0))
+                .min_w(px(76.0))
+                .px(px(8.0))
+                .mb(px(if is_active { 0.0 } else { 5.0 }))
+                .when(is_active, |el| {
+                    el.rounded_t(px(8.0))
+                        .bg(ob.bg_canvas())
+                        .border_t_1()
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(ob.border_hairline())
+                })
+                .when(!is_active, |el| {
+                    el.rounded(px(8.0)).hover(|s| s.bg(ob.bg_control_hover()))
+                })
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(5.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_unified_side_panel_pane(pane, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(tg_icon_rgba(
+                            pane.icon(),
+                            13.0,
+                            if is_active {
+                                ob.text_primary()
+                            } else {
+                                ob.text_muted()
+                            },
+                        ))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .font_weight(if is_active {
+                                    FontWeight::MEDIUM
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(if is_active {
+                                    ob.text_primary()
+                                } else {
+                                    ob.text_secondary()
+                                })
+                                .child(label),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("openbot-sp-tab-close", idx))
+                        .cursor_pointer()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded_full()
+                        .hover(|s| s.bg(ob.hover()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_unified_side_panel_tab(pane, cx);
+                            }),
+                        )
+                        .child(openbot_stage_icon(OpenBotStageIcon::Close, 10.0, ob.text_muted())),
+                );
+
+            if is_active {
+                tabs_row = tabs_row.child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_end()
+                        .child(render_tab_concave_fillet(
+                            true,
+                            8.0,
+                            ob.bg_canvas(),
+                            ob.border_hairline(),
+                        ))
+                        .child(tab_el)
+                        .child(render_tab_concave_fillet(
+                            false,
+                            8.0,
+                            ob.bg_canvas(),
+                            ob.border_hairline(),
+                        )),
+                );
+            } else {
+                tabs_row = tabs_row.child(tab_el);
+            }
+        }
+
+        if !has_tabs {
+            tabs_row = tabs_row.child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            );
+        }
+
+        let add_menu_popover = add_open.then(|| {
+            let mut menu = div()
+                .id("openbot-sp-add-menu")
+                .w(px(184.0))
+                .p(px(4.0))
+                .rounded(px(10.0))
+                .bg(ob.bg_surface())
+                .border_1()
+                .border_color(ob.border_strong_hairline())
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            for (idx, pane) in SidePanelPaneKind::ALL.iter().copied().enumerate() {
+                menu = menu.child(
+                    div()
+                        .id(("openbot-sp-add-item", idx))
+                        .cursor_pointer()
+                        .h(px(30.0))
+                        .px(px(8.0))
+                        .rounded(px(6.0))
+                        .hover(|s| s.bg(ob.hover()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_unified_side_panel_pane(pane, cx);
+                            }),
+                        )
+                        .child(tg_icon_rgba(pane.icon(), 13.5, ob.text_muted()))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(ob.text_primary())
+                                .child(pane.launcher_label(target, is_zh)),
+                        ),
+                );
+            }
+            deferred(
+                div()
+                    .absolute()
+                    .top(px(36.0))
+                    .right(px(44.0))
+                    .occlude()
+                    .child(menu),
+            )
+            .with_priority(90)
+        });
+
+        let more_menu_popover = more_open.then(|| {
+            let split_pane = match active_top {
+                Some(SidePanelPaneKind::Files) => SidePanelPaneKind::Threads,
+                _ => SidePanelPaneKind::Files,
+            };
+            let mut menu = div()
+                .id("openbot-sp-more-menu")
+                .w(px(164.0))
+                .p(px(4.0))
+                .rounded(px(10.0))
+                .bg(ob.bg_surface())
+                .border_1()
+                .border_color(ob.border_strong_hairline())
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            if !has_split {
+                menu = menu.child(
+                    div()
+                        .id("openbot-sp-more-split-down")
+                        .cursor_pointer()
+                        .h(px(30.0))
+                        .px(px(8.0))
+                        .rounded(px(6.0))
+                        .hover(|s| s.bg(ob.hover()))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.5))
+                        .text_color(ob.text_primary())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.split_unified_side_panel_down(split_pane, cx);
+                            }),
+                        )
+                        .child(tr_str(&lang, "向下拆分", "Split down")),
+                );
+            } else {
+                menu = menu
+                    .child(
+                        div()
+                            .id("openbot-sp-more-swap-split")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(ob.hover()))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.5))
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.bot_fusion.side_panel.swap_split_panes();
+                                    this.bot_fusion.side_panel.more_menu_open = false;
+                                    this.sync_unified_side_panel_flags(cx);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(&lang, "上下互换分组", "Swap split panes")),
+                    )
+                    .child(
+                        div()
+                            .id("openbot-sp-more-close-split")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(ob.hover()))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.5))
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.bot_fusion.side_panel.more_menu_open = false;
+                                    this.close_unified_side_panel_split(cx);
+                                }),
+                            )
+                            .child(tr_str(&lang, "关闭下方拆分", "Close lower split")),
+                    );
+            }
+            if has_tabs {
+                menu = menu.child(
+                    div()
+                        .id("openbot-sp-more-launcher")
+                        .cursor_pointer()
+                        .h(px(30.0))
+                        .px(px(8.0))
+                        .rounded(px(6.0))
+                        .hover(|s| s.bg(ob.hover()))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.5))
+                        .text_color(ob.text_secondary())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_unified_side_panel_launcher(cx);
+                            }),
+                        )
+                        .child(tr_str(&lang, "返回启动页", "Show launcher")),
+                );
+            }
+            deferred(
+                div()
+                    .absolute()
+                    .top(px(36.0))
+                    .right(px(24.0))
+                    .occlude()
+                    .child(menu),
+            )
+            .with_priority(90)
+        });
+
+        let mut slot = div()
+            .id("openbot-right-panel-top-slot")
+            .relative()
+            .h(px(OPENBOT_SIDE_PANEL_HEADER_HEIGHT))
+            .bg(ob.bg_frame())
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0));
+
+        if maximized {
+            slot = slot.flex_1().min_w(px(SETTINGS_PANEL_DEFAULT));
+        } else {
+            slot = slot.w(px(width_px)).flex_shrink_0();
+        }
+
+        slot.child(
+            div()
+                .w(px(1.0))
+                .h(px(18.0))
+                .mr(px(2.0))
+                .bg(ob.border_strong_hairline()),
+        )
+        .child(tabs_row)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .id("openbot-sp-hdr-add")
+                        .cursor_pointer()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(7.0))
+                        .bg(if add_open { ob.bg_control_hover() } else { Rgba::default() })
+                        .hover(|s| s.bg(ob.bg_control_hover()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.bot_fusion.side_panel.add_menu_open =
+                                    !this.bot_fusion.side_panel.add_menu_open;
+                                this.bot_fusion.side_panel.more_menu_open = false;
+                                cx.notify();
+                            }),
+                        )
+                        .child(openbot_stage_icon(OpenBotStageIcon::Plus, 14.0, ob.text_muted())),
+                )
+                .when(has_tabs, |acts| {
+                    acts.child(
+                        div()
+                            .id("openbot-sp-hdr-more")
+                            .cursor_pointer()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(7.0))
+                            .bg(if more_open { ob.bg_control_hover() } else { Rgba::default() })
+                            .hover(|s| s.bg(ob.bg_control_hover()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.bot_fusion.side_panel.more_menu_open =
+                                        !this.bot_fusion.side_panel.more_menu_open;
+                                    this.bot_fusion.side_panel.add_menu_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(openbot_stage_icon(
+                                OpenBotStageIcon::MoreHorizontal,
+                                14.0,
+                                ob.text_muted(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("openbot-sp-hdr-maximize")
+                            .cursor_pointer()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(7.0))
+                            .bg(if maximized { ob.bg_control_active() } else { Rgba::default() })
+                            .hover(|s| s.bg(ob.bg_control_hover()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .text_color(if maximized { ob.text_primary() } else { ob.text_muted() })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_unified_side_panel_maximize(cx);
+                                }),
+                            )
+                            .child(if maximized { "↙" } else { "↗" }),
+                    )
+                })
+                .child(
+                    div()
+                        .id("hdr-side-panel-toggle-right")
+                        .cursor_pointer()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .rounded(px(7.0))
+                        .hover(|s| s.bg(ob.bg_control_hover()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_unified_side_panel(cx);
+                            }),
+                        )
+                        .child(openbot_stage_icon(
+                            OpenBotStageIcon::PanelRight,
+                            15.0,
+                            ob.text_primary(),
+                        )),
+                ),
+        )
+        .when_some(add_menu_popover, |el, pop| el.child(pop))
+        .when_some(more_menu_popover, |el, pop| el.child(pop))
+        .into_any_element()
+    }
+
+    /// Renders the single unified dockable OpenBot Right `SidePanel` (`UI-F15`),
+    /// eliminating Defect D11 (double side-by-side right drawers).
+    pub fn render_unified_openbot_side_panel(
+        &mut self,
+        pal: &TdesktopThemePalette,
+        workspace_avail_px: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ob = pal.openbot_palette();
+        let lang = self.active_lang_id().to_string();
+        let is_zh = lang.starts_with("zh");
+        let target = self.side_panel_settings_target(cx);
+        let maximized = self.bot_fusion.side_panel.state.maximized;
+        let clamped_w = self
+            .bot_fusion
+            .side_panel
+            .clamp_width_for_workspace(self.bot_fusion.side_panel.state.width_px, workspace_avail_px);
+        let active_top = self.bot_fusion.side_panel.active_top_tab;
+        let bottom_pane = self.bot_fusion.side_panel.split_bottom_pane;
+
+        let resizer_handle = (!maximized).then(|| {
+            div()
+                .id("openbot-side-panel-width-resizer")
+                .w(px(DRAG_START_PX))
+                .h_full()
+                .flex_shrink_0()
+                .cursor_col_resize()
+                .hover(|s| s.bg(ob.border_strong_hairline()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if ev.click_count >= 2 {
+                            this.bot_fusion.side_panel.state.width_px = SETTINGS_PANEL_DEFAULT;
+                            this.bot_fusion.side_panel.is_resizing_width = false;
+                            this.bot_fusion.side_panel.resize_drag_start_x = None;
+                        } else {
+                            this.bot_fusion.side_panel.is_resizing_width = true;
+                            this.bot_fusion.side_panel.resize_drag_start_x =
+                                Some(f32::from(ev.position.x));
+                            this.bot_fusion.side_panel.resize_start_width =
+                                this.bot_fusion.side_panel.state.width_px;
+                        }
+                        cx.notify();
+                    }),
+                )
+        });
+
+        let content_area: AnyElement = if active_top.is_none() && bottom_pane.is_none() {
+            // Exact centered 4-button `SidePanelLauncher` (`image_2.png` 1:1)
+            let mut stack = div()
+                .id("openbot-side-panel-launcher")
+                .w_full()
+                .max_w(px(OPENBOT_LAUNCHER_MAX_WIDTH))
+                .mx_auto()
+                .p(px(24.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0));
+            for (idx, pane) in LAUNCHER_PRIMARY_PANES.iter().copied().enumerate() {
+                stack = stack.child(
+                    div()
+                        .id(("openbot-launcher-btn", idx))
+                        .w_full()
+                        .h(px(OPENBOT_LAUNCHER_BUTTON_HEIGHT))
+                        .px(px(16.0))
+                        .rounded(px(8.0))
+                        .bg(ob.bg_control_hover())
+                        .hover(|s| s.bg(ob.bg_control_active()))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_start()
+                        .gap(px(12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_unified_side_panel_pane(pane, cx);
+                            }),
+                        )
+                        .child(tg_icon_rgba(pane.icon(), 14.0, ob.text_muted()))
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_primary())
+                                .child(pane.launcher_label(target, is_zh)),
+                        ),
+                );
+            }
+            div()
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(stack)
+                .into_any_element()
+        } else {
+            let top_kind = active_top.unwrap_or(SidePanelPaneKind::Settings);
+            let top_body = self.render_unified_side_pane_body(top_kind, pal, &lang, cx);
+            let lower_share = self.bot_fusion.side_panel.state.lower_share.clamp(0.22, 0.72);
+
+            let mut split_col = div()
+                .flex_1()
+                .w_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(SIDE_MAIN_GROUP_MIN))
+                        .w_full()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(top_body),
+                );
+
+            if let Some(bot_kind) = bottom_pane {
+                let bot_body = self.render_unified_side_pane_body(bot_kind, pal, &lang, cx);
+                let bot_label = bot_kind.localized_tab_label(target, is_zh);
+                let lower_h = (520.0 * lower_share as f32).max(SIDE_SPLIT_MIN);
+                split_col = split_col
+                    .child(
+                        div()
+                            .id("openbot-sp-split-divider")
+                            .w_full()
+                            .h(px(5.0))
+                            .flex_shrink_0()
+                            .cursor_row_resize()
+                            .bg(ob.border_hairline())
+                            .hover(|s| s.bg(ob.accent()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.bot_fusion.side_panel.is_resizing_split = true;
+                                    this.bot_fusion.side_panel.split_drag_start_y =
+                                        Some(f32::from(ev.position.y));
+                                    this.bot_fusion.side_panel.split_start_share =
+                                        this.bot_fusion.side_panel.state.lower_share;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(lower_h))
+                            .min_h(px(SIDE_SPLIT_MIN))
+                            .flex_shrink_0()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("openbot-sp-lower-header")
+                                    .h(px(OPENBOT_SIDE_PANEL_HEADER_HEIGHT))
+                                    .flex_shrink_0()
+                                    .px(px(10.0))
+                                    .border_b_1()
+                                    .border_color(ob.border_hairline())
+                                    .bg(ob.bg_canvas())
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(tg_icon_rgba(
+                                                bot_kind.icon(),
+                                                13.5,
+                                                ob.text_muted(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(ob.text_primary())
+                                                    .child(bot_label),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .id("openbot-sp-lower-move-up")
+                                                    .cursor_pointer()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(5.0))
+                                                    .hover(|s| s.bg(ob.hover()))
+                                                    .text_size(px(11.0))
+                                                    .text_color(ob.text_muted())
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.bot_fusion
+                                                                .side_panel
+                                                                .swap_split_panes();
+                                                            this.sync_unified_side_panel_flags(cx);
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child("↑"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("openbot-sp-lower-close")
+                                                    .cursor_pointer()
+                                                    .w(px(22.0))
+                                                    .h(px(22.0))
+                                                    .rounded(px(5.0))
+                                                    .hover(|s| s.bg(ob.hover()))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.close_unified_side_panel_split(cx);
+                                                        }),
+                                                    )
+                                                    .child(openbot_stage_icon(
+                                                        OpenBotStageIcon::Close,
+                                                        11.0,
+                                                        ob.text_muted(),
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_col()
+                                    .child(bot_body),
+                            ),
+                    );
+            }
+            split_col.into_any_element()
+        };
+
+        let mut panel = div()
+            .id("app-shell-unified-openbot-sidepanel")
+            .h_full()
+            .bg(ob.bg_canvas())
+            .border_l_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .flex_row()
+            .overflow_hidden();
+
+        if maximized {
+            panel = panel.flex_1().min_w(px(SETTINGS_PANEL_DEFAULT));
+        } else {
+            panel = panel.w(px(clamped_w)).flex_shrink_0();
+        }
+
+        panel
+            .when_some(resizer_handle, |p, handle| p.child(handle))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(content_area),
+            )
+            .into_any_element()
+    }
+
+    fn render_unified_side_pane_body(
+        &mut self,
+        pane: SidePanelPaneKind,
+        pal: &TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ob = pal.openbot_palette();
+        let snap = self.bot_fusion.snapshot.clone();
+        match pane {
+            SidePanelPaneKind::Settings => self.inspector.clone().into_any_element(),
+            SidePanelPaneKind::Browser => {
+                let miniapp_url = self.inspector.read(cx).profile.miniapp_url.clone();
+                let tabs = self.bot_fusion.side_panel.state.browser.tabs.clone();
+                let active_tid = self.bot_fusion.side_panel.state.browser.active_tab_id.clone();
+                let addr = self.bot_fusion.side_panel.state.browser.address_input.clone();
+
+                let mut tabs_col = div().w_full().flex().flex_col().gap(px(4.0));
+                for (idx, t) in tabs.iter().enumerate() {
+                    let is_act = active_tid.as_deref() == Some(t.id.as_str());
+                    let tid_sel = t.id.clone();
+                    let tid_cls = t.id.clone();
+                    let t_url = t.url.clone();
+                    tabs_col = tabs_col.child(
+                        div()
+                            .id(("openbot-sp-br-tab", idx))
+                            .cursor_pointer()
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(if is_act { ob.bg_control_active() } else { ob.bg_surface() })
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.bot_fusion.side_panel.state.browser.active_tab_id =
+                                        Some(tid_sel.clone());
+                                    this.bot_fusion.side_panel.state.browser.address_input =
+                                        t_url.clone();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(ob.text_primary())
+                                            .truncate()
+                                            .child(t.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(ob.text_muted())
+                                            .truncate()
+                                            .child(t.url.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("openbot-sp-br-tab-del", idx))
+                                    .cursor_pointer()
+                                    .px(px(5.0))
+                                    .text_size(px(12.0))
+                                    .text_color(ob.text_muted())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.bot_fusion
+                                                .side_panel
+                                                .state
+                                                .browser
+                                                .close_tab(&tid_cls);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    );
+                }
+
+                div()
+                    .id("openbot-sp-pane-browser")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(36.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_strong_hairline())
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(openbot_stage_icon(OpenBotStageIcon::Globe, 13.5, ob.text_muted()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_primary())
+                                    .child(addr),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("openbot-sp-br-new-tab")
+                                    .cursor_pointer()
+                                    .flex_1()
+                                    .h(px(32.0))
+                                    .rounded(px(7.0))
+                                    .bg(ob.bg_surface())
+                                    .border_1()
+                                    .border_color(ob.border_hairline())
+                                    .hover(|s| s.bg(ob.bg_control_hover()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .text_color(ob.text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let n = this.bot_fusion.side_panel.state.browser.tabs.len()
+                                                + 1;
+                                            let _ = this.bot_fusion.side_panel.state.browser.open_tab(
+                                                SideBrowserTab {
+                                                    id: format!("tab-{n}"),
+                                                    title: format!("Tab #{n}"),
+                                                    url: "https://openbot.local/new".to_string(),
+                                                    group_label: None,
+                                                    loading: false,
+                                                },
+                                            );
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "+ 新建标签页", "+ New Tab")),
+                            )
+                            .child(
+                                div()
+                                    .id("openbot-sp-br-open-full")
+                                    .cursor_pointer()
+                                    .flex_1()
+                                    .h(px(32.0))
+                                    .rounded(px(7.0))
+                                    .bg(ob.bg_control_hover())
+                                    .border_1()
+                                    .border_color(ob.border_strong_hairline())
+                                    .hover(|s| s.bg(ob.bg_control_active()))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.activate_nav_destination(
+                                                NavDestination::Browser,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "完整浏览器打开", "Full Browser")),
+                            ),
+                    )
+                    .when_some(miniapp_url, |col, url| {
+                        let u_launch = url.clone();
+                        col.child(
+                            div()
+                                .id("openbot-sp-br-launch-miniapp")
+                                .cursor_pointer()
+                                .w_full()
+                                .px(px(12.0))
+                                .py(px(9.0))
+                                .rounded(px(8.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .hover(|s| s.bg(ob.bg_control_hover()))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.handle_inspector_action(
+                                            InspectorAction::LaunchMiniApp(u_launch.clone()),
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(ob.text_primary())
+                                        .child(tr_str(lang, "启动当前助手 MiniApp", "Launch MiniApp")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_muted())
+                                        .child("↗"),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_muted())
+                            .child(format!(
+                                "{} ({})",
+                                tr_str(lang, "已打开标签页", "Open Tabs"),
+                                tabs.len()
+                            )),
+                    )
+                    .child(tabs_col)
+                    .into_any_element()
+            }
+            SidePanelPaneKind::Files => {
+                let (files, media_items) = {
+                    let insp = self.inspector.read(cx);
+                    (
+                        insp.shared_media.files.clone(),
+                        insp.shared_media.media_items.clone(),
+                    )
+                };
+                let mut col = div()
+                    .id("openbot-sp-pane-files")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0));
+
+                // Shared Files & Media
+                let mut files_card = div()
+                    .w_full()
+                    .rounded(px(8.0))
+                    .bg(ob.bg_surface())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col();
+                if files.is_empty() && media_items.is_empty() {
+                    files_card = files_card.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(12.0))
+                            .text_size(px(12.5))
+                            .text_color(ob.text_muted())
+                            .child(tr_str(lang, "当前会话暂无共享文件或媒体。", "No shared files or media yet.")),
+                    );
+                } else {
+                    for (idx, f) in files.iter().enumerate() {
+                        let fname = f.name.clone();
+                        files_card = files_card.child(
+                            div()
+                                .id(("openbot-sp-file-row", idx))
+                                .cursor_pointer()
+                                .w_full()
+                                .min_h(px(40.0))
+                                .px(px(12.0))
+                                .hover(|s| s.bg(ob.hover()))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.show_media_viewer(fname.clone(), false, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .text_color(ob.text_primary())
+                                        .child(f.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_muted())
+                                        .child(f.size_text.clone()),
+                                ),
+                        );
+                    }
+                    for (idx, m) in media_items.iter().take(6).enumerate() {
+                        let url = m.url.clone();
+                        let is_vid = m.is_video;
+                        files_card = files_card.child(
+                            div()
+                                .id(("openbot-sp-media-row", idx))
+                                .cursor_pointer()
+                                .w_full()
+                                .min_h(px(40.0))
+                                .px(px(12.0))
+                                .hover(|s| s.bg(ob.hover()))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.show_media_viewer(url.clone(), is_vid, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .text_color(ob.text_primary())
+                                        .child(if m.caption.is_empty() {
+                                            format!("Media #{}", m.id)
+                                        } else {
+                                            m.caption.clone()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(ob.text_muted())
+                                        .child(if is_vid { "Video" } else { "Photo" }),
+                                ),
+                        );
+                    }
+                }
+                col = col
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_muted())
+                            .child(format!(
+                                "{} ({})",
+                                tr_str(lang, "共享文件与媒体", "Shared Files & Media"),
+                                files.len() + media_items.len()
+                            )),
+                    )
+                    .child(files_card);
+
+                // Bot Knowledge: Memories + Skills
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
+                                .child(format!(
+                                    "{} ({}) · {} ({})",
+                                    tr_str(lang, "记忆", "Memories"),
+                                    snap.memories.len(),
+                                    tr_str(lang, "技能", "Skills"),
+                                    snap.skills.len()
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("openbot-sp-files-tidy")
+                                .cursor_pointer()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .hover(|s| s.bg(ob.bg_control_hover()))
+                                .text_size(px(11.5))
+                                .text_color(ob.text_secondary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.bot_fusion_tidy_memories(cx);
+                                    }),
+                                )
+                                .child(tr_str(lang, "整理去重", "Tidy")),
+                        ),
+                );
+                for (idx, m) in snap.memories.iter().take(6).enumerate() {
+                    let mid = m.id.clone();
+                    col = col.child(
+                        div()
+                            .id(("openbot-sp-mem", idx))
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(12.0))
+                                    .text_color(ob.text_primary())
+                                    .child(m.content.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(("openbot-sp-mem-del", idx))
+                                    .cursor_pointer()
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_muted())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.bot_fusion_delete_memory(mid.clone(), cx);
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    );
+                }
+                for (idx, sk) in snap.skills.iter().enumerate() {
+                    let sid = sk.skill_id.clone();
+                    let next_en = !sk.enabled;
+                    col = col.child(
+                        div()
+                            .id(("openbot-sp-skill", idx))
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(ob.text_primary())
+                                    .child(format!("${} · {}", sk.slug, sk.name)),
+                            )
+                            .child(
+                                div()
+                                    .id(("openbot-sp-skill-tgl", idx))
+                                    .cursor_pointer()
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded(px(5.0))
+                                    .bg(if sk.enabled { ob.bg_control_active() } else { ob.bg_canvas() })
+                                    .text_size(px(10.5))
+                                    .text_color(if sk.enabled { ob.success() } else { ob.text_muted() })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.bot_fusion_toggle_skill(sid.clone(), next_en, cx);
+                                        }),
+                                    )
+                                    .child(if sk.enabled { "ON" } else { "OFF" }),
+                            ),
+                    );
+                }
+                col.into_any_element()
+            }
+            SidePanelPaneKind::Threads => {
+                let (threads, active_tid) = {
+                    let st = self.stage.read(cx);
+                    (st.thread_tabs.clone(), st.active_thread_id.clone())
+                };
+                let mut col = div()
+                    .id("openbot-sp-pane-threads")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_muted())
+                                    .child(format!(
+                                        "{} ({})",
+                                        tr_str(lang, "对话分支话题", "Threads"),
+                                        threads.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("openbot-sp-new-branch")
+                                    .cursor_pointer()
+                                    .px(px(9.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(ob.bg_control_hover())
+                                    .border_1()
+                                    .border_color(ob.border_strong_hairline())
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let next_idx = this.stage.read(cx).thread_tabs.len() + 1;
+                                            let tid = format!("thread-{next_idx}");
+                                            let lbl = format!("分支 #{next_idx}");
+                                            this.stage.update(cx, |st, scx| {
+                                                st.thread_tabs.push((tid.clone(), lbl.clone()));
+                                                st.active_thread_id = Some(tid);
+                                                scx.notify();
+                                            });
+                                            this.bot_fusion_branch_from_active_message(
+                                                format!("m-{next_idx}"),
+                                                Some(lbl),
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "+ 新建分支", "+ New Branch")),
+                            ),
+                    );
+
+                if threads.is_empty() {
+                    col = col.child(
+                        div()
+                            .p(px(12.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .text_size(px(12.0))
+                            .text_color(ob.text_muted())
+                            .child(tr_str(lang, "暂无分支话题，点击「+ 新建分支」从当前上下文开启并行讨论。", "Click '+ New Branch' to fork a side thread.")),
+                    );
+                } else {
+                    for (idx, (tid, lbl)) in threads.into_iter().enumerate() {
+                        let is_sel = active_tid.as_deref() == Some(tid.as_str());
+                        let tid_click = tid.clone();
+                        col = col.child(
+                            div()
+                                .id(("openbot-sp-thread-row", idx))
+                                .cursor_pointer()
+                                .w_full()
+                                .px(px(10.0))
+                                .py(px(8.0))
+                                .rounded(px(8.0))
+                                .bg(if is_sel { ob.bg_control_active() } else { ob.bg_surface() })
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .text_size(px(12.5))
+                                .text_color(ob.text_primary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.stage.update(cx, |st, scx| {
+                                            st.active_thread_id = Some(tid_click.clone());
+                                            scx.notify();
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(lbl),
+                        );
+                    }
+                }
+
+                // Workflows section
+                col = col.child(
+                    div()
+                        .mt(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
+                                .child(format!(
+                                    "{} ({})",
+                                    tr_str(lang, "工作流", "Workflows"),
+                                    snap.workflows.len()
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("openbot-sp-wf-create")
+                                .cursor_pointer()
+                                .px(px(9.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .hover(|s| s.bg(ob.bg_control_hover()))
+                                .text_size(px(11.5))
+                                .text_color(ob.text_primary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.bot_fusion_create_starter_workflow(cx);
+                                    }),
+                                )
+                                .child(tr_str(lang, "+ 新建审批流", "+ New Flow")),
+                        ),
+                );
+                for (idx, wf) in snap.workflows.iter().enumerate() {
+                    let wid = wf.id.clone();
+                    col = col.child(
+                        div()
+                            .id(("openbot-sp-wf-card", idx))
+                            .w_full()
+                            .p(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_primary())
+                                    .child(wf.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id(("openbot-sp-wf-run", idx))
+                                    .cursor_pointer()
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(6.0))
+                                    .bg(ob.bg_control_hover())
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.bot_fusion_run_workflow(wid.clone(), cx);
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "▶ 运行", "▶ Run")),
+                            ),
+                    );
+                }
+
+                // Queue controls
+                col = col.child(
+                    div()
+                        .mt(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
+                                .child(format!(
+                                    "{} ({})",
+                                    tr_str(lang, "消息队列", "Queue"),
+                                    snap.queue_items.len()
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("openbot-sp-q-pause")
+                                .cursor_pointer()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .text_size(px(11.5))
+                                .text_color(ob.text_secondary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.bot_fusion_queue_toggle_pause(cx);
+                                    }),
+                                )
+                                .child(if snap.queue_paused {
+                                    tr_str(lang, "恢复队列", "Resume")
+                                } else {
+                                    tr_str(lang, "暂停队列", "Pause")
+                                }),
+                        ),
+                );
+                for (idx, q) in snap.queue_items.iter().enumerate() {
+                    let sid = q.delivery_id.clone();
+                    let cid = q.delivery_id.clone();
+                    col = col.child(
+                        div()
+                            .id(("openbot-sp-q-row", idx))
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(ob.text_primary())
+                                    .child(q.text.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .id(("openbot-sp-q-steer", idx))
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(5.0))
+                                            .bg(ob.bg_control_hover())
+                                            .text_size(px(10.5))
+                                            .text_color(ob.text_primary())
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.bot_fusion_queue_steer(sid.clone(), cx);
+                                                }),
+                                            )
+                                            .child("⚡"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("openbot-sp-q-cancel", idx))
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(ob.text_muted())
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.bot_fusion_queue_cancel(cid.clone(), cx);
+                                                }),
+                                            )
+                                            .child("×"),
+                                    ),
+                            ),
+                    );
+                }
+                col.into_any_element()
+            }
+            SidePanelPaneKind::Question => {
+                let turns = self.bot_fusion.side_panel.state.question.turns.clone();
+                let last_err = self.bot_fusion.side_panel.side_question_last_error.clone();
+                let last_q = turns.last().map(|t| t.question.clone());
+                let mut col = div()
+                    .id("openbot-sp-pane-question")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_muted())
+                                    .child(format!(
+                                        "{} ({}/20)",
+                                        tr_str(lang, "无痕旁问", "Side Question"),
+                                        turns.len()
+                                    )),
+                            )
+                            .when(!turns.is_empty(), |r| {
+                                r.child(
+                                    div()
+                                        .id("openbot-sp-q-clear")
+                                        .cursor_pointer()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_muted())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.bot_fusion.side_panel.state.question.turns.clear();
+                                                this.bot_fusion.side_question_last = None;
+                                                this.bot_fusion.side_panel.side_question_last_error =
+                                                    None;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "清空", "Clear")),
+                                )
+                            }),
+                    );
+
+                if turns.is_empty() {
+                    col = col.child(
+                        div()
+                            .p(px(12.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .text_size(px(12.0))
+                            .text_color(ob.text_muted())
+                            .child(tr_str(
+                                lang,
+                                "在输入框使用 `$side 问题` 或点击下方快捷提问发起无痕旁问，不污染主对话历史。",
+                                "Use `$side question` or quick prompts below to ask without polluting main history.",
+                            )),
+                    );
+                } else {
+                    for (idx, t) in turns.iter().enumerate() {
+                        col = col.child(
+                            div()
+                                .id(("openbot-sp-sideq-turn", idx))
+                                .p(px(10.0))
+                                .rounded(px(8.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_primary())
+                                        .child(format!("Q: {}", t.question)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(ob.text_secondary())
+                                        .child(t.answer.clone()),
+                                ),
+                        );
+                    }
+                }
+
+                if let (Some(_err), Some(retry_q)) = (last_err, last_q) {
+                    col = col.child(
+                        div()
+                            .id("openbot-sp-sideq-retry")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(ob.bg_control_hover())
+                            .text_size(px(12.0))
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.bot_fusion_ask_side_question(retry_q.clone(), cx);
+                                }),
+                            )
+                            .child(tr_str(lang, "↻ 重试上次旁问", "↻ Retry last question")),
+                    );
+                }
+
+                let quick_prompts = [
+                    tr_str(lang, "总结当前对话要点", "Summarize this conversation"),
+                    tr_str(lang, "列出下一步行动项", "List next action items"),
+                ];
+                let mut quick = div().flex().flex_wrap().gap(px(6.0));
+                for (idx, prompt) in quick_prompts.into_iter().enumerate() {
+                    let p_owned = prompt.to_string();
+                    quick = quick.child(
+                        div()
+                            .id(("openbot-sp-sideq-quick", idx))
+                            .cursor_pointer()
+                            .px(px(9.0))
+                            .py(px(5.0))
+                            .rounded(px(6.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .hover(|s| s.bg(ob.bg_control_hover()))
+                            .text_size(px(11.5))
+                            .text_color(ob.text_secondary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.bot_fusion_ask_side_question(p_owned.clone(), cx);
+                                }),
+                            )
+                            .child(prompt),
+                    );
+                }
+                col.child(quick).into_any_element()
+            }
+            SidePanelPaneKind::Subagent => {
+                let awaiting = self.bot_fusion.awaiting_replies.clone();
+                let mut col = div()
+                    .id("openbot-sp-pane-subagent")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_muted())
+                            .child(format!(
+                                "{} ({}) · {} ({})",
+                                tr_str(lang, "执行步骤", "Steps"),
+                                snap.recent_steps.len(),
+                                tr_str(lang, "子任务", "Subtasks"),
+                                awaiting.len()
+                            )),
+                    );
+
+                for (idx, aw) in awaiting.iter().enumerate() {
+                    col = col.child(
+                        div()
+                            .id(("openbot-sp-sub-await", idx))
+                            .p(px(9.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_primary())
+                                    .child(aw.agent_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(ob.text_muted())
+                                    .child(
+                                        aw.preview
+                                            .clone()
+                                            .or_else(|| aw.waiting_reason.clone())
+                                            .unwrap_or_else(|| format!("{:?}", aw.state)),
+                                    ),
+                            ),
+                    );
+                }
+                if snap.recent_steps.is_empty() && awaiting.is_empty() {
+                    col = col.child(
+                        div()
+                            .p(px(12.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .text_size(px(12.0))
+                            .text_color(ob.text_muted())
+                            .child(tr_str(lang, "暂无子助手执行步骤。", "No subagent steps recorded yet.")),
+                    );
+                } else {
+                    for (idx, st) in snap.recent_steps.iter().take(12).enumerate() {
+                        col = col.child(
+                            div()
+                                .id(("openbot-sp-sub-step", idx))
+                                .p(px(9.0))
+                                .rounded(px(8.0))
+                                .bg(ob.bg_surface())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(ob.text_primary())
+                                                .child(st.label.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(ob.text_muted())
+                                                .child(st.status.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_secondary())
+                                        .child(st.detail.clone()),
+                                ),
+                        );
+                    }
+                }
+                col.into_any_element()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn openbot_right_side_panel_state_tabs_split_swap_and_clamp() {
+        let mut sp = OpenBotRightSidePanelState::default();
+        assert!(!sp.state.open);
+        assert!(sp.open_tabs.is_empty());
+
+        sp.return_to_launcher();
+        assert!(sp.state.open);
+        assert!(sp.open_tabs.is_empty());
+        assert!(!sp.is_settings_visible());
+
+        sp.open_pane(SidePanelPaneKind::Settings);
+        assert!(sp.is_settings_visible());
+        assert_eq!(sp.active_top_tab, Some(SidePanelPaneKind::Settings));
+        assert_eq!(sp.state.active_splits, vec![SidePanelPaneKind::Settings]);
+
+        sp.split_down(SidePanelPaneKind::Files);
+        assert_eq!(sp.split_bottom_pane, Some(SidePanelPaneKind::Files));
+        assert_eq!(
+            sp.state.active_splits,
+            vec![SidePanelPaneKind::Settings, SidePanelPaneKind::Files]
+        );
+
+        assert!(sp.swap_split_panes());
+        assert_eq!(sp.active_top_tab, Some(SidePanelPaneKind::Files));
+        assert_eq!(sp.split_bottom_pane, Some(SidePanelPaneKind::Settings));
+        assert!(sp.is_settings_visible());
+
+        assert_eq!(sp.clamp_width_for_workspace(200.0, 1000.0), SETTINGS_PANEL_DEFAULT);
+        assert_eq!(
+            sp.clamp_width_for_workspace(1500.0, 1000.0),
+            1000.0 - CONVERSATION_PANEL_MIN
+        );
+
+        assert!(sp.close_tab(SidePanelPaneKind::Settings));
+        assert!(sp.close_tab(SidePanelPaneKind::Files));
+        assert!(sp.state.open);
+        assert!(sp.open_tabs.is_empty());
+        assert!(!sp.state.maximized);
+    }
+
+    #[std::prelude::v1::test]
+    fn openbot_m3_followup_plush_spec_normalization() {
+        let (shape, hue, color_hex) = normalize_fabushi_plush_spec("plush:poulpe", "violet");
+        assert!(shape.is_some());
+        assert!(hue.is_some() || color_hex.is_some());
     }
 }

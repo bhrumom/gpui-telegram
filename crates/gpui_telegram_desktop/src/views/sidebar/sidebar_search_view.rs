@@ -14,7 +14,7 @@ use crate::views::sidebar::ui::chat_search_empty::ChatSearchEmptyUi;
 use crate::views::sidebar::ui::chat_search_in::ChatSearchInUi;
 use crate::views::sidebar::ui::top_peers_strip::TopPeerItem;
 
-fn split_highlight_segments(text: &str, query: &str) -> (String, String, String) {
+pub fn split_highlight_segments(text: &str, query: &str) -> (String, String, String) {
     let q_chars: Vec<char> = query.trim().chars().flat_map(|c| c.to_lowercase()).collect();
     if q_chars.is_empty() {
         return (text.to_string(), String::new(), String::new());
@@ -44,6 +44,27 @@ fn split_highlight_segments(text: &str, query: &str) -> (String, String, String)
         }
     }
     (text.to_string(), String::new(), String::new())
+}
+
+/// Centers a long message snippet around the first match with up to 32 leading characters (`global-search-text.ts`).
+pub fn snippet_around(text: &str, query: &str) -> String {
+    let cleaned = text.replace(['\n', '\r'], " ");
+    let q = query.trim();
+    if q.is_empty() {
+        return cleaned;
+    }
+    let (prefix, matched, suffix) = split_highlight_segments(&cleaned, q);
+    if matched.is_empty() {
+        return cleaned;
+    }
+    let prefix_chars: Vec<char> = prefix.chars().collect();
+    let trimmed_prefix = if prefix_chars.len() > 32 {
+        let tail: String = prefix_chars[prefix_chars.len() - 32..].iter().collect();
+        format!("…{tail}")
+    } else {
+        prefix
+    };
+    format!("{trimmed_prefix}{matched}{suffix}")
 }
 
 fn tag_icon_for(tag_id: &str) -> IconName {

@@ -24,22 +24,31 @@ use gpui_telegram_client::{AuthResponse, ClientConfig, StoredSession, TelegramCl
 use gpui_telegram_core::types::ChatId;
 
 use crate::app::session::send_as_peers::SendAsKey;
-use crate::app::{preferences::{AppPreferences, ThemeMode}, TelegramApp};
+use crate::app::{
+    preferences::{AppPreferences, ThemeMode},
+    DesktopUpdateState, TelegramApp,
+};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::theme::{
-    tg_icon, IconName, OpenBotColorScheme, TdesktopThemeMode, TdesktopThemePalette,
+    tg_icon, tg_icon_rgba, IconName, OpenBotColorScheme, TdesktopThemeMode, TdesktopThemePalette,
 };
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::app_shell::{
     build_account_record, compute_shell_palette,
     local_subscription_bridge::ShellMagpieLocalState,
-    resolve_active_target_chat_id,
+    propagate_theme_and_locale, resolve_active_target_chat_id,
     shell_theme::tdesktop_mode_for_window_appearance,
     window_connecting_widget::ConnectionStatus as BannerConnectionStatus, ModalContainer,
     ShellBotBrowserState, ShellBotFusionState, ShellContentHubState, ShellPanelState,
+    ShellThemeTargets,
 };
-use crate::views::chat_sidebar::{BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel};
+use crate::views::apple_sidebar::{
+    AppleSidebarEvent, PINNABLE_SECTIONS, RailHelpAction, load_page_rail_pins,
+};
+use crate::views::chat_sidebar::{
+    BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel, PendingCreateGroupRequest,
+};
 use crate::views::composer::field_autocomplete::MentionRow;
 use crate::views::composer::BotKeyboard;
 use crate::views::nav_rail::NavDestination;
@@ -47,8 +56,21 @@ use crate::views::openbot::{
     OPENBOT_SYNTHETIC_DIALOG_PREFIX, OpenBotRuntimeBridge, OpenBotWorkspaceShell,
     TelegramBidirectionalProjection, load_telegram_bidirectional_projection,
 };
+use crate::views::openbot::agent_studio::{
+    GlobalSearchResultItem, GlobalSearchSectionKind, GlobalSearchTab,
+};
+use crate::views::openbot::channel_editor::{
+    ChannelCreateDialogModal, ChannelCreateMemberCandidate, ChannelCreateSubmission,
+};
 use crate::views::settings::{
     sections::SettingsLocalPasscodeSections, settings_type::SettingsSectionType, SettingsRouter,
+};
+use crate::views::sidebar::global_search_modal::GlobalSearchModal;
+use crate::views::sidebar::openbot_sidebar_chrome::render_openbot_sidebar_topbar;
+use crate::views::stage::cards::models::MessageContent;
+use crate::views::stage::stage_bars::{
+    render_openbot_conversation_header, render_openbot_right_panel_top_slot, OpenBotHeaderProps,
+    TopBarUiAction,
 };
 use crate::views::orca::{
     OrcaBotsWorkspace, OrcaDesktopRuntime, OrcaIdeWorkspace, ScopedJumpPalette,
@@ -178,6 +200,14 @@ pub struct AppShell {
     pub(crate) prev_composer_focused: std::cell::Cell<bool>,
     pub(crate) last_ime_modal_snapshot:
         Option<(crate::views::boxes::modal_types::ActiveTextField, Option<ModalDialogKind>)>,
+    /// Floating `Cmd/Ctrl+K` OpenBot `GlobalSearch` modal (`UI-F07`).
+    pub global_search_modal: Option<Entity<GlobalSearchModal>>,
+    /// Floating `440px` OpenBot `ChannelCreateDialog` modal (`UI-F11`).
+    pub channel_create_dialog: Option<Entity<ChannelCreateDialogModal>>,
+    pub(crate) chat_nav_history: Vec<u64>,
+    pub(crate) chat_nav_cursor: Option<usize>,
+    pub(crate) chat_nav_suppress_push: bool,
+    pub(crate) last_nav_observed_selection_rev: u64,
 }
 
 impl AppShell {
@@ -216,8 +246,9 @@ impl AppShell {
         let preferences = AppPreferences::load(&app_dir, &local_storage);
         let is_chinese_locale = preferences.localization.language_code.starts_with("zh");
         let init_radius = preferences.appearance.bubble_radius;
-        let (theme_mode, init_palette) =
+        let (theme_mode, raw_init_palette) =
             compute_shell_palette(&preferences, None, None, init_radius, None);
+        let init_palette = raw_init_palette.with_openbot_chrome();
         let init_lang = if is_chinese_locale { "zh-CN" } else { "en" };
 
         composer.update(cx, |comp, _| {
@@ -240,7 +271,10 @@ impl AppShell {
             );
         });
 
-        let apple_sidebar = cx.new(|_| AppleAppSidebar::new(init_palette, init_lang));
+        let init_pins = load_page_rail_pins(&app_dir);
+        let apple_sidebar = cx.new(|_| {
+            AppleAppSidebar::new_with_pins(init_palette, init_lang, init_pins)
+        });
         let content_hub = cx.new(|_| ContentHubWorkspace::new(init_palette, init_lang));
         let main_menu_drawer = cx.new(|_| {
             let mut m = MainMenuDrawer::new(Vec::new(), 0);
@@ -311,6 +345,12 @@ impl AppShell {
             compose_isolation_snapshot: None,
             prev_composer_focused: std::cell::Cell::new(false),
             last_ime_modal_snapshot: None,
+            global_search_modal: None,
+            channel_create_dialog: None,
+            chat_nav_history: Vec::new(),
+            chat_nav_cursor: None,
+            chat_nav_suppress_push: false,
+            last_nav_observed_selection_rev: 0,
         };
 
         shell_instance.overlays.is_passcode_locked = shell_instance.has_local_passcode_configured();
@@ -319,8 +359,13 @@ impl AppShell {
             shell.sync_discovered_subscriptions_to_local_fabushi_and_vault(cx);
         })
         .detach();
+        cx.observe(&shell_instance.sidebar, |shell, _, cx| {
+            shell.process_openbot_sidebar_hooks(cx);
+        })
+        .detach();
         shell_instance.sync_theme_and_locale_to_views(cx);
         shell_instance.hydrate_settings_from_preferences(cx);
+        shell_instance.ensure_openbot_chrome_palette(cx);
         shell_instance.refresh_settings_truth(cx);
         shell_instance.ensure_remote_host_runtime_bootstrapped(cx);
 
@@ -936,6 +981,11 @@ impl AppShell {
             self.settings_router.update(cx, |r, rcx| {
                 r.reset_for_logout_or_account_switch(rcx);
             });
+            self.global_search_modal = None;
+            self.channel_create_dialog = None;
+            self.chat_nav_history.clear();
+            self.chat_nav_cursor = None;
+            self.last_nav_observed_selection_rev = 0;
         }
         let srv_url = self.client.config.server_url.clone();
         self.proxy_op_generation = self.proxy_op_generation.wrapping_add(1);
@@ -1151,6 +1201,11 @@ impl AppShell {
             });
         }
         self.openbot_workspace = None;
+        self.global_search_modal = None;
+        self.channel_create_dialog = None;
+        self.chat_nav_history.clear();
+        self.chat_nav_cursor = None;
+        self.last_nav_observed_selection_rev = 0;
         self.community_workspace = None;
         self.orca_runtime = None;
         self.orca_bots_workspace = None;
@@ -1467,6 +1522,7 @@ impl AppShell {
         let width_px = self.overlays.last_viewport_width.round().max(960.0) as u32;
         let created = cx.new(|_| {
             let mut ws = OpenBotWorkspaceShell::with_data_dir(&data_dir);
+            ws.set_embedded_in_app_shell(true);
             ws.sync_color_scheme(scheme);
             ws.sync_locale(&lang);
             ws.set_window_width(width_px);
@@ -1649,6 +1705,7 @@ impl AppShell {
         self.theme_state.bubble_radius_px = prefs_snapshot.appearance.bubble_radius;
         self.settings_router.update(cx, |r, rcx| r.sync_preferences(prefs_snapshot, rcx));
         self.sync_theme_and_locale_to_views(cx);
+        self.ensure_openbot_chrome_palette(cx);
         cx.notify();
     }
 
@@ -2381,6 +2438,8 @@ impl AppShell {
             || self.overlays.media_viewer_overlay.is_some()
             || self.overlays.iv_viewer_overlay.is_some()
             || self.overlays.computer_overlay.is_some()
+            || self.global_search_modal.is_some()
+            || self.channel_create_dialog.is_some()
             || self.is_publish_review_modal_active(cx)
             || (self
                 .miniapps
@@ -2652,7 +2711,11 @@ impl AppShell {
     /// to retain `NSWindow.firstResponder`. Floating PiP Mini Apps and all GPUI inputs/modals
     /// return `false` so host `GPUIView` owns keyboard and IME routing.
     pub fn should_native_webview_own_keyboard(&self, cx: &App) -> bool {
-        if !self.is_authenticated || self.overlays.is_passcode_locked {
+        if !self.is_authenticated
+            || self.overlays.is_passcode_locked
+            || self.global_search_modal.is_some()
+            || self.channel_create_dialog.is_some()
+        {
             return false;
         }
         let miniapp_owns = !self.has_miniapp_top_modal(cx)
@@ -2669,6 +2732,10 @@ impl AppShell {
         self.active_panel == ActiveWorkspacePanel::Browser
             && !self.has_browser_shell_blocker(cx)
             && !self.is_browser_workspace_input_active(cx)
+            && !{
+                let rail = self.apple_sidebar.read(cx);
+                rail.more_menu_open || rail.help_menu_open
+            }
             && self.browser_workspace.as_ref().is_some_and(|bw| {
                 let bw_read = bw.read(cx);
                 bw_read.active_engine == crate::views::browser::BrowserEngineKind::WkWebView
@@ -2704,9 +2771,19 @@ impl Render for AppShell {
             }
         }
 
+        let (mut rail_more_open, mut rail_help_open) = {
+            let rail = self.apple_sidebar.read(cx);
+            (rail.more_menu_open, rail.help_menu_open)
+        };
+        let global_search_open = self.global_search_modal.is_some();
+        let channel_create_open = self.channel_create_dialog.is_some();
         let browser_occluded = !self.is_authenticated
             || self.active_panel != ActiveWorkspacePanel::Browser
-            || self.has_browser_visual_occlusion_overlay(cx);
+            || self.has_browser_visual_occlusion_overlay(cx)
+            || rail_more_open
+            || rail_help_open
+            || global_search_open
+            || channel_create_open;
         if let Some(ref bw) = self.browser_workspace {
             let bw_read = bw.read(cx);
             let want_visible = self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Browser;
@@ -2750,7 +2827,10 @@ impl Render for AppShell {
         }
 
         if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Browser {
-            let has_shell_blocker = self.has_browser_shell_blocker(cx);
+            let has_shell_blocker = self.has_browser_shell_blocker(cx)
+                || rail_more_open
+                || rail_help_open
+                || global_search_open;
             if !has_shell_blocker {
                 if let Some(bw) = self.browser_workspace.clone() {
                     let has_native_claim = bw.read(cx).has_pending_webview_focus_claim();
@@ -2794,6 +2874,28 @@ impl Render for AppShell {
             }
         }
 
+        let vp = window.viewport_size();
+        let (vp_w, vp_h) = (f32::from(vp.width), f32::from(vp.height));
+        if (vp_w - self.overlays.last_viewport_width).abs() >= 1.0 && vp_w > 0.0 {
+            self.overlays.last_viewport_width = vp_w;
+            self.app.sync_viewport_size(vp_w, vp_h);
+            if let Some(ref ws) = self.openbot_workspace {
+                ws.update(cx, |shell, _| shell.set_window_width(vp_w.round() as u32));
+            }
+        }
+        let effective_vp_w = if vp_w > 0.0 {
+            vp_w
+        } else {
+            self.overlays.last_viewport_width
+        };
+        let is_narrow_viewport = effective_vp_w <= 720.0;
+        let has_update_notice = matches!(
+            self.overlays.updater_state,
+            DesktopUpdateState::Available { .. } | DesktopUpdateState::ReadyToRestart { .. }
+        );
+
+        self.ensure_openbot_chrome_palette(cx);
+
         if self.is_authenticated {
             let (acc_name, acc_initials, is_conn) = {
                 let r = self.nav_rail.read(cx);
@@ -2810,12 +2912,34 @@ impl Render for AppShell {
                 {
                     sb.set_account_info(acc_name, acc_initials, is_conn);
                 }
+                if sb.narrow_hidden != is_narrow_viewport {
+                    sb.set_narrow_hidden(is_narrow_viewport);
+                }
+                if sb.has_update_notice != has_update_notice {
+                    sb.set_update_notice(has_update_notice);
+                }
+                rail_more_open = sb.more_menu_open;
+                rail_help_open = sb.help_menu_open;
             });
+            let contacts_modal_active = self.sidebar.read(cx).is_contacts_modal_open
+                || matches!(
+                    self.modal_container.read(cx).dialog.kind,
+                    Some(ModalDialogKind::Contacts)
+                );
+            if !contacts_modal_active
+                && self.apple_sidebar.read(cx).highlighted_destination
+                    == Some(crate::views::apple_sidebar::AppleSidebarSection::Contacts)
+            {
+                self.sync_apple_sidebar_to_active_panel(cx);
+            }
         }
 
         if self.is_authenticated && self.active_panel == ActiveWorkspacePanel::Community {
             let sb_w = self.apple_sidebar.read(cx).effective_width();
-            let occluded = self.has_community_visual_occlusion_overlay(cx);
+            let occluded = self.has_community_visual_occlusion_overlay(cx)
+                || rail_more_open
+                || rail_help_open
+                || global_search_open;
             if let Some(cw) = self.community_workspace.clone() {
                 if occluded && cw.read(cx).has_focused_text_input() {
                     if self.community_ime_preedit_input_gen.is_some() {
@@ -2839,26 +2963,31 @@ impl Render for AppShell {
         }
 
         let cdp_surface_focused = self.is_authenticated && self.is_browser_cdp_viewport_focused(window, cx);
-        if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
+        if let Some(ref cc) = self.channel_create_dialog {
+            let cc_fh = cc.read(cx).focus_handle.clone();
+            if self.is_authenticated && !cc_fh.is_focused(window) {
+                cc_fh.focus(window);
+            }
+        } else if let Some(ref gs) = self.global_search_modal {
+            let gs_fh = gs.read(cx).focus_handle.clone();
+            if self.is_authenticated && !gs_fh.is_focused(window) {
+                gs_fh.focus(window);
+            }
+        } else if self.is_authenticated && !cdp_surface_focused && !self.focus_handle.is_focused(window) {
             self.focus_handle.focus(window);
         }
         if !self.should_native_webview_own_keyboard(cx) {
             self.restore_native_host_focus(window);
         }
         self.bot_browser.last_rendered_cdp_surface_focused = cdp_surface_focused;
-        let vp = window.viewport_size();
-        let (vp_w, vp_h) = (f32::from(vp.width), f32::from(vp.height));
-        if (vp_w - self.overlays.last_viewport_width).abs() >= 1.0 && vp_w > 0.0 {
-            self.overlays.last_viewport_width = vp_w;
-            self.app.sync_viewport_size(vp_w, vp_h);
-            if let Some(ref ws) = self.openbot_workspace {
-                ws.update(cx, |shell, _| shell.set_window_width(vp_w.round() as u32));
-            }
-        }
 
         self.reconcile_chat_scoped_toasts(cx);
         self.schedule_current_toast_dismiss(cx);
         let pal = self.theme_state.palette;
+        let ob = pal.openbot_palette();
+        let ob_frame = ob.bg_frame();
+        let ob_canvas = ob.bg_canvas();
+        let ob_border = ob.frame_card_border();
         let current_toast = self
             .window_runtime
             .controller
@@ -2868,18 +2997,13 @@ impl Render for AppShell {
         let update_banner = self.render_in_app_update_banner(cx);
 
         if !self.is_authenticated {
-            let login_bg = if pal.is_apple_style() && !pal.mode.is_dark() {
-                pal.dialogs_bg
-            } else {
-                pal.window_bg
-            };
             return div()
                 .id("app-shell-login-root")
                 .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, _| {
                     this.restore_native_host_focus(window);
                 }))
                 .size_full()
-                .bg(rgb(login_bg))
+                .bg(ob_canvas)
                 .flex()
                 .flex_col()
                 .relative()
@@ -2921,13 +3045,33 @@ impl Render for AppShell {
             .window_runtime
             .connecting_widget
             .localized_status_text(self.active_lang_id());
-        let (contacts_open, creation_modal, account_popover_open, is_apple_compose_mode) = {
+        if (rail_more_open || rail_help_open) && self.sidebar.read(cx).is_account_popover_open {
+            self.sidebar.update(cx, |sb, _| {
+                sb.is_account_popover_open = false;
+            });
+        }
+        let (
+            contacts_open,
+            creation_modal,
+            account_popover_open,
+            is_apple_compose_mode,
+            sidebar_is_closed,
+            sidebar_is_compact,
+            sidebar_rendered_w,
+            sidebar_can_back,
+            sidebar_can_forward,
+        ) = {
             let sb = self.sidebar.read(cx);
             (
                 sb.is_contacts_modal_open,
                 sb.active_creation_modal,
                 sb.is_account_popover_open,
                 pal.is_apple_style() && sb.is_plus_menu_open,
+                sb.is_sidebar_closed,
+                sb.is_collapsed,
+                sb.rendered_sidebar_width(),
+                sb.can_navigate_back,
+                sb.can_navigate_forward,
             )
         };
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
@@ -2942,11 +3086,36 @@ impl Render for AppShell {
                 | ActiveWorkspacePanel::OpenBot
         );
         let show_chat_sidebar = !in_content_hub && !in_full_workspace;
+        let want_external_topbar = show_chat_sidebar && !is_narrow_viewport && pal.is_apple_style();
+        let want_external_stage_header =
+            want_external_topbar && !is_apple_compose_mode;
+        if self.sidebar.read(cx).external_topbar_hosted != want_external_topbar {
+            self.sidebar.update(cx, |sb, _| {
+                sb.external_topbar_hosted = want_external_topbar;
+            });
+        }
+        if self.stage.read(cx).external_header_hosted != want_external_stage_header {
+            self.stage.update(cx, |st, _| {
+                st.external_header_hosted = want_external_stage_header;
+            });
+        }
+        let stage_agent_busy = {
+            let st = self.stage.read(cx);
+            !st.bot_activity_state.is_empty()
+                && !st.bot_activity_state.eq_ignore_ascii_case("idle")
+        };
+        if self.composer.read(cx).is_agent_busy != stage_agent_busy {
+            self.composer.update(cx, |c, _| {
+                c.set_agent_busy(stage_agent_busy);
+            });
+        }
         let publish_review_modal_open = self.is_publish_review_modal_active(cx);
         let has_blocking_overlay = contacts_open
             || creation_modal.is_some()
             || self.modal_container.read(cx).is_modal_active()
             || publish_review_modal_open
+            || self.global_search_modal.is_some()
+            || self.channel_create_dialog.is_some()
             || self
                 .miniapps
                 .create_bot_box
@@ -2972,20 +3141,220 @@ impl Render for AppShell {
                 .is_some_and(|ov| ov.read(cx).is_open)
                 && !self.miniapps.is_miniapp_minimized);
         self.sync_compose_state_to_composer(false, cx);
+        self.drain_and_handle_openbot_inspector_action(cx);
         let bot_fusion_strip = if show_chat_sidebar && !hide_composer && !is_apple_compose_mode {
             self.render_bot_fusion_composer_strip(cx)
         } else {
             None
         };
-        let bot_companion_panel = if show_chat_sidebar
-            && !is_apple_compose_mode
-            && self.bot_fusion.companion_open
-            && self.stage.read(cx).active_fabushi_bot.is_some()
-        {
-            Some(self.render_bot_companion_sidepanel(cx))
+        let use_unified_openbot_side_panel =
+            show_chat_sidebar && !is_apple_compose_mode && pal.is_apple_style();
+        let rail_w_for_sp = if is_narrow_viewport {
+            0.0
         } else {
-            None
+            self.apple_sidebar.read(cx).effective_width()
         };
+        let sb_w_for_sp = if sidebar_is_closed {
+            0.0
+        } else {
+            sidebar_rendered_w
+        };
+        let workspace_avail_px = (effective_vp_w - rail_w_for_sp - sb_w_for_sp - 8.0).max(456.0);
+
+        let (unified_side_panel, unified_maximized, bot_companion_panel, right_panel_slot_w) =
+            if use_unified_openbot_side_panel {
+                self.reconcile_unified_side_panel_sync(cx);
+                let open = self.is_unified_side_panel_open();
+                let max_mode = open && self.bot_fusion.side_panel.state.maximized;
+                let panel = open.then(|| {
+                    self.render_unified_openbot_side_panel(&pal, workspace_avail_px, cx)
+                });
+                let slot_w = if open {
+                    self.bot_fusion.side_panel.state.width_px
+                } else {
+                    0.0
+                };
+                (panel, max_mode, None, slot_w)
+            } else {
+                if self.inspector.read(cx).embedded_in_side_panel {
+                    self.inspector.update(cx, |insp, _| {
+                        insp.embedded_in_side_panel = false;
+                    });
+                }
+                let comp = if show_chat_sidebar
+                    && !is_apple_compose_mode
+                    && self.bot_fusion.companion_open
+                    && self.stage.read(cx).active_fabushi_bot.is_some()
+                {
+                    Some(self.render_bot_companion_sidepanel(cx))
+                } else {
+                    None
+                };
+                let inspector_open = !is_apple_compose_mode && self.inspector.read(cx).is_open;
+                let slot_w: f32 = if comp.is_some() {
+                    380.0
+                } else if inspector_open {
+                    320.0
+                } else {
+                    0.0
+                };
+                (None, false, comp, slot_w)
+            };
+        let right_panel_slot_open = want_external_stage_header && right_panel_slot_w > 0.0;
+
+        let workspace_card = div()
+            .id("app-shell-workspace-card")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .flex()
+            .overflow_hidden()
+            .bg(ob_canvas)
+            .when(!is_narrow_viewport, |el| {
+                el.rounded(px(14.0)).border_1().border_color(ob_border)
+            })
+            .when(in_content_hub, |el| {
+                el.child(
+                    div()
+                        .id("app-shell-content-hub-slot")
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h_full()
+                        .overflow_hidden()
+                        .child(self.content_hub.clone()),
+                )
+            })
+            .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
+                if let Some(ref bw) = self.browser_workspace {
+                    row.child(
+                        div()
+                            .id("app-shell-browser-slot")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(bw.clone()),
+                    )
+                } else {
+                    row
+                }
+            })
+            .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
+                if let Some(ref cw) = self.community_workspace {
+                    row.child(
+                        div()
+                            .id("app-shell-community-slot")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(cw.clone()),
+                    )
+                } else {
+                    row
+                }
+            })
+            .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
+                if let Some(ref ob_ws) = self.orca_bots_workspace {
+                    row.child(
+                        div()
+                            .id("app-shell-orca-bots-slot")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(ob_ws.clone()),
+                    )
+                } else {
+                    row
+                }
+            })
+            .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
+                if let Some(ref oi) = self.orca_ide_workspace {
+                    row.child(
+                        div()
+                            .id("app-shell-orca-ide-slot")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .overflow_hidden()
+                            .child(oi.clone()),
+                    )
+                } else {
+                    row
+                }
+            })
+            .when(self.active_panel == ActiveWorkspacePanel::OpenBot, |row| {
+                row.child(
+                    div()
+                        .id("app-shell-openbot-slot")
+                        .flex_1()
+                        .size_full()
+                        .min_h(px(0.0))
+                        .min_w(px(0.0))
+                        .flex()
+                        .overflow_hidden()
+                        .when_some(self.openbot_workspace.clone(), |slot, ws| {
+                            slot.child(div().flex_1().size_full().child(ws))
+                        }),
+                )
+            })
+            .when(show_chat_sidebar, |row| {
+                row.when(!sidebar_is_closed, |r| r.child(self.sidebar.clone()))
+                    .when(!unified_maximized, |r| {
+                        r.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full()
+                                .overflow_hidden()
+                                .bg(ob_canvas)
+                                .child(
+                                    div()
+                                        .id("app-shell-stage-slot")
+                                        .relative()
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .child(if is_apple_compose_mode {
+                                            self.render_apple_compose_stage(cx)
+                                        } else {
+                                            self.stage.clone().into_any_element()
+                                        })
+                                        .when(!has_blocking_overlay, |el| {
+                                            el.when_some(current_toast.clone(), |el, toast| {
+                                                let bottom_gap = if show_bot_start_bar {
+                                                    pal.scaled_px(68.0)
+                                                        .max(52.0 + pal.scaled_px(16.0))
+                                                } else {
+                                                    pal.scaled_px(16.0)
+                                                };
+                                                el.child(self.render_toast_banner_slot(
+                                                    toast.text,
+                                                    bottom_gap,
+                                                    pal,
+                                                    cx,
+                                                ))
+                                            })
+                                        }),
+                                )
+                                .when_some(bot_fusion_strip, |el, strip| el.child(strip))
+                                .when(!hide_composer, |el| el.child(self.composer.clone()))
+                                .into_any_element(),
+                        )
+                    })
+                    .when(use_unified_openbot_side_panel, |r| {
+                        r.when_some(unified_side_panel, |r2, panel| r2.child(panel))
+                    })
+                    .when(!use_unified_openbot_side_panel, |r| {
+                        r.when_some(bot_companion_panel, |r2, panel| r2.child(panel))
+                            .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
+                    })
+            });
 
         div()
             .id("app-shell-authenticated-root")
@@ -2993,145 +3362,360 @@ impl Render for AppShell {
             .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, _| {
                 this.restore_native_host_focus(window);
             }))
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                let mut changed = false;
+                if this.bot_fusion.side_panel.is_resizing_width {
+                    if let Some(start_x) = this.bot_fusion.side_panel.resize_drag_start_x {
+                        let delta_x = f32::from(ev.position.x) - start_x;
+                        let target_w = this.bot_fusion.side_panel.resize_start_width - delta_x;
+                        this.bot_fusion
+                            .side_panel
+                            .clamp_width_for_workspace(target_w, workspace_avail_px);
+                        changed = true;
+                    }
+                }
+                if this.bot_fusion.side_panel.is_resizing_split {
+                    if let Some(start_y) = this.bot_fusion.side_panel.split_drag_start_y {
+                        let delta_y = f32::from(ev.position.y) - start_y;
+                        let next_share = (this.bot_fusion.side_panel.split_start_share
+                            - (delta_y as f64 / 520.0))
+                            .clamp(0.22, 0.72);
+                        this.bot_fusion.side_panel.state.lower_share = next_share;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.bot_fusion.side_panel.is_resizing_width
+                        || this.bot_fusion.side_panel.is_resizing_split
+                    {
+                        this.bot_fusion.side_panel.is_resizing_width = false;
+                        this.bot_fusion.side_panel.resize_drag_start_x = None;
+                        this.bot_fusion.side_panel.is_resizing_split = false;
+                        this.bot_fusion.side_panel.split_drag_start_y = None;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                let mods = event.keystroke.modifiers;
+                let cmd = mods.platform || mods.control;
+                if key.eq_ignore_ascii_case("escape") {
+                    if this.channel_create_dialog.is_some() {
+                        this.close_channel_create_dialog(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.global_search_modal.is_some() {
+                        this.close_global_search_palette(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.active_panel == ActiveWorkspacePanel::Chats {
+                        if this.close_unified_side_panel_popovers() {
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        let closed_insp_pop = this.inspector.update(cx, |insp, icx| {
+                            let c = insp.close_openbot_popovers();
+                            if c {
+                                icx.notify();
+                            }
+                            c
+                        });
+                        if closed_insp_pop {
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    let closed_stage_pop = this.stage.update(cx, |st, scx| {
+                        let c = st.close_openbot_popovers();
+                        if c {
+                            scx.notify();
+                        }
+                        c
+                    });
+                    if closed_stage_pop {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    let closed_sb_pop = this.sidebar.update(cx, |sb, scx| {
+                        let c = sb.close_openbot_popovers();
+                        if c {
+                            scx.notify();
+                        }
+                        c
+                    });
+                    if closed_sb_pop {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    let closed = this.apple_sidebar.update(cx, |sb, scx| {
+                        let c = sb.close_popovers();
+                        if c {
+                            scx.notify();
+                        }
+                        c
+                    });
+                    if closed {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if this.active_panel == ActiveWorkspacePanel::Chats
+                        && this.is_unified_side_panel_open()
+                        && !this.inspector.read(cx).is_bot_input_active()
+                    {
+                        this.close_unified_side_panel(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                if this.is_authenticated && !this.overlays.is_passcode_locked {
+                    if cmd && !mods.alt && !mods.shift && key.eq_ignore_ascii_case("k") {
+                        this.toggle_global_search_palette(None, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if cmd && mods.shift && !mods.alt && key.eq_ignore_ascii_case("e") {
+                        this.toggle_global_search_palette(Some(GlobalSearchTab::Files), cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if cmd && !mods.alt && !mods.shift && key.eq_ignore_ascii_case("b") {
+                        this.sidebar.update(cx, |sb, scx| {
+                            sb.toggle_closed_from_user();
+                            scx.notify();
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if cmd && !mods.alt && !mods.shift && key == "[" {
+                        this.navigate_chat_history(-1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if cmd && !mods.alt && !mods.shift && key == "]" {
+                        this.navigate_chat_history(1, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 this.handle_window_key_down(event, window, cx);
             }))
-            .relative().size_full().flex().flex_col()
-            .bg(rgb(pal.window_bg))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(ob_frame)
             .child(ime_canvas)
             .when_some(update_banner, |el, banner| el.child(banner))
             .child(
-                div().flex_1().w_full().min_h(px(0.0)).flex().overflow_hidden()
-                    .child(self.apple_sidebar.clone())
-                    .when(in_content_hub, |el| {
-                        el.child(
-                            div()
-                                .id("app-shell-content-hub-slot")
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .h_full()
-                                .overflow_hidden()
-                                .child(self.content_hub.clone()),
-                        )
+                div()
+                    .id("app-shell-window-row")
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.0))
+                    .flex()
+                    .bg(ob_frame)
+                    .when(!is_narrow_viewport, |row| {
+                        row.child(self.apple_sidebar.clone())
                     })
-                    .when(self.active_panel == ActiveWorkspacePanel::Browser, |row| {
-                        if let Some(ref bw) = self.browser_workspace {
-                            row.child(
-                                div()
-                                    .id("app-shell-browser-slot")
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .h_full()
-                                    .overflow_hidden()
-                                    .child(bw.clone()),
-                            )
-                        } else {
-                            row
-                        }
-                    })
-                    .when(self.active_panel == ActiveWorkspacePanel::Community, |row| {
-                        if let Some(ref cw) = self.community_workspace {
-                            row.child(
-                                div()
-                                    .id("app-shell-community-slot")
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .h_full()
-                                    .overflow_hidden()
-                                    .child(cw.clone()),
-                            )
-                        } else {
-                            row
-                        }
-                    })
-                    .when(self.active_panel == ActiveWorkspacePanel::OrcaBots, |row| {
-                        if let Some(ref ob) = self.orca_bots_workspace {
-                            row.child(
-                                div()
-                                    .id("app-shell-orca-bots-slot")
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .h_full()
-                                    .overflow_hidden()
-                                    .child(ob.clone()),
-                            )
-                        } else {
-                            row
-                        }
-                    })
-                    .when(self.active_panel == ActiveWorkspacePanel::OrcaIde, |row| {
-                        if let Some(ref oi) = self.orca_ide_workspace {
-                            row.child(
-                                div()
-                                    .id("app-shell-orca-ide-slot")
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .h_full()
-                                    .overflow_hidden()
-                                    .child(oi.clone()),
-                            )
-                        } else {
-                            row
-                        }
-                    })
-                    .when(self.active_panel == ActiveWorkspacePanel::OpenBot, |row| {
-                        row.child(
-                            div()
-                                .id("app-shell-openbot-slot")
-                                .flex_1()
-                                .size_full()
-                                .min_h(px(0.0))
-                                .min_w(px(0.0))
-                                .flex()
-                                .overflow_hidden()
-                                .when_some(self.openbot_workspace.clone(), |slot, ws| {
-                                    slot.child(div().flex_1().size_full().child(ws))
-                                }),
-                        )
-                    })
-                    .when(show_chat_sidebar, |row| {
-                        row.child(self.sidebar.clone())
-                            .child(
-                                div().flex().flex_col().flex_1().min_w(px(0.0)).h_full().overflow_hidden()
-                                    .bg(rgb(pal.stage_bg))
-                                    .child(
-                                        div()
-                                            .id("app-shell-stage-slot")
-                                            .relative()
-                                            .flex_1()
-                                            .min_h(px(0.0))
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .child(if is_apple_compose_mode {
-                                                self.render_apple_compose_stage(cx)
-                                            } else {
-                                                self.stage.clone().into_any_element()
-                                            })
-                                            .when(!has_blocking_overlay, |el| {
-                                                el.when_some(current_toast.clone(), |el, toast| {
-                                                    let bottom_gap = if show_bot_start_bar {
-                                                        pal.scaled_px(68.0)
-                                                            .max(52.0 + pal.scaled_px(16.0))
-                                                    } else {
-                                                        pal.scaled_px(16.0)
-                                                    };
-                                                    el.child(self.render_toast_banner_slot(
-                                                        toast.text,
-                                                        bottom_gap,
-                                                        pal,
+                    .child(
+                        div()
+                            .id("app-shell-workspace-frame")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .bg(ob_frame)
+                            .when(!is_narrow_viewport, |el| {
+                                el.pr(px(4.0)).pb(px(4.0))
+                            })
+                            .when(!is_narrow_viewport, |el| {
+                                let topbar_slot_w = if sidebar_is_closed {
+                                    44.0
+                                } else {
+                                    sidebar_rendered_w.max(88.0)
+                                };
+                                el.child(
+                                    div()
+                                        .id("app-shell-top-chrome-strip")
+                                        .w_full()
+                                        .h(px(38.0))
+                                        .flex_shrink_0()
+                                        .bg(ob_frame)
+                                        .flex()
+                                        .items_center()
+                                        .when(want_external_topbar, |strip| {
+                                            strip.child(
+                                                div()
+                                                    .w(px(topbar_slot_w))
+                                                    .h_full()
+                                                    .flex_shrink_0()
+                                                    .child(render_openbot_sidebar_topbar(
+                                                        sidebar_can_back,
+                                                        sidebar_can_forward,
+                                                        sidebar_is_compact && !sidebar_is_closed,
+                                                        sidebar_is_closed,
+                                                        &pal,
                                                         cx,
-                                                    ))
+                                                        |this, cx| this.navigate_chat_history(-1, cx),
+                                                        |this, cx| this.navigate_chat_history(1, cx),
+                                                        |this, cx| {
+                                                            this.sidebar.update(cx, |sb, scx| {
+                                                                sb.toggle_openbot_compact_from_user();
+                                                                scx.notify();
+                                                            });
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .when(want_external_stage_header, |strip| {
+                                            let st_snap = {
+                                                let st = self.stage.read(cx);
+                                                (
+                                                    st.active_chat_id,
+                                                    st.chat_title.clone(),
+                                                    st.chat_subtitle.clone(),
+                                                    st.chat_avatar_initials.clone(),
+                                                    st.chat_avatar_url.clone(),
+                                                    st.active_fabushi_bot.clone(),
+                                                    st.is_bot_chat,
+                                                    st.is_effective_group_chat(),
+                                                    st.group_member_tiles.clone(),
+                                                    st.group_member_briefs.clone(),
+                                                    st.bot_activity_state.clone(),
+                                                    st.active_thread_id.clone(),
+                                                    st.thread_tabs.clone(),
+                                                    st.active_model_label.clone(),
+                                                    st.active_thinking_effort.clone(),
+                                                    st.model_picker_open,
+                                                    st.pinned_popover_entries().len(),
+                                                    st.pinned_popover_open,
+                                                    st.search_open,
+                                                    st.more_menu_open,
+                                                    st.is_inspector_open || st.is_bot_companion_open,
+                                                    st.effective_stage_width(),
+                                                    st.message_ttl_seconds,
+                                                )
+                                            };
+                                            let lang_hdr = self.active_lang_id().to_string();
+                                            let header_tiles = (!st_snap.8.is_empty()).then_some(st_snap.8.as_slice());
+                                            let props = OpenBotHeaderProps {
+                                                chat_id: st_snap.0,
+                                                title: &st_snap.1,
+                                                subtitle: &st_snap.2,
+                                                initials: &st_snap.3,
+                                                avatar_url: st_snap.4.as_deref(),
+                                                active_fabushi_bot: st_snap.5.as_ref(),
+                                                is_bot_chat: st_snap.6,
+                                                is_group_chat: st_snap.7,
+                                                group_member_tiles: header_tiles,
+                                                group_member_briefs: &st_snap.9,
+                                                bot_activity_state: &st_snap.10,
+                                                active_thread_id: st_snap.11.as_deref(),
+                                                thread_tabs: &st_snap.12,
+                                                active_model_label: &st_snap.13,
+                                                active_thinking_effort: &st_snap.14,
+                                                model_picker_open: st_snap.15,
+                                                pinned_count: st_snap.16,
+                                                pinned_popover_open: st_snap.17,
+                                                search_open: st_snap.18,
+                                                more_menu_open: st_snap.19,
+                                                side_panel_open: st_snap.20,
+                                                right_panel_slot_open,
+                                                external_hosted: true,
+                                                available_width_px: st_snap.21,
+                                                is_isolated_lock: false,
+                                                message_ttl_seconds: st_snap.22,
+                                            };
+                                            strip
+                                                .when(!unified_maximized, |s| {
+                                                    s.child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .h_full()
+                                                            .child(
+                                                                render_openbot_conversation_header(
+                                                                    &props,
+                                                                    &pal,
+                                                                    &lang_hdr,
+                                                                    cx,
+                                                                    |this, action, cx| {
+                                                                        this.stage.update(
+                                                                            cx,
+                                                                            |st, scx| {
+                                                                                st.handle_topbar_action(
+                                                                                    action, scx,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                ),
+                                                            ),
+                                                    )
                                                 })
-                                            }),
-                                    )
-                                    .when_some(bot_fusion_strip, |el, strip| el.child(strip))
-                                    .when(!hide_composer, |el| el.child(self.composer.clone()))
-                                    .into_any_element(),
-                            )
-                            .when_some(bot_companion_panel, |row, panel| row.child(panel))
-                            .when(!is_apple_compose_mode, |el| el.child(self.inspector.clone()))
-                    }),
+                                                .when(right_panel_slot_open, |s| {
+                                                    if use_unified_openbot_side_panel {
+                                                        s.child(
+                                                            self.render_unified_side_panel_top_header(
+                                                                right_panel_slot_w,
+                                                                unified_maximized,
+                                                                &pal,
+                                                                cx,
+                                                            ),
+                                                        )
+                                                    } else {
+                                                        s.child(
+                                                            render_openbot_right_panel_top_slot(
+                                                                right_panel_slot_w,
+                                                                &pal,
+                                                                cx,
+                                                                |this, cx| {
+                                                                    this.stage.update(
+                                                                        cx,
+                                                                        |st, scx| {
+                                                                            st.handle_topbar_action(
+                                                                                TopBarUiAction::ToggleSidePanel,
+                                                                                scx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            ),
+                                                        )
+                                                    }
+                                                })
+                                        })
+                                        .when(!want_external_stage_header, |strip| {
+                                            strip.child(
+                                                div()
+                                                    .flex_1()
+                                                    .h_full()
+                                                    .window_control_area(WindowControlArea::Drag),
+                                            )
+                                        }),
+                                )
+                            })
+                            .child(workspace_card),
+                    ),
             )
             .when(show_conn_banner && !has_blocking_overlay, |el| {
                 let pill_bg = if pal.mode.is_dark() {
@@ -3181,6 +3765,8 @@ impl Render for AppShell {
             .when(self.active_panel == ActiveWorkspacePanel::Settings, |el| el.child(self.settings_router.clone().into_any_element()))
             .when(self.active_panel == ActiveWorkspacePanel::TaskCenter, |el| el.child(self.render_task_center_modal_overlay(cx)))
             .when(self.active_panel == ActiveWorkspacePanel::McpTools, |el| el.child(self.render_mcp_tools_modal_overlay(cx)))
+            .when(rail_more_open, |el| el.child(self.render_rail_more_menu_overlay(vp_h, cx)))
+            .when(rail_help_open, |el| el.child(self.render_rail_help_menu_overlay(cx)))
             .when(account_popover_open, |el| el.child(self.render_account_popover_overlay(cx)))
             .child(self.modal_container.clone())
             .when(publish_review_modal_open, |el| {
@@ -3189,6 +3775,8 @@ impl Render for AppShell {
             .when_some(self.overlays.computer_overlay.clone(), |el, ov| el.child(self.render_remote_computer_overlay(ov)))
             .when_some(self.orca_jump_palette.clone(), |el, ov| el.child(ov))
             .when_some(self.orca_security_modal.clone(), |el, ov| el.child(ov))
+            .when_some(self.global_search_modal.clone(), |el, ov| el.child(ov))
+            .when_some(self.channel_create_dialog.clone(), |el, ov| el.child(ov))
             .when(self.overlays.is_passcode_locked, |el| el.child(self.render_passcode_lock_overlay(cx)))
             .when_some(
                 self.computers.pending_approvals.first().cloned(),
@@ -3204,6 +3792,860 @@ impl Render for AppShell {
                     el.child(self.render_toast_banner(toast.text, pal, cx))
                 })
             })
+            .into_any_element()
+    }
+}
+
+impl AppShell {
+    /// Ensures `self.theme_state.palette` carries OpenBot `383a35d2` monochrome surfaces and
+    /// propagates it to child views when changed (idempotent; zero redundant render work).
+    fn ensure_openbot_chrome_palette(&mut self, cx: &mut Context<Self>) {
+        let ob_pal = self.theme_state.palette.with_openbot_chrome();
+        if ob_pal == self.theme_state.palette {
+            return;
+        }
+        self.theme_state.palette = ob_pal;
+        let lang = self.active_lang_id().to_string();
+        propagate_theme_and_locale(
+            ShellThemeTargets {
+                nav_rail: &self.nav_rail,
+                apple_sidebar: &self.apple_sidebar,
+                content_hub: &self.content_hub,
+                main_menu_drawer: &self.main_menu_drawer,
+                sidebar: &self.sidebar,
+                stage: &self.stage,
+                composer: &self.composer,
+                inspector: &self.inspector,
+                modal_container: &self.modal_container,
+                tasks_workspace: &self.tasks_workspace,
+                browser_workspace: self.browser_workspace.as_ref(),
+                openbot_workspace: self.openbot_workspace.as_ref(),
+                community_workspace: self.community_workspace.as_ref(),
+                orca_bots_workspace: self.orca_bots_workspace.as_ref(),
+                orca_ide_workspace: self.orca_ide_workspace.as_ref(),
+                orca_jump_palette: self.orca_jump_palette.as_ref(),
+                talk_mode_overlay: self.rtc_talk.talk_mode_overlay.as_ref(),
+                computer_overlay: self.overlays.computer_overlay.as_ref(),
+                media_viewer_overlay: self.overlays.media_viewer_overlay.as_ref(),
+                iv_viewer_overlay: self.overlays.iv_viewer_overlay.as_ref(),
+                auth_wizard: &self.auth_wizard,
+                settings_router: &self.settings_router,
+                miniapp_overlay: self.miniapps.miniapp_overlay.as_ref(),
+                create_bot_box: self.miniapps.create_bot_box.as_ref(),
+            },
+            &ob_pal,
+            &lang,
+            cx,
+        );
+        if let Some(ref gs) = self.global_search_modal {
+            gs.update(cx, |m, mcx| {
+                m.set_theme_and_locale(ob_pal, lang.clone());
+                mcx.notify();
+            });
+        }
+        if let Some(ref cc) = self.channel_create_dialog {
+            cc.update(cx, |m, mcx| {
+                m.set_theme_and_locale(ob_pal, lang.clone());
+                mcx.notify();
+            });
+        }
+    }
+
+    /// Processes OpenBot sidebar `+` menu / search / navigation callbacks and tracks chat history.
+    fn process_openbot_sidebar_hooks(&mut self, cx: &mut Context<Self>) {
+        let (
+            active_chat,
+            sel_rev,
+            nav_back,
+            nav_fwd,
+            open_gs,
+            open_agent_studio,
+            open_new_group,
+            open_new_folder,
+        ) = self.sidebar.update(cx, |sb, _| {
+            (
+                sb.active_chat_id,
+                sb.selection_revision,
+                sb.take_pending_nav_back(),
+                sb.take_pending_nav_forward(),
+                sb.take_pending_open_global_search(),
+                sb.take_pending_open_create_agent_studio(),
+                sb.take_pending_open_new_group(),
+                sb.take_pending_open_new_folder(),
+            )
+        });
+
+        if sel_rev != self.last_nav_observed_selection_rev {
+            self.last_nav_observed_selection_rev = sel_rev;
+            if let Some(cid) = active_chat {
+                if !self.chat_nav_suppress_push {
+                    if let Some(cur) = self.chat_nav_cursor {
+                        if self.chat_nav_history.get(cur) != Some(&cid) {
+                            self.chat_nav_history.truncate(cur + 1);
+                            self.chat_nav_history.push(cid);
+                            self.chat_nav_cursor = Some(self.chat_nav_history.len() - 1);
+                        }
+                    } else {
+                        self.chat_nav_history.push(cid);
+                        self.chat_nav_cursor = Some(0);
+                    }
+                    if self.chat_nav_history.len() > 64 {
+                        let drop_n = self.chat_nav_history.len() - 64;
+                        self.chat_nav_history.drain(..drop_n);
+                        self.chat_nav_cursor = self
+                            .chat_nav_cursor
+                            .map(|c| c.saturating_sub(drop_n));
+                    }
+                }
+                self.sync_sidebar_nav_flags(cx);
+            }
+        }
+
+        if nav_back {
+            self.navigate_chat_history(-1, cx);
+        }
+        if nav_fwd {
+            self.navigate_chat_history(1, cx);
+        }
+        if open_gs {
+            self.open_global_search_palette(None, cx);
+        }
+        if open_agent_studio {
+            self.open_fabushi_creator_modal(cx);
+        }
+        if open_new_group {
+            if self.theme_state.palette.is_apple_style() {
+                self.open_channel_create_dialog(cx);
+            } else {
+                let title = tr_str(self.active_lang_id(), "新建群聊", "New Group").to_string();
+                self.open_modal_dialog(title, ModalDialogKind::NewGroup, 420.0, 520.0, cx);
+            }
+        }
+        if open_new_folder {
+            self.navigate_settings_to(SettingsSectionType::Folders, cx);
+        }
+        let contacts_modal_active = self.sidebar.read(cx).is_contacts_modal_open
+            || matches!(
+                self.modal_container.read(cx).dialog.kind,
+                Some(ModalDialogKind::Contacts)
+            );
+        if !contacts_modal_active
+            && self.apple_sidebar.read(cx).highlighted_destination
+                == Some(crate::views::apple_sidebar::AppleSidebarSection::Contacts)
+        {
+            self.sync_apple_sidebar_to_active_panel(cx);
+        }
+    }
+
+    /// Collects live Fabushi bots + Telegram contacts for `ChannelCreateDialogModal`.
+    pub fn collect_channel_create_candidates(&self, cx: &App) -> Vec<ChannelCreateMemberCandidate> {
+        let sb = self.sidebar.read(cx);
+        let mut out = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        for d in &sb.dialogs {
+            let is_group = sb.group_chat_ids.contains(&d.id)
+                || sb.channel_chat_ids.contains(&d.id)
+                || d.folder == "Groups"
+                || d.folder == "Channels";
+            if is_group || sb.saved_messages_id == Some(d.id) {
+                continue;
+            }
+            let is_bot = sb.bot_ids.contains(&d.id) || d.folder == "Bots";
+            let key = format!("peer-{}", d.id);
+            if !seen_ids.insert(key.clone()) {
+                continue;
+            }
+            let uname = self
+                .session_sync
+                .rich_chats_by_id
+                .get(&d.id)
+                .and_then(|rc| rc.peer_username.clone().or_else(|| rc.username.clone()));
+            let user_id = self
+                .session_sync
+                .rich_chats_by_id
+                .get(&d.id)
+                .and_then(|rc| rc.peer_user_id.map(|u| u as u64))
+                .or(Some(d.id));
+            out.push(ChannelCreateMemberCandidate {
+                id: key,
+                user_id,
+                username: uname,
+                name: d.peer_name.clone(),
+                description: d.last_message.clone(),
+                is_bot,
+                avatar_seed: Some(format!("bot-{}", d.id)),
+                avatar_hue: None,
+                avatar_color: None,
+                avatar_url: None,
+            });
+        }
+        out.sort_by(|a, b| b.is_bot.cmp(&a.is_bot).then_with(|| a.name.cmp(&b.name)));
+        out
+    }
+
+    /// Opens OpenBot's `440px` `ChannelCreateDialogModal` populated with live bots & contacts.
+    pub fn open_channel_create_dialog(&mut self, cx: &mut Context<Self>) {
+        self.occlude_browser_for_overlay(cx);
+        self.ime.clear_preedit();
+        self.global_search_modal = None;
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        let candidates = self.collect_channel_create_candidates(cx);
+        let modal = cx.new(|mcx| ChannelCreateDialogModal::new(candidates, pal, lang, mcx));
+        cx.observe(&modal, |shell, ent, cx| {
+            let (submit, close) = ent.update(cx, |m, _| {
+                (m.take_pending_submit(), m.take_pending_close())
+            });
+            if close {
+                shell.channel_create_dialog = None;
+            }
+            if let Some(sub) = submit {
+                shell.handle_channel_create_submission(sub, cx);
+            }
+            if close {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.channel_create_dialog = Some(modal);
+        cx.notify();
+    }
+
+    /// Closes `ChannelCreateDialogModal` cleanly.
+    pub fn close_channel_create_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.channel_create_dialog.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn handle_channel_create_submission(
+        &mut self,
+        sub: ChannelCreateSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        let local_id = 900_000_000u64
+            .wrapping_add(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64 % 99_999_999)
+                    .unwrap_or(1),
+            );
+        let req = PendingCreateGroupRequest {
+            local_dialog_id: local_id,
+            title: sub.name.clone(),
+            member_ids: sub.member_user_ids,
+            member_usernames: sub.member_usernames,
+            about: None,
+        };
+        if self.is_authenticated && self.session_sync.session_token.is_some() {
+            self.dispatch_create_group(req, cx);
+        }
+        self.show_toast(
+            format!(
+                "{}: {}",
+                tr_str(self.active_lang_id(), "正在创建群聊", "Creating channel"),
+                sub.name
+            ),
+            2000,
+            cx,
+        );
+    }
+
+    fn sync_sidebar_nav_flags(&mut self, cx: &mut Context<Self>) {
+        let can_back = self.chat_nav_cursor.is_some_and(|c| c > 0);
+        let can_fwd = self
+            .chat_nav_cursor
+            .is_some_and(|c| c + 1 < self.chat_nav_history.len());
+        self.sidebar.update(cx, |sb, scx| {
+            if sb.can_navigate_back != can_back || sb.can_navigate_forward != can_fwd {
+                sb.can_navigate_back = can_back;
+                sb.can_navigate_forward = can_fwd;
+                scx.notify();
+            }
+        });
+    }
+
+    /// Steps backward (`delta = -1`, `Cmd+[`) or forward (`delta = 1`, `Cmd+]`) through visited chats.
+    pub fn navigate_chat_history(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(cur) = self.chat_nav_cursor else {
+            return;
+        };
+        let next_i = cur as isize + delta;
+        if next_i < 0 || (next_i as usize) >= self.chat_nav_history.len() {
+            return;
+        }
+        let next_idx = next_i as usize;
+        let target_chat_id = self.chat_nav_history[next_idx];
+        self.chat_nav_cursor = Some(next_idx);
+        self.chat_nav_suppress_push = true;
+        self.active_panel = ActiveWorkspacePanel::Chats;
+        self.sidebar.update(cx, |sb, scx| {
+            sb.select_dialog_from_user(target_chat_id);
+            scx.notify();
+        });
+        self.chat_nav_suppress_push = false;
+        self.sync_sidebar_nav_flags(cx);
+        cx.notify();
+    }
+
+    /// Collects live cross-domain search candidates across all 7 OpenBot `GlobalSearch` sections.
+    pub fn collect_global_search_items(&self, cx: &App) -> Vec<GlobalSearchResultItem> {
+        let lang = self.active_lang_id();
+        let mut out = Vec::new();
+
+        // 1 & 2: Agents & Channels from live sidebar dialogs
+        let (dialogs, bot_ids, group_ids, channel_ids) = {
+            let sb = self.sidebar.read(cx);
+            (
+                sb.dialogs.clone(),
+                sb.bot_ids.clone(),
+                sb.group_chat_ids.clone(),
+                sb.channel_chat_ids.clone(),
+            )
+        };
+        let mut dialog_names = std::collections::HashMap::new();
+        for d in &dialogs {
+            dialog_names.insert(d.id, d.peer_name.clone());
+            let is_channel = channel_ids.contains(&d.id) || d.folder == "Channels";
+            let is_group = !is_channel
+                && (group_ids.contains(&d.id) || d.folder == "Groups" || d.folder == "Work");
+            let is_bot = !is_channel && !is_group && (bot_ids.contains(&d.id) || d.folder == "Bots");
+            let section = if is_bot {
+                GlobalSearchSectionKind::Agents
+            } else {
+                GlobalSearchSectionKind::Channels
+            };
+            out.push(GlobalSearchResultItem {
+                id: format!("chat:{}:{}", d.id, if is_bot { "1" } else { "0" }),
+                section,
+                title: d.peer_name.clone(),
+                subtitle: d.last_message.clone(),
+                badge: (!d.timestamp.is_empty()).then(|| d.timestamp.clone()),
+                avatar_seed: Some(format!("bot-{}", d.id)),
+                shortcut_hint: None,
+            });
+        }
+
+        // 3 & 4: Recent Messages & Files from hydrated stage chat_histories
+        let stage = self.stage.read(cx);
+        let mut msg_count = 0usize;
+        let mut file_count = 0usize;
+        for (&cid, history) in &stage.chat_histories {
+            let peer = dialog_names
+                .get(&cid)
+                .cloned()
+                .unwrap_or_else(|| format!("Chat #{cid}"));
+            for m in history.iter().rev().take(12) {
+                match &m.content {
+                    MessageContent::Text { text, .. } => {
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if msg_count < 60 {
+                            msg_count += 1;
+                            out.push(GlobalSearchResultItem {
+                                id: format!("msg:{cid}:{}", m.id),
+                                section: GlobalSearchSectionKind::Messages,
+                                title: peer.clone(),
+                                subtitle: trimmed.to_string(),
+                                badge: (!m.timestamp.is_empty()).then(|| m.timestamp.clone()),
+                                avatar_seed: Some(format!("bot-{cid}")),
+                                shortcut_hint: None,
+                            });
+                        }
+                    }
+                    MessageContent::Media { url, caption, .. } => {
+                        if file_count < 30 {
+                            file_count += 1;
+                            let title = url
+                                .rsplit('/')
+                                .next()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(peer.as_str())
+                                .to_string();
+                            out.push(GlobalSearchResultItem {
+                                id: format!("file:{cid}:{}", m.id),
+                                section: GlobalSearchSectionKind::Files,
+                                title,
+                                subtitle: caption.clone().unwrap_or_else(|| peer.clone()),
+                                badge: (!m.timestamp.is_empty()).then(|| m.timestamp.clone()),
+                                avatar_seed: None,
+                                shortcut_hint: None,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 5: Live Routines from Bot Fusion snapshot
+        for r in &self.bot_fusion.snapshot.routines {
+            out.push(GlobalSearchResultItem {
+                id: format!("routine:{}", r.id),
+                section: GlobalSearchSectionKind::Routines,
+                title: r.name.clone(),
+                subtitle: if r.instruction.is_empty() {
+                    r.schedule_label.clone()
+                } else {
+                    r.instruction.clone()
+                },
+                badge: Some(r.schedule_label.clone()),
+                avatar_seed: None,
+                shortcut_hint: None,
+            });
+        }
+
+        // 6: Quick Actions
+        let actions = [
+            ("action:new_agent", tr_str(lang, "新建助手", "New Agent"), tr_str(lang, "打开助手创建工作室", "Open Create Agent Studio")),
+            ("action:new_group", tr_str(lang, "新建群聊", "New Group"), tr_str(lang, "创建多人或智能体群组", "Create a new group chat")),
+            ("action:new_folder", tr_str(lang, "新建分组", "New Section"), tr_str(lang, "管理聊天分组标签", "Manage sidebar chat folders")),
+            ("action:toggle_theme", tr_str(lang, "切换深浅外观", "Toggle Theme"), tr_str(lang, "在深色与浅色主题间切换", "Switch between dark and light theme")),
+            ("action:toggle_lang", tr_str(lang, "切换界面语言", "Switch Language"), tr_str(lang, "在中文与 English 间切换", "Toggle Chinese / English locale")),
+        ];
+        for (id, title, sub) in actions {
+            out.push(GlobalSearchResultItem {
+                id: id.to_string(),
+                section: GlobalSearchSectionKind::Actions,
+                title: title.to_string(),
+                subtitle: sub.to_string(),
+                badge: None,
+                avatar_seed: None,
+                shortcut_hint: None,
+            });
+        }
+
+        // 7: Settings shortcuts
+        let settings_entries = [
+            ("setting:main", tr_str(lang, "通用设置", "General Settings"), tr_str(lang, "应用偏好与账号设置", "Preferences & account")),
+            ("setting:chat", tr_str(lang, "外观与主题", "Appearance & Chat"), tr_str(lang, "主题、缩放与消息样式", "Theme, scale, and chat layout")),
+            ("setting:folders", tr_str(lang, "聊天分组", "Chat Folders"), tr_str(lang, "管理侧边栏标签页", "Manage sidebar folder tabs")),
+            ("setting:ai_providers", tr_str(lang, "AI 模型提供商", "AI Providers"), tr_str(lang, "配置模型密钥与默认模型", "Configure model providers & keys")),
+            ("setting:privacy", tr_str(lang, "隐私与安全", "Privacy & Security"), tr_str(lang, "密码锁、会话与加密", "Passcode, sessions & encryption")),
+            ("setting:shortcuts", tr_str(lang, "键盘快捷键", "Keyboard Shortcuts"), tr_str(lang, "查看全局快捷键列表", "View desktop keyboard shortcuts")),
+        ];
+        for (id, title, sub) in settings_entries {
+            out.push(GlobalSearchResultItem {
+                id: id.to_string(),
+                section: GlobalSearchSectionKind::Settings,
+                title: title.to_string(),
+                subtitle: sub.to_string(),
+                badge: None,
+                avatar_seed: None,
+                shortcut_hint: None,
+            });
+        }
+
+        out
+    }
+
+    /// Opens the floating `GlobalSearchModal` (`Cmd/Ctrl+K`) populated with live items.
+    pub fn open_global_search_palette(
+        &mut self,
+        initial_tab: Option<GlobalSearchTab>,
+        cx: &mut Context<Self>,
+    ) {
+        self.occlude_browser_for_overlay(cx);
+        self.ime.clear_preedit();
+        self.sidebar.update(cx, |sb, scx| {
+            let changed = sb.close_openbot_popovers() || sb.is_account_popover_open;
+            sb.is_account_popover_open = false;
+            if changed {
+                scx.notify();
+            }
+        });
+        self.apple_sidebar.update(cx, |sb, scx| {
+            if sb.close_popovers() {
+                scx.notify();
+            }
+        });
+
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        let items = self.collect_global_search_items(cx);
+        let modal = cx.new(|mcx| {
+            let mut m = GlobalSearchModal::new(pal, lang, mcx);
+            if let Some(tab) = initial_tab {
+                m.state.active_tab = tab;
+            }
+            m.set_items(items);
+            m
+        });
+        cx.observe(&modal, |shell, ent, cx| {
+            let (act, close) = ent.update(cx, |m, _| {
+                (m.take_pending_activate(), m.take_pending_close())
+            });
+            if close {
+                shell.global_search_modal = None;
+            }
+            if let Some(hit) = act {
+                shell.handle_global_search_activation(hit, cx);
+            }
+            if close {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.global_search_modal = Some(modal);
+        cx.notify();
+    }
+
+    /// Closes `GlobalSearchModal` cleanly.
+    pub fn close_global_search_palette(&mut self, cx: &mut Context<Self>) {
+        if self.global_search_modal.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Toggles `GlobalSearchModal`, optionally jumping to a specific tab (`Cmd+Shift+E` -> `Files`).
+    pub fn toggle_global_search_palette(
+        &mut self,
+        initial_tab: Option<GlobalSearchTab>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref existing) = self.global_search_modal {
+            if let Some(tab) = initial_tab {
+                if existing.read(cx).state.active_tab != tab {
+                    existing.update(cx, |m, mcx| {
+                        m.state.active_tab = tab;
+                        m.state.selected_index = 0;
+                        mcx.notify();
+                    });
+                    return;
+                }
+            }
+            self.close_global_search_palette(cx);
+        } else {
+            self.open_global_search_palette(initial_tab, cx);
+        }
+    }
+
+    fn handle_global_search_activation(
+        &mut self,
+        item: GlobalSearchResultItem,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(rest) = item.id.strip_prefix("chat:") {
+            let mut parts = rest.split(':');
+            if let Some(cid) = parts.next().and_then(|s| s.parse::<u64>().ok()) {
+                let is_bot = parts.next() == Some("1");
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.open_or_select_chat(cid, Some(item.title), is_bot, cx);
+                cx.notify();
+            }
+        } else if let Some(rest) = item
+            .id
+            .strip_prefix("msg:")
+            .or_else(|| item.id.strip_prefix("file:"))
+        {
+            if let Some(cid) = rest.split(':').next().and_then(|s| s.parse::<u64>().ok()) {
+                self.active_panel = ActiveWorkspacePanel::Chats;
+                self.open_or_select_chat(cid, Some(item.title), false, cx);
+                cx.notify();
+            }
+        } else if item.id.starts_with("routine:") {
+            self.open_openbot_workspace(cx);
+        } else {
+            match item.id.as_str() {
+                "action:new_agent" => self.open_fabushi_creator_modal(cx),
+                "action:new_group" => {
+                    if self.theme_state.palette.is_apple_style() {
+                        self.open_channel_create_dialog(cx);
+                    } else {
+                        let title = tr_str(self.active_lang_id(), "新建群聊", "New Group").to_string();
+                        self.open_modal_dialog(title, ModalDialogKind::NewGroup, 420.0, 520.0, cx);
+                    }
+                }
+                "action:new_folder" => self.navigate_settings_to(SettingsSectionType::Folders, cx),
+                "action:toggle_theme" => {
+                    self.nav_rail.update(cx, |r, rcx| {
+                        r.theme_toggle_requested = true;
+                        rcx.notify();
+                    });
+                }
+                "action:toggle_lang" => self.toggle_language(cx),
+                "setting:main" => self.navigate_settings_to(SettingsSectionType::Main, cx),
+                "setting:chat" => self.navigate_settings_to(SettingsSectionType::Chat, cx),
+                "setting:folders" => self.navigate_settings_to(SettingsSectionType::Folders, cx),
+                "setting:ai_providers" => {
+                    self.navigate_settings_to(SettingsSectionType::AiProviders, cx)
+                }
+                "setting:privacy" => {
+                    self.navigate_settings_to(SettingsSectionType::PrivacySecurity, cx)
+                }
+                "setting:shortcuts" => {
+                    self.navigate_settings_to(SettingsSectionType::Shortcuts, cx)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Root-level unclipped `...` `RailMoreMenu` popover (`left: 58px`, `top: 46px`, `w: 232px`).
+    fn render_rail_more_menu_overlay(&self, vp_h: f32, cx: &mut Context<Self>) -> AnyElement {
+        let ob = self.theme_state.palette.openbot_palette();
+        let lang = self.active_lang_id().to_string();
+        let effective_vp_h = if vp_h > 0.0 { vp_h } else { 720.0 };
+        let (pinned, active_dest, hovered_row) = {
+            let rail = self.apple_sidebar.read(cx);
+            (
+                rail.pinned_sections.clone(),
+                rail.active_rail_destination(),
+                rail.hovered_more_row,
+            )
+        };
+        let surface_bg = ob.bg_surface();
+        let border_col = ob.border_strong_hairline();
+        let hover_bg = ob.bg_control_hover();
+        let active_bg = ob.bg_control_active();
+        let text_pri = ob.text_primary();
+        let text_muted = ob.text_muted();
+
+        let mut card = div()
+            .id("rail-more-menu-card")
+            .absolute()
+            .left(px(58.0))
+            .top(px(46.0))
+            .w(px(232.0))
+            .max_h(px((effective_vp_h - 62.0).max(200.0)))
+            .overflow_y_scroll()
+            .rounded(px(14.0))
+            .bg(surface_bg)
+            .border_1()
+            .border_color(border_col)
+            .p(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        for sec in PINNABLE_SECTIONS {
+            let is_active = active_dest == Some(sec);
+            let is_pinned = pinned.contains(&sec);
+            let is_hovered = hovered_row == Some(sec);
+            let row_id = SharedString::from(format!("rail-more-row-{}", sec.element_id()));
+            let pin_id = SharedString::from(format!("rail-more-pin-{}", sec.element_id()));
+
+            card = card.child(
+                div()
+                    .id(row_id)
+                    .h(px(32.0))
+                    .flex_shrink_0()
+                    .w_full()
+                    .px(px(8.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .when(is_active, |el| el.bg(active_bg))
+                    .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.apple_sidebar.update(cx, |rail, rcx| {
+                            if *hovered {
+                                if rail.hovered_more_row != Some(sec) {
+                                    rail.hovered_more_row = Some(sec);
+                                    rcx.notify();
+                                }
+                            } else if rail.hovered_more_row == Some(sec) {
+                                rail.hovered_more_row = None;
+                                rcx.notify();
+                            }
+                        });
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.apple_sidebar.update(cx, |rail, rcx| {
+                                rail.select_section(sec, rcx);
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(9.0))
+                            .child(tg_icon_rgba(
+                                sec.icon_name(),
+                                16.0,
+                                if is_active { text_pri } else { text_muted },
+                            ))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(if is_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .text_color(text_pri)
+                                    .child(sec.localized_label(&lang)),
+                            ),
+                    )
+                    .when(is_pinned || is_hovered, |el| {
+                        el.child(
+                            div()
+                                .id(pin_id)
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .flex_shrink_0()
+                                .rounded(px(8.0))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(is_pinned, |p| p.bg(active_bg))
+                                .hover(move |s| s.bg(active_bg))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.apple_sidebar.update(cx, |rail, rcx| {
+                                            rail.toggle_pin(sec, rcx);
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tg_icon_rgba(
+                                    IconName::Pin,
+                                    13.0,
+                                    if is_pinned { text_pri } else { text_muted },
+                                )),
+                        )
+                    }),
+            );
+        }
+
+        div()
+            .id("rail-more-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.apple_sidebar.update(cx, |rail, rcx| {
+                        if rail.close_popovers() {
+                            rcx.notify();
+                        }
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(card)
+            .into_any_element()
+    }
+
+    /// Root-level unclipped `?` `RailHelpMenu` popover (`left: 58px`, `bottom: 92px`, `w: 212px`).
+    fn render_rail_help_menu_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ob = self.theme_state.palette.openbot_palette();
+        let lang = self.active_lang_id().to_string();
+        let surface_bg = ob.bg_surface();
+        let border_col = ob.border_strong_hairline();
+        let hover_bg = ob.bg_control_hover();
+        let text_pri = ob.text_primary();
+        let text_muted = ob.text_muted();
+
+        let items: [(RailHelpAction, &'static str, &'static str, &'static str); 3] = [
+            (
+                RailHelpAction::Shortcuts,
+                "rail-help-shortcuts",
+                tr_str(&lang, "键盘快捷键", "Keyboard Shortcuts"),
+                "Cmd+/",
+            ),
+            (
+                RailHelpAction::ExportData,
+                "rail-help-export-data",
+                tr_str(&lang, "导出数据", "Export Data"),
+                "",
+            ),
+            (
+                RailHelpAction::About,
+                "rail-help-about",
+                tr_str(&lang, "关于 Fabushi", "About Fabushi"),
+                "",
+            ),
+        ];
+
+        let mut card = div()
+            .id("rail-help-menu-card")
+            .absolute()
+            .left(px(58.0))
+            .bottom(px(92.0))
+            .w(px(212.0))
+            .rounded(px(14.0))
+            .bg(surface_bg)
+            .border_1()
+            .border_color(border_col)
+            .p(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        for (action, id, label, hint) in items {
+            card = card.child(
+                div()
+                    .id(id)
+                    .h(px(32.0))
+                    .w_full()
+                    .px(px(8.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.handle_apple_sidebar_event(
+                                &AppleSidebarEvent::OpenHelpAction(action),
+                                cx,
+                            );
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .child(label),
+                    )
+                    .when(!hint.is_empty(), |el| {
+                        el.child(div().text_size(px(11.0)).text_color(text_muted).child(hint))
+                    }),
+            );
+        }
+
+        div()
+            .id("rail-help-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.apple_sidebar.update(cx, |rail, rcx| {
+                        if rail.close_popovers() {
+                            rcx.notify();
+                        }
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(card)
             .into_any_element()
     }
 }

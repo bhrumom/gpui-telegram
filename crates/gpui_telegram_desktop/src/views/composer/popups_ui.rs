@@ -3,12 +3,28 @@
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
+use crate::components::avatar::render_plush_bot_avatar;
 use crate::components::bots::bot_attach_web_view::peer_matches_types;
 use crate::i18n::{tr_key_or, tr_str};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::views::stage::openbot_stage_chrome::{openbot_stage_icon, OpenBotStageIcon};
 use super::attachments_drawer::{AttachmentKind, ComposerAttachMiniApp};
 use super::field_autocomplete::{AutocompleteType, FieldAutocomplete};
 use super::formatting_bar::{FormattingBar, TextStyleKind};
+
+/// OpenBot `+` `ComposerAddMenu` semantic actions (`UI-F13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerOpenBotAddAction {
+    AttachFiles,
+    InsertSkillTrigger,
+    TeachTask,
+    SideQuestion,
+    LiveVoice,
+    Workflows,
+    NewChat,
+    Formatting,
+    EmojiPicker,
+}
 
 #[derive(Debug, Clone)]
 pub enum ComposerPopupAction {
@@ -19,6 +35,7 @@ pub enum ComposerPopupAction {
     SendSilent,
     ScheduleMessage,
     ClosePopups,
+    OpenBotAdd(ComposerOpenBotAddAction),
 }
 
 const EMOJI_SHORTCODES: &[(&str, &str)] = &[
@@ -37,35 +54,47 @@ pub fn render_autocomplete_popup<V: 'static>(
     let is_dark = palette.mode.is_dark();
     let is_apple = palette.is_apple_style();
 
-    // Rich Grok Bot `@mention` elevated listbox (14px radius, 32px rows, AI Bot / @everyone badges)
+    // OpenBot tucked `@mention` picker (`#121212` dark / `#f8f8fa` light, `29px` rows, max 7 rows = `213px`)
     if emoji_token.is_none()
         && ac.is_open
         && ac.autocomplete_type == AutocompleteType::Mentions
         && !ac.mention_rows.is_empty()
     {
         let sel_idx = ac.selected_index.max(0) as usize;
-        let hbg = palette.row_hover_rgba();
-        let active_bg = palette.row_active_rgba();
+        let ob = palette.openbot_palette();
+        let hbg = if is_apple { ob.hover() } else { palette.row_hover_rgba() };
+        let active_bg = if is_apple {
+            ob.bg_control_active()
+        } else {
+            palette.row_active_rgba()
+        };
+        let tucked_bg: Rgba = if is_apple {
+            if is_dark { rgb(0x121212).into() } else { rgb(0xF8F8FA).into() }
+        } else {
+            rgb(palette.menu_bg).into()
+        };
+        let tucked_border: Rgba = if is_apple {
+            if is_dark { rgb(0x222222).into() } else { rgb(0xE6E6EA).into() }
+        } else {
+            palette.hairline_border_rgba()
+        };
         let mut box_el = div()
             .id("composer-autocomplete-popup")
-            .w(px(360.0))
-            .max_h(px(320.0))
+            .when(is_apple, |el| el.w_full().max_h(px(213.0)))
+            .when(!is_apple, |el| el.w(px(360.0)).max_h(px(320.0)))
             .overflow_y_scroll()
-            .mb(px(6.0))
-            .p(px(6.0))
+            .mb(px(if is_apple { 4.0 } else { 6.0 }))
+            .p(px(5.0))
             .rounded(px(14.0))
-            .bg(rgb(palette.menu_bg))
+            .bg(tucked_bg)
             .border_1()
-            .border_color(palette.hairline_border_rgba())
-            .when(is_dark, |el| el.border_t_1().border_color(palette.specular_top_highlight_rgba()))
+            .border_color(tucked_border)
             .flex()
             .flex_col()
-            .gap(px(2.0));
-        box_el = if is_apple {
-            box_el.shadow(palette.popover_shadows())
-        } else {
-            box_el.shadow_lg()
-        };
+            .gap(px(1.0));
+        if !is_apple {
+            box_el = box_el.shadow_lg();
+        }
 
         for (idx, m) in ac.mention_rows.iter().take(12).enumerate() {
             let act = on_action.clone();
@@ -93,20 +122,29 @@ pub fn render_autocomplete_popup<V: 'static>(
                 .take(1)
                 .collect::<String>()
                 .to_uppercase();
-            let avatar = if is_everyone {
+            let avatar: AnyElement = if is_everyone {
                 div()
-                    .w(px(24.0))
-                    .h(px(24.0))
+                    .w(px(18.0))
+                    .h(px(18.0))
                     .rounded_full()
                     .flex_shrink_0()
-                    .bg(rgb(badge_bg))
+                    .bg(ob.bg_control_active())
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(badge_fg))
-                    .child("@")
+                    .child(openbot_stage_icon(OpenBotStageIcon::UsersRound, 11.5, ob.text_primary()))
+                    .into_any_element()
+            } else if m.is_bot && is_apple {
+                render_plush_bot_avatar(
+                    &m.name,
+                    None,
+                    None,
+                    None,
+                    18.0,
+                    openbot_contracts::avatar::AvatarMood::Idle,
+                    None,
+                )
+                .into_any_element()
             } else if m.is_bot {
                 div()
                     .w(px(24.0))
@@ -118,20 +156,23 @@ pub fn render_autocomplete_popup<V: 'static>(
                     .items_center()
                     .justify_center()
                     .child(tg_icon(IconName::BotRobot, 13.0, 0xFFFFFF))
+                    .into_any_element()
             } else {
+                let sz = if is_apple { 18.0 } else { 24.0 };
                 div()
-                    .w(px(24.0))
-                    .h(px(24.0))
+                    .w(px(sz))
+                    .h(px(sz))
                     .rounded_full()
                     .flex_shrink_0()
                     .bg(rgb(avatar_fill))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(10.5))
+                    .text_size(px(if is_apple { 9.5 } else { 10.5 }))
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(0xFFFFFF))
                     .child(if initials.is_empty() { "U".to_string() } else { initials })
+                    .into_any_element()
             };
 
             let handle_label = if !m.username.trim().is_empty() {
@@ -148,10 +189,9 @@ pub fn render_autocomplete_popup<V: 'static>(
             box_el = box_el.child(
                 div()
                     .id(SharedString::from(format!("ac-row-{}", idx)))
-                    .min_h(px(32.0))
+                    .h(px(if is_apple { 29.0 } else { 32.0 }))
                     .px(px(8.0))
-                    .py(px(5.0))
-                    .rounded(px(8.0))
+                    .rounded(px(7.0))
                     .when(active, |el| el.bg(active_bg))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hbg))
@@ -172,10 +212,11 @@ pub fn render_autocomplete_popup<V: 'static>(
                             .min_w(px(0.0))
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
+                            .gap(px(7.0))
                             .child(avatar)
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w(px(0.0))
                                     .flex()
                                     .items_center()
@@ -183,22 +224,38 @@ pub fn render_autocomplete_popup<V: 'static>(
                                     .overflow_hidden()
                                     .child(
                                         div()
-                                            .truncate()
+                                            .flex_shrink_0()
+                                            .max_w(px(180.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
                                             .text_size(px(13.0))
                                             .font_weight(if active {
-                                                FontWeight::SEMIBOLD
-                                            } else {
                                                 FontWeight::MEDIUM
+                                            } else {
+                                                FontWeight::NORMAL
                                             })
-                                            .text_color(rgb(palette.text_primary))
+                                            .text_color(if is_apple {
+                                                ob.text_primary()
+                                            } else {
+                                                rgb(palette.text_primary).into()
+                                            })
                                             .child(display_title),
                                     )
                                     .when(!handle_label.is_empty(), |row| {
                                         row.child(
                                             div()
-                                                .truncate()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
                                                 .text_size(px(12.0))
-                                                .text_color(rgb(palette.text_secondary))
+                                                .text_color(if is_apple {
+                                                    ob.text_dim()
+                                                } else {
+                                                    rgb(palette.text_secondary).into()
+                                                })
                                                 .child(handle_label),
                                         )
                                     }),
@@ -209,18 +266,22 @@ pub fn render_autocomplete_popup<V: 'static>(
                             .flex_shrink_0()
                             .px(px(6.0))
                             .py(px(1.5))
-                            .rounded_full()
-                            .bg(if m.is_bot || is_everyone {
+                            .rounded(px(5.0))
+                            .bg(if is_apple {
+                                ob.bg_control()
+                            } else if m.is_bot || is_everyone {
                                 rgb(badge_bg).into()
                             } else {
                                 TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.12)
                             })
                             .text_size(px(10.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if m.is_bot || is_everyone {
-                                rgb(badge_fg)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if is_apple {
+                                ob.text_muted()
+                            } else if m.is_bot || is_everyone {
+                                rgb(badge_fg).into()
                             } else {
-                                rgb(palette.text_secondary)
+                                rgb(palette.text_secondary).into()
                             })
                             .child(role_badge),
                     ),
@@ -357,40 +418,180 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
         .collect();
 
     let is_apple = palette.is_apple_style();
-    let sep_col: Rgba = if is_apple {
-        palette.separator_rgba()
-    } else {
-        rgb(palette.border_fg).into()
-    };
+    if is_apple {
+        let ob = palette.openbot_palette();
+        let hover_bg = ob.hover();
+        let ob_entries: [(ComposerOpenBotAddAction, OpenBotStageIcon, &str); 7] = [
+            (ComposerOpenBotAddAction::AttachFiles, OpenBotStageIcon::FileText, tr_str(lang_id, "附加文件或图片", "Attach files")),
+            (ComposerOpenBotAddAction::InsertSkillTrigger, OpenBotStageIcon::Puzzle, tr_str(lang_id, "使用技能 ($)", "Use skill ($)")),
+            (ComposerOpenBotAddAction::TeachTask, OpenBotStageIcon::Globe, tr_str(lang_id, "教任务（浏览器演示）", "Teach a task")),
+            (ComposerOpenBotAddAction::SideQuestion, OpenBotStageIcon::SideQuestion, tr_str(lang_id, "旁问 (Side Question)", "Side question")),
+            (ComposerOpenBotAddAction::LiveVoice, OpenBotStageIcon::AudioLines, tr_str(lang_id, "语音对话", "Voice conversation")),
+            (ComposerOpenBotAddAction::Workflows, OpenBotStageIcon::Workflow, tr_str(lang_id, "工作流", "Workflows")),
+            (ComposerOpenBotAddAction::NewChat, OpenBotStageIcon::NewChat, tr_str(lang_id, "新对话 (/new)", "New chat")),
+        ];
+        let mut box_el = div()
+            .id("composer-attachments-popup")
+            .w(px(252.0))
+            .mb(px(6.0))
+            .p(px(6.0))
+            .rounded(px(14.0))
+            .bg(ob.bg_surface())
+            .border_1()
+            .border_color(ob.border_strong_hairline())
+            .shadow(palette.popover_shadows())
+            .flex()
+            .flex_col()
+            .gap(px(1.0));
+        for (idx, (act_kind, icon_kind, label)) in ob_entries.into_iter().enumerate() {
+            let act = on_action.clone();
+            box_el = box_el.child(
+                div()
+                    .id(SharedString::from(format!("att-ob-opt-{}", idx)))
+                    .h(px(32.0))
+                    .px(px(9.0))
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        act(this, ComposerPopupAction::OpenBotAdd(act_kind), cx);
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(openbot_stage_icon(icon_kind, 14.5, ob.text_muted()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(13.0))
+                            .text_color(ob.text_primary())
+                            .child(label.to_string()),
+                    ),
+            );
+        }
+        box_el = box_el.child(div().w_full().h(px(1.0)).my(px(4.0)).bg(ob.border_hairline()));
+        let extra_tools: [(ComposerPopupAction, &str, &str); 5] = [
+            (ComposerPopupAction::OpenBotAdd(ComposerOpenBotAddAction::EmojiPicker), "😊", tr_str(lang_id, "表情 / 贴纸", "Emoji & Stickers")),
+            (ComposerPopupAction::OpenBotAdd(ComposerOpenBotAddAction::Formatting), "Aa", tr_str(lang_id, "文字格式", "Formatting")),
+            (ComposerPopupAction::ChooseAttachment(AttachmentKind::CreatePoll), "📊", tr_key_or(lang_id, "lng_polls_create", "Poll")),
+            (ComposerPopupAction::ChooseAttachment(AttachmentKind::SendLocation), "📍", tr_key_or(lang_id, "lng_attach_location", "Location")),
+            (ComposerPopupAction::ChooseAttachment(AttachmentKind::ShareContact), "👤", tr_key_or(lang_id, "lng_attach_contact", "Contact")),
+        ];
+        for (idx, (popup_act, glyph, label)) in extra_tools.into_iter().enumerate() {
+            let act = on_action.clone();
+            box_el = box_el.child(
+                div()
+                    .id(SharedString::from(format!("att-opt-{}", idx)))
+                    .h(px(30.0))
+                    .px(px(9.0))
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        act(this, popup_act.clone(), cx);
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .text_color(ob.text_muted())
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(12.5))
+                            .text_color(ob.text_secondary())
+                            .child(label.to_string()),
+                    ),
+            );
+        }
+        if !filtered_apps.is_empty() {
+            box_el = box_el
+                .child(div().w_full().h(px(1.0)).my(px(4.0)).bg(ob.border_hairline()))
+                .child(
+                    div()
+                        .px(px(9.0))
+                        .py(px(2.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_dim())
+                        .child(tr_str(lang_id, "小程序", "Mini Apps")),
+                );
+            for app in filtered_apps {
+                let act = on_action.clone();
+                let app_owned = app.clone();
+                box_el = box_el.child(
+                    div()
+                        .id(SharedString::from(format!("att-miniapp-{}", app.short_name)))
+                        .h(px(30.0))
+                        .px(px(9.0))
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            act(this, ComposerPopupAction::ChooseMiniApp(app_owned.clone()), cx);
+                        }))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(12.5))
+                                .text_color(ob.text_primary())
+                                .child(app.title),
+                        ),
+                );
+            }
+        }
+        return box_el.into_any_element();
+    }
+
+    let sep_col: Rgba = rgb(palette.border_fg).into();
     let mut box_el = div()
         .id("composer-attachments-popup")
-        .w(px(if is_apple { 248.0 } else { 236.0 }))
+        .w(px(236.0))
         .mb(px(8.0))
         .p(px(6.0))
-        .rounded(px(if is_apple { 16.0 } else { 10.0 }))
-        .bg(if is_apple {
-            TdesktopThemePalette::rgba_with_alpha(palette.menu_bg, 0.96)
-        } else {
-            rgb(palette.menu_bg).into()
-        })
+        .rounded(px(10.0))
+        .bg(rgb(palette.menu_bg))
         .border_1()
         .border_color(sep_col)
+        .shadow_lg()
         .flex()
         .flex_col()
         .gap(px(2.0));
-    box_el = if is_apple {
-        box_el.shadow(palette.popover_shadows())
-    } else {
-        box_el.shadow_lg()
-    };
 
-    for (idx, (kind, icon, badge_col, label)) in entries.into_iter().enumerate() {
+    for (idx, (kind, icon, _badge_col, label)) in entries.into_iter().enumerate() {
         let act = on_action.clone();
         box_el = box_el.child(
             div()
                 .id(SharedString::from(format!("att-opt-{}", idx)))
-                .when(is_apple, |el| el.h(px(38.0)).px(px(8.0)).rounded(px(10.0)))
-                .when(!is_apple, |el| el.px(px(10.0)).py(px(7.0)).rounded(px(7.0)))
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(7.0))
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(hbg)))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -399,24 +600,10 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
                 .flex()
                 .items_center()
                 .gap(px(10.0))
-                .child(if is_apple {
-                    div()
-                        .w(px(28.0))
-                        .h(px(28.0))
-                        .rounded_full()
-                        .bg(TdesktopThemePalette::rgba_with_alpha(badge_col, 0.16))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(tg_icon(icon, 14.5, badge_col))
-                        .into_any_element()
-                } else {
-                    tg_icon(icon, 16.0, palette.accent).into_any_element()
-                })
+                .child(tg_icon(icon, 16.0, palette.accent))
                 .child(
                     div()
                         .text_size(px(13.0))
-                        .when(is_apple, |el| el.font_weight(FontWeight::MEDIUM))
                         .text_color(rgb(palette.text_primary))
                         .child(label.to_string()),
                 ),

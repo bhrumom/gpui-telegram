@@ -193,6 +193,14 @@ impl ImeSafetyMachine {
 
     pub fn backspace(&mut self) {
         if self.cursor_index > 0 && !self.text_buffer.is_empty() {
+            if let Some((start, end)) = super::editor_state::atomic_reference_chip_span_before_cursor(
+                &self.text_buffer,
+                self.cursor_index,
+            ) {
+                self.text_buffer.replace_range(start..end, "");
+                self.cursor_index = start;
+                return;
+            }
             let mut prev_char_boundary = self.cursor_index - 1;
             while !self.text_buffer.is_char_boundary(prev_char_boundary) && prev_char_boundary > 0 {
                 prev_char_boundary -= 1;

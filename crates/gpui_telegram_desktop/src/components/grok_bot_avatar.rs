@@ -1611,52 +1611,58 @@ fn paint_grok_avatar(bounds: Bounds<Pixels>, props: &GrokBotAvatarProps, window:
     }
 }
 
-/// Renders an animated (or paused) unified Bot avatar — dispatching OpenBot `plush:*` /
-/// `bloub:*` specs to the Plush/Bloub engine and geometric specs to Grok Bot 0.18.
+/// Renders a unified Bot avatar — defaulting all Fabushi/OpenBot bot specs (`plush:*`, `blob`,
+/// `pebble`, `squircle`, `tablet`, `wedge`, `hex`, `cloud`, `teardrop`, `""`, etc.) to 3D felt
+/// `PlushFeltRenderer`, `bloub:*` to flat `BloubBotEngine`, and explicit `grok2d:*` to legacy 2D vector.
 pub fn render_grok_bot_avatar(props: GrokBotAvatarProps) -> gpui::Div {
     let size_px = if props.size_px.is_finite() && props.size_px > 0.0 {
         props.size_px
     } else {
         32.0
     };
-    if crate::components::avatar::is_openbot_prefixed_shape(&props.shape) {
-        let resolved = resolve_body_colors(&props.source_id, &props.color, props.surface_bg_rgb);
-        let hex_color = format!("#{:06x}", resolved.swatch_rgb & 0xFF_FFFF);
-        let paper_hex = format!("#{:06x}", props.surface_bg_rgb & 0xFF_FFFF);
-        if let Some(openbot_div) = crate::components::avatar::render_openbot_prefixed_avatar(
-            &props.shape,
-            hex_color,
-            &props.source_id,
-            props.state,
+    let trimmed_shape = props.shape.trim();
+    if let Some(legacy_2d) = trimmed_shape
+        .strip_prefix("grok2d:")
+        .or_else(|| trimmed_shape.strip_prefix("GROK2D:"))
+    {
+        let render_props = GrokBotAvatarProps {
+            shape: legacy_2d.trim().to_string(),
             size_px,
-            &paper_hex,
-        ) {
-            return openbot_div;
-        }
-    }
-    let render_props = GrokBotAvatarProps {
-        size_px,
-        ..props
-    };
-
-    div()
-        .relative()
-        .w(px(size_px))
-        .h(px(size_px))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _cx| {
-                    paint_grok_avatar(bounds, &render_props, window);
-                },
-            )
+            ..props
+        };
+        return div()
+            .relative()
             .w(px(size_px))
-            .h(px(size_px)),
-        )
+            .h(px(size_px))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _cx| {
+                        paint_grok_avatar(bounds, &render_props, window);
+                    },
+                )
+                .w(px(size_px))
+                .h(px(size_px)),
+            );
+    }
+
+    let explicit_hex = (!props.color.trim().is_empty()).then(|| {
+        let resolved = resolve_body_colors(&props.source_id, &props.color, props.surface_bg_rgb);
+        format!("#{:06x}", resolved.swatch_rgb & 0xFF_FFFF)
+    });
+    let paper_hex = format!("#{:06x}", props.surface_bg_rgb & 0xFF_FFFF);
+    crate::components::avatar::render_openbot_bot_plush_or_flat(
+        trimmed_shape,
+        explicit_hex,
+        &props.source_id,
+        props.state,
+        size_px,
+        &paper_hex,
+    )
 }
 
 fn persona_initials(fallback_label: &str, source_id: &str) -> String {

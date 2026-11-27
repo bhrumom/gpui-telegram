@@ -11,23 +11,131 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::components::avatar::{
-    parse_fabushi_hex_color, OPENBOT_BLOUB_AVATAR_PRESETS, OPENBOT_PLUSH_AVATAR_PRESETS,
+    legacy_shape_to_bloub_shape, parse_fabushi_hex_color, render_plush_bot_avatar,
 };
-use crate::components::grok_bot_avatar::{
-    render_grok_bot_avatar, trigger_grok_avatar_bounce, trigger_grok_avatar_spin,
-    GrokBotAvatarProps, GrokPersonaState, GROK_COLOR_PALETTE,
-};
+use crate::components::bloub_avatar::{render_agent_avatar, AgentAvatarProps};
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::openbot_palette::parse_css_color_to_rgba;
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use gpui_telegram_proto::miniapp_contracts::{
-    CreateFabushiBotRequest, CLASSIC_INITIALS_AVATAR_SHAPE, GROK_AVATAR_SHAPES,
+    CreateFabushiBotRequest, CLASSIC_INITIALS_AVATAR_SHAPE,
 };
 use gpui_telegram_proto::{
     CodingAgentBotConfig, CodingPermissionMode, CodingProviderKind, DetectedCodingProvider,
 };
+use openbot_contracts::avatar::{
+    AvatarColorChoice, AvatarMood, BloubExpression, BloubShape, PlushTransition,
+    AVATAR_COLOR_CHOICES,
+};
 use orca_core::bot_ecosystem::templates::{
     BotTemplate, BotTemplateCategory, BUILTIN_BOT_TEMPLATES,
 };
+
+const STUDIO_FACE_CHOICES: [(BloubShape, BloubExpression); 12] = [
+    (BloubShape::Cercle, BloubExpression::Attentif),
+    (BloubShape::Squircle, BloubExpression::Curieux),
+    (BloubShape::Triangle, BloubExpression::Neutre),
+    (BloubShape::Hexagone, BloubExpression::Surpris),
+    (BloubShape::Carre, BloubExpression::Attentif),
+    (BloubShape::Galet, BloubExpression::Curieux),
+    (BloubShape::Pentagone, BloubExpression::Neutre),
+    (BloubShape::Capsule, BloubExpression::Attentif),
+    (BloubShape::Losange, BloubExpression::Curieux),
+    (BloubShape::Nuage, BloubExpression::Surpris),
+    (BloubShape::Fantome, BloubExpression::Neutre),
+    (BloubShape::Poulpe, BloubExpression::Curieux),
+];
+
+const STUDIO_AUTO_HEX: &str = "#8b5cf6";
+
+struct StudioStarterSuggestion {
+    id: &'static str,
+    title_zh: &'static str,
+    title_en: &'static str,
+    desc_zh: &'static str,
+    desc_en: &'static str,
+    prompt_zh: &'static str,
+    prompt_en: &'static str,
+    shape: BloubShape,
+    color_hex: &'static str,
+}
+
+const STUDIO_STARTER_SUGGESTIONS: [StudioStarterSuggestion; 6] = [
+    StudioStarterSuggestion {
+        id: "inbox-helper",
+        title_zh: "收件箱助手",
+        title_en: "Inbox Helper",
+        desc_zh: "起草回复，避免遗漏跟进。",
+        desc_en: "Draft crisp replies and never miss a follow-up.",
+        prompt_zh: "帮我整理收件箱、提炼紧急事项并起草得体的回复，避免遗漏跟进。",
+        prompt_en: "Help me triage my inbox, surface urgent threads, and draft crisp replies.",
+        shape: BloubShape::Squircle,
+        color_hex: "#e152b0",
+    },
+    StudioStarterSuggestion {
+        id: "trip-planner",
+        title_zh: "行程规划师",
+        title_en: "Trip Planner",
+        desc_zh: "比较方案，制定实用的行程。",
+        desc_en: "Compare options and build practical day-by-day itineraries.",
+        prompt_zh: "帮我比较机酒与交通方案，制定细致实用的每日行程计划。",
+        prompt_en: "Compare flights and hotels and build practical day-by-day travel itineraries.",
+        shape: BloubShape::Triangle,
+        color_hex: "#3b93f0",
+    },
+    StudioStarterSuggestion {
+        id: "personal-organizer",
+        title_zh: "个人整理师",
+        title_en: "Personal Organizer",
+        desc_zh: "把笔记、杂事和任务整理成简单的计划。",
+        desc_en: "Turn notes, errands, and tasks into a simple plan.",
+        prompt_zh: "把我的零散笔记、日常杂事和待办任务整理成清晰可执行的计划。",
+        prompt_en: "Turn my notes, errands, and tasks into a clean, actionable daily plan.",
+        shape: BloubShape::Hexagone,
+        color_hex: "#f0b429",
+    },
+    StudioStarterSuggestion {
+        id: "shopping-scout",
+        title_zh: "购物侦察员",
+        title_en: "Shopping Scout",
+        desc_zh: "对比参数、口碑与价格，减少踩坑。",
+        desc_en: "Compare specs, reviews, and prices before every purchase.",
+        prompt_zh: "帮我研究商品参数、用户口碑和价格走势，客观分析优缺点。",
+        prompt_en: "Research product specs, verified reviews, and prices and highlight trade-offs.",
+        shape: BloubShape::Capsule,
+        color_hex: "#3ecf8e",
+    },
+    StudioStarterSuggestion {
+        id: "writing-partner",
+        title_zh: "写作搭档",
+        title_en: "Writing Partner",
+        desc_zh: "列大纲、润色文稿并打磨表达。",
+        desc_en: "Outline, edit, and sharpen memos and long-form drafts.",
+        prompt_zh: "和我一起列大纲、润色文档并给出清晰的表达修改建议。",
+        prompt_en: "Collaborate on outlines, edit prose clearly, and sharpen long-form drafts.",
+        shape: BloubShape::Nuage,
+        color_hex: "#5d67ee",
+    },
+    StudioStarterSuggestion {
+        id: "learning-coach",
+        title_zh: "学习教练",
+        title_en: "Learning Coach",
+        desc_zh: "拆解难点、设计练习并循序渐进。",
+        desc_en: "Break down tough concepts with active practice.",
+        prompt_zh: "用循序渐进的例子和练习题，帮我彻底掌握复杂概念。",
+        prompt_en: "Teach tough concepts step by step with concise examples and active quizzes.",
+        shape: BloubShape::Galet,
+        color_hex: "#f08a24",
+    },
+];
+
+const STUDIO_MODEL_CHOICES: [(&str, &str); 5] = [
+    ("", "GPT-6-Luna (默认)"),
+    ("gpt-6-luna", "GPT-6-Luna"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+    ("deepseek-reasoner", "DeepSeek Reasoner"),
+];
 
 fn template_category_label_zh(cat: BotTemplateCategory) -> &'static str {
     match cat {
@@ -40,8 +148,45 @@ fn template_category_label_zh(cat: BotTemplateCategory) -> &'static str {
     }
 }
 
-fn template_plush_avatar_spec(idx: usize) -> &'static str {
-    OPENBOT_PLUSH_AVATAR_PRESETS[idx % OPENBOT_PLUSH_AVATAR_PRESETS.len()].0
+fn template_plush_avatar_spec(idx: usize) -> String {
+    let shape = STUDIO_FACE_CHOICES[idx % STUDIO_FACE_CHOICES.len()].0;
+    format!("plush:{}", shape.as_str())
+}
+
+fn thinking_level_label(level: &str, lang: &str) -> &'static str {
+    match level {
+        "off" => tr_str(lang, "关", "Off"),
+        "low" => tr_str(lang, "低", "Low"),
+        "high" => tr_str(lang, "高", "High"),
+        _ => tr_str(lang, "中", "Med"),
+    }
+}
+
+fn resolve_studio_shape_and_expr(avatar_shape: &str) -> (BloubShape, BloubExpression) {
+    let raw = avatar_shape
+        .trim()
+        .strip_prefix("plush:")
+        .or_else(|| avatar_shape.trim().strip_prefix("PLUSH:"))
+        .unwrap_or(avatar_shape.trim());
+    let shape = BloubShape::parse(raw)
+        .or_else(|| legacy_shape_to_bloub_shape(raw))
+        .unwrap_or(BloubShape::Cercle);
+    let expr = STUDIO_FACE_CHOICES
+        .iter()
+        .find(|(s, _)| *s == shape)
+        .map(|(_, e)| *e)
+        .unwrap_or(BloubExpression::Attentif);
+    (shape, expr)
+}
+
+fn resolve_studio_hex(avatar_color: &str, auto_color: bool) -> String {
+    if auto_color {
+        return STUDIO_AUTO_HEX.to_string();
+    }
+    if let Some(rgb_u32) = parse_fabushi_hex_color(avatar_color) {
+        return format!("#{:06x}", rgb_u32 & 0xFF_FFFF);
+    }
+    STUDIO_AUTO_HEX.to_string()
 }
 
 fn parse_coding_extra_args(raw: &str) -> Vec<String> {
@@ -211,6 +356,10 @@ pub struct CreateManagedBotBoxPeers {
     pub status_message: Option<String>,
     pub palette: TdesktopThemePalette,
     pub language_id: String,
+    pub auto_avatar_color: bool,
+    pub model_picker_open: bool,
+    pub advanced_open: bool,
+    pub hero_wink_toggle: bool,
 }
 
 impl Default for CreateManagedBotBoxPeers {
@@ -263,6 +412,10 @@ impl CreateManagedBotBoxPeers {
             status_message: None,
             palette: TdesktopThemePalette::default(),
             language_id: "en".to_string(),
+            auto_avatar_color: true,
+            model_picker_open: false,
+            advanced_open: false,
+            hero_wink_toggle: false,
         }
     }
 
@@ -281,8 +434,9 @@ impl CreateManagedBotBoxPeers {
         } else {
             format!("{} — {}", tpl.tagline, soul.lines().take(3).collect::<Vec<_>>().join(" "))
         };
-        self.avatar_shape = template_plush_avatar_spec(idx).to_string();
-        self.avatar_color = tpl.avatar_color.to_string();
+        self.avatar_shape = template_plush_avatar_spec(idx);
+        self.avatar_color = tpl.avatar_color.to_ascii_lowercase();
+        self.auto_avatar_color = false;
         self.use_dynamic_avatar = true;
         self.avatar_style_tab = 0;
         self.selected_template_id = Some(tpl.id.to_string());
@@ -394,7 +548,13 @@ impl CreateManagedBotBoxPeers {
         self.is_ai_mode = false;
         self.active_field = 1;
         self.is_submitting = false;
+        self.model_picker_open = false;
         self.status_message = None;
+        if self.avatar_shape == "blob" && self.avatar_color == "blue" {
+            self.avatar_shape = "plush:cercle".to_string();
+            self.avatar_color = STUDIO_AUTO_HEX.to_string();
+            self.auto_avatar_color = true;
+        }
     }
 
     pub fn open_template_creator(&mut self) {
@@ -705,367 +865,237 @@ impl CreateManagedBotBoxPeers {
         was
     }
 
-    fn render_avatar_chooser_card(
+    /// Renders OpenBot's `FirstAgentSetup` avatar studio block: `72x72px` interactive 3D plush
+    /// hero + `9x2` 18 circular color swatches (`#42a0ff` active ring) + 12 `33x33px` plush faces.
+    fn render_studio_avatar_picker(
         &self,
-        preview_label: &str,
         pal: TdesktopThemePalette,
-        lang: &str,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let preview_bg = parse_fabushi_hex_color(&self.avatar_color).unwrap_or(pal.accent);
-        let preview_initials = classic_preview_initials(preview_label);
+    ) -> Div {
+        let ob = pal.openbot_palette();
+        let dark = pal.mode.is_dark();
+        let accent_ring = ob.accent_text();
+        let accent_soft = ob.accent_soft();
+        let hover_bg = ob.hover();
+        let border_dot = ob.border_strong();
 
-        let preview_stage = div()
-            .id("create-bot-modal-preview-stage")
+        let (active_shape, active_expr) = resolve_studio_shape_and_expr(&self.avatar_shape);
+        let active_hex = resolve_studio_hex(&self.avatar_color, self.auto_avatar_color);
+        let hero_seed = if self.bot_name.trim().is_empty() {
+            "new-agent".to_string()
+        } else {
+            self.bot_name.trim().to_string()
+        };
+
+        let hero_visual: AnyElement = if self.use_dynamic_avatar {
+            let mut props = AgentAvatarProps::new(&hero_seed)
+                .with_size(72.0)
+                .with_mood(if self.hero_wink_toggle {
+                    AvatarMood::Responded
+                } else {
+                    AvatarMood::Idle
+                })
+                .with_hue_and_color(None, Some(active_hex.clone()));
+            props.shape_override = Some(active_shape);
+            props.expression_override = Some(if self.hero_wink_toggle {
+                BloubExpression::Heureux
+            } else {
+                active_expr
+            });
+            props.eye_scale = 1.25;
+            props.transition = PlushTransition::Cut;
+            props.dark_scheme = dark;
+            render_agent_avatar(&props, None, 0.0).into_any_element()
+        } else {
+            let bg_rgb = parse_fabushi_hex_color(&active_hex).unwrap_or(0x8B5CF6);
+            let initials = classic_preview_initials(if self.bot_name.trim().is_empty() {
+                "New agent"
+            } else {
+                self.bot_name.as_str()
+            });
+            div()
+                .w(px(72.0))
+                .h(px(72.0))
+                .rounded_full()
+                .bg(rgb(bg_rgb))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(24.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(0xFFFFFF))
+                .child(initials)
+                .into_any_element()
+        };
+
+        let hero_btn = div()
+            .id("studio-hero-plush-btn")
             .cursor_pointer()
-            .w(px(72.0))
-            .h(px(72.0))
-            .flex_shrink_0()
-            .rounded(px(12.0))
-            .bg(rgb(pal.card_bg))
-            .border_1()
-            .border_color(rgb(pal.border_fg))
+            .w(px(76.0))
+            .h(px(76.0))
+            .rounded_full()
             .flex()
             .items_center()
             .justify_center()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| {
-                    trigger_grok_avatar_spin("create-bot-modal-preview");
+                cx.listener(|this, _, _, cx| {
+                    this.hero_wink_toggle = !this.hero_wink_toggle;
                     cx.notify();
                 }),
             )
-            .child(if self.use_dynamic_avatar {
-                render_grok_bot_avatar(
-                    GrokBotAvatarProps::new(
-                        "create-bot-modal-preview",
-                        &self.avatar_shape,
-                        &self.avatar_color,
-                        64.0,
-                    )
-                    .with_state(GrokPersonaState::Happy)
-                    .with_follow_pointer(true)
-                    .with_surface_bg(pal.card_bg),
+            .child(hero_visual);
+
+        // Exact 9x2 = 18 circular swatches: index 0 Auto (#8b5cf6) + 17 AVATAR_COLOR_CHOICES
+        let mut swatch_cells: Vec<AnyElement> = Vec::with_capacity(18);
+        let auto_selected = self.auto_avatar_color;
+        swatch_cells.push(
+            div()
+                .id("studio-color-swatch-auto")
+                .cursor_pointer()
+                .w(px(28.0))
+                .h(px(28.0))
+                .rounded_full()
+                .when(auto_selected, |el| el.border_1().border_color(accent_ring))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.auto_avatar_color = true;
+                        this.avatar_color = STUDIO_AUTO_HEX.to_string();
+                        this.use_dynamic_avatar = true;
+                        cx.notify();
+                    }),
                 )
-            } else {
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded_full()
+                        .bg(rgb(0x8B5CF6))
+                        .border_1()
+                        .border_color(border_dot),
+                )
+                .into_any_element(),
+        );
+        for (idx, choice) in AVATAR_COLOR_CHOICES.iter().enumerate() {
+            let swatch_hex = match *choice {
+                AvatarColorChoice::Hue { swatch, .. }
+                | AvatarColorChoice::Preset { swatch, .. } => swatch,
+            };
+            let normalized_hex = swatch_hex.to_ascii_lowercase();
+            let is_selected = !self.auto_avatar_color
+                && active_hex.eq_ignore_ascii_case(&normalized_hex);
+            let swatch_rgba =
+                parse_css_color_to_rgba(swatch_hex).unwrap_or_else(|| rgb(0x3B93F0));
+            let hex_for_click = normalized_hex.clone();
+            swatch_cells.push(
                 div()
-                    .w(px(64.0))
-                    .h(px(64.0))
+                    .id(SharedString::from(format!("studio-color-swatch-{idx}")))
+                    .cursor_pointer()
+                    .w(px(28.0))
+                    .h(px(28.0))
                     .rounded_full()
-                    .bg(rgb(preview_bg))
-                    .border_1()
-                    .border_color(rgba(0xFFFFFF38))
+                    .when(is_selected, |el| el.border_1().border_color(accent_ring))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(0xFFFFFF))
-                    .text_size(px(22.0))
-                    .font_weight(FontWeight::BOLD)
-                    .child(preview_initials)
-            });
-
-        let right_controls = if self.use_dynamic_avatar {
-            let style_tab = self.avatar_style_tab.min(2);
-            let style_tabs: [(u8, &str); 3] = [
-                (0, tr_str(lang, "毛绒 Plush", "Plush 3D")),
-                (1, tr_str(lang, "拟人 Bloub", "Bloub")),
-                (2, tr_str(lang, "几何 Grok", "Geometric")),
-            ];
-            let choices: Vec<(&'static str, &'static str)> = match style_tab {
-                0 => OPENBOT_PLUSH_AVATAR_PRESETS.to_vec(),
-                1 => OPENBOT_BLOUB_AVATAR_PRESETS.to_vec(),
-                _ => GROK_AVATAR_SHAPES.iter().map(|&s| (s, s)).collect(),
-            };
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .flex_1()
-                .min_w(px(0.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .children(style_tabs.into_iter().map(|(tab_id, label)| {
-                            let active = style_tab == tab_id;
-                            div()
-                                .id(SharedString::from(format!("fab-avatar-style-tab-{tab_id}")))
-                                .cursor_pointer()
-                                .px(px(8.0))
-                                .py(px(2.5))
-                                .rounded(px(999.0))
-                                .bg(if active {
-                                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16)
-                                } else {
-                                    rgb(pal.input_bg).into()
-                                })
-                                .border_1()
-                                .border_color(if active {
-                                    rgb(pal.accent).into()
-                                } else {
-                                    pal.separator_rgba()
-                                })
-                                .text_size(px(10.5))
-                                .font_weight(if active {
-                                    FontWeight::SEMIBOLD
-                                } else {
-                                    FontWeight::NORMAL
-                                })
-                                .text_color(rgb(if active {
-                                    pal.accent
-                                } else {
-                                    pal.text_secondary
-                                }))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.avatar_style_tab = tab_id;
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(label)
-                        })),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(4.0))
-                        .children(choices.into_iter().enumerate().map(|(idx, (shape, label))| {
-                            let active = self.avatar_shape.eq_ignore_ascii_case(shape);
-                            let shape_owned = shape.to_string();
-                            let opt_id = format!("create-bot-shape-opt-{style_tab}-{idx}");
-                            let btn_bg = if active {
-                                TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
-                            } else {
-                                rgb(pal.input_bg).into()
-                            };
-                            div()
-                                .id(SharedString::from(format!("fab-shape-pick-{style_tab}-{idx}")))
-                                .cursor_pointer()
-                                .px(px(6.0))
-                                .py(px(3.0))
-                                .rounded(px(8.0))
-                                .bg(btn_bg)
-                                .border_1()
-                                .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.avatar_shape = shape_owned.clone();
-                                        trigger_grok_avatar_bounce("create-bot-modal-preview");
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    render_grok_bot_avatar(
-                                        GrokBotAvatarProps::new(
-                                            opt_id.as_str(),
-                                            shape,
-                                            &self.avatar_color,
-                                            26.0,
-                                        )
-                                        .with_state(GrokPersonaState::Idle)
-                                        .with_paused(true)
-                                        .with_surface_bg(pal.input_bg),
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(10.5))
-                                        .font_weight(if active {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::NORMAL
-                                        })
-                                        .text_color(rgb(if active {
-                                            pal.text_primary
-                                        } else {
-                                            pal.text_secondary
-                                        }))
-                                        .child(label),
-                                )
-                        })),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(px(5.0))
-                        .children(GROK_COLOR_PALETTE.iter().enumerate().map(|(idx, spec)| {
-                            let active = self.avatar_color.eq_ignore_ascii_case(spec.id);
-                            let spec_id = spec.id;
-                            div()
-                                .id(SharedString::from(format!("fab-color-pick-{idx}")))
-                                .cursor_pointer()
-                                .w(px(20.0))
-                                .h(px(20.0))
-                                .rounded_full()
-                                .bg(rgb(spec.swatch_rgb))
-                                .border_2()
-                                .border_color(rgb(if active {
-                                    pal.text_primary
-                                } else if spec_id == "black" {
-                                    pal.border_fg
-                                } else {
-                                    pal.card_bg
-                                }))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.avatar_color = spec_id.to_string();
-                                        trigger_grok_avatar_bounce("create-bot-modal-preview");
-                                        cx.notify();
-                                    }),
-                                )
-                        })),
-                )
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .flex_1()
-                .min_w(px(0.0))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(pal.text_primary))
-                        .child(tr_str(
-                            lang,
-                            "已启用经典字母圆形头像",
-                            "Classic Initials Avatar Enabled",
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(pal.text_secondary))
-                        .child(tr_str(
-                            lang,
-                            "将使用名称首字母生成经典纯色头像；点击右上角「✦ 动态角色」可随时切回 Grok 角色。",
-                            "Uses classic circular initials. Switch to ✦ Dynamic anytime for an animated Grok character.",
-                        )),
-                )
-        };
-
-        div()
-            .id("create-bot-avatar-chooser-card")
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .p(px(10.0))
-            .rounded(px(10.0))
-            .bg(rgb(pal.card_bg))
-            .border_1()
-            .border_color(rgb(pal.border_fg))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(pal.text_primary))
-                            .child(tr_str(
-                                lang,
-                                "Grok Bot 动态角色头像",
-                                "Grok Dynamic Character",
-                            )),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.auto_avatar_color = false;
+                            this.avatar_color = hex_for_click.clone();
+                            this.use_dynamic_avatar = true;
+                            cx.notify();
+                        }),
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .id("create-bot-avatar-mode-dynamic")
-                                    .cursor_pointer()
-                                    .px(px(8.0))
-                                    .py(px(3.0))
-                                    .rounded(px(999.0))
-                                    .bg(rgb(if self.use_dynamic_avatar {
-                                        pal.accent
-                                    } else {
-                                        pal.input_bg
-                                    }))
-                                    .border_1()
-                                    .border_color(rgb(if self.use_dynamic_avatar {
-                                        pal.accent
-                                    } else {
-                                        pal.border_fg
-                                    }))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(if self.use_dynamic_avatar {
-                                        0xFFFFFF
-                                    } else {
-                                        pal.text_primary
-                                    }))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.use_dynamic_avatar = true;
-                                            trigger_grok_avatar_bounce("create-bot-modal-preview");
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "✦ 动态角色", "✦ Dynamic")),
-                            )
-                            .child(
-                                div()
-                                    .id("create-bot-avatar-mode-classic")
-                                    .cursor_pointer()
-                                    .px(px(8.0))
-                                    .py(px(3.0))
-                                    .rounded(px(999.0))
-                                    .bg(rgb(if !self.use_dynamic_avatar {
-                                        pal.accent
-                                    } else {
-                                        pal.input_bg
-                                    }))
-                                    .border_1()
-                                    .border_color(rgb(if !self.use_dynamic_avatar {
-                                        pal.accent
-                                    } else {
-                                        pal.border_fg
-                                    }))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(if !self.use_dynamic_avatar {
-                                        0xFFFFFF
-                                    } else {
-                                        pal.text_primary
-                                    }))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.use_dynamic_avatar = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "Aa 经典字母", "Aa Classic")),
-                            ),
-                    ),
-            )
-            .child(
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded_full()
+                            .bg(swatch_rgba)
+                            .border_1()
+                            .border_color(border_dot),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let row_1: Vec<AnyElement> = swatch_cells.drain(..9.min(swatch_cells.len())).collect();
+        let row_2: Vec<AnyElement> = swatch_cells;
+        let color_grid = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(4.0))
+            .child(div().flex().items_center().justify_center().gap(px(4.0)).children(row_1))
+            .child(div().flex().items_center().justify_center().gap(px(4.0)).children(row_2));
+
+        // Exact 12 selectable 33x33px 3D plush faces (24x24px preview, rainbow in Auto mode)
+        const RAINBOW_AUTO_HEX: [&str; 12] = [
+            "#8b5cf6", "#e8483f", "#3b93f0", "#e152b0", "#5d67ee", "#f08a24",
+            "#38bdf8", "#8b5cf6", "#e8483f", "#f27ba5", "#3b93f0", "#e8483f",
+        ];
+        let mut face_row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_center()
+            .gap(px(2.0));
+        for (idx, (shape, expr)) in STUDIO_FACE_CHOICES.iter().enumerate() {
+            let is_selected = self.use_dynamic_avatar && *shape == active_shape;
+            let face_color = if self.auto_avatar_color {
+                RAINBOW_AUTO_HEX[idx].to_string()
+            } else {
+                active_hex.clone()
+            };
+            let face_seed = format!("studio-face-{idx}-{}", shape.as_str());
+            let mut fp = AgentAvatarProps::new(&face_seed)
+                .with_size(24.0)
+                .with_hue_and_color(None, Some(face_color));
+            fp.shape_override = Some(*shape);
+            fp.expression_override = Some(*expr);
+            fp.eye_scale = 1.25;
+            fp.transition = PlushTransition::Cut;
+            fp.dark_scheme = dark;
+            let shape_spec = format!("plush:{}", shape.as_str());
+            face_row = face_row.child(
                 div()
+                    .id(SharedString::from(format!("studio-face-choice-{idx}")))
+                    .cursor_pointer()
+                    .w(px(33.0))
+                    .h(px(33.0))
+                    .rounded(px(8.0))
+                    .when(is_selected, |el| {
+                        el.bg(accent_soft).border_1().border_color(accent_ring)
+                    })
+                    .hover(move |s| if is_selected { s } else { s.bg(hover_bg) })
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .child(preview_stage)
-                    .child(right_controls),
-            )
+                    .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.avatar_shape = shape_spec.clone();
+                            this.use_dynamic_avatar = true;
+                            cx.notify();
+                        }),
+                    )
+                    .child(render_agent_avatar(&fp, None, 0.0)),
+            );
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(12.0))
+            .child(hero_btn)
+            .child(color_grid)
+            .child(face_row)
     }
 
     fn render_coding_agent_panel(
@@ -1402,227 +1432,271 @@ impl CreateManagedBotBoxPeers {
             .child(permission_pills)
             .child(toggles_row)
     }
-    fn render_template_gallery_panel(
+    /// Renders OpenBot's bottom `推荐` horizontal suggestion carousel (`256x112px` cards,
+    /// `42x42px` 3D plush, 6 OpenBot starter suggestions + all 24 Orca `BUILTIN_BOT_TEMPLATES`).
+    fn render_studio_suggestions_carousel(
         &self,
         pal: TdesktopThemePalette,
         lang: &str,
         cx: &mut Context<Self>,
     ) -> Div {
-        let active_cat = self.template_category_filter;
+        let ob = pal.openbot_palette();
+        let border = ob.border_strong_hairline();
+        let hover_bg = ob.hover();
+        let active_bg = ob.bg_control_active();
+        let accent_ring = ob.accent_text();
+        let accent_soft = ob.accent_soft();
+        let text_pri = ob.text_primary();
+        let text_muted = ob.text_muted();
         let is_zh = lang.starts_with("zh");
 
-        let mut cat_row = div().flex().flex_wrap().items_center().gap(px(4.0)).child(
-            div()
-                .id("tpl-cat-all")
-                .cursor_pointer()
-                .px(px(8.0))
-                .py(px(3.0))
-                .rounded(px(999.0))
-                .bg(if active_cat.is_none() {
-                    TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
-                } else {
-                    rgb(pal.card_bg).into()
-                })
-                .border_1()
-                .border_color(if active_cat.is_none() {
-                    rgb(pal.accent).into()
-                } else {
-                    pal.separator_rgba()
-                })
-                .text_size(px(10.5))
-                .font_weight(if active_cat.is_none() {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(rgb(if active_cat.is_none() {
-                    pal.accent
-                } else {
-                    pal.text_secondary
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.template_category_filter = None;
-                        cx.notify();
-                    }),
-                )
-                .child(tr_str(lang, "全部 (24)", "All (24)")),
-        );
+        let categories: [Option<BotTemplateCategory>; 7] = [
+            None,
+            Some(BotTemplateCategory::Personal),
+            Some(BotTemplateCategory::Planning),
+            Some(BotTemplateCategory::Coding),
+            Some(BotTemplateCategory::Support),
+            Some(BotTemplateCategory::Ops),
+            Some(BotTemplateCategory::Releases),
+        ];
 
-        for (idx, cat) in BotTemplateCategory::ALL.into_iter().enumerate() {
-            let selected = active_cat == Some(cat);
-            let label = if is_zh {
-                template_category_label_zh(cat)
-            } else {
-                cat.label()
-            };
-            cat_row = cat_row.child(
+        let cat_pills = div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .flex_wrap()
+            .children(categories.into_iter().enumerate().map(|(idx, cat)| {
+                let active = self.template_category_filter == cat;
+                let label = match cat {
+                    None => tr_str(lang, "全部", "All"),
+                    Some(c) => {
+                        if is_zh {
+                            template_category_label_zh(c)
+                        } else {
+                            c.label()
+                        }
+                    }
+                };
                 div()
-                    .id(SharedString::from(format!("tpl-cat-{idx}")))
+                    .id(SharedString::from(format!("studio-tpl-cat-{idx}")))
                     .cursor_pointer()
+                    .h(px(22.0))
                     .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(px(999.0))
-                    .bg(if selected {
-                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.18)
-                    } else {
-                        rgb(pal.card_bg).into()
-                    })
-                    .border_1()
-                    .border_color(if selected {
-                        rgb(pal.accent).into()
-                    } else {
-                        pal.separator_rgba()
-                    })
-                    .text_size(px(10.5))
-                    .font_weight(if selected {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .text_color(rgb(if selected {
-                        pal.accent
-                    } else {
-                        pal.text_secondary
-                    }))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(active_bg))
+                    .hover(move |s| if active { s } else { s.bg(hover_bg) })
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if active { text_pri } else { text_muted })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.template_category_filter = Some(cat);
+                            this.template_category_filter = cat;
                             cx.notify();
                         }),
                     )
-                    .child(label),
-            );
+                    .child(label)
+            }));
+
+        let mut cards: Vec<AnyElement> = Vec::new();
+
+        if self.template_category_filter.is_none() {
+            for (idx, sug) in STUDIO_STARTER_SUGGESTIONS.iter().enumerate() {
+                let selected = self.selected_template_id.as_deref() == Some(sug.id);
+                let title = if is_zh { sug.title_zh } else { sug.title_en };
+                let desc = if is_zh { sug.desc_zh } else { sug.desc_en };
+                let prompt = if is_zh { sug.prompt_zh } else { sug.prompt_en };
+                let plush = render_plush_bot_avatar(
+                    sug.id,
+                    Some(sug.shape),
+                    None,
+                    Some(sug.color_hex),
+                    42.0,
+                    AvatarMood::Idle,
+                    None,
+                );
+                let sug_id = sug.id;
+                let sug_shape = format!("plush:{}", sug.shape.as_str());
+                let sug_color = sug.color_hex;
+                cards.push(
+                    div()
+                        .id(SharedString::from(format!("studio-starter-card-{idx}")))
+                        .cursor_pointer()
+                        .w(px(256.0))
+                        .h(px(112.0))
+                        .flex_shrink_0()
+                        .p(px(16.0))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(if selected { accent_ring } else { border })
+                        .when(selected, |el| el.bg(accent_soft))
+                        .hover(move |s| if selected { s } else { s.bg(hover_bg) })
+                        .flex()
+                        .items_center()
+                        .gap(px(14.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.bot_name = title.to_string();
+                                this.description = prompt.to_string();
+                                this.avatar_shape = sug_shape.clone();
+                                this.avatar_color = sug_color.to_string();
+                                this.auto_avatar_color = false;
+                                this.use_dynamic_avatar = true;
+                                this.selected_template_id = Some(sug_id.to_string());
+                                this.selected_template_skills.clear();
+                                this.is_template_mode = false;
+                                this.is_coding_agent_mode = false;
+                                this.is_ai_mode = false;
+                                this.is_fabushi_mode = true;
+                                this.active_field = 1;
+                                cx.notify();
+                            }),
+                        )
+                        .child(plush)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(15.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text_pri)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .line_height(px(18.0))
+                                        .text_color(text_muted)
+                                        .child(desc),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
         }
 
-        let mut grid = div()
-            .id("create-bot-template-grid")
-            .w_full()
-            .max_h(px(230.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_wrap()
-            .gap(px(6.0));
-
-        for (idx, tpl) in BUILTIN_BOT_TEMPLATES.iter().enumerate() {
-            if let Some(filter_cat) = active_cat {
-                if tpl.category != filter_cat {
+        for (global_idx, tpl) in BUILTIN_BOT_TEMPLATES.iter().enumerate() {
+            if let Some(cat) = self.template_category_filter {
+                if tpl.category != cat {
                     continue;
                 }
             }
             let selected = self.selected_template_id.as_deref() == Some(tpl.id);
-            let plush_spec = template_plush_avatar_spec(idx);
-            let tpl_copy = *tpl;
-            let skill_badge = if is_zh {
-                format!("{} 项技能", tpl.bundled_skills.len())
-            } else {
-                format!("{} skills", tpl.bundled_skills.len())
-            };
-            grid = grid.child(
+            let shape = STUDIO_FACE_CHOICES[global_idx % STUDIO_FACE_CHOICES.len()].0;
+            let color_hex = parse_fabushi_hex_color(tpl.avatar_color)
+                .map(|c| format!("#{:06x}", c & 0xFF_FFFF));
+            let plush = render_plush_bot_avatar(
+                tpl.id,
+                Some(shape),
+                None,
+                color_hex.as_deref(),
+                42.0,
+                AvatarMood::Idle,
+                None,
+            );
+            cards.push(
                 div()
-                    .id(SharedString::from(format!("bot-tpl-card-{idx}")))
+                    .id(SharedString::from(format!("studio-orca-tpl-card-{global_idx}")))
                     .cursor_pointer()
-                    .w(px(244.0))
-                    .p(px(8.0))
-                    .rounded(px(10.0))
-                    .bg(if selected {
-                        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14)
-                    } else {
-                        rgb(pal.card_bg).into()
-                    })
+                    .w(px(256.0))
+                    .h(px(112.0))
+                    .flex_shrink_0()
+                    .p(px(16.0))
+                    .rounded(px(12.0))
                     .border_1()
-                    .border_color(if selected {
-                        rgb(pal.accent).into()
-                    } else {
-                        pal.separator_rgba()
-                    })
-                    .hover(|s| s.bg(rgb(pal.hover_bg)))
+                    .border_color(if selected { accent_ring } else { border })
+                    .when(selected, |el| el.bg(accent_soft))
+                    .hover(move |s| if selected { s } else { s.bg(hover_bg) })
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(14.0))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.apply_template(&tpl_copy, idx);
-                            trigger_grok_avatar_bounce("create-bot-modal-preview");
+                            if let Some(t) = BUILTIN_BOT_TEMPLATES.get(global_idx) {
+                                this.apply_template(t, global_idx);
+                            }
                             cx.notify();
                         }),
                     )
-                    .child(render_grok_bot_avatar(
-                        GrokBotAvatarProps::new(
-                            format!("tpl-prev-{idx}"),
-                            plush_spec,
-                            tpl.avatar_color,
-                            34.0,
-                        )
-                        .with_state(GrokPersonaState::Idle)
-                        .with_paused(true)
-                        .with_surface_bg(pal.card_bg),
-                    ))
+                    .child(plush)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
+                            .overflow_hidden()
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(px(4.0))
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(4.0))
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.text_primary))
-                                            .child(tpl.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .px(px(5.0))
-                                            .py(px(1.0))
-                                            .rounded(px(999.0))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                pal.accent, 0.14,
-                                            ))
-                                            .text_size(px(9.5))
-                                            .text_color(rgb(pal.accent))
-                                            .child(skill_badge),
-                                    ),
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(15.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text_pri)
+                                    .child(tpl.name),
                             )
                             .child(
                                 div()
-                                    .truncate()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_size(px(13.0))
+                                    .line_height(px(18.0))
+                                    .text_color(text_muted)
                                     .child(tpl.tagline),
                             ),
-                    ),
+                    )
+                    .into_any_element(),
             );
         }
 
         div()
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(10.0))
             .child(
                 div()
-                    .text_size(px(11.5))
-                    .text_color(rgb(pal.text_secondary))
-                    .child(tr_str(
-                        lang,
-                        "选择一个角色模板，自动填充人设、毛绒形象与内置技能并创建为原生消息机器人：",
-                        "Pick a role template to pre-fill persona, Plush avatar, and bundled skills as a native Bot:",
-                    )),
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_muted)
+                            .child(tr_str(lang, "推荐", "Suggestions")),
+                    )
+                    .child(cat_pills),
             )
-            .child(cat_row)
-            .child(grid)
+            .child(
+                div()
+                    .id("studio-suggestions-carousel-scroll")
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .pb(px(4.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .children(cards),
+            )
     }
 }
 
@@ -1632,15 +1706,15 @@ impl Render for CreateManagedBotBoxPeers {
             return div().into_any_element();
         }
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.as_str();
         let is_coding = self.is_coding_agent_mode;
         let is_template = self.is_template_mode && !is_coding;
-        let is_fabushi = self.is_fabushi_mode && !is_coding && !is_template;
-        let is_ai = self.is_ai_mode && !is_coding && !is_template && !is_fabushi;
+        let is_fabushi = (self.is_fabushi_mode || is_template) && !is_coding;
+        let is_ai = self.is_ai_mode && !is_coding && !is_fabushi;
+        let is_token = !is_coding && !is_fabushi && !is_ai;
         let prompt = self.nl_prompt.clone();
-        let can_submit = if is_template {
-            false
-        } else if is_coding || is_fabushi {
+        let can_submit = if is_coding || is_fabushi {
             self.is_valid() && !self.is_submitting
         } else if is_ai {
             !prompt.trim().is_empty() && !self.is_submitting
@@ -1648,420 +1722,846 @@ impl Render for CreateManagedBotBoxPeers {
             self.is_valid() && !self.is_submitting
         };
 
-        let presets: [(&str, &str); 3] = [
-            ("☕ 咖啡点单", "创建一个精品咖啡点单和会员积分小程序"),
-            ("✅ 团队待办", "创建一个支持分配负责人、优先级和 AI 总结的待办清单小程序"),
-            ("📊 投票决策", "创建一个实时团队投票和数据分析小程序"),
-        ];
-        let preview_label = if self.bot_name.trim().is_empty() {
-            "FB"
-        } else {
-            self.bot_name.as_str()
-        };
-        let avatar_chooser_card = self.render_avatar_chooser_card(preview_label, pal, lang, cx);
+        let bg_canvas = ob.bg_canvas();
+        let bg_control = ob.bg_control();
+        let bg_surface = ob.bg_surface();
+        let bg_active = ob.bg_control_active();
+        let hover_bg = ob.hover();
+        let border_subtle = ob.border();
+        let border_strong = ob.border_strong_hairline();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+        let danger = ob.danger();
+        let cta_bg = ob.surface_light();
+        let cta_fg = ob.text_on_light();
 
-        div()
-            .id("create-managed-bot-modal")
-            .w(if is_coding || is_template { px(560.0) } else { self.width })
-            .min_h(self.height)
-            .p(px(16.0))
-            .rounded(px(14.0))
-            .bg(rgb(pal.modal_bg))
-            .border_1()
-            .border_color(rgb(pal.border_fg))
-            .shadow_lg()
+        let (active_shape, _) = resolve_studio_shape_and_expr(&self.avatar_shape);
+        let active_hex = resolve_studio_hex(&self.avatar_color, self.auto_avatar_color);
+        let header_name = if self.bot_name.trim().is_empty() {
+            tr_str(lang, "新助手", "New agent").to_string()
+        } else {
+            self.bot_name.trim().to_string()
+        };
+        let header_plush = render_plush_bot_avatar(
+            &header_name,
+            Some(active_shape),
+            None,
+            Some(&active_hex),
+            18.0,
+            AvatarMood::Idle,
+            None,
+        );
+
+        let mode_pill = |id: &'static str, label: &'static str, active: bool| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .when(active, |el| el.bg(bg_active))
+                .hover(move |s| if active { s } else { s.bg(hover_bg) })
+                .flex()
+                .items_center()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if active { text_pri } else { text_muted })
+                .child(label)
+        };
+
+        let header = div()
+            .id("create-bot-studio-header")
+            .h(px(38.0))
+            .flex_shrink_0()
+            .w_full()
+            .px(px(12.0))
+            .border_b_1()
+            .border_color(border_subtle)
             .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap(px(7.0))
+                    .child(header_plush)
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(tg_icon(IconName::BotRobot, 20.0, pal.accent))
-                            .child(
-                                div()
-                                    .text_size(px(15.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(pal.text_primary))
-                                    .child(if is_coding {
-                                        tr_str(lang, "新建编程智能体 (Coding Agent)", "New Coding Agent Bot")
-                                    } else if is_template {
-                                        tr_str(lang, "从角色模板创建机器人 (24 套)", "Create Bot from Template (24)")
-                                    } else if is_fabushi {
-                                        tr_str(lang, "新建 Fabushi Bot 智能体", "New Fabushi Bot Agent")
-                                    } else if is_ai {
-                                        tr_str(lang, "BotFather · AI 快速创建", "BotFather · AI Bot & Mini App")
-                                    } else {
-                                        tr_str(lang, "BotFather · 连接托管 Bot", "BotFather · Connect Managed Bot")
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("create-managed-bot-close-btn")
-                            .cursor_pointer()
-                            .p(px(4.0))
-                            .rounded_full()
-                            .hover(|s| s.bg(rgb(pal.hover_bg)))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.is_visible = false;
-                                this.pending_close = true;
-                                cx.notify();
-                            }))
-                            .child(tg_icon(IconName::Close, 16.0, pal.icon_fg)),
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(text_pri)
+                            .child(header_name),
                     ),
             )
             .child(
                 div()
                     .flex()
-                    .gap(px(5.0))
+                    .items_center()
+                    .gap(px(3.0))
+                    .flex_shrink_0()
                     .child(
-                        div()
-                            .id("create-bot-tab-fabushi")
-                            .cursor_pointer()
-                            .flex_1()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(if is_fabushi { pal.accent } else { pal.card_bg }))
-                            .flex()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if is_fabushi { 0xFFFFFF } else { pal.text_primary }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.open_fabushi_creator();
-                                cx.notify();
-                            }))
-                            .child(tr_str(lang, "✦ 智能体", "✦ Agent")),
+                        mode_pill("create-bot-tab-fabushi", tr_str(lang, "助手", "Agent"), is_fabushi)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_fabushi_creator();
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .child(
-                        div()
-                            .id("create-bot-tab-templates")
-                            .cursor_pointer()
-                            .flex_1()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(if is_template { pal.accent } else { pal.card_bg }))
-                            .flex()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if is_template { 0xFFFFFF } else { pal.text_primary }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.open_template_creator();
-                                cx.notify();
-                            }))
-                            .child(tr_str(lang, "📦 模板(24)", "📦 Templates")),
+                        mode_pill("create-bot-tab-coding", tr_str(lang, "编程", "Coding"), is_coding)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_coding_agent_creator();
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .child(
-                        div()
-                            .id("create-bot-tab-coding")
-                            .cursor_pointer()
-                            .flex_1()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(if is_coding { pal.accent } else { pal.card_bg }))
-                            .flex()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if is_coding { 0xFFFFFF } else { pal.text_primary }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.open_coding_agent_creator();
-                                cx.notify();
-                            }))
-                            .child(tr_str(lang, "💻 编程", "💻 Coding")),
-                    )
-                    .child(
-                        div()
-                            .id("create-bot-tab-ai")
-                            .cursor_pointer()
-                            .flex_1()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(if is_ai { pal.accent } else { pal.card_bg }))
-                            .flex()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if is_ai { 0xFFFFFF } else { pal.text_primary }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        mode_pill("create-bot-tab-ai", "AI", is_ai).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
                                 this.open_ai_creator();
                                 cx.notify();
-                            }))
-                            .child(tr_str(lang, "⚡ 一句话", "⚡ AI")),
+                            }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("create-bot-tab-manual")
-                            .cursor_pointer()
-                            .flex_1()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(if !is_coding && !is_template && !is_fabushi && !is_ai { pal.accent } else { pal.card_bg }))
-                            .flex()
-                            .justify_center()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if !is_coding && !is_template && !is_fabushi && !is_ai { 0xFFFFFF } else { pal.text_primary }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        mode_pill("create-bot-tab-manual", "Token", is_token).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
                                 this.is_coding_agent_mode = false;
                                 this.is_template_mode = false;
                                 this.is_fabushi_mode = false;
                                 this.is_ai_mode = false;
                                 this.active_field = 1;
                                 cx.notify();
-                            }))
-                            .child(tr_str(lang, "🔑 Token", "🔑 Token")),
-                    ),
-            )
-            .when(!is_template, |el| el.child(avatar_chooser_card))
-            .when(is_template, |el| el.child(self.render_template_gallery_panel(pal, lang, cx)))
-            .when(is_coding, |el| el.child(self.render_coding_agent_panel(pal, lang, cx)))
-            .when(is_fabushi, |el| {
-                let fab_fields: [(u8, &str, &str, String); 4] = [
-                    (
-                        1,
-                        tr_str(lang, "智能体名称 *", "Agent Name *"),
-                        tr_str(lang, "例如：Research Lead", "e.g. Research Lead"),
-                        self.bot_name.clone(),
-                    ),
-                    (
-                        2,
-                        tr_str(lang, "@用户名（可选，留空自动生成 *_bot）", "@username (optional, auto *_bot)"),
-                        tr_str(lang, "留空自动生成 research_lead_bot", "Leave blank for auto *_bot"),
-                        self.bot_username.clone(),
-                    ),
-                    (
-                        3,
-                        tr_str(lang, "人设与职责 (SOUL / Mandate)", "Persona & Mandate (SOUL)"),
-                        tr_str(lang, "描述其职责与记忆边界…", "Describe capabilities and persona…"),
-                        self.description.clone(),
-                    ),
-                    (
-                        4,
-                        tr_str(lang, "首选模型（可选）", "Preferred Model (optional)"),
-                        tr_str(lang, "留空继承 Host Active Provider", "Inherit Host Active Provider"),
-                        self.preferred_model.clone(),
-                    ),
-                ];
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .children(fab_fields.into_iter().map(|(fid, label, placeholder, val)| {
-                            let active = self.active_field == fid;
-                            div()
-                                .id(("fab-field", fid as u64))
-                                .cursor_pointer()
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(pal.input_bg))
-                                .border_1()
-                                .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                    this.active_field = fid;
+                            }),
+                        ),
+                    )
+                    .child(div().w(px(1.0)).h(px(14.0)).mx(px(4.0)).bg(border_strong))
+                    .child(
+                        div()
+                            .id("create-managed-bot-close-btn")
+                            .cursor_pointer()
+                            .h(px(26.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .text_size(px(12.0))
+                            .text_color(text_muted)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.is_visible = false;
+                                    this.pending_close = true;
                                     cx.notify();
-                                }))
-                                .child(div().text_size(px(10.5)).text_color(rgb(pal.text_secondary)).child(label))
-                                .child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .text_color(rgb(if val.is_empty() { pal.text_secondary } else { pal.text_primary }))
-                                        .child(if val.is_empty() { placeholder.to_string() } else { val }),
-                                )
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(tr_str(lang, "思考:", "Think:")))
-                                        .children(["off", "low", "medium", "high"].into_iter().enumerate().map(|(idx, lvl)| {
-                                            let active = self.thinking_level == lvl;
-                                            let owned = lvl.to_string();
-                                            div()
-                                                .id(SharedString::from(format!("fab-think-pick-{idx}")))
-                                                .cursor_pointer()
-                                                .px(px(6.0))
-                                                .py(px(2.5))
-                                                .rounded(px(6.0))
-                                                .bg(rgb(if active { pal.accent } else { pal.card_bg }))
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(if active { 0xFFFFFF } else { pal.text_primary }))
-                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                }),
+                            )
+                            .child(tr_str(lang, "取消", "Cancel")),
+                    ),
+            );
+
+        let model_display = if self.preferred_model.trim().is_empty() {
+            "GPT-6-Luna".to_string()
+        } else {
+            self.preferred_model.trim().to_string()
+        };
+        let think_display = thinking_level_label(&self.thinking_level, lang);
+
+        let fabushi_body = is_fabushi.then(|| {
+            let avatar_picker = self.render_studio_avatar_picker(pal, cx);
+            let suggestions = self.render_studio_suggestions_carousel(pal, lang, cx);
+            let name_active = self.active_field == 1;
+            let desc_active = self.active_field == 3;
+            let user_active = self.active_field == 2;
+            let model_field_active = self.active_field == 4;
+
+            let model_dropdown = self.model_picker_open.then(|| {
+                div()
+                    .id("studio-model-picker-dropdown")
+                    .w_full()
+                    .p(px(8.0))
+                    .rounded(px(10.0))
+                    .bg(bg_surface)
+                    .border_1()
+                    .border_color(border_strong)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(STUDIO_MODEL_CHOICES.into_iter().enumerate().map(|(idx, (id_val, lbl))| {
+                                let selected = self.preferred_model.trim() == id_val;
+                                let owned = id_val.to_string();
+                                div()
+                                    .id(SharedString::from(format!("studio-model-opt-{idx}")))
+                                    .cursor_pointer()
+                                    .h(px(30.0))
+                                    .px(px(8.0))
+                                    .rounded(px(6.0))
+                                    .when(selected, |el| el.bg(bg_active))
+                                    .hover(move |s| if selected { s } else { s.bg(hover_bg) })
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .text_size(px(13.0))
+                                    .text_color(if selected { text_pri } else { text_sec })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.preferred_model = owned.clone();
+                                            this.model_picker_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(lbl)
+                            })),
+                    )
+                    .child(div().h(px(1.0)).w_full().bg(border_subtle))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(text_muted)
+                                    .child(tr_str(lang, "推理深度", "Reasoning")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .children(["off", "low", "medium", "high"].into_iter().enumerate().map(|(idx, lvl)| {
+                                        let active = self.thinking_level == lvl;
+                                        let owned = lvl.to_string();
+                                        div()
+                                            .id(SharedString::from(format!("fab-think-pick-{idx}")))
+                                            .cursor_pointer()
+                                            .h(px(24.0))
+                                            .px(px(8.0))
+                                            .rounded(px(6.0))
+                                            .when(active, |el| el.bg(bg_active))
+                                            .hover(move |s| if active { s } else { s.bg(hover_bg) })
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(12.0))
+                                            .text_color(if active { text_pri } else { text_muted })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
                                                     this.thinking_level = owned.clone();
                                                     cx.notify();
-                                                }))
-                                                .child(lvl)
-                                        })),
+                                                }),
+                                            )
+                                            .child(thinking_level_label(lvl, lang))
+                                    })),
+                            ),
+                    )
+            });
+
+            let advanced_section = self.advanced_open.then(|| {
+                div()
+                    .w_full()
+                    .p(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(bg_control)
+                    .border_1()
+                    .border_color(border_strong)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("fab-field-username")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(bg_canvas)
+                            .border_1()
+                            .border_color(if user_active { text_muted } else { border_strong })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.active_field = 2;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(text_muted)
+                                    .child(tr_str(lang, "@用户名 (可选，自动生成 *_bot)", "@username (optional)")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(if self.bot_username.is_empty() { text_muted } else { text_pri })
+                                    .child(if self.bot_username.is_empty() {
+                                        "auto_agent_bot".to_string()
+                                    } else {
+                                        self.bot_username.clone()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("fab-field-custom-model")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(bg_canvas)
+                            .border_1()
+                            .border_color(if model_field_active { text_muted } else { border_strong })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.active_field = 4;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(text_muted)
+                                    .child(tr_str(lang, "自定义模型 ID (可选)", "Custom model ID (optional)")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(if self.preferred_model.is_empty() { text_muted } else { text_pri })
+                                    .child(if self.preferred_model.is_empty() {
+                                        tr_str(lang, "留空继承默认模型", "Inherit default").to_string()
+                                    } else {
+                                        self.preferred_model.clone()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(div().text_size(px(11.5)).text_color(text_muted).child(tr_str(lang, "审批", "Approval")))
+                                    .children(["prompt", "autonomous", "strict"].into_iter().enumerate().map(|(idx, mode)| {
+                                        let active = self.approval_mode == mode;
+                                        let owned = mode.to_string();
+                                        div()
+                                            .id(SharedString::from(format!("fab-app-pick-{idx}")))
+                                            .cursor_pointer()
+                                            .h(px(22.0))
+                                            .px(px(7.0))
+                                            .rounded(px(6.0))
+                                            .when(active, |el| el.bg(bg_active))
+                                            .hover(move |s| if active { s } else { s.bg(hover_bg) })
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(11.0))
+                                            .text_color(if active { text_pri } else { text_muted })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.approval_mode = owned.clone();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(if mode == "autonomous" { "auto" } else { mode })
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("studio-toggle-classic-avatar")
+                                    .cursor_pointer()
+                                    .h(px(22.0))
+                                    .px(px(7.0))
+                                    .rounded(px(6.0))
+                                    .when(!self.use_dynamic_avatar, |el| el.bg(bg_active))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(11.0))
+                                    .text_color(if !self.use_dynamic_avatar { text_pri } else { text_muted })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.use_dynamic_avatar = !this.use_dynamic_avatar;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if self.use_dynamic_avatar {
+                                        tr_str(lang, "3D 毛绒头像", "3D Plush")
+                                    } else {
+                                        tr_str(lang, "经典首字母", "Classic")
+                                    }),
+                            ),
+                    )
+            });
+
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .justify_between()
+                .gap(px(24.0))
+                .child(
+                    div()
+                        .w(px(420.0))
+                        .max_w_full()
+                        .mx_auto()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(avatar_picker)
+                        .child(
+                            div()
+                                .w_full()
+                                .mt(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(5.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(3.0))
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(text_sec)
+                                                .child(tr_str(lang, "名称", "Name"))
+                                                .child(div().text_color(danger).child("*")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("fab-field-1")
+                                                .cursor_pointer()
+                                                .w_full()
+                                                .h(px(38.0))
+                                                .px(px(12.0))
+                                                .rounded(px(8.0))
+                                                .bg(bg_control)
+                                                .border_1()
+                                                .border_color(if name_active { text_muted } else { border_strong })
+                                                .flex()
+                                                .items_center()
+                                                .text_size(px(14.0))
+                                                .text_color(if self.bot_name.is_empty() { text_muted } else { text_pri })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.active_field = 1;
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(if self.bot_name.is_empty() {
+                                                    tr_str(lang, "新助手", "New agent").to_string()
+                                                } else if name_active {
+                                                    format!("{}|", self.bot_name)
+                                                } else {
+                                                    self.bot_name.clone()
+                                                }),
+                                        ),
                                 )
                                 .child(
                                     div()
                                         .flex()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(tr_str(lang, "审批:", "Approval:")))
-                                        .children(["prompt", "autonomous", "strict"].into_iter().enumerate().map(|(idx, mode)| {
-                                            let active = self.approval_mode == mode;
-                                            let owned = mode.to_string();
+                                        .flex_col()
+                                        .gap(px(5.0))
+                                        .child(
                                             div()
-                                                .id(SharedString::from(format!("fab-app-pick-{idx}")))
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(text_sec)
+                                                .child(tr_str(
+                                                    lang,
+                                                    "这个助手要帮你做什么？",
+                                                    "What should this agent help you with?",
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("fab-field-3")
                                                 .cursor_pointer()
-                                                .px(px(6.0))
-                                                .py(px(2.5))
-                                                .rounded(px(6.0))
-                                                .bg(rgb(if active { pal.accent } else { pal.card_bg }))
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(if active { 0xFFFFFF } else { pal.text_primary }))
-                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                    this.approval_mode = owned.clone();
-                                                    cx.notify();
-                                                }))
-                                                .child(if mode == "autonomous" { "yolo" } else { mode })
-                                        })),
+                                                .w_full()
+                                                .min_h(px(64.0))
+                                                .max_h(px(180.0))
+                                                .p(px(10.0))
+                                                .rounded(px(8.0))
+                                                .bg(bg_control)
+                                                .border_1()
+                                                .border_color(if desc_active { text_muted } else { border_strong })
+                                                .text_size(px(13.5))
+                                                .line_height(px(19.0))
+                                                .text_color(if self.description.is_empty() { text_muted } else { text_pri })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.active_field = 3;
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(if self.description.is_empty() {
+                                                    tr_str(
+                                                        lang,
+                                                        "规划行程、比较方案，或者处理日常工作。",
+                                                        "Plan trips, compare options, or handle daily work.",
+                                                    )
+                                                    .to_string()
+                                                } else if desc_active {
+                                                    format!("{}|", self.description)
+                                                } else {
+                                                    self.description.clone()
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("studio-model-selector-row")
+                                        .cursor_pointer()
+                                        .w_full()
+                                        .h(px(44.0))
+                                        .px(px(12.0))
+                                        .rounded(px(8.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(if self.model_picker_open { text_muted } else { border_strong })
+                                        .hover(move |s| s.bg(bg_active))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.model_picker_open = !this.model_picker_open;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(text_pri)
+                                                .child(tr_str(lang, "模型", "Model")),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .text_size(px(13.0))
+                                                .text_color(text_sec)
+                                                .child(format!("{model_display} · {think_display}"))
+                                                .child(tg_icon_rgba(IconName::ChevronDown, 12.0, text_muted)),
+                                        ),
+                                )
+                                .when_some(model_dropdown, |el, dd| el.child(dd))
+                                .child(
+                                    div()
+                                        .id("studio-advanced-toggle")
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap(px(4.0))
+                                        .text_size(px(11.5))
+                                        .text_color(text_muted)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.advanced_open = !this.advanced_open;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if self.advanced_open {
+                                            tr_str(lang, "收起高级选项", "Hide advanced")
+                                        } else {
+                                            tr_str(lang, "高级选项 (@用户名 / 审批)", "Advanced (@username / approval)")
+                                        }),
+                                )
+                                .when_some(advanced_section, |el, adv| el.child(adv))
+                                .when_some(self.status_message.clone(), |el, msg| {
+                                    el.child(div().text_size(px(12.0)).text_color(ob.success()).child(msg))
+                                })
+                                .child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .w_full()
+                                        .flex()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .id("create-managed-bot-submit-btn")
+                                                .cursor_pointer()
+                                                .min_w(px(132.0))
+                                                .h(px(36.0))
+                                                .px(px(18.0))
+                                                .rounded(px(8.0))
+                                                .bg(cta_bg)
+                                                .when(!can_submit, |el| el.opacity(0.42))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(13.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(cta_fg)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.submit();
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(if self.is_submitting {
+                                                    tr_str(lang, "正在创建助手…", "Creating agent…")
+                                                } else {
+                                                    tr_str(lang, "创建助手", "Create agent")
+                                                }),
+                                        ),
                                 ),
                         ),
                 )
-            })
-            .when(is_ai, |el| {
-                el.child(
+                .child(suggestions)
+        });
+
+        let presets: [(&str, &str); 3] = [
+            ("☕ 咖啡点单", "创建一个精品咖啡点单和会员积分小程序"),
+            ("✅ 团队待办", "创建一个支持分配负责人、优先级和 AI 总结的待办清单小程序"),
+            ("📊 投票决策", "创建一个实时团队投票和数据分析小程序"),
+        ];
+
+        let secondary_submit = (!is_fabushi).then(|| {
+            div()
+                .mt(px(8.0))
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
                     div()
+                        .id("create-managed-bot-submit-btn")
+                        .cursor_pointer()
+                        .min_w(px(164.0))
+                        .h(px(36.0))
+                        .px(px(18.0))
+                        .rounded(px(8.0))
+                        .bg(cta_bg)
+                        .when(!can_submit, |el| el.opacity(0.42))
                         .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
-                                .child(tr_str(
-                                    lang,
-                                    "描述你想要的机器人和小程序，系统将自动创建可交互 Mini App 并绑定专属 AI 伴侣机器人：",
-                                    "Describe the Bot + Mini App you want. Companion AI Bot + interactive Mini App will be provisioned automatically:",
-                                )),
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cta_fg)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.submit();
+                                cx.notify();
+                            }),
                         )
-                        .child(
-                            div()
-                                .id("create-managed-bot-nl-input")
-                                .w_full()
-                                .min_h(px(76.0))
-                                .p(px(10.0))
-                                .rounded(px(10.0))
-                                .bg(rgb(pal.input_bg))
-                                .border_1()
-                                .border_color(rgb(pal.accent))
-                                .text_size(px(13.0))
-                                .text_color(rgb(if prompt.is_empty() { pal.text_secondary } else { pal.text_primary }))
-                                .child(if prompt.is_empty() {
-                                    tr_str(lang, "例如：帮我做一个极简咖啡点单小程序和AI店长…", "e.g., Build a specialty coffee ordering Mini App with AI barista…").to_string()
-                                } else {
-                                    prompt
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(6.0))
-                                .children(presets.into_iter().map(|(pill, full)| {
-                                    let full_owned = full.to_string();
-                                    div()
-                                        .cursor_pointer()
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(999.0))
-                                        .bg(rgb(pal.card_bg))
-                                        .border_1()
-                                        .border_color(rgb(pal.border_fg))
-                                        .hover(|s| s.bg(rgb(pal.hover_bg)))
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(pal.text_link))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                            this.nl_prompt = full_owned.clone();
-                                            cx.notify();
-                                        }))
-                                        .child(pill)
-                                })),
-                        ),
+                        .child(if self.is_submitting {
+                            tr_str(lang, "正在创建…", "Provisioning…")
+                        } else if is_coding {
+                            tr_str(lang, "创建编程助手", "Create Coding Agent")
+                        } else if is_ai {
+                            tr_str(lang, "立即生成助手", "Create AI Agent")
+                        } else {
+                            tr_str(lang, "保存并连接", "Connect Bot")
+                        }),
                 )
-            })
-            .when(!is_coding && !is_template && !is_fabushi && !is_ai, |el| {
-                let fields: [(u8, &str, String); 3] = [
-                    (1, "Bot Name", self.bot_name.clone()),
-                    (2, "@username (must end with bot)", self.bot_username.clone()),
-                    (3, "HTTP API Token", self.bot_token.clone()),
-                ];
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .children(fields.into_iter().map(|(fid, label, val)| {
-                            let active = self.active_field == fid;
-                            div()
-                                .id(("adv-bot-field", fid as u64))
-                                .cursor_pointer()
-                                .p(px(9.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(pal.input_bg))
-                                .border_1()
-                                .border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                    this.active_field = fid;
-                                    cx.notify();
-                                }))
-                                .child(div().text_size(px(11.0)).text_color(rgb(pal.text_secondary)).child(label))
-                                .child(div().text_size(px(13.0)).text_color(rgb(pal.text_primary)).child(if val.is_empty() { "—".to_string() } else { val }))
-                        })),
-                )
-            })
-            .when_some(self.status_message.clone(), |el, msg| {
-                el.child(div().text_size(px(12.0)).text_color(rgb(pal.success)).child(msg))
-            })
+        });
+
+        div()
+            .id("create-managed-bot-modal")
+            .w(px(860.0))
+            .max_w(px(900.0))
+            .max_h(px(740.0))
+            .rounded(px(14.0))
+            .bg(bg_canvas)
+            .border_1()
+            .border_color(ob.border_hairline())
+            .shadow(pal.popover_shadows())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .child(header)
             .child(
                 div()
-                    .id("create-managed-bot-submit-btn")
-                    .cursor_pointer()
-                    .w_full()
-                    .h(px(36.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(if can_submit { pal.accent } else { pal.muted_badge_bg }))
+                    .id("create-bot-studio-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .px(px(24.0))
+                    .py(px(20.0))
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(13.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xFFFFFF))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                        this.submit();
-                        cx.notify();
-                    }))
-                    .child(if self.is_submitting {
-                        tr_str(lang, "正在创建并部署…", "Provisioning…")
-                    } else if is_coding {
-                        tr_str(lang, "💻 创建本地编程智能体", "💻 Create Coding Agent Bot")
-                    } else if is_fabushi {
-                        tr_str(lang, "✦ 创建独立 Fabushi 智能体", "✦ Create Isolated Fabushi Agent")
-                    } else if is_ai {
-                        tr_str(lang, "✨ 立即创建 Bot & 小程序", "✨ Create Bot & Mini App")
-                    } else {
-                        tr_str(lang, "保存并连接 Bot", "Connect Managed Bot")
-                    }),
+                    .flex_col()
+                    .gap(px(14.0))
+                    .when_some(fabushi_body, |el, body| el.child(body))
+                    .when(is_coding, |el| {
+                        el.child(
+                            div()
+                                .w(px(560.0))
+                                .max_w_full()
+                                .mx_auto()
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .child(self.render_coding_agent_panel(pal, lang, cx))
+                                .when_some(self.status_message.clone(), |el, msg| {
+                                    el.child(div().text_size(px(12.0)).text_color(ob.success()).child(msg))
+                                }),
+                        )
+                    })
+                    .when(is_ai, |el| {
+                        el.child(
+                            div()
+                                .w(px(460.0))
+                                .max_w_full()
+                                .mx_auto()
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(text_sec)
+                                        .child(tr_str(
+                                            lang,
+                                            "描述你想要的助手与小程序，系统将自动创建可交互 Mini App 并绑定专属 AI 助手：",
+                                            "Describe the Bot + Mini App you want to generate:",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("create-managed-bot-nl-input")
+                                        .w_full()
+                                        .min_h(px(90.0))
+                                        .p(px(12.0))
+                                        .rounded(px(8.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(border_strong)
+                                        .text_size(px(13.5))
+                                        .text_color(if prompt.is_empty() { text_muted } else { text_pri })
+                                        .child(if prompt.is_empty() {
+                                            tr_str(
+                                                lang,
+                                                "例如：帮我做一个极简咖啡点单小程序和 AI 店长…",
+                                                "e.g. Build a specialty coffee ordering Mini App with AI barista…",
+                                            )
+                                            .to_string()
+                                        } else {
+                                            prompt
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(6.0))
+                                        .children(presets.into_iter().map(|(pill, full)| {
+                                            let full_owned = full.to_string();
+                                            div()
+                                                .cursor_pointer()
+                                                .px(px(10.0))
+                                                .py(px(4.0))
+                                                .rounded(px(8.0))
+                                                .bg(bg_control)
+                                                .border_1()
+                                                .border_color(border_strong)
+                                                .hover(move |s| s.bg(hover_bg))
+                                                .text_size(px(12.0))
+                                                .text_color(text_sec)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.nl_prompt = full_owned.clone();
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(pill)
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(is_token, |el| {
+                        let fields: [(u8, &str, String); 3] = [
+                            (1, tr_str(lang, "助手名称", "Bot Name"), self.bot_name.clone()),
+                            (2, tr_str(lang, "@用户名 (以 bot 结尾)", "@username (ends with bot)"), self.bot_username.clone()),
+                            (3, "HTTP API Token", self.bot_token.clone()),
+                        ];
+                        el.child(
+                            div()
+                                .w(px(420.0))
+                                .max_w_full()
+                                .mx_auto()
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .children(fields.into_iter().map(|(fid, label, val)| {
+                                    let active = self.active_field == fid;
+                                    div()
+                                        .id(("adv-bot-field", fid as u64))
+                                        .cursor_pointer()
+                                        .p(px(10.0))
+                                        .rounded(px(8.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(if active { text_muted } else { border_strong })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.active_field = fid;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(div().text_size(px(11.5)).text_color(text_muted).child(label))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .text_color(if val.is_empty() { text_muted } else { text_pri })
+                                                .child(if val.is_empty() { "—".to_string() } else { val }),
+                                        )
+                                })),
+                        )
+                    })
+                    .when_some(secondary_submit, |el, btn| el.child(btn)),
             )
             .into_any_element()
     }
@@ -2070,6 +2570,8 @@ impl Render for CreateManagedBotBoxPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::grok_bot_avatar::GROK_COLOR_PALETTE;
+    use gpui_telegram_proto::miniapp_contracts::GROK_AVATAR_SHAPES;
 
     #[std::prelude::v1::test]
     fn test_create_bot_box_defaults_and_dynamic_classic_toggle() {

@@ -1,4 +1,4 @@
-use crate::theme::palette::TdesktopThemePalette;
+use crate::views::app_shell::modal_container::macos_modal_backdrop_rgba;
 use crate::views::boxes::modal_render_gifts_stories::{
     render_send_credits, render_star_gifts, render_stories_viewer,
 };
@@ -133,7 +133,7 @@ pub fn render_dialog_overlay<V: 'static>(
         .top_0()
         .left_0()
         .size_full()
-        .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.58))
+        .bg(macos_modal_backdrop_rgba(dlg.palette))
         .flex()
         .items_center()
         .justify_center()

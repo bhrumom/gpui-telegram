@@ -1267,5 +1267,90 @@ impl AppShell {
                 cx,
             );
         }
+
+        let (ob_add_action, stop_turn, start_live_voice) = self.composer.update(cx, |c, _| {
+            (
+                c.take_openbot_add_action(),
+                c.take_stop_active_turn(),
+                c.take_live_voice_start(),
+            )
+        });
+        if stop_turn {
+            self.stage.update(cx, |st, scx| {
+                st.set_bot_activity("idle", None);
+                scx.notify();
+            });
+            self.composer.update(cx, |c, ccx| {
+                c.set_agent_busy(false);
+                ccx.notify();
+            });
+            if !self.bot_fusion.snapshot.queue_paused
+                && !self.bot_fusion.snapshot.queue_items.is_empty()
+            {
+                self.bot_fusion_queue_toggle_pause(cx);
+            }
+            self.show_toast(
+                tr_str(lang, "已停止当前回复", "Stopped active response"),
+                1800,
+                cx,
+            );
+        }
+        if start_live_voice {
+            self.activate_nav_destination(crate::views::nav_rail::NavDestination::TalkMode, cx);
+        }
+        if let Some(add_act) = ob_add_action {
+            use crate::views::composer::popups_ui::ComposerOpenBotAddAction;
+            match add_act {
+                ComposerOpenBotAddAction::TeachTask => {
+                    self.activate_nav_destination(
+                        crate::views::nav_rail::NavDestination::Browser,
+                        cx,
+                    );
+                }
+                ComposerOpenBotAddAction::SideQuestion => {
+                    let draft = self.composer.update(cx, |c, ccx| {
+                        let t = c.text().trim().to_string();
+                        if !t.is_empty() {
+                            c.set_text(String::new());
+                            ccx.notify();
+                        }
+                        t
+                    });
+                    if !draft.is_empty() {
+                        self.bot_fusion_ask_side_question(draft, cx);
+                    } else {
+                        self.composer.update(cx, |c, ccx| {
+                            c.set_text("$side ".to_string());
+                            c.is_input_focused = true;
+                            ccx.notify();
+                        });
+                    }
+                }
+                ComposerOpenBotAddAction::Workflows => {
+                    self.toggle_bot_companion_panel(
+                        Some(crate::views::drawer::BotCompanionTab::Workflow),
+                        cx,
+                    );
+                }
+                ComposerOpenBotAddAction::NewChat => {
+                    if self.stage.read(cx).active_fabushi_bot.is_some()
+                        || self.stage.read(cx).is_bot_chat
+                    {
+                        self.append_outgoing_text("/new".to_string(), cx);
+                    } else {
+                        self.composer.update(cx, |c, ccx| {
+                            c.clear();
+                            c.is_input_focused = true;
+                            ccx.notify();
+                        });
+                    }
+                }
+                ComposerOpenBotAddAction::AttachFiles
+                | ComposerOpenBotAddAction::InsertSkillTrigger
+                | ComposerOpenBotAddAction::LiveVoice
+                | ComposerOpenBotAddAction::Formatting
+                | ComposerOpenBotAddAction::EmojiPicker => {}
+            }
+        }
     }
 }

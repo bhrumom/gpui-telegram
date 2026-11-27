@@ -43,8 +43,11 @@ pub use statistics::*;
 
 pub mod openbot_palette;
 pub use openbot_palette::{
-    AppThemePalette, ChatBackdropScene, OpenBotColorScheme, OpenBotPalette, ThemeDirectoryWatcher,
-    ThemeEvalReport, ThemeEvalRequest, ThemeHotReloadProbeReport, ThemePaletteError,
-    ThemeSweepReducedMotionProbeReport, evaluate_theme_spec, probe_theme_hot_reload,
-    probe_theme_sweep_reduced_motion,
+    AppThemePalette, CHAT_COLOR_PRESETS, ChatBackdropScene, ChatColorPreset,
+    OPENBOT_BADGE_NEW_DARK, OPENBOT_BADGE_NEW_LIGHT, OPENBOT_FELT_AMBER, OPENBOT_FELT_CREAM,
+    OPENBOT_FELT_PLUM, OPENBOT_FELT_RASPBERRY, OpenBotColorScheme, OpenBotPalette,
+    ThemeDirectoryWatcher, ThemeEvalReport, ThemeEvalRequest, ThemeHotReloadProbeReport,
+    ThemePaletteError, ThemeSweepReducedMotionProbeReport, evaluate_theme_spec,
+    probe_theme_hot_reload, probe_theme_sweep_reduced_motion, readable_chat_background,
+    readable_chat_background_for_dark, solid_bubble_takes_dark_text,
 };

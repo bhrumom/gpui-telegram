@@ -466,3 +466,168 @@ pub(super) fn preset_palette(
         blur_wallpaper: false,
     }
 }
+
+/// Overlays OpenBot `383a35d2` monochrome dark/light surfaces onto `pal`, eliminating harsh
+/// `#007AFF`/`#0A84FF`/`#116DD2`/`#1680F3` active/chrome fills while preserving `mode`,
+/// `Classic` green bubbles/wallpaper, typography, scale, bubble radius, and wallpaper blur.
+pub(super) fn apply_openbot_chrome(mut pal: TdesktopThemePalette) -> TdesktopThemePalette {
+    if pal.mode.is_dark() {
+        pal.window_bg = 0x0D0D0D;
+        pal.nav_rail_bg = 0x0D0D0D;
+        pal.rail_bg = 0x0D0D0D;
+        pal.top_bar_bg = 0x0D0D0D;
+        pal.topbar_bg = 0x0D0D0D;
+        pal.dialogs_bg = 0x1A1A1A;
+        pal.history_bg = 0x1A1A1A;
+        pal.stage_bg = 0x1A1A1A;
+        pal.hover_bg = 0x242424;
+        pal.dialogs_hover_bg = 0x242424;
+        pal.dialogs_active_bg = 0x212121;
+        pal.compose_bg = 0x212121;
+        pal.composer_bg = 0x212121;
+        pal.input_bg = 0x212121;
+        pal.card_bg = 0x212121;
+        pal.modal_bg = 0x212121;
+        pal.tooltip_bg = 0x212121;
+        pal.tooltip_fg = 0xFFFFFF;
+        pal.menu_bg = 0x212121;
+        pal.menu_hover_bg = 0x242424;
+        pal.msg_in_bg = 0x212121;
+        pal.msg_in_selected_bg = 0x2A2A2A;
+        pal.msg_out_bg = 0x242424;
+        pal.msg_out_bg_top = 0x242424;
+        pal.msg_out_bg_bottom = 0x242424;
+        pal.msg_out_fg = 0xFFFFFF;
+        pal.msg_out_secondary_fg = 0x979797;
+        pal.msg_out_link_fg = 0x42A0FF;
+        pal.msg_out_selected_bg = 0x2A2A2A;
+        pal.msg_in_date_fg = 0x6A6A6A;
+        pal.msg_out_date_fg = 0x979797;
+        pal.code_bg = 0x141414;
+        pal.code_fg = 0xDCDCDC;
+        pal.service_pill_bg = 0x212121;
+        pal.service_pill_fg = 0x979797;
+        pal.unread_badge_bg = 0x705083;
+        pal.unread_badge_fg = 0xF6EFE2;
+        pal.muted_badge_bg = 0x3A3A3D;
+        pal.online_dot_fg = 0x31CF76;
+        pal.check_read_fg = 0x42A0FF;
+        pal.check_sent_fg = 0x979797;
+        pal.icon_fg = 0x979797;
+        pal.icon_active = 0xFFFFFF;
+        pal.border_fg = 0x262626;
+        pal.text_primary = 0xFFFFFF;
+        pal.text_secondary = 0x979797;
+        pal.text_link = 0x42A0FF;
+        pal.accent = 0x007CF7;
+        pal.accent_hover = 0x1F8FFF;
+        pal.active_button_fg = 0xFFFFFF;
+        pal.reply_bar_fg = 0x42A0FF;
+        pal.reply_bar_bg = 0x2A2A2A;
+        pal.reaction_bg = 0x212121;
+        pal.reaction_active_bg = 0x2A2A2A;
+        pal.danger = 0xFD2F3B;
+        pal.success = 0x31CF76;
+        pal.wallpaper_top = 0x1A1A1A;
+        pal.wallpaper_bottom = 0x1A1A1A;
+        pal.wallpaper_pattern = 0x212121;
+    } else if pal.mode == TdesktopThemeMode::Classic {
+        pal.window_bg = 0xE8E8EB;
+        pal.nav_rail_bg = 0xE8E8EB;
+        pal.rail_bg = 0xE8E8EB;
+        pal.top_bar_bg = 0xE8E8EB;
+        pal.topbar_bg = 0xE8E8EB;
+        pal.dialogs_bg = 0xF5F5F6;
+        pal.hover_bg = 0xF0F0F2;
+        pal.dialogs_hover_bg = 0xF0F0F2;
+        pal.dialogs_active_bg = 0xE8E8EB;
+        pal.compose_bg = 0xFFFFFF;
+        pal.composer_bg = 0xFFFFFF;
+        pal.input_bg = 0xFFFFFF;
+        pal.card_bg = 0xFFFFFF;
+        pal.modal_bg = 0xFFFFFF;
+        pal.menu_bg = 0xFFFFFF;
+        pal.menu_hover_bg = 0xF0F0F2;
+        pal.unread_badge_bg = 0x705083;
+        pal.unread_badge_fg = 0xF6EFE2;
+        pal.icon_fg = 0x6B6B70;
+        pal.icon_active = 0x141414;
+        pal.border_fg = 0xE8E8EB;
+        pal.text_primary = 0x141414;
+        pal.text_secondary = 0x6B6B70;
+        pal.accent = 0x007CF7;
+        pal.accent_hover = 0x006AD4;
+        pal.reaction_active_bg = 0xE8E8EB;
+    } else {
+        pal.window_bg = 0xE8E8EB;
+        pal.nav_rail_bg = 0xE8E8EB;
+        pal.rail_bg = 0xE8E8EB;
+        pal.top_bar_bg = 0xE8E8EB;
+        pal.topbar_bg = 0xE8E8EB;
+        pal.dialogs_bg = 0xF5F5F6;
+        pal.history_bg = 0xF5F5F6;
+        pal.stage_bg = 0xF5F5F6;
+        pal.hover_bg = 0xF0F0F2;
+        pal.dialogs_hover_bg = 0xF0F0F2;
+        pal.dialogs_active_bg = 0xE8E8EB;
+        pal.compose_bg = 0xFFFFFF;
+        pal.composer_bg = 0xFFFFFF;
+        pal.input_bg = 0xFFFFFF;
+        pal.card_bg = 0xFFFFFF;
+        pal.modal_bg = 0xFFFFFF;
+        pal.tooltip_bg = 0x1C1C1E;
+        pal.tooltip_fg = 0xFFFFFF;
+        pal.menu_bg = 0xFFFFFF;
+        pal.menu_hover_bg = 0xF0F0F2;
+        pal.msg_in_bg = 0xFFFFFF;
+        pal.msg_in_selected_bg = 0xE8E8EB;
+        pal.msg_out_bg = 0xFCFCFC;
+        pal.msg_out_bg_top = 0xFCFCFC;
+        pal.msg_out_bg_bottom = 0xFCFCFC;
+        pal.msg_out_fg = 0x141414;
+        pal.msg_out_secondary_fg = 0x6B6B70;
+        pal.msg_out_link_fg = 0x0064C8;
+        pal.msg_out_selected_bg = 0xE8E8EB;
+        pal.msg_in_date_fg = 0x8E8E93;
+        pal.msg_out_date_fg = 0x6B6B70;
+        pal.code_bg = 0xF0F0F2;
+        pal.code_fg = 0x141414;
+        pal.service_pill_bg = 0xFFFFFF;
+        pal.service_pill_fg = 0x6B6B70;
+        pal.unread_badge_bg = 0x705083;
+        pal.unread_badge_fg = 0xF6EFE2;
+        pal.muted_badge_bg = 0xC7C7CC;
+        pal.online_dot_fg = 0x1FA85A;
+        pal.check_read_fg = 0x0064C8;
+        pal.check_sent_fg = 0x8E8E93;
+        pal.icon_fg = 0x6B6B70;
+        pal.icon_active = 0x141414;
+        pal.border_fg = 0xE8E8EB;
+        pal.text_primary = 0x141414;
+        pal.text_secondary = 0x6B6B70;
+        pal.text_link = 0x0064C8;
+        pal.accent = 0x007CF7;
+        pal.accent_hover = 0x006AD4;
+        pal.active_button_fg = 0xFFFFFF;
+        pal.reply_bar_fg = 0x0064C8;
+        pal.reply_bar_bg = 0xE8E8EB;
+        pal.reaction_bg = 0xFFFFFF;
+        pal.reaction_active_bg = 0xE8E8EB;
+        pal.danger = 0xE8222D;
+        pal.success = 0x1FA85A;
+        pal.wallpaper_top = 0xF5F5F6;
+        pal.wallpaper_bottom = 0xF5F5F6;
+        pal.wallpaper_pattern = 0xE8E8EB;
+    }
+    pal
+}
+
+/// Builds a `TdesktopThemePalette` directly on OpenBot `383a35d2` monochrome chrome surfaces.
+pub(super) fn preset_openbot_palette(
+    mode: TdesktopThemeMode,
+    accent: u32,
+    font_size_px: u32,
+    bubble_radius_px: u32,
+) -> TdesktopThemePalette {
+    apply_openbot_chrome(preset_palette(mode, accent, font_size_px, bubble_radius_px))
+}

@@ -2,6 +2,10 @@ use crate::theme::TdesktopThemePalette;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+pub use crate::components::bloub_avatar::{
+    ChannelAgentBrief, ChannelAvatarLayout, FeltStatusBadgeState, SidebarFeltBadge,
+    render_channel_avatar, render_felt_status_badge,
+};
 pub use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, render_grok_persona_avatar, trigger_grok_avatar_bounce,
     trigger_grok_avatar_spin, GrokBotAvatarProps, GrokPersonaState, GROK_COLOR_PALETTE,
@@ -43,9 +47,10 @@ fn avatar_initials(label: &str) -> String {
     out.to_uppercase()
 }
 
-/// Renders one of the 8 Grok/Fabushi geometric avatar silhouettes (`blob`, `pebble`,
-/// `squircle`, `tablet`, `wedge`, `hex`, `cloud`, `teardrop`, plus legacy aliases)
-/// or classic circular initials when `shape` is `"classic"`.
+/// Renders a bot avatar — defaulting all Fabushi/OpenBot bot silhouettes (`plush:*`, `blob`,
+/// `pebble`, `squircle`, `tablet`, `wedge`, `hex`, `cloud`, `teardrop`, `""`, etc.) to 3D tactile
+/// felt [`crate::components::bloub_avatar::PlushFeltRenderer`], flat `bloub:*` to `BloubBotEngine`,
+/// `grok2d:*` to legacy 2D vector, and `"classic"` to circular initials.
 pub fn render_fabushi_shape_avatar(
     shape: &str,
     bg_hex: u32,
@@ -73,27 +78,37 @@ pub fn render_fabushi_shape_avatar(
             .child(initials);
     }
 
-    if let Some(openbot_div) =
-        render_openbot_prefixed_avatar(norm, format!("#{:06x}", bg_hex & 0xFF_FFFF), label, GrokPersonaState::Idle, size_px, pal_paper_default())
-    {
-        return openbot_div;
+    if norm.to_ascii_lowercase().starts_with("grok2d:") {
+        return render_grok_bot_avatar(GrokBotAvatarProps::new(
+            label,
+            norm,
+            format!("#{:06X}", bg_hex & 0xFF_FFFF),
+            size_px,
+        ));
     }
 
-    render_grok_bot_avatar(GrokBotAvatarProps::new(
+    render_openbot_bot_plush_or_flat(
+        norm,
+        Some(format!("#{:06x}", bg_hex & 0xFF_FFFF)),
         label,
-        shape,
-        format!("#{:06X}", bg_hex & 0xFF_FFFF),
+        GrokPersonaState::Idle,
         size_px,
-    ))
+        pal_paper_default(),
+    )
 }
 
 const fn pal_paper_default() -> &'static str {
     crate::components::bloub_avatar::DEFAULT_PAPER
 }
 
-fn grok_persona_to_openbot_mood(state: GrokPersonaState) -> openbot_contracts::avatar::AvatarMood {
-    use openbot_contracts::avatar::AvatarMood;
-    match state {
+fn grok_persona_to_openbot_mood_and_activity(
+    state: GrokPersonaState,
+) -> (
+    openbot_contracts::avatar::AvatarMood,
+    Option<openbot_contracts::avatar::AgentStepActivity>,
+) {
+    use openbot_contracts::avatar::{AgentStepActivity, AvatarMood};
+    let mood = match state {
         GrokPersonaState::Sleeping | GrokPersonaState::Drowsy | GrokPersonaState::PoweringDown => {
             AvatarMood::Asleep
         }
@@ -119,7 +134,94 @@ fn grok_persona_to_openbot_mood(state: GrokPersonaState) -> openbot_contracts::a
         | GrokPersonaState::Proud
         | GrokPersonaState::Excited => AvatarMood::Responded,
         _ => AvatarMood::Idle,
+    };
+    let activity = match state {
+        GrokPersonaState::Searching => Some(AgentStepActivity::Searching),
+        GrokPersonaState::Writing => Some(AgentStepActivity::Editing),
+        GrokPersonaState::Working | GrokPersonaState::Sending | GrokPersonaState::Uploading => {
+            Some(AgentStepActivity::Working)
+        }
+        _ => None,
+    };
+    (mood, activity)
+}
+
+/// Maps explicit legacy Fabushi/Grok shape identifiers onto their OpenBot [`BloubShape`] equivalent.
+/// Generic `"blob"`, `"teardrop"`, `""`, and `"plush"` return `None` so deterministic FNV-1a seeding applies.
+pub fn legacy_shape_to_bloub_shape(shape: &str) -> Option<openbot_contracts::avatar::BloubShape> {
+    use openbot_contracts::avatar::BloubShape;
+    match shape.trim().to_ascii_lowercase().as_str() {
+        "pebble" | "galet" => Some(BloubShape::Galet),
+        "squircle" => Some(BloubShape::Squircle),
+        "tablet" | "capsule" => Some(BloubShape::Capsule),
+        "hex" | "hexagon" | "hexagone" => Some(BloubShape::Hexagone),
+        "cloud" | "nuage" => Some(BloubShape::Nuage),
+        "wedge" | "triangle" => Some(BloubShape::Triangle),
+        "diamond" | "losange" => Some(BloubShape::Losange),
+        "circle" | "cercle" => Some(BloubShape::Cercle),
+        "shield" | "pentagone" => Some(BloubShape::Pentagone),
+        "carre" => Some(BloubShape::Carre),
+        "fantome" => Some(BloubShape::Fantome),
+        "meduse" => Some(BloubShape::Meduse),
+        "poulpe" => Some(BloubShape::Poulpe),
+        _ => None,
     }
+}
+
+/// Renders a 3D tactile felt OpenBot `PlushBot` avatar across all 10+3 silhouettes, 18 colors,
+/// 7 moods, and 8 tool activities (`PROJECT.md` M1 contract).
+pub fn render_plush_bot_avatar(
+    seed: &str,
+    shape: Option<openbot_contracts::avatar::BloubShape>,
+    hue: Option<openbot_contracts::avatar::AvatarHue>,
+    color: Option<&str>,
+    size_px: f32,
+    mood: openbot_contracts::avatar::AvatarMood,
+    activity: Option<openbot_contracts::avatar::AgentStepActivity>,
+) -> Div {
+    use crate::components::bloub_avatar::{
+        PlushFeltRenderer, render_plush_avatar_element, small_size_eye_scale,
+    };
+    let safe_size = if size_px.is_finite() && size_px > 0.0 {
+        size_px
+    } else {
+        32.0
+    };
+    let clean_seed = if seed.trim().is_empty() {
+        "agent"
+    } else {
+        seed.trim()
+    };
+    let normalized_color = color
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| openbot_contracts::avatar::is_avatar_color(c));
+    let mut renderer = PlushFeltRenderer::for_seed_with_activity(
+        clean_seed,
+        shape,
+        hue,
+        normalized_color.as_deref(),
+        mood,
+        activity,
+    );
+    renderer.set_eye_scale(small_size_eye_scale(safe_size));
+    let sample = renderer.sample_plush_frame(0.0, true);
+    render_plush_avatar_element(&sample, safe_size)
+}
+
+/// Renders an OpenBot 3D `PlushBot` (or flat `:flat:\d+` / custom photo) avatar through a stateful
+/// [`crate::components::bloub_avatar::AgentAvatarController`], enforcing `ACTIVITY_HOLD_MS = 1400ms`.
+pub fn render_plush_bot_avatar_with_controller(
+    props: &crate::components::bloub_avatar::AgentAvatarProps,
+    controller: &mut crate::components::bloub_avatar::AgentAvatarController,
+    now_ms: u64,
+) -> Div {
+    controller.sync_url(props.avatar_url.as_deref());
+    controller.sync_activity(props.activity, now_ms);
+    crate::components::bloub_avatar::render_agent_avatar(
+        props,
+        Some(controller),
+        (now_ms as f64) / 1000.0,
+    )
 }
 
 fn is_usable_custom_avatar_url(url: &str) -> bool {
@@ -172,45 +274,56 @@ pub const OPENBOT_BLOUB_AVATAR_PRESETS: [(&str, &str); 8] = [
     ("bloub:poulpe", "Poulpe"),
 ];
 
-pub(crate) fn is_openbot_prefixed_shape(shape: &str) -> bool {
-    let lower = shape.trim().to_ascii_lowercase();
-    lower == "bloub"
-        || lower == "plush"
-        || lower.starts_with("bloub:")
-        || lower.starts_with("plush:")
-}
-
-pub(crate) fn render_openbot_prefixed_avatar(
+pub(crate) fn render_openbot_bot_plush_or_flat(
     raw_shape: &str,
-    color_hex: String,
+    color_hex: Option<String>,
     label: &str,
     persona_state: GrokPersonaState,
     size_px: f32,
     paper_hex: &str,
-) -> Option<Div> {
+) -> Div {
     use crate::components::bloub_avatar::{
         BloubBotEngine, PlushCharacterId, PlushFeltRenderer, bloub_shape_to_engine,
         bloub_to_engine_shape, render_flat_bloub_element, render_plush_avatar_element,
-        render_plush_seed_avatar, small_size_eye_scale,
+        small_size_eye_scale,
     };
     use openbot_contracts::avatar::{
-        BloubShape, avatar_mood_presentation, bloub_avatar_profile, plush_mood_presentation,
-        seeded_expression,
+        AvatarStyle, BloubShape, activity_mood_presentation, avatar_mood_presentation,
+        avatar_style_for_seed, bloub_avatar_profile, plush_mood_presentation, seeded_expression,
     };
 
+    let safe_size = if size_px.is_finite() && size_px > 0.0 {
+        size_px
+    } else {
+        32.0
+    };
     let trimmed = raw_shape.trim();
     let lower = trimmed.to_ascii_lowercase();
-    let mood = grok_persona_to_openbot_mood(persona_state);
-    let explicit_hex = openbot_contracts::avatar::is_avatar_color(&color_hex).then_some(color_hex.as_str());
+    let (mood, activity) = grok_persona_to_openbot_mood_and_activity(persona_state);
+    let normalized_hex = color_hex
+        .as_deref()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| openbot_contracts::avatar::is_avatar_color(c));
+    let explicit_hex = normalized_hex.as_deref();
+    let base_seed = if label.trim().is_empty() {
+        "agent"
+    } else {
+        label.trim()
+    };
 
-    if lower == "bloub" || lower.starts_with("bloub:") {
+    if lower == "bloub"
+        || lower.starts_with("bloub:")
+        || avatar_style_for_seed(base_seed) == AvatarStyle::Flat
+    {
         let suffix = trimmed
             .split_once(':')
             .map(|(_, rest)| rest.trim())
             .unwrap_or("");
         let suffix_lower = suffix.to_ascii_lowercase();
         let mood_pres = avatar_mood_presentation(mood);
-        if let Some(bloub_shape) = BloubShape::parse(&suffix_lower) {
+        if (lower == "bloub" || lower.starts_with("bloub:"))
+            && let Some(bloub_shape) = BloubShape::parse(&suffix_lower)
+        {
             let seed = if label.trim().is_empty() {
                 &suffix_lower
             } else {
@@ -224,9 +337,13 @@ pub(crate) fn render_openbot_prefixed_avatar(
             );
             let sample = engine.sample(0.0, true);
             let ink = explicit_hex.unwrap_or("#e8483f");
-            return Some(render_flat_bloub_element(&sample, ink, paper_hex, size_px));
+            return render_flat_bloub_element(&sample, ink, paper_hex, safe_size);
         }
-        let seed = if suffix.is_empty() { label.trim() } else { suffix };
+        let seed = if (lower == "bloub" || lower.starts_with("bloub:")) && !suffix.is_empty() {
+            suffix
+        } else {
+            base_seed
+        };
         let profile = bloub_avatar_profile(seed, None, explicit_hex);
         let expr = mood_pres.expression.unwrap_or(profile.expression);
         let engine = BloubBotEngine::new(
@@ -235,7 +352,7 @@ pub(crate) fn render_openbot_prefixed_avatar(
             mood_pres.state.to_parametric(),
         );
         let sample = engine.sample(0.0, true);
-        return Some(render_flat_bloub_element(&sample, &profile.color, paper_hex, size_px));
+        return render_flat_bloub_element(&sample, &profile.color, paper_hex, safe_size);
     }
 
     if lower == "plush" || lower.starts_with("plush:") {
@@ -244,15 +361,18 @@ pub(crate) fn render_openbot_prefixed_avatar(
             .map(|(_, rest)| rest.trim())
             .unwrap_or("");
         let suffix_lower = suffix.to_ascii_lowercase();
-        let mood_pres = plush_mood_presentation(mood);
+        let mood_pres = match activity {
+            Some(act) => activity_mood_presentation(act),
+            None => plush_mood_presentation(mood),
+        };
         if let Some(ch) = PlushCharacterId::parse(&suffix_lower) {
             let mut renderer = PlushFeltRenderer::for_character(ch, mood_pres.state);
             if let Some(expr) = mood_pres.expression {
                 renderer.set_expression(expr);
             }
-            renderer.set_eye_scale(small_size_eye_scale(size_px));
+            renderer.set_eye_scale(small_size_eye_scale(safe_size));
             let sample = renderer.sample_plush_frame(0.0, true);
-            return Some(render_plush_avatar_element(&sample, size_px));
+            return render_plush_avatar_element(&sample, safe_size);
         }
         if let Some(bloub_shape) = BloubShape::parse(&suffix_lower) {
             let seed = if label.trim().is_empty() {
@@ -268,23 +388,24 @@ pub(crate) fn render_openbot_prefixed_avatar(
                 expr,
                 mood_pres.state,
             );
-            renderer.set_eye_scale(small_size_eye_scale(size_px));
+            renderer.set_eye_scale(small_size_eye_scale(safe_size));
             let sample = renderer.sample_plush_frame(0.0, true);
-            return Some(render_plush_avatar_element(&sample, size_px));
+            return render_plush_avatar_element(&sample, safe_size);
         }
-        let seed = if suffix.is_empty() { label.trim() } else { suffix };
-        return Some(render_plush_seed_avatar(
-            seed,
-            None,
-            explicit_hex,
-            mood,
-            0.0,
-            true,
-            size_px,
-        ));
+        let seed = if suffix.is_empty() { base_seed } else { suffix };
+        return render_plush_bot_avatar(seed, None, None, explicit_hex, safe_size, mood, activity);
     }
 
-    None
+    let mapped_shape = legacy_shape_to_bloub_shape(trimmed);
+    render_plush_bot_avatar(
+        base_seed,
+        mapped_shape,
+        None,
+        explicit_hex,
+        safe_size,
+        mood,
+        activity,
+    )
 }
 
 pub struct Avatar {
@@ -373,47 +494,30 @@ impl Render for Avatar {
             .filter(|u| is_usable_custom_avatar_url(u));
 
         if let Some(shape) = &self.shape {
-            if is_openbot_prefixed_shape(shape) && usable_url.is_none() {
-                let hex_color = format!("#{:06x}", resolved_color & 0xFF_FFFF);
-                let paper_hex = format!("#{:06x}", pal.dialogs_bg & 0xFF_FFFF);
-                if let Some(openbot_el) = render_openbot_prefixed_avatar(
-                    shape,
-                    hex_color,
-                    &self.label,
-                    self.persona_state,
-                    self.size,
-                    &paper_hex,
-                ) {
-                    return openbot_el.when(self.is_online, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .right(px(0.0))
-                                .bottom(px(0.0))
-                                .w(px(dot_size))
-                                .h(px(dot_size))
-                                .rounded_full()
-                                .bg(rgb(pal.online_dot_fg))
-                                .border_2()
-                                .border_color(rgb(pal.dialogs_bg)),
-                        )
-                    });
-                }
-            }
-        }
-
-        if let (Some(shape), None) = (&self.shape, &self.avatar_url) {
-            if !shape.trim().eq_ignore_ascii_case("classic") {
-                let color_arg = self
-                    .color_spec
-                    .clone()
-                    .unwrap_or_else(|| format!("#{:06X}", resolved_color & 0xFF_FFFF));
-                return render_grok_bot_avatar(
-                    GrokBotAvatarProps::new(&self.label, shape, color_arg, self.size)
-                        .with_state(self.persona_state)
-                        .with_surface_bg(pal.dialogs_bg),
-                )
-                .when(self.is_online, |el| {
+            if usable_url.is_none() && !shape.trim().eq_ignore_ascii_case("classic") {
+                let rendered = if shape.trim().to_ascii_lowercase().starts_with("grok2d:") {
+                    let color_arg = self
+                        .color_spec
+                        .clone()
+                        .unwrap_or_else(|| format!("#{:06X}", resolved_color & 0xFF_FFFF));
+                    render_grok_bot_avatar(
+                        GrokBotAvatarProps::new(&self.label, shape, color_arg, self.size)
+                            .with_state(self.persona_state)
+                            .with_surface_bg(pal.dialogs_bg),
+                    )
+                } else {
+                    let hex_color = format!("#{:06x}", resolved_color & 0xFF_FFFF);
+                    let paper_hex = format!("#{:06x}", pal.dialogs_bg & 0xFF_FFFF);
+                    render_openbot_bot_plush_or_flat(
+                        shape,
+                        Some(hex_color),
+                        &self.label,
+                        self.persona_state,
+                        self.size,
+                        &paper_hex,
+                    )
+                };
+                return rendered.when(self.is_online, |el| {
                     el.child(
                         div()
                             .absolute()
@@ -443,9 +547,9 @@ impl Render for Avatar {
             .text_size(px((self.size * 0.36).clamp(11.0, 26.0)))
             .font_weight(FontWeight::BOLD)
             .map(|el| {
-                if let Some(ref url) = self.avatar_url {
+                if let Some(url) = usable_url {
                     el.overflow_hidden()
-                        .child(img(url.clone()).w_full().h_full().object_fit(ObjectFit::Cover))
+                        .child(img(url.to_string()).w_full().h_full().object_fit(ObjectFit::Cover))
                 } else {
                     el.child(initials)
                 }

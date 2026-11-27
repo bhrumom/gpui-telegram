@@ -2162,3 +2162,926 @@ mod tests {
         assert_eq!(resumed, vec!["task-1".to_string(), "task-2".to_string()]);
     }
 }
+
+/// Live candidate member row (Fabushi bot or Telegram contact) shown in `ChannelCreateDialogModal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCreateMemberCandidate {
+    pub id: String,
+    pub user_id: Option<u64>,
+    pub username: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub is_bot: bool,
+    pub avatar_seed: Option<String>,
+    pub avatar_hue: Option<AvatarHue>,
+    pub avatar_color: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+/// Submitted payload when the user clicks `Create` in `ChannelCreateDialogModal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCreateSubmission {
+    pub name: String,
+    pub member_user_ids: Vec<u64>,
+    pub member_usernames: Vec<String>,
+    pub member_agent_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelCreateInputField {
+    Name,
+    MemberSearch,
+}
+
+/// Interactive OpenBot `ChannelCreateDialog` modal entity (`UI-F11`, `ChannelCreateDialog.tsx`).
+/// Owns its own `FocusHandle` and `EntityInputHandler` `canvas` for full macOS/Linux CJK IME.
+pub struct ChannelCreateDialogModal {
+    pub name: String,
+    pub search_query: String,
+    pub active_field: ChannelCreateInputField,
+    pub candidates: Vec<ChannelCreateMemberCandidate>,
+    pub selected_ids: Vec<String>,
+    pub validation_error: Option<String>,
+    pub palette: crate::theme::TdesktopThemePalette,
+    pub language_id: String,
+    pub focus_handle: FocusHandle,
+    pub ime: crate::components::ui::TextInputController,
+    pub pending_submit: Option<ChannelCreateSubmission>,
+    pub pending_close: bool,
+}
+
+impl ChannelCreateDialogModal {
+    pub fn new(
+        candidates: Vec<ChannelCreateMemberCandidate>,
+        palette: crate::theme::TdesktopThemePalette,
+        language_id: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            name: String::new(),
+            search_query: String::new(),
+            active_field: ChannelCreateInputField::Name,
+            candidates,
+            selected_ids: Vec::new(),
+            validation_error: None,
+            palette,
+            language_id: language_id.into(),
+            focus_handle: cx.focus_handle(),
+            ime: crate::components::ui::TextInputController::new(),
+            pending_submit: None,
+            pending_close: false,
+        }
+    }
+
+    pub fn set_theme_and_locale(
+        &mut self,
+        palette: crate::theme::TdesktopThemePalette,
+        language_id: impl Into<String>,
+    ) {
+        self.palette = palette;
+        self.language_id = language_id.into();
+    }
+
+    pub fn take_pending_submit(&mut self) -> Option<ChannelCreateSubmission> {
+        self.pending_submit.take()
+    }
+
+    pub fn take_pending_close(&mut self) -> bool {
+        std::mem::take(&mut self.pending_close)
+    }
+
+    pub fn can_submit(&self) -> bool {
+        !self.name.trim().is_empty() && !self.selected_ids.is_empty()
+    }
+
+    pub fn filtered_candidates(&self) -> Vec<&ChannelCreateMemberCandidate> {
+        let q = self.search_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return self.candidates.iter().collect();
+        }
+        self.candidates
+            .iter()
+            .filter(|c| {
+                c.name.to_ascii_lowercase().contains(&q)
+                    || c.description.to_ascii_lowercase().contains(&q)
+                    || c.username
+                        .as_deref()
+                        .is_some_and(|u| u.to_ascii_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    pub fn toggle_member(&mut self, id: &str) {
+        if let Some(pos) = self.selected_ids.iter().position(|s| s == id) {
+            self.selected_ids.remove(pos);
+        } else if self.selected_ids.len() < CHANNEL_MEMBERS_MAX {
+            self.selected_ids.push(id.to_string());
+        }
+        self.validation_error = None;
+    }
+
+    pub fn request_close(&mut self, cx: &mut Context<Self>) {
+        self.ime.clear_ime_state();
+        self.pending_close = true;
+        cx.notify();
+    }
+
+    pub fn try_submit(&mut self, cx: &mut Context<Self>) {
+        let trimmed = self.name.trim();
+        if trimmed.is_empty() {
+            self.validation_error = Some(
+                crate::i18n::tr_str(&self.language_id, "请输入群聊名称", "Channel name is required")
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if self.selected_ids.is_empty() {
+            self.validation_error = Some(
+                crate::i18n::tr_str(
+                    &self.language_id,
+                    "请至少选择 1 位助手或成员",
+                    "Select at least one agent or member",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut member_user_ids = Vec::new();
+        let mut member_usernames = Vec::new();
+        let mut member_agent_ids = Vec::new();
+        for sid in &self.selected_ids {
+            if let Some(c) = self.candidates.iter().find(|cand| &cand.id == sid) {
+                if let Some(uid) = c.user_id {
+                    if !member_user_ids.contains(&uid) {
+                        member_user_ids.push(uid);
+                    }
+                }
+                if let Some(ref uname) = c.username {
+                    let clean = uname.trim().trim_start_matches('@').to_string();
+                    if !clean.is_empty() && !member_usernames.contains(&clean) {
+                        member_usernames.push(clean);
+                    }
+                }
+                if c.is_bot {
+                    member_agent_ids.push(c.id.clone());
+                }
+            }
+        }
+        self.ime.clear_ime_state();
+        self.pending_submit = Some(ChannelCreateSubmission {
+            name: trimmed.to_string(),
+            member_user_ids,
+            member_usernames,
+            member_agent_ids,
+        });
+        self.pending_close = true;
+        cx.notify();
+    }
+
+    fn active_text(&self) -> &str {
+        match self.active_field {
+            ChannelCreateInputField::Name => &self.name,
+            ChannelCreateInputField::MemberSearch => &self.search_query,
+        }
+    }
+
+    fn active_text_mut(&mut self) -> &mut String {
+        match self.active_field {
+            ChannelCreateInputField::Name => &mut self.name,
+            ChannelCreateInputField::MemberSearch => &mut self.search_query,
+        }
+    }
+
+    fn insert_committed_text(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let clean = crate::components::ui::sanitize_paste_text(raw, false);
+        if clean.is_empty() {
+            return;
+        }
+        let limit = match self.active_field {
+            ChannelCreateInputField::Name => CHANNEL_NAME_MAX_LEN,
+            ChannelCreateInputField::MemberSearch => 120,
+        };
+        let buf = self.active_text_mut();
+        for ch in clean.chars() {
+            if utf16_len(buf) + ch.len_utf16() <= limit {
+                buf.push(ch);
+            }
+        }
+        self.validation_error = None;
+        self.ime.clear_preedit();
+        cx.notify();
+    }
+}
+
+impl ChannelCreateDialogModal {
+    pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
+        let cmd = mods.platform || mods.control;
+
+        if key.eq_ignore_ascii_case("escape") {
+            cx.stop_propagation();
+            self.request_close(cx);
+            return;
+        }
+        if key.eq_ignore_ascii_case("tab") {
+            cx.stop_propagation();
+            self.ime.clear_ime_state();
+            self.active_field = match self.active_field {
+                ChannelCreateInputField::Name => ChannelCreateInputField::MemberSearch,
+                ChannelCreateInputField::MemberSearch => ChannelCreateInputField::Name,
+            };
+            cx.notify();
+            return;
+        }
+        if key.eq_ignore_ascii_case("enter") {
+            cx.stop_propagation();
+            if self.ime.has_preedit() {
+                if let Some(p) = self.ime.ime_preedit.take().filter(|s| !s.is_empty()) {
+                    self.insert_committed_text(&p, cx);
+                }
+                return;
+            }
+            if self.can_submit() {
+                self.try_submit(cx);
+            }
+            return;
+        }
+        if cmd && !mods.shift && !mods.alt && key.eq_ignore_ascii_case("v") {
+            cx.stop_propagation();
+            if let Some(clip) = cx.read_from_clipboard() {
+                if let Some(text) = clip.text() {
+                    self.insert_committed_text(&text, cx);
+                }
+            }
+            return;
+        }
+        if key.eq_ignore_ascii_case("backspace") {
+            cx.stop_propagation();
+            if self.ime.has_preedit() {
+                self.ime.clear_preedit();
+                cx.notify();
+                return;
+            }
+            self.active_text_mut().pop();
+            self.validation_error = None;
+            cx.notify();
+            return;
+        }
+        if !cmd && !mods.alt {
+            if self.ime.has_preedit() || self.ime.take_just_committed() {
+                return;
+            }
+            if key == "space" {
+                cx.stop_propagation();
+                self.insert_committed_text(" ", cx);
+            } else if let Some(ref kc) = event.keystroke.key_char {
+                if !kc.chars().all(|c| c.is_control()) {
+                    cx.stop_propagation();
+                    self.insert_committed_text(kc, cx);
+                }
+            }
+        }
+    }
+}
+
+impl EntityInputHandler for ChannelCreateDialogModal {
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let base = self.active_text();
+        let full = self
+            .ime
+            .ime_preedit
+            .as_deref()
+            .map_or_else(|| base.to_string(), |p| format!("{base}{p}"));
+        let start = crate::components::ui::utf16_offset_to_utf8(&full, range_utf16.start);
+        let end = crate::components::ui::utf16_offset_to_utf8(&full, range_utf16.end).max(start);
+        Some(full.get(start..end).unwrap_or("").to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let base = self.active_text();
+        let range = if self.ime.has_preedit() {
+            self.ime.selected_utf16_range(base)?
+        } else {
+            let total = crate::components::ui::utf16_len(base);
+            total..total
+        };
+        Some(UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.ime.has_preedit() {
+            self.ime.marked_utf16_range(self.active_text())
+        } else {
+            None
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = self.ime.ime_preedit.take().filter(|s| !s.is_empty()) {
+            self.insert_committed_text(&p, cx);
+            self.ime.mark_ime_committed();
+            return;
+        }
+        self.ime.clear_ime_state();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_composing = self.ime.has_preedit();
+        self.insert_committed_text(text, cx);
+        if was_composing {
+            self.ime.mark_ime_committed();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(committed) = self.ime.handle_replace_and_mark(new_text) {
+            self.insert_committed_text(&committed, cx);
+            self.ime.mark_ime_committed();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let chars = self.active_text().chars().count()
+            + self
+                .ime
+                .ime_preedit
+                .as_deref()
+                .map_or(0, |p| p.chars().count());
+        let caret_x = element_bounds.origin.x + px(24.0 + (chars as f32 * 8.0).min(240.0));
+        let y_off = match self.active_field {
+            ChannelCreateInputField::Name => 92.0,
+            ChannelCreateInputField::MemberSearch => 176.0,
+        };
+        Some(Bounds::new(
+            point(caret_x, element_bounds.origin.y + px(y_off)),
+            size(px(2.0), px(20.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(crate::components::ui::utf16_len(self.active_text()))
+    }
+}
+
+impl Render for ChannelCreateDialogModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ob = self.palette.openbot_palette();
+        let is_dark = self.palette.mode.is_dark();
+        let lang = self.language_id.as_str();
+        let is_zh = lang.starts_with("zh");
+        let vp_h = f32::from(window.viewport_size().height).max(480.0);
+        let scrim = if is_dark {
+            hsla(0.0, 0.0, 0.0, 0.52)
+        } else {
+            hsla(0.0, 0.0, 0.0, 0.28)
+        };
+        let input_bg: Rgba = if is_dark {
+            rgb(0x1E1E1E).into()
+        } else {
+            ob.bg_canvas()
+        };
+        let hover_bg = ob.hover();
+        let focus_border = ob.text_dim();
+        let idle_border = ob.border_strong_hairline();
+
+        let ime_entity = cx.entity().clone();
+        let ime_focus = self.focus_handle.clone();
+        let ime_canvas = canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, cx| {
+                window.handle_input(
+                    &ime_focus,
+                    ElementInputHandler::new(bounds, ime_entity.clone()),
+                    cx,
+                );
+            },
+        )
+        .absolute()
+        .inset_0()
+        .size_full();
+
+        let preedit = self.ime.ime_preedit.as_deref().unwrap_or("");
+        let name_focused = self.active_field == ChannelCreateInputField::Name;
+        let search_focused = self.active_field == ChannelCreateInputField::MemberSearch;
+        let name_display = if name_focused && !preedit.is_empty() {
+            format!("{}{}", self.name, preedit)
+        } else {
+            self.name.clone()
+        };
+        let search_display = if search_focused && !preedit.is_empty() {
+            format!("{}{}", self.search_query, preedit)
+        } else {
+            self.search_query.clone()
+        };
+
+        let filtered: Vec<ChannelCreateMemberCandidate> =
+            self.filtered_candidates().into_iter().cloned().collect();
+        let selected_count = self.selected_ids.len();
+        let can_submit = self.can_submit();
+
+        let mut list = div()
+            .id("channel-create-member-scroll")
+            .w_full()
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .py(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_muted())
+                    .child(if self.candidates.is_empty() {
+                        if is_zh { "暂无可添加的助手或联系人" } else { "No agents or contacts available" }
+                    } else if is_zh {
+                        "未找到匹配的成员"
+                    } else {
+                        "No matching agents or contacts"
+                    }),
+            );
+        } else {
+            for (idx, cand) in filtered.into_iter().enumerate() {
+                let is_checked = self.selected_ids.iter().any(|s| s == &cand.id);
+                let cid = cand.id.clone();
+                let avatar_el: AnyElement = if cand.is_bot {
+                    crate::components::avatar::render_plush_bot_avatar(
+                        cand.avatar_seed.as_deref().unwrap_or(&cand.name),
+                        None,
+                        cand.avatar_hue,
+                        cand.avatar_color.as_deref(),
+                        24.0,
+                        AvatarMood::Idle,
+                        None,
+                    )
+                    .into_any_element()
+                } else {
+                    let initial: String = cand
+                        .name
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(1)
+                        .collect::<String>()
+                        .to_uppercase();
+                    div()
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(rgb(self.palette.peer_avatar_color(cand.user_id.unwrap_or(idx as u64) as i64)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xFFFFFF))
+                        .child(if initial.is_empty() { "?".to_string() } else { initial })
+                        .into_any_element()
+                };
+                let check_bg = if is_checked { ob.surface_light() } else { input_bg };
+                let row_bg = if is_checked { ob.accent_soft() } else { hsla(0.0, 0.0, 0.0, 0.0).into() };
+                list = list.child(
+                    div()
+                        .id(("channel-create-cand-row", idx))
+                        .w_full()
+                        .h(px(40.0))
+                        .px(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(row_bg)
+                        .hover(move |s| s.bg(hover_bg))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_member(&cid);
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_shrink_0()
+                                .rounded(px(4.0))
+                                .bg(check_bg)
+                                .border_1()
+                                .border_color(if is_checked { ob.surface_light() } else { idle_border })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(is_checked, |b| {
+                                    b.child(crate::views::stage::openbot_stage_chrome::openbot_stage_icon(
+                                        crate::views::stage::openbot_stage_chrome::OpenBotStageIcon::Check,
+                                        11.0,
+                                        ob.text_on_light(),
+                                    ))
+                                }),
+                        )
+                        .child(avatar_el)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_primary())
+                                        .child(cand.name),
+                                )
+                                .when(!cand.description.trim().is_empty(), |col| {
+                                    col.child(
+                                        div()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(11.5))
+                                            .text_color(ob.text_muted())
+                                            .child(cand.description),
+                                    )
+                                }),
+                        )
+                        .when(cand.is_bot, |row| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(6.0))
+                                    .py(px(1.5))
+                                    .rounded(px(5.0))
+                                    .bg(ob.bg_control_active())
+                                    .text_size(px(10.5))
+                                    .text_color(ob.text_muted())
+                                    .child(if is_zh { "助手" } else { "Agent" }),
+                            )
+                        }),
+                );
+            }
+        }
+
+        let card = div()
+            .id("openbot-channel-create-dialog-card")
+            .relative()
+            .w(px(440.0))
+            .max_w_full()
+            .max_h(px((vp_h - 48.0).max(360.0)))
+            .rounded(px(14.0))
+            .bg(ob.bg_surface())
+            .border_1()
+            .border_color(ob.border_strong_hairline())
+            .shadow(self.palette.popover_shadows())
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .child(ime_canvas)
+            .child(
+                div()
+                    .px(px(16.0))
+                    .py(px(14.0))
+                    .border_b_1()
+                    .border_color(ob.border_hairline())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_primary())
+                            .child(if is_zh { "新建群聊" } else { "New channel" }),
+                    )
+                    .child(
+                        div()
+                            .id("channel-create-close-btn")
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.request_close(cx);
+                                }),
+                            )
+                            .child(crate::views::stage::openbot_stage_chrome::openbot_stage_icon(
+                                crate::views::stage::openbot_stage_chrome::OpenBotStageIcon::Close,
+                                15.0,
+                                ob.text_muted(),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .when_some(self.validation_error.clone(), |col, err| {
+                        col.child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .rounded(px(8.0))
+                                .bg(ob.rgba("--openbot-danger-soft").unwrap_or_else(|| ob.danger()))
+                                .text_size(px(12.5))
+                                .text_color(ob.danger())
+                                .child(err),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_secondary())
+                                    .child(if is_zh { "名称 *" } else { "Name *" }),
+                            )
+                            .child(
+                                div()
+                                    .id("channel-create-name-input")
+                                    .h(px(38.0))
+                                    .px(px(12.0))
+                                    .rounded(px(8.0))
+                                    .bg(input_bg)
+                                    .border_1()
+                                    .border_color(if name_focused { focus_border } else { idle_border })
+                                    .cursor_text()
+                                    .flex()
+                                    .items_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.ime.clear_ime_state();
+                                            this.active_field = ChannelCreateInputField::Name;
+                                            window.focus(&this.focus_handle);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(14.0))
+                                            .text_color(if name_display.is_empty() {
+                                                ob.text_dim()
+                                            } else {
+                                                ob.text_primary()
+                                            })
+                                            .child(if name_display.is_empty() {
+                                                if is_zh {
+                                                    "例如：产品设计讨论组".to_string()
+                                                } else {
+                                                    "e.g. Design Sync".to_string()
+                                                }
+                                            } else if name_focused {
+                                                format!("{}|", name_display)
+                                            } else {
+                                                name_display
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(ob.text_secondary())
+                                            .child(if is_zh { "添加助手或成员 *" } else { "Add agents *" }),
+                                    )
+                                    .when(selected_count > 0, |r| {
+                                        r.child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(ob.text_muted())
+                                                .child(if is_zh {
+                                                    format!("已选 {selected_count}")
+                                                } else {
+                                                    format!("{selected_count} selected")
+                                                }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("channel-create-member-search")
+                                    .h(px(34.0))
+                                    .px(px(10.0))
+                                    .rounded(px(8.0))
+                                    .bg(input_bg)
+                                    .border_1()
+                                    .border_color(if search_focused { focus_border } else { idle_border })
+                                    .cursor_text()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.ime.clear_ime_state();
+                                            this.active_field = ChannelCreateInputField::MemberSearch;
+                                            window.focus(&this.focus_handle);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(crate::views::stage::openbot_stage_chrome::openbot_stage_icon(
+                                        crate::views::stage::openbot_stage_chrome::OpenBotStageIcon::Search,
+                                        14.0,
+                                        ob.text_muted(),
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(13.0))
+                                            .text_color(if search_display.is_empty() {
+                                                ob.text_dim()
+                                            } else {
+                                                ob.text_primary()
+                                            })
+                                            .child(if search_display.is_empty() {
+                                                if is_zh {
+                                                    "搜索助手或联系人…".to_string()
+                                                } else {
+                                                    "Search agents or contacts…".to_string()
+                                                }
+                                            } else if search_focused {
+                                                format!("{}|", search_display)
+                                            } else {
+                                                search_display
+                                            }),
+                                    ),
+                            )
+                            .child(list),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .border_t_1()
+                    .border_color(ob.border_hairline())
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("channel-create-cancel-btn")
+                            .h(px(32.0))
+                            .px(px(14.0))
+                            .rounded(px(8.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .text_size(px(13.0))
+                            .text_color(ob.text_muted())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.request_close(cx);
+                                }),
+                            )
+                            .child(if is_zh { "取消" } else { "Cancel" }),
+                    )
+                    .child(
+                        div()
+                            .id("channel-create-submit-btn")
+                            .h(px(32.0))
+                            .px(px(16.0))
+                            .rounded(px(8.0))
+                            .bg(ob.surface_light())
+                            .when(!can_submit, |el| el.opacity(0.45))
+                            .when(can_submit, |el| {
+                                el.cursor_pointer().hover(|s| s.opacity(0.88)).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.try_submit(cx);
+                                    }),
+                                )
+                            })
+                            .flex()
+                            .items_center()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_on_light())
+                            .child(if is_zh { "创建" } else { "Create" }),
+                    ),
+            );
+
+        div()
+            .id("openbot-channel-create-backdrop")
+            .track_focus(&self.focus_handle)
+            .key_context("ChannelCreateDialogModal")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.handle_key_down(event, cx);
+            }))
+            .absolute()
+            .inset_0()
+            .bg(scrim)
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.request_close(cx);
+                }),
+            )
+            .child(card)
+    }
+}

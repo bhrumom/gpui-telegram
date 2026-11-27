@@ -3,12 +3,21 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+use crate::components::avatar::{
+    legacy_shape_to_bloub_shape, parse_fabushi_hex_color, render_channel_avatar,
+    render_fabushi_shape_avatar, render_felt_status_badge, render_plush_bot_avatar,
+    ChannelAgentBrief, ChannelAvatarLayout, FeltStatusBadgeState,
+};
+use crate::components::bloub_avatar::{PlushCharacterId, SidebarPlushRingKind};
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
 };
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
-use crate::views::chat_sidebar::{BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel};
+use crate::views::chat_sidebar::{
+    BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel, OPENBOT_HIDE_TIMESTAMP_WIDTH,
+    ROW_HEIGHT,
+};
 use crate::views::sidebar::dialogs_entry::DialogsEntry;
 use crate::views::sidebar::dialogs_row::DialogsRow;
 use crate::views::sidebar::ui::dialogs_layout::DialogsLayoutUi;
@@ -17,6 +26,8 @@ use crate::views::sidebar::ui::dialogs_message_view::{
 };
 use crate::views::sidebar::ui::dialogs_pill::DialogsPillUi;
 use crate::views::sidebar::ui::dialogs_topics_view::DialogsTopicsViewUi;
+use openbot_contracts::avatar::{AgentStepActivity, AvatarMood, BloubShape};
+use openbot_contracts::channels::ChannelMember;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarContextAction {
@@ -33,6 +44,8 @@ pub struct SidebarDialogMeta {
     pub is_verified: bool,
     pub is_premium: bool,
     pub is_bot: bool,
+    pub is_group: bool,
+    pub group_member_briefs: Vec<ChannelAgentBrief>,
     pub fabushi_shape: Option<String>,
     pub fabushi_color: Option<u32>,
     pub grok_avatar: Option<BotGrokAvatarVisual>,
@@ -447,20 +460,196 @@ pub fn resolve_dialog_avatar_kind(
     classic_fallback()
 }
 
-/// Shared circular / animated bot avatar renderer used by expanded dialog rows, the Apple Messages
-/// 3-column Pinned Chats avatar grid, and the collapsed sidebar rail.
-pub(crate) fn render_dialog_avatar(
+fn map_persona_state_to_openbot(
+    state: GrokPersonaState,
+    exec_state: Option<&str>,
+) -> (AvatarMood, Option<AgentStepActivity>) {
+    let raw = exec_state.unwrap_or("").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "failed" | "error" => (AvatarMood::Failed, None),
+        "blocked" | "awaiting_approval" | "approval" | "needs_approval" => {
+            (AvatarMood::Waiting, None)
+        }
+        "responded" | "done" | "completed" => (AvatarMood::Responded, None),
+        "searching" | "search" => (AvatarMood::Working, Some(AgentStepActivity::Searching)),
+        "coding" | "shell" | "terminal" => (AvatarMood::Working, Some(AgentStepActivity::Running)),
+        "writing" | "editing" => (AvatarMood::Working, Some(AgentStepActivity::Editing)),
+        "tool" | "working" => (AvatarMood::Working, Some(AgentStepActivity::Working)),
+        _ => match state {
+            GrokPersonaState::Thinking | GrokPersonaState::Loading => {
+                (AvatarMood::Working, Some(AgentStepActivity::Working))
+            }
+            GrokPersonaState::Searching => {
+                (AvatarMood::Working, Some(AgentStepActivity::Searching))
+            }
+            GrokPersonaState::Working => (AvatarMood::Working, Some(AgentStepActivity::Running)),
+            GrokPersonaState::Happy
+            | GrokPersonaState::Excited
+            | GrokPersonaState::Proud
+            | GrokPersonaState::Laughing => (AvatarMood::Responded, None),
+            GrokPersonaState::Angry | GrokPersonaState::Sad | GrokPersonaState::Suspicious => {
+                (AvatarMood::Failed, None)
+            }
+            GrokPersonaState::Sleeping | GrokPersonaState::Drowsy => (AvatarMood::Asleep, None),
+            _ => (AvatarMood::Idle, None),
+        },
+    }
+}
+
+/// Resolves OpenBot's avatar-anchored felt status badge priority:
+/// `ErrorRaspberry` > `WaitingAmber` > `Working3Balls` > `UnreadPlum` > `RespondedGreen`.
+pub fn resolve_dialog_felt_badge_state(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    preview_priority: &DialogPreviewPriority,
+) -> Option<FeltStatusBadgeState> {
+    if meta.is_saved_messages {
+        return None;
+    }
+    let exec = meta
+        .grok_avatar
+        .as_ref()
+        .map(|g| g.execution_state.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(exec.as_str(), "failed" | "error") {
+        return Some(FeltStatusBadgeState::ErrorRaspberry);
+    }
+    if matches!(preview_priority, DialogPreviewPriority::BlockedApproval(_))
+        || matches!(
+            exec.as_str(),
+            "blocked" | "awaiting_approval" | "approval" | "needs_approval"
+        )
+    {
+        return Some(FeltStatusBadgeState::WaitingAmber);
+    }
+    let is_working = item.typing_indicator.is_some()
+        || matches!(
+            exec.as_str(),
+            "working" | "thinking" | "tool" | "coding" | "writing" | "searching"
+        );
+    if is_working {
+        return Some(FeltStatusBadgeState::Working3Balls);
+    }
+    if item.unread_count > 0 || meta.is_unread_marked {
+        return Some(FeltStatusBadgeState::UnreadPlum(item.unread_count.max(1)));
+    }
+    if matches!(exec.as_str(), "responded" | "done" | "completed") {
+        return Some(FeltStatusBadgeState::RespondedGreen);
+    }
+    None
+}
+
+fn current_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn build_group_cluster_members(
+    seed_id: u64,
+    peer_name: &str,
+    meta: &SidebarDialogMeta,
+    is_dark: bool,
+) -> (Vec<ChannelMember>, Vec<ChannelAgentBrief>) {
+    if !meta.group_member_briefs.is_empty() {
+        let members: Vec<ChannelMember> = meta
+            .group_member_briefs
+            .iter()
+            .map(|b| ChannelMember {
+                agent_id: b.id.clone(),
+            })
+            .collect();
+        return (members, meta.group_member_briefs.clone());
+    }
+    let tiles = derive_cluster_tiles(seed_id, peer_name, None, is_dark);
+    let count = tiles.len().clamp(2, 3);
+    let mut members = Vec::with_capacity(count);
+    let mut briefs = Vec::with_capacity(count);
+    for (idx, (_, color_rgb)) in tiles.into_iter().take(count).enumerate() {
+        let id = format!("group-{seed_id}-member-{idx}");
+        members.push(ChannelMember {
+            agent_id: id.clone(),
+        });
+        briefs.push(ChannelAgentBrief {
+            id: id.clone(),
+            avatar_seed: Some(id),
+            avatar_hue: None,
+            avatar_color: Some(format!("#{:06x}", color_rgb & 0xFF_FFFF)),
+            avatar_url: None,
+        });
+    }
+    (members, briefs)
+}
+
+fn render_openbot_bot_avatar(
+    source_id: &str,
+    shape: &str,
+    color: &str,
+    state: GrokPersonaState,
+    exec_state: Option<&str>,
+    peer_name: &str,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+) -> Div {
+    let trimmed = shape.trim();
+    if trimmed.to_ascii_lowercase().starts_with("grok2d:") {
+        return render_grok_bot_avatar(
+            GrokBotAvatarProps::new(source_id, trimmed, color, avatar_size_px)
+                .with_state(state)
+                .with_follow_pointer(true)
+                .with_paused(false)
+                .with_surface_bg(surface_bg_hex),
+        );
+    }
+    let stripped = trimmed
+        .strip_prefix("plush:")
+        .or_else(|| trimmed.strip_prefix("PLUSH:"))
+        .unwrap_or(trimmed);
+    if PlushCharacterId::parse(stripped).is_some() {
+        let bg_hex = parse_fabushi_hex_color(color).unwrap_or(0x8B5CF6);
+        return render_fabushi_shape_avatar(trimmed, bg_hex, peer_name, avatar_size_px);
+    }
+    let bloub_shape = BloubShape::parse(stripped)
+        .or_else(|| legacy_shape_to_bloub_shape(stripped))
+        .or_else(|| legacy_shape_to_bloub_shape(trimmed));
+    let hex_color = parse_fabushi_hex_color(color)
+        .map(|rgb_u32| format!("#{:06x}", rgb_u32 & 0xFF_FFFF));
+    let (mood, activity) = map_persona_state_to_openbot(state, exec_state);
+    render_plush_bot_avatar(
+        source_id,
+        bloub_shape,
+        None,
+        hex_color.as_deref(),
+        avatar_size_px,
+        mood,
+        activity,
+    )
+}
+
+/// Shared circular / 3D plush / channel cluster avatar renderer used by expanded dialog rows,
+/// the centered pinned chats grid, and the compact sidebar rail.
+pub(crate) fn render_dialog_avatar_with_options(
     item: &DialogItemModel,
     meta: &SidebarDialogMeta,
     palette: &TdesktopThemePalette,
     avatar_size_px: f32,
     surface_bg_hex: u32,
     online_dot_border: Rgba,
+    is_selected: bool,
+    suppress_online_dot: bool,
 ) -> Div {
     let avatar_size = px(avatar_size_px);
     let initials_font_px = (avatar_size_px * 0.35).clamp(12.0, 19.0);
     let saved_icon_px = (avatar_size_px * 0.48).clamp(17.0, 26.0);
     let bot_icon_px = (avatar_size_px * 0.44).clamp(17.0, 24.0);
+    let is_openbot = palette.is_apple_style();
+    let is_dark = palette.mode.is_dark();
+    let ring_kind = if is_selected {
+        SidebarPlushRingKind::Selected
+    } else {
+        SidebarPlushRingKind::Default
+    };
 
     let circle_base = |bg_hex: u32| -> Div {
         div()
@@ -478,75 +667,192 @@ pub(crate) fn render_dialog_avatar(
             .text_size(px(initials_font_px))
     };
 
-    let mut avatar = match resolve_dialog_avatar_kind(item, meta, palette) {
-        DialogAvatarKind::SavedMessages { bg_hex } => {
-            circle_base(bg_hex).child(tg_icon(IconName::SavedMessages, saved_icon_px, 0xFFFFFF))
-        }
-        DialogAvatarKind::CompositeGroup { seed_id } => render_composite_group_avatar(
-            seed_id,
-            &item.peer_name,
+    let kind = resolve_dialog_avatar_kind(item, meta, palette);
+    let mut avatar = if is_openbot && meta.is_group && !meta.is_bot && !meta.is_saved_messages {
+        let (members, briefs) = build_group_cluster_members(item.id, &item.peer_name, meta, is_dark);
+        render_channel_avatar(
+            &members,
+            &briefs,
+            ChannelAvatarLayout::Cluster,
             None,
+            None,
+            false,
             avatar_size_px,
-            surface_bg_hex,
-            palette.mode.is_dark(),
-        ),
-        DialogAvatarKind::GrokBot {
-            source_id,
-            shape,
-            color,
-            state,
-        } => render_grok_bot_avatar(
-            GrokBotAvatarProps::new(&source_id, &shape, &color, avatar_size_px)
-                .with_state(state)
-                .with_follow_pointer(true)
-                .with_paused(false)
-                .with_surface_bg(surface_bg_hex),
-        ),
-        DialogAvatarKind::FabushiShape { shape, bg_hex } => {
-            crate::components::avatar::render_fabushi_shape_avatar(
-                &shape,
-                bg_hex,
-                &item.peer_name,
-                avatar_size_px,
-            )
-        }
-        DialogAvatarKind::ClassicBotIcon { bg_hex } => {
-            circle_base(bg_hex).child(tg_icon(IconName::BotRobot, bot_icon_px, 0xFFFFFF))
-        }
-        DialogAvatarKind::ClassicInitials { bg_hex, initials } => {
-            circle_base(bg_hex).child(initials)
+            Some(ring_kind),
+            is_dark,
+            0.0,
+        )
+    } else {
+        match kind {
+            DialogAvatarKind::SavedMessages { bg_hex } => {
+                circle_base(bg_hex).child(tg_icon(IconName::SavedMessages, saved_icon_px, 0xFFFFFF))
+            }
+            DialogAvatarKind::CompositeGroup { seed_id } => {
+                if is_openbot {
+                    let (members, briefs) =
+                        build_group_cluster_members(seed_id, &item.peer_name, meta, is_dark);
+                    render_channel_avatar(
+                        &members,
+                        &briefs,
+                        ChannelAvatarLayout::Cluster,
+                        None,
+                        None,
+                        false,
+                        avatar_size_px,
+                        Some(ring_kind),
+                        is_dark,
+                        0.0,
+                    )
+                } else {
+                    render_composite_group_avatar(
+                        seed_id,
+                        &item.peer_name,
+                        None,
+                        avatar_size_px,
+                        surface_bg_hex,
+                        is_dark,
+                    )
+                }
+            }
+            DialogAvatarKind::GrokBot {
+                source_id,
+                shape,
+                color,
+                state,
+            } => {
+                if is_openbot {
+                    let exec_state = meta.grok_avatar.as_ref().map(|g| g.execution_state.as_str());
+                    render_openbot_bot_avatar(
+                        &source_id,
+                        &shape,
+                        &color,
+                        state,
+                        exec_state,
+                        &item.peer_name,
+                        avatar_size_px,
+                        surface_bg_hex,
+                    )
+                } else {
+                    render_grok_bot_avatar(
+                        GrokBotAvatarProps::new(&source_id, &shape, &color, avatar_size_px)
+                            .with_state(state)
+                            .with_follow_pointer(true)
+                            .with_paused(false)
+                            .with_surface_bg(surface_bg_hex),
+                    )
+                }
+            }
+            DialogAvatarKind::FabushiShape { shape, bg_hex } => {
+                render_fabushi_shape_avatar(&shape, bg_hex, &item.peer_name, avatar_size_px)
+            }
+            DialogAvatarKind::ClassicBotIcon { bg_hex } => {
+                circle_base(bg_hex).child(tg_icon(IconName::BotRobot, bot_icon_px, 0xFFFFFF))
+            }
+            DialogAvatarKind::ClassicInitials { bg_hex, initials } => {
+                circle_base(bg_hex).child(initials)
+            }
         }
     };
 
-    let is_agent_running = item.typing_indicator.is_some()
-        || meta.grok_avatar.as_ref().is_some_and(|g| {
-            let s = g.execution_state.trim().to_ascii_lowercase();
-            !s.is_empty() && s != "idle" && s != "blocked" && s != "awaiting_approval"
-        });
-    if (item.is_online || is_agent_running) && !meta.is_saved_messages {
-        let dot_px = (avatar_size_px * 0.24).clamp(8.5, 11.5);
-        let dot_color = if is_agent_running {
-            palette.accent
-        } else {
-            palette.online_dot_fg
-        };
-        avatar = avatar.relative().child(
-            div()
-                .absolute()
-                .bottom_0()
-                .right_0()
-                .w(px(dot_px))
-                .h(px(dot_px))
-                .rounded_full()
-                .bg(rgb(dot_color))
-                .border_2()
-                .border_color(online_dot_border),
-        );
+    if !suppress_online_dot {
+        let is_agent_running = item.typing_indicator.is_some()
+            || meta.grok_avatar.as_ref().is_some_and(|g| {
+                let s = g.execution_state.trim().to_ascii_lowercase();
+                !s.is_empty() && s != "idle" && s != "blocked" && s != "awaiting_approval"
+            });
+        if (item.is_online || is_agent_running) && !meta.is_saved_messages {
+            let dot_px = (avatar_size_px * 0.24).clamp(8.5, 11.5);
+            let dot_color = if is_agent_running {
+                palette.accent
+            } else {
+                palette.online_dot_fg
+            };
+            avatar = avatar.relative().child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(dot_px))
+                    .h(px(dot_px))
+                    .rounded_full()
+                    .bg(rgb(dot_color))
+                    .border_2()
+                    .border_color(online_dot_border),
+            );
+        }
     }
 
     avatar
 }
 
+/// Backward-compatible wrapper around [`render_dialog_avatar_with_options`].
+pub(crate) fn render_dialog_avatar(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    online_dot_border: Rgba,
+) -> Div {
+    render_dialog_avatar_with_options(
+        item,
+        meta,
+        palette,
+        avatar_size_px,
+        surface_bg_hex,
+        online_dot_border,
+        false,
+        palette.is_apple_style() && (meta.is_bot || meta.is_group),
+    )
+}
+
+/// Renders an OpenBot avatar with bottom-right felt status badge (`Working3Balls`, `UnreadPlum`,
+/// `WaitingAmber`, `ErrorRaspberry`, `RespondedGreen`).
+pub(crate) fn render_openbot_dialog_avatar_with_badge(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    is_selected: bool,
+    lang_id: &str,
+) -> Div {
+    let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
+    let badge_state = resolve_dialog_felt_badge_state(item, meta, &preview_priority);
+    let suppress_dot = badge_state.is_some() || meta.is_bot || meta.is_group;
+    let base = render_dialog_avatar_with_options(
+        item,
+        meta,
+        palette,
+        avatar_size_px,
+        surface_bg_hex,
+        rgb(surface_bg_hex),
+        is_selected,
+        suppress_dot,
+    );
+    let now_ms = current_wall_ms();
+    let is_dark = palette.mode.is_dark();
+    div()
+        .relative()
+        .w(px(avatar_size_px))
+        .h(px(avatar_size_px))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(base)
+        .when_some(badge_state, |el, st| {
+            el.child(
+                div()
+                    .absolute()
+                    .bottom(px(-3.0))
+                    .right(px(-5.0))
+                    .child(render_felt_status_badge(st, surface_bg_hex, is_dark, now_ms)),
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn render_dialog_row_item<V: 'static>(
     item: &DialogItemModel,
     index: usize,
@@ -561,6 +867,39 @@ pub fn render_dialog_row_item<V: 'static>(
     on_toggle_topics: impl Fn(&mut V, &mut Context<V>) + 'static,
     on_open_miniapp: impl Fn(&mut V, String, &mut Context<V>) + 'static,
 ) -> AnyElement {
+    let width_px = if is_narrow { 200.0 } else { 280.0 };
+    render_dialog_row_item_with_width(
+        item,
+        index,
+        is_selected,
+        width_px,
+        meta,
+        palette,
+        lang_id,
+        cx,
+        on_select,
+        on_context,
+        on_toggle_topics,
+        on_open_miniapp,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_dialog_row_item_with_width<V: 'static>(
+    item: &DialogItemModel,
+    index: usize,
+    is_selected: bool,
+    sidebar_width_px: f32,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_select: impl Fn(&mut V, &mut Context<V>) + 'static,
+    on_context: impl Fn(&mut V, Point<Pixels>, &mut Context<V>) + 'static,
+    on_toggle_topics: impl Fn(&mut V, &mut Context<V>) + 'static,
+    on_open_miniapp: impl Fn(&mut V, String, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let is_narrow = sidebar_width_px <= OPENBOT_HIDE_TIMESTAMP_WIDTH;
     let mut entry = DialogsEntry::new(item.id as i64, item.peer_name.clone());
     entry.data.is_forum = meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty());
     entry.set_active(is_selected);
@@ -580,47 +919,55 @@ pub fn render_dialog_row_item<V: 'static>(
     pill.is_muted = item.is_muted;
 
     if palette.is_apple_style() {
-        // Grok Bot `dC` sidebar row rhythm: 54px height, 10px pill radius, 36px avatar, 8px gap,
-        // translucent 6% hover / 8% active fills, and 4-tier preview priority order.
+        // OpenBot `383a35d2` sidebar row rhythm: 62px height, 8px radius, 46px 3D plush/cluster
+        // avatar + felt status badge, active #212121/#e8e8eb, hide timestamp <= 210px, D6-safe ellipsis.
+        let ob = palette.openbot_palette();
         let is_dark = palette.mode.is_dark();
-        let row_height = palette.scaled_px(54.0);
-        let row_hover_bg = palette.row_hover_rgba();
-        let row_active_bg = palette.row_active_rgba();
+        let row_height = palette.scaled_px(ROW_HEIGHT);
+        let row_hover_bg = ob.hover();
+        let row_active_bg = if is_dark { ob.bg_surface() } else { rgb(0xE8E8EB) };
         let row_surface_hex = if is_selected {
-            if is_dark { 0x1F1F1F } else { 0xE5E5E5 }
+            if is_dark { 0x212121 } else { 0xE8E8EB }
+        } else if is_dark {
+            0x1A1A1A
         } else {
-            palette.dialogs_bg
+            0xF5F5F6
         };
-        let name_fg: Rgba = rgb(palette.text_primary);
-        let sub_fg: Rgba = rgb(palette.text_secondary);
-        let time_fg: Rgba = rgb(palette.msg_in_date_fg);
-        let avatar_size_px = palette.scaled_px(36.0);
-        let online_border = rgb(row_surface_hex);
-        let avatar = render_dialog_avatar(
+        let name_fg = ob.text_primary();
+        let sub_fg = ob.text_muted();
+        let time_fg = ob.text_readable();
+        let avatar_size_px = palette.scaled_px(46.0);
+        let avatar = render_openbot_dialog_avatar_with_badge(
             item,
             meta,
             palette,
             avatar_size_px,
             row_surface_hex,
-            online_border,
+            is_selected,
+            lang_id,
         );
 
         let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
-        let is_blocked = matches!(preview_priority, DialogPreviewPriority::BlockedApproval(_));
         let has_unread = item.unread_count > 0 || meta.is_unread_marked;
-        let (_, _, warn_text_hex) = TdesktopThemePalette::bot_hue_colors("yellow", is_dark);
+        let hide_timestamp = sidebar_width_px <= OPENBOT_HIDE_TIMESTAMP_WIDTH;
 
         let mut title_row = div()
             .flex_1()
             .min_w(px(0.0))
+            .overflow_hidden()
             .flex()
             .items_center()
             .gap(px(palette.scaled_px(4.0)))
-            .overflow_hidden()
             .child(
                 div()
-                    .truncate()
-                    .text_size(px(palette.scaled_px(13.5)))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .pr(px(2.0))
+                    .text_size(px(palette.scaled_px(14.5)))
+                    .line_height(px(palette.scaled_px(20.0)))
                     .font_weight(if is_selected || has_unread {
                         FontWeight::SEMIBOLD
                     } else {
@@ -630,103 +977,131 @@ pub fn render_dialog_row_item<V: 'static>(
                     .child(item.peer_name.clone()),
             );
         if meta.is_verified {
-            title_row = title_row.child(tg_icon(
+            title_row = title_row.child(tg_icon_rgba(
                 IconName::Verified,
-                palette.scaled_px(12.5),
-                palette.accent,
+                palette.scaled_px(12.0),
+                ob.accent_text(),
             ));
         }
         if meta.is_premium {
-            title_row = title_row.child(tg_icon(
+            title_row = title_row.child(tg_icon_rgba(
                 IconName::PremiumStar,
                 palette.scaled_px(11.5),
-                palette.accent,
+                ob.text_muted(),
             ));
         }
         if item.is_muted {
             title_row = title_row.child(tg_icon_rgba(
                 IconName::Mute,
                 palette.scaled_px(11.0),
-                TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.72),
+                ob.text_dim(),
             ));
         }
 
         let top_row = div()
             .w_full()
+            .min_w(px(0.0))
+            .overflow_hidden()
             .flex()
-            .items_center()
+            .items_baseline()
             .justify_between()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .child(title_row)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(palette.scaled_px(11.5)))
-                    .text_color(time_fg)
-                    .child(item.timestamp.clone()),
-            );
+            .when(!hide_timestamp && !item.timestamp.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(palette.scaled_px(12.5)))
+                        .line_height(px(palette.scaled_px(16.0)))
+                        .text_color(time_fg)
+                        .child(item.timestamp.clone()),
+                )
+            });
 
-        let preview_font = px(palette.scaled_px(12.5));
-        let preview_line: AnyElement = match preview_priority {
+        // D6 bulletproof GPUI 0.2.2 CJK truncation: apply flex_1 + min_w(0) + overflow_hidden +
+        // whitespace_nowrap + text_ellipsis DIRECTLY on flex children with NO non-flex w_full wrapper.
+        let preview_font = px(palette.scaled_px(13.5));
+        let preview_lh = px(palette.scaled_px(18.0));
+        let preview_slot: AnyElement = match preview_priority {
             DialogPreviewPriority::BlockedApproval(detail) => div()
-                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
                 .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap(px(3.0))
                 .text_size(preview_font)
+                .line_height(preview_lh)
                 .child(
                     div()
                         .flex_shrink_0()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(warn_text_hex))
+                        .text_color(ob.warning())
                         .child(tr_str(lang_id, "等你处理：", "Needs you: ")),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .truncate()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .pr(px(2.0))
                         .text_color(sub_fg)
                         .child(detail),
                 )
                 .into_any_element(),
             DialogPreviewPriority::Draft(draft) => div()
-                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
                 .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap(px(3.0))
                 .text_size(preview_font)
+                .line_height(preview_lh)
                 .child(
                     div()
                         .flex_shrink_0()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.danger))
+                        .text_color(ob.danger())
                         .child(tr_str(lang_id, "草稿：", "Draft: ")),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .truncate()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .pr(px(2.0))
                         .text_color(sub_fg)
                         .child(draft),
                 )
                 .into_any_element(),
             DialogPreviewPriority::LiveActivity(activity) => div()
-                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
                 .overflow_hidden()
-                .truncate()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .pr(px(2.0))
                 .text_size(preview_font)
+                .line_height(preview_lh)
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(palette.accent))
+                .text_color(ob.text_secondary())
                 .child(activity)
                 .into_any_element(),
             DialogPreviewPriority::Message(text) => {
+                let display_text = if text.trim().is_empty() {
+                    tr_str(lang_id, "暂无消息", "No messages yet").to_string()
+                } else {
+                    text
+                };
                 if let Some(icon) = media_badge_svg_rgba(preview_ui.media_badge, sub_fg) {
                     div()
-                        .w_full()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .overflow_hidden()
                         .flex()
                         .items_center()
@@ -736,20 +1111,28 @@ pub fn render_dialog_row_item<V: 'static>(
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .truncate()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .pr(px(2.0))
                                 .text_size(preview_font)
+                                .line_height(preview_lh)
                                 .text_color(sub_fg)
-                                .child(text),
+                                .child(display_text),
                         )
                         .into_any_element()
                 } else {
                     div()
-                        .w_full()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .overflow_hidden()
-                        .truncate()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .pr(px(2.0))
                         .text_size(preview_font)
+                        .line_height(preview_lh)
                         .text_color(sub_fg)
-                        .child(text)
+                        .child(display_text)
                         .into_any_element()
                 }
             }
@@ -772,10 +1155,10 @@ pub fn render_dialog_row_item<V: 'static>(
                     .px(px(palette.scaled_px(8.0)))
                     .py(px(palette.scaled_px(2.0)))
                     .rounded_full()
-                    .bg(rgb(palette.accent))
+                    .bg(ob.bg_control_active())
                     .text_size(px(palette.scaled_px(10.5)))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xFFFFFF))
+                    .text_color(ob.text_primary())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
@@ -784,60 +1167,6 @@ pub fn render_dialog_row_item<V: 'static>(
                         }),
                     )
                     .child(tr_str(lang_id, "打开", "Open")),
-            );
-        }
-
-        // Trailing attention slot priority (Grok Bot §2.5): blocked amber dot > unread dot/pill
-        if is_blocked {
-            has_aux = true;
-            right_aux = right_aux.child(
-                div()
-                    .w(px(palette.scaled_px(8.0)))
-                    .h(px(palette.scaled_px(8.0)))
-                    .rounded_full()
-                    .bg(rgb(warn_text_hex)),
-            );
-        } else if item.unread_count > 1 {
-            has_aux = true;
-            let (count_bg, count_fg) = if item.is_muted {
-                (
-                    TdesktopThemePalette::rgba_with_alpha(palette.muted_badge_bg, 0.22),
-                    rgb(palette.text_secondary),
-                )
-            } else {
-                (
-                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16),
-                    rgb(palette.accent),
-                )
-            };
-            right_aux = right_aux.child(
-                div()
-                    .h(px(palette.scaled_px(16.0)))
-                    .min_w(px(palette.scaled_px(16.0)))
-                    .px(px(palette.scaled_px(5.0)))
-                    .rounded_full()
-                    .bg(count_bg)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(palette.scaled_px(10.5)))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(count_fg)
-                    .child(format!("{}", pill.count)),
-            );
-        } else if has_unread {
-            has_aux = true;
-            let dot_bg = if item.is_muted {
-                rgb(palette.muted_badge_bg)
-            } else {
-                rgb(palette.accent)
-            };
-            right_aux = right_aux.child(
-                div()
-                    .w(px(palette.scaled_px(7.5)))
-                    .h(px(palette.scaled_px(7.5)))
-                    .rounded_full()
-                    .bg(dot_bg),
             );
         }
 
@@ -855,7 +1184,7 @@ pub fn render_dialog_row_item<V: 'static>(
                     .px(px(4.0))
                     .py(px(2.0))
                     .rounded(px(5.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.12))
+                    .bg(ob.bg_control_active())
                     .flex()
                     .items_center()
                     .on_mouse_down(
@@ -865,17 +1194,19 @@ pub fn render_dialog_row_item<V: 'static>(
                             on_toggle_topics(this, cx);
                         }),
                     )
-                    .child(tg_icon(chev, 10.0, palette.accent)),
+                    .child(tg_icon_rgba(chev, 10.0, ob.text_secondary())),
             );
         }
 
         let bottom_row = div()
             .w_full()
+            .min_w(px(0.0))
+            .overflow_hidden()
             .flex()
             .items_center()
             .justify_between()
             .gap(px(6.0))
-            .child(div().flex_1().min_w(px(0.0)).child(preview_line))
+            .child(preview_slot)
             .when(has_aux, |el| el.child(right_aux));
 
         return div()
@@ -884,9 +1215,9 @@ pub fn render_dialog_row_item<V: 'static>(
             .h(px(row_height))
             .flex_shrink_0()
             .w_full()
-            .px(px(palette.scaled_px(8.0)))
-            .py(px(palette.scaled_px(6.0)))
-            .rounded(px(palette.scaled_px(10.0)))
+            .p(px(palette.scaled_px(8.0)))
+            .mb(px(2.0))
+            .rounded(px(8.0))
             .when(is_selected, |el| el.bg(row_active_bg))
             .hover(move |s| if is_selected { s } else { s.bg(row_hover_bg) })
             .flex()
@@ -914,7 +1245,7 @@ pub fn render_dialog_row_item<V: 'static>(
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap(px(palette.scaled_px(1.5)))
+                    .gap(px(palette.scaled_px(2.0)))
                     .child(top_row)
                     .child(bottom_row),
             )
@@ -993,12 +1324,20 @@ pub fn render_dialog_row_item<V: 'static>(
         );
 
     let mut title_row = div()
+        .flex_1()
+        .min_w(px(0.0))
         .flex()
         .items_center()
         .gap(px(palette.scaled_px(4.0)))
         .overflow_hidden();
     title_row = title_row.child(
         div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .pr(px(2.0))
             .text_size(px(palette.scaled_px(14.0)))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(name_fg)
@@ -1033,12 +1372,15 @@ pub fn render_dialog_row_item<V: 'static>(
     let preview_font = px(palette.scaled_px(13.0));
     let preview_line: AnyElement = if preview_ui.is_draft {
         div()
+            .flex_1()
+            .min_w(px(0.0))
             .flex()
             .items_center()
             .gap(px(3.0))
             .overflow_hidden()
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_size(preview_font)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(palette.danger))
@@ -1046,6 +1388,12 @@ pub fn render_dialog_row_item<V: 'static>(
             )
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .pr(px(2.0))
                     .text_size(preview_font)
                     .text_color(rgb(sub_fg_hex))
                     .child(preview_ui.text),
@@ -1053,6 +1401,12 @@ pub fn render_dialog_row_item<V: 'static>(
             .into_any_element()
     } else if let Some(ref typing) = item.typing_indicator {
         div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .pr(px(2.0))
             .text_size(preview_font)
             .text_color(if use_inverted_sel {
                 rgb(palette.active_button_fg)
@@ -1062,12 +1416,24 @@ pub fn render_dialog_row_item<V: 'static>(
             .child(typing.clone())
             .into_any_element()
     } else {
-        let mut line = div().flex().items_center().gap(px(4.0)).overflow_hidden();
+        let mut line = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .overflow_hidden();
         if let Some(icon) = media_badge_svg_rgba(preview_ui.media_badge, rgb(sub_fg_hex)) {
             line = line.child(icon);
         }
         line.child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .pr(px(2.0))
                 .text_size(preview_font)
                 .text_color(rgb(sub_fg_hex))
                 .child(preview_ui.text),
@@ -1200,11 +1566,13 @@ pub fn render_dialog_row_item<V: 'static>(
 
     let mut bottom_row = div()
         .w_full()
+        .min_w(px(0.0))
+        .overflow_hidden()
         .flex()
         .items_center()
         .justify_between()
         .gap(px(6.0))
-        .child(div().flex_1().overflow_hidden().child(preview_line))
+        .child(preview_line)
         .child(right_badges);
     if meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty()) {
         let chev = if meta.is_topics_expanded {
@@ -1238,6 +1606,7 @@ pub fn render_dialog_row_item<V: 'static>(
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.0))
                 .h_full()
                 .overflow_hidden()
                 .flex()

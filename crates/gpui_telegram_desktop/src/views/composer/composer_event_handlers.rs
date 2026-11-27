@@ -321,6 +321,83 @@ impl CanonicalComposer {
         if self.ime_machine.is_composing() && key != "escape" {
             return false;
         }
+        if self.dollar_ac_visible && !self.dollar_ac_matches.is_empty() {
+            let len = self.dollar_ac_matches.len();
+            match key {
+                "up" => {
+                    self.dollar_ac_selected = if self.dollar_ac_selected == 0 {
+                        len.saturating_sub(1)
+                    } else {
+                        self.dollar_ac_selected - 1
+                    };
+                    return true;
+                }
+                "down" => {
+                    self.dollar_ac_selected = (self.dollar_ac_selected + 1) % len;
+                    return true;
+                }
+                "tab" => {
+                    let idx = self.dollar_ac_selected.min(len.saturating_sub(1));
+                    self.select_dollar_autocomplete_index(idx);
+                    return true;
+                }
+                "enter" if !is_shift => {
+                    let idx = self.dollar_ac_selected.min(len.saturating_sub(1));
+                    self.select_dollar_autocomplete_index(idx);
+                    return true;
+                }
+                "escape" => {
+                    self.dollar_ac_visible = false;
+                    self.dollar_ac_matches.clear();
+                    self.dollar_ac_selected = 0;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if self.autocomplete.is_open && !self.autocomplete.mention_rows.is_empty() {
+            match key {
+                "up" => {
+                    self.autocomplete.move_selection("Up");
+                    return true;
+                }
+                "down" => {
+                    self.autocomplete.move_selection("Down");
+                    return true;
+                }
+                "tab" => {
+                    let sel = self.autocomplete.selected_index.max(0) as usize;
+                    if let Some(m) = self.autocomplete.mention_rows.get(sel) {
+                        let insert = if !m.username.trim().is_empty() {
+                            format!("@{} ", m.username.trim().trim_start_matches('@'))
+                        } else {
+                            format!("@{} ", m.name.trim())
+                        };
+                        self.replace_active_trigger_token(&insert);
+                        self.autocomplete.hide();
+                        return true;
+                    }
+                }
+                "enter" if !is_shift => {
+                    let sel = self.autocomplete.selected_index.max(0) as usize;
+                    if let Some(m) = self.autocomplete.mention_rows.get(sel) {
+                        let insert = if !m.username.trim().is_empty() {
+                            format!("@{} ", m.username.trim().trim_start_matches('@'))
+                        } else {
+                            format!("@{} ", m.name.trim())
+                        };
+                        self.replace_active_trigger_token(&insert);
+                        self.autocomplete.hide();
+                        return true;
+                    }
+                }
+                "escape" => {
+                    self.autocomplete.hide();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if self.bot_ac_visible && !self.bot_ac_matches.is_empty() {
             let len = self.bot_ac_matches.len();
             match key {
@@ -807,6 +884,12 @@ impl CanonicalComposer {
             ComposerBarAction::CycleSendAs => {
                 self.cycle_send_as_peer();
             }
+            ComposerBarAction::StopActiveTurn => {
+                self.pending_stop_active_turn = true;
+            }
+            ComposerBarAction::StartLiveVoice => {
+                self.pending_live_voice_start = true;
+            }
         }
         cx.notify();
     }
@@ -855,6 +938,26 @@ impl CanonicalComposer {
                 self.editor.send_options_open = false;
                 self.attachments_drawer.close();
                 self.autocomplete.hide();
+            }
+            ComposerPopupAction::OpenBotAdd(add_act) => {
+                use crate::views::composer::popups_ui::ComposerOpenBotAddAction;
+                self.attachments_drawer.close();
+                match add_act {
+                    ComposerOpenBotAddAction::AttachFiles => self.prompt_native_files(cx),
+                    ComposerOpenBotAddAction::InsertSkillTrigger => {
+                        self.editor.insert_at_cursor(&mut self.ime_machine, "$");
+                        self.sync_autocomplete();
+                    }
+                    ComposerOpenBotAddAction::Formatting => self.toggle_formatting(),
+                    ComposerOpenBotAddAction::EmojiPicker => self.toggle_emoji_picker(),
+                    ComposerOpenBotAddAction::LiveVoice => {
+                        self.pending_live_voice_start = true;
+                        self.pending_openbot_add_action = Some(add_act);
+                    }
+                    other => {
+                        self.pending_openbot_add_action = Some(other);
+                    }
+                }
             }
         }
         cx.notify();
@@ -951,11 +1054,14 @@ impl CanonicalComposer {
         };
         if self.dollar_ac_visible && !self.dollar_ac_matches.is_empty() {
             let pal = self.palette;
+            let is_apple = pal.is_apple_style();
+            let ob = pal.openbot_palette();
+            let is_dark = pal.mode.is_dark();
             let matches = self.dollar_ac_matches.clone();
             let total_matches = matches.len();
             let sel = self.dollar_ac_selected.min(total_matches.saturating_sub(1));
-            let window_start = if total_matches > 8 && sel >= 5 {
-                (sel - 4).min(total_matches - 8)
+            let window_start = if total_matches > 7 && sel >= 4 {
+                (sel - 3).min(total_matches - 7)
             } else {
                 0
             };
@@ -963,38 +1069,50 @@ impl CanonicalComposer {
                 .into_iter()
                 .enumerate()
                 .skip(window_start)
-                .take(8)
+                .take(7)
                 .collect();
+            let bg_c: Rgba = if is_apple {
+                if is_dark { rgb(0x121212).into() } else { rgb(0xF8F8FA).into() }
+            } else {
+                rgb(pal.menu_bg).into()
+            };
+            let border_c: Rgba = if is_apple {
+                if is_dark { rgb(0x222222).into() } else { rgb(0xE6E6EA).into() }
+            } else {
+                rgb(pal.border_fg).into()
+            };
+            let row_hover = if is_apple { ob.hover() } else { rgb(pal.menu_hover_bg).into() };
+            let row_sel = if is_apple { ob.bg_control_active() } else { rgb(pal.input_bg).into() };
             return Some(
                 div()
                     .id("composer-bot-dollar-popup")
-                    .mb(px(6.0))
-                    .w(px(380.0))
-                    .max_h(px(280.0))
+                    .mb(px(if is_apple { 4.0 } else { 6.0 }))
+                    .when(is_apple, |el| el.w_full().max_h(px(213.0)))
+                    .when(!is_apple, |el| el.w(px(380.0)).max_h(px(280.0)).shadow_lg())
                     .overflow_y_scroll()
-                    .rounded(px(12.0))
-                    .bg(rgb(pal.menu_bg))
+                    .rounded(px(14.0))
+                    .bg(bg_c)
                     .border_1()
-                    .border_color(rgb(pal.border_fg))
-                    .shadow_lg()
-                    .p(px(6.0))
+                    .border_color(border_c)
+                    .p(px(5.0))
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(1.0))
                     .children(visible_rows.into_iter().map(|(idx, item)| {
                         let is_sel = idx == sel;
                         let token_lbl = format!("${}", item.token.trim().trim_start_matches('$'));
                         div()
                             .id(SharedString::from(format!("bot-dollar-row-{idx}")))
+                            .h(px(if is_apple { 29.0 } else { 36.0 }))
                             .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .when(is_sel, |d| d.bg(rgb(pal.input_bg)))
-                            .hover(move |s| s.bg(rgb(pal.menu_hover_bg)))
+                            .rounded(px(7.0))
+                            .when(is_sel, |d| d.bg(row_sel))
+                            .hover(move |s| s.bg(row_hover))
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.select_dollar_autocomplete_index(idx);
                                     this.sync_bot_menu_compact_state(Some(cx));
                                     cx.notify();
@@ -1009,49 +1127,47 @@ impl CanonicalComposer {
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .overflow_hidden()
                                     .child(
                                         div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(pal.accent))
-                                                    .child(token_lbl),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(rgb(pal.text_primary))
-                                                    .truncate()
-                                                    .child(item.title),
-                                            ),
+                                            .flex_shrink_0()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if is_apple {
+                                                ob.accent_text()
+                                            } else {
+                                                rgb(pal.accent).into()
+                                            })
+                                            .child(token_lbl),
                                     )
-                                    .when(!item.subtitle.is_empty(), |col| {
-                                        col.child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(pal.text_secondary))
-                                                .truncate()
-                                                .child(item.subtitle),
-                                        )
-                                    }),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.5))
+                                            .text_color(if is_apple {
+                                                ob.text_primary()
+                                            } else {
+                                                rgb(pal.text_primary).into()
+                                            })
+                                            .child(item.title),
+                                    ),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
                                     .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded_full()
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.accent))
+                                    .py(px(1.5))
+                                    .rounded(px(5.0))
+                                    .bg(if is_apple { ob.bg_control() } else { TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14) })
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if is_apple { ob.text_muted() } else { rgb(pal.accent).into() })
                                     .child(item.badge),
                             )
                     }))

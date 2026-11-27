@@ -36,7 +36,7 @@ pub use clusters_and_editor::{
     EDITOR_COLOR_TOTAL_CELLS, EDITOR_EYES_AVATAR_PX, EDITOR_EYES_CELL_HEIGHT_PX, EDITOR_EYES_COLS,
     EDITOR_GUTTER_PX, EDITOR_MAX_WIDTH_PX, EDITOR_MIN_PANEL_WIDTH_PX, EDITOR_RADIUS_PX,
     EDITOR_SHAPE_AVATAR_PX, EDITOR_SHAPE_CELL_HEIGHT_PX, EDITOR_SHAPE_COLS,
-    EDITOR_UPLOAD_MIN_HEIGHT_PX, EDITOR_UPLOAD_PREVIEW_PX, KnownChannelIcon,
+    EDITOR_UPLOAD_MIN_HEIGHT_PX, EDITOR_UPLOAD_PREVIEW_PX, FeltStatusBadgeState, KnownChannelIcon,
     PLUSH_BODY_SCALE as PLUSH_BODY_SCALE_F32, SIDEBAR_BADGE_BUMP_MS, SIDEBAR_BADGE_RESIZE_MS,
     SIDEBAR_BADGE_ROLL_IN_MS, SIDEBAR_BADGE_ROLL_OFFSET_RATIO, SIDEBAR_BADGE_ROLL_OUT_MS,
     SIDEBAR_FELT_DEFAULT_BOX_PX, SIDEBAR_FELT_RING_BORDER_PX, SIDEBAR_FELT_RING_WIDTH_PX,
@@ -45,8 +45,9 @@ pub use clusters_and_editor::{
     SidebarPlushRingSpec, SidebarRoutinePhase, SidebarWaitReason, WORKING_FACE_NOMINAL_MS,
     channel_activity_sentence, channel_icon_glyph, channel_icon_tile_colors, known_channel_icon,
     render_agent_avatar, render_agent_flat_svg, render_avatar_editor_popover,
-    render_channel_avatar, render_channel_icon_tile, render_sidebar_felt_badge,
-    resolve_channel_cluster, resolve_channel_cluster_sized, sidebar_plush_ring_svg_defs,
+    render_channel_avatar, render_channel_icon_tile, render_felt_status_badge,
+    render_sidebar_felt_badge, resolve_channel_cluster, resolve_channel_cluster_sized,
+    sidebar_plush_ring_svg_defs, working_ball_hop_sample,
 };
 pub use crew_pile::*;
 pub use eyefit::*;

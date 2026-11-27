@@ -3,14 +3,14 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, linear_color_stop, linear_gradient, px, rgb, Div, ElementId, FontWeight,
-    InteractiveElement, ParentElement, SharedString, Stateful, Styled,
+    div, linear_color_stop, linear_gradient, px, rgb, AnyElement, Div, ElementId, FontWeight,
+    InteractiveElement, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
 };
 use gpui_telegram_proto::creations::{CoverArtwork, CreationKind, CreationReviewStatus};
 
 use crate::components::ui::{delete_prev_word, pop_last_char, TextInputController};
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 
 /// Char-boundary-safe text input state supporting ASCII, CJK IME preedit, cursor navigation,
 /// Alt-word backspace, and Cmd+A full-selection overwrite.
@@ -182,13 +182,13 @@ pub fn parse_hex_color(hex: &str, fallback: u32) -> u32 {
     }
 }
 
-/// Returns the Apple HIG brand accent color for each creative vertical.
+/// Returns the cover fallback accent color for each creative vertical (neutral slate for Apps).
 pub fn creation_kind_accent(kind: CreationKind) -> u32 {
     match kind {
-        CreationKind::Book => 0xFF9500,
-        CreationKind::Music => 0xFA2D48,
-        CreationKind::Game => 0x5856D6,
-        CreationKind::App => 0x007AFF,
+        CreationKind::Book => 0x52463A,
+        CreationKind::Music => 0x4E3840,
+        CreationKind::Game => 0x3D3B52,
+        CreationKind::App => 0x3A3A3E,
     }
 }
 
@@ -202,20 +202,210 @@ pub fn creation_kind_label(kind: CreationKind, lang_id: &str) -> &'static str {
     }
 }
 
-/// Standard grouped macOS card surface with subtle hairline separator border.
+/// OpenBot monochrome primary CTA button (`#f0f0f0`/`#141414` dark, `#1c1c1e`/`#ffffff` light).
+pub(crate) fn openbot_primary_cta_btn(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let label_str: SharedString = label.into();
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(14.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.surface_light())
+        .text_color(ob.text_on_light())
+        .hover(|s| s.opacity(0.84))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .whitespace_nowrap()
+        .child(label_str)
+}
+
+/// OpenBot monochrome secondary/outline CTA button with `1px` hairline border.
+pub(crate) fn openbot_secondary_btn(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let hover_bg = ob.bg_control_hover();
+    let label_str: SharedString = label.into();
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded(px(8.0))
+        .bg(ob.bg_control())
+        .border_1()
+        .border_color(ob.border_strong_hairline())
+        .text_color(ob.text_primary())
+        .hover(move |s| s.bg(hover_bg))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.5))
+        .font_weight(FontWeight::MEDIUM)
+        .whitespace_nowrap()
+        .child(label_str)
+}
+
+/// OpenBot `38px` `PageHeader` bar with optional clickable parent breadcrumb (`parent › title`)
+/// and optional trailing controls slot.
+pub(crate) fn openbot_page_header(
+    title: impl Into<SharedString>,
+    breadcrumb_parent: Option<Stateful<Div>>,
+    trailing: Option<AnyElement>,
+    pal: TdesktopThemePalette,
+) -> Div {
+    let ob = pal.openbot_palette();
+    let title_str: SharedString = title.into();
+    let mut left = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0));
+    if let Some(parent_el) = breadcrumb_parent {
+        left = left.child(parent_el).child(
+            div()
+                .text_size(px(13.0))
+                .text_color(ob.text_muted())
+                .child("›"),
+        );
+    }
+    left = left.child(
+        div()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(14.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(ob.text_primary())
+            .child(title_str),
+    );
+
+    let mut bar = div()
+        .h(px(38.0))
+        .flex_shrink_0()
+        .w_full()
+        .px(px(16.0))
+        .bg(ob.bg_canvas())
+        .border_b_1()
+        .border_color(ob.border_hairline())
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(left);
+    if let Some(right) = trailing {
+        bar = bar.child(right);
+    }
+    bar
+}
+
+/// OpenBot `MarketplaceNav` row (`32px` height, `8px` radius, monochrome active & hover states).
+pub(crate) fn openbot_marketplace_nav_item(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+    count_opt: Option<usize>,
+    pal: TdesktopThemePalette,
+) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let label_str: SharedString = label.into();
+    let hover_bg = ob.bg_control_hover();
+    let active_bg = ob.bg_control_active();
+    let text_pri = ob.text_primary();
+    let text_muted = ob.text_muted();
+    let text_dim = ob.text_dim();
+
+    div()
+        .id(id)
+        .cursor_pointer()
+        .w_full()
+        .h(px(32.0))
+        .px(px(10.0))
+        .rounded(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .when(active, |el| {
+            el.bg(active_bg)
+                .text_color(text_pri)
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!active, |el| {
+            el.text_color(text_muted)
+                .hover(move |s| s.bg(hover_bg).text_color(text_pri))
+        })
+        .text_size(px(13.0))
+        .child(div().flex_1().min_w(px(0.0)).truncate().child(label_str))
+        .when_some(count_opt, |el, count| {
+            el.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(if active { text_muted } else { text_dim })
+                    .child(format!("{count}")),
+            )
+        })
+}
+
+/// OpenBot 2-column `Marketplace` browse shell: `240px` left sidebar nav + right scrollable
+/// `880px`-max centered canvas on `ob.bg_canvas()`.
+pub(crate) fn openbot_marketplace_shell(
+    left_nav: Div,
+    body_scroll: Stateful<Div>,
+    pal: TdesktopThemePalette,
+) -> Div {
+    let ob = pal.openbot_palette();
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .overflow_hidden()
+        .bg(ob.bg_canvas())
+        .flex()
+        .flex_row()
+        .child(
+            div()
+                .id("openbot-marketplace-left-nav")
+                .w(px(240.0))
+                .flex_shrink_0()
+                .h_full()
+                .bg(ob.bg_sidebar())
+                .border_r_1()
+                .border_color(ob.border_hairline())
+                .p(px(12.0))
+                .overflow_y_scroll()
+                .child(left_nav),
+        )
+        .child(body_scroll.flex_1().min_w(px(0.0)).h_full().overflow_y_scroll())
+}
+
+/// Standard OpenBot grouped card surface (`14px` radius, `#212121`/`#ffffff`, crisp 1px border).
 pub fn apple_grouped_card(pal: TdesktopThemePalette) -> Div {
+    let ob = pal.openbot_palette();
     div()
         .w_full()
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
         .border_1()
-        .border_color(pal.separator_rgba())
+        .border_color(ob.frame_card_border())
         .overflow_hidden()
 }
 
 /// Horizontal hairline divider inset for grouped cards.
 pub fn apple_hairline(pal: TdesktopThemePalette) -> Div {
-    div().w_full().h(px(1.0)).bg(pal.separator_rgba())
+    let ob = pal.openbot_palette();
+    div().w_full().h(px(1.0)).bg(ob.border_hairline())
 }
 
 /// Renders a 2:3 or 1:1 Apple-style gradient cover artwork card with safe `#RRGGBB` parsing.
@@ -258,36 +448,51 @@ pub fn cover_artwork_box(
         )
 }
 
-/// Renders a semantic Apple pill badge for a creation's [`CreationReviewStatus`].
+/// Renders a semantic OpenBot pill badge for a creation's [`CreationReviewStatus`].
 pub fn review_status_badge(
     status: CreationReviewStatus,
     lang_id: &str,
     pal: TdesktopThemePalette,
 ) -> Div {
-    let (fg, bg_alpha, label) = match status {
+    let ob = pal.openbot_palette();
+    let (fg, bg_col, border_col, label) = match status {
         CreationReviewStatus::Draft => (
-            pal.text_secondary,
-            0.14,
+            ob.text_muted(),
+            ob.bg_control_active(),
+            ob.border_hairline(),
             tr_str(lang_id, "草稿", "Draft"),
         ),
-        CreationReviewStatus::PendingReview => (
-            0xFF9F0A,
-            0.18,
-            tr_str(lang_id, "审核中", "Pending Review"),
-        ),
-        CreationReviewStatus::Published => (
-            0x30D158,
-            0.18,
-            tr_str(lang_id, "已上架", "Published"),
-        ),
-        CreationReviewStatus::Rejected => (
-            pal.danger,
-            0.18,
-            tr_str(lang_id, "已退回", "Rejected"),
-        ),
+        CreationReviewStatus::PendingReview => {
+            let w = ob.warning();
+            (
+                w,
+                gpui::Rgba { a: 0.14, ..w },
+                gpui::Rgba { a: 0.28, ..w },
+                tr_str(lang_id, "审核中", "Pending Review"),
+            )
+        }
+        CreationReviewStatus::Published => {
+            let s = ob.success();
+            (
+                s,
+                gpui::Rgba { a: 0.14, ..s },
+                gpui::Rgba { a: 0.28, ..s },
+                tr_str(lang_id, "已上架", "Published"),
+            )
+        }
+        CreationReviewStatus::Rejected => {
+            let d = ob.danger();
+            (
+                d,
+                gpui::Rgba { a: 0.14, ..d },
+                gpui::Rgba { a: 0.28, ..d },
+                tr_str(lang_id, "已退回", "Rejected"),
+            )
+        }
         CreationReviewStatus::Unpublished => (
-            0x8E8E93,
-            0.18,
+            ob.text_dim(),
+            ob.bg_control(),
+            ob.border_hairline(),
             tr_str(lang_id, "已下架", "Unpublished"),
         ),
     };
@@ -295,26 +500,29 @@ pub fn review_status_badge(
         .px(px(8.0))
         .py(px(2.0))
         .rounded(px(999.0))
-        .bg(TdesktopThemePalette::rgba_with_alpha(fg, bg_alpha))
+        .bg(bg_col)
         .border_1()
-        .border_color(TdesktopThemePalette::rgba_with_alpha(fg, 0.30))
+        .border_color(border_col)
         .text_size(px(11.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(fg))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
         .child(label)
 }
 
-/// Renders an Apple segmented filter pill button.
+/// Renders an OpenBot monochrome segmented filter pill button.
 pub fn filter_pill(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     active: bool,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     let label_str: SharedString = label.into();
-    let active_bg = rgb(pal.accent);
-    let inactive_bg = pal.card_surface_rgba();
-    let hover_bg = pal.row_hover_rgba();
+    let active_bg = ob.surface_light();
+    let active_fg = ob.text_on_light();
+    let inactive_bg = ob.bg_control();
+    let hover_bg = ob.bg_control_hover();
+    let text_pri = ob.text_primary();
     div()
         .id(id)
         .cursor_pointer()
@@ -323,63 +531,64 @@ pub fn filter_pill(
         .rounded(px(999.0))
         .when(active, |el| {
             el.bg(active_bg)
-                .text_color(rgb(pal.active_button_fg))
+                .text_color(active_fg)
                 .font_weight(FontWeight::SEMIBOLD)
         })
         .when(!active, |el| {
             el.bg(inactive_bg)
                 .border_1()
-                .border_color(pal.separator_rgba())
-                .text_color(rgb(pal.text_secondary))
-                .hover(move |s| s.bg(hover_bg))
+                .border_color(ob.border_hairline())
+                .text_color(ob.text_muted())
+                .hover(move |s| s.bg(hover_bg).text_color(text_pri))
         })
         .text_size(px(12.0))
         .child(label_str)
 }
 
-/// Renders a compact star rating pill (`★ 4.8 (12)`).
+/// Renders a compact monochrome star rating pill (`★ 4.8 (12)`).
 pub fn rating_pill(rating_avg: f32, rating_count: u32, pal: TdesktopThemePalette) -> Div {
-    let text = if rating_count > 0 {
-        format!("★ {:.1} ({})", rating_avg, rating_count)
+    let ob = pal.openbot_palette();
+    let label = if rating_count > 0 {
+        format!("{:.1} ({})", rating_avg, rating_count)
     } else {
-        "★ New".to_string()
+        "New".to_string()
     };
     div()
         .px(px(7.0))
         .py(px(2.0))
         .rounded(px(6.0))
-        .bg(TdesktopThemePalette::rgba_with_alpha(0xFF9F0A, 0.14))
+        .bg(ob.bg_control_active())
+        .border_1()
+        .border_color(ob.border_hairline())
+        .flex()
+        .items_center()
+        .gap(px(3.0))
         .text_size(px(11.0))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(if pal.mode.is_dark() { 0xFFD60A } else { 0xB25000 }))
-        .child(text)
+        .child(div().text_color(ob.warning()).child("★"))
+        .child(div().text_color(ob.text_secondary()).child(label))
 }
 
-/// Renders a full-bleed Apple vertical hero banner card.
+/// Renders a flat OpenBot monochrome editorial hero banner card (zero neon gradients).
 pub fn hero_banner(
     id: &'static str,
     kicker: &str,
     title: &str,
     subtitle: &str,
-    start_hex: &str,
-    end_hex: &str,
+    _start_hex: &str,
+    _end_hex: &str,
     icon: IconName,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
-    let start = parse_hex_color(start_hex, pal.accent);
-    let end = parse_hex_color(end_hex, 0x1C1C1E);
+    let ob = pal.openbot_palette();
     div()
         .id(id)
         .w_full()
-        .rounded(px(16.0))
-        .p(px(20.0))
-        .bg(linear_gradient(
-            135.0,
-            linear_color_stop(rgb(start), 0.0),
-            linear_color_stop(rgb(end), 1.0),
-        ))
+        .rounded(px(14.0))
+        .p(px(18.0))
+        .bg(ob.bg_surface())
         .border_1()
-        .border_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18))
+        .border_color(ob.border_strong_hairline())
         .flex()
         .items_center()
         .justify_between()
@@ -393,38 +602,41 @@ pub fn hero_banner(
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.80))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
                         .child(kicker.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(22.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xFFFFFF))
+                        .text_size(px(20.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
                         .child(title.to_string()),
                 )
                 .child(
                     div()
                         .text_size(px(13.0))
-                        .text_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.88))
+                        .text_color(ob.text_secondary())
                         .child(subtitle.to_string()),
                 ),
         )
         .child(
             div()
-                .w(px(52.0))
-                .h(px(52.0))
-                .rounded(px(14.0))
-                .bg(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18))
+                .w(px(44.0))
+                .h(px(44.0))
+                .flex_shrink_0()
+                .rounded(px(12.0))
+                .bg(ob.bg_control_active())
+                .border_1()
+                .border_color(ob.border_hairline())
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(tg_icon(icon, 26.0, 0xFFFFFF)),
+                .child(tg_icon_rgba(icon, 22.0, ob.text_primary())),
         )
 }
 
-/// Renders an Apple HIG empty-state card with an icon, description, and `@CreatorStudioBot` CTA button.
+/// Renders an OpenBot empty-state card with a monochrome icon tile, description, and CTA button.
 pub fn empty_state_card_shell(
     icon: IconName,
     title: &str,
@@ -432,42 +644,47 @@ pub fn empty_state_card_shell(
     cta_btn: Stateful<Div>,
     pal: TdesktopThemePalette,
 ) -> Div {
+    let ob = pal.openbot_palette();
     apple_grouped_card(pal)
-        .p(px(28.0))
+        .border_color(ob.border_strong_hairline())
+        .px(px(24.0))
+        .py(px(32.0))
         .flex()
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(10.0))
+        .gap(px(8.0))
         .child(
             div()
-                .w(px(48.0))
-                .h(px(48.0))
-                .rounded(px(14.0))
-                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                .w(px(44.0))
+                .h(px(44.0))
+                .rounded(px(12.0))
+                .bg(ob.bg_control_active())
+                .border_1()
+                .border_color(ob.border_hairline())
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(tg_icon(icon, 24.0, pal.accent)),
+                .child(tg_icon_rgba(icon, 22.0, ob.text_secondary())),
         )
         .child(
             div()
                 .text_size(px(15.0))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(pal.text_primary))
+                .text_color(ob.text_primary())
                 .child(title.to_string()),
         )
         .child(
             div()
                 .text_size(px(13.0))
-                .text_color(rgb(pal.text_secondary))
+                .text_color(ob.text_muted())
                 .child(subtitle.to_string()),
         )
-        .child(div().pt(px(4.0)).child(cta_btn))
+        .child(div().pt(px(6.0)).child(cta_btn))
 }
 
-/// Renders a styled Apple input field showing committed text, inline IME preedit, focus ring,
-/// and `Cmd+A` selection highlight.
+/// Renders a monochrome OpenBot input field showing committed text, inline IME preedit,
+/// focus border, and `Cmd+A` selection highlight.
 pub fn render_editable_field_box(
     id: &'static str,
     field: &EditableFieldState,
@@ -476,10 +693,11 @@ pub fn render_editable_field_box(
     multiline: bool,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     let border_col = if focused {
-        TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.85)
+        ob.border_strong_hairline()
     } else {
-        pal.separator_rgba()
+        ob.border_hairline()
     };
     let preedit_opt = if focused {
         field.ime_preedit.clone()
@@ -493,6 +711,10 @@ pub fn render_editable_field_box(
     let before_owned = before_cur.to_string();
     let after_owned = after_cur.to_string();
     let selected_all = focused && field.select_all && !field.text.is_empty();
+    let caret_col = ob.text_primary();
+    let text_pri = ob.text_primary();
+    let text_muted = ob.text_muted();
+    let sel_bg = ob.hover();
 
     div()
         .id(id)
@@ -503,7 +725,7 @@ pub fn render_editable_field_box(
         .px(px(10.0))
         .py(px(7.0))
         .rounded(px(8.0))
-        .bg(rgb(pal.input_bg))
+        .bg(ob.bg_control())
         .border_1()
         .border_color(border_col)
         .flex()
@@ -512,69 +734,45 @@ pub fn render_editable_field_box(
         .text_size(px(13.0))
         .when(is_empty, |el| {
             el.when(focused, |f_el| {
-                f_el.child(
-                    div()
-                        .w(px(1.5))
-                        .h(px(15.0))
-                        .mr(px(1.0))
-                        .bg(rgb(pal.accent)),
-                )
+                f_el.child(div().w(px(1.5)).h(px(15.0)).mr(px(1.0)).bg(caret_col))
             })
-            .child(
-                div()
-                    .text_color(rgb(pal.text_secondary))
-                    .child(placeholder.to_string()),
-            )
+            .child(div().text_color(text_muted).child(placeholder.to_string()))
         })
         .when(!is_empty && selected_all, |el| {
             el.child(
                 div()
-                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.28))
+                    .bg(sel_bg)
                     .rounded(px(3.0))
-                    .text_color(rgb(pal.text_primary))
+                    .text_color(text_pri)
                     .child(display_committed.clone()),
             )
             .when_some(preedit_opt.clone(), |p_el, pre| {
-                p_el.child(
-                    div()
-                        .text_color(rgb(pal.accent))
-                        .underline()
-                        .child(pre),
-                )
+                p_el.child(div().text_color(text_pri).underline().child(pre))
             })
             .when(focused, |f_el| {
-                f_el.child(div().w(px(1.5)).h(px(15.0)).bg(rgb(pal.accent)))
+                f_el.child(div().w(px(1.5)).h(px(15.0)).bg(caret_col))
             })
         })
         .when(!is_empty && !selected_all && !focused, |el| {
-            el.child(
-                div()
-                    .text_color(rgb(pal.text_primary))
-                    .child(display_committed),
-            )
+            el.child(div().text_color(text_pri).child(display_committed))
         })
         .when(!is_empty && !selected_all && focused, |el| {
             el.when(!before_owned.is_empty(), |b_el| {
-                b_el.child(div().text_color(rgb(pal.text_primary)).child(before_owned))
+                b_el.child(div().text_color(text_pri).child(before_owned))
             })
             .when_some(preedit_opt, |p_el, pre| {
-                p_el.child(
-                    div()
-                        .text_color(rgb(pal.accent))
-                        .underline()
-                        .child(pre),
-                )
+                p_el.child(div().text_color(text_pri).underline().child(pre))
             })
             .when(focused, |f_el| {
-                f_el.child(div().w(px(1.5)).h(px(15.0)).bg(rgb(pal.accent)))
+                f_el.child(div().w(px(1.5)).h(px(15.0)).bg(caret_col))
             })
             .when(!after_owned.is_empty(), |a_el| {
-                a_el.child(div().text_color(rgb(pal.text_primary)).child(after_owned))
+                a_el.child(div().text_color(text_pri).child(after_owned))
             })
         })
 }
 
-/// Formats seconds into `M:SS` / `MM:SS` for Apple Music durations and timers.
+/// Formats seconds into `M:SS` / `MM:SS` for Music durations and timers.
 pub fn format_duration_secs(secs: u64) -> String {
     let mins = secs / 60;
     let rem = secs % 60;
@@ -586,21 +784,22 @@ pub fn format_duration_ms(ms: u64) -> String {
     format_duration_secs(ms / 1000)
 }
 
-/// Renders an Apple HIG slim horizontal progress bar (`0.0..=1.0`).
-pub fn apple_progress_bar(fraction: f32, accent_rgb: u32, pal: TdesktopThemePalette) -> Div {
+/// Renders an OpenBot monochrome horizontal progress bar (`0.0..=1.0`).
+pub fn apple_progress_bar(fraction: f32, _accent_rgb: u32, pal: TdesktopThemePalette) -> Div {
+    let ob = pal.openbot_palette();
     let clamped = fraction.clamp(0.0, 1.0);
     div()
         .w_full()
         .h(px(4.0))
         .rounded(px(999.0))
-        .bg(pal.separator_rgba())
+        .bg(ob.bg_control_active())
         .overflow_hidden()
         .child(
             div()
                 .h_full()
                 .w(gpui::relative(clamped))
                 .rounded(px(999.0))
-                .bg(rgb(accent_rgb)),
+                .bg(ob.surface_light()),
         )
 }
 
@@ -610,6 +809,7 @@ pub fn apple_shelf_header(
     subtitle: Option<String>,
     pal: TdesktopThemePalette,
 ) -> Div {
+    let ob = pal.openbot_palette();
     div()
         .w_full()
         .flex()
@@ -618,48 +818,46 @@ pub fn apple_shelf_header(
         .gap(px(8.0))
         .child(
             div()
-                .text_size(px(17.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(pal.text_primary))
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ob.text_primary())
                 .child(title.into()),
         )
         .when_some(subtitle, |el, sub| {
-            el.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(pal.text_secondary))
-                    .child(sub),
-            )
+            el.child(div().text_size(px(12.0)).text_color(ob.text_muted()).child(sub))
         })
 }
 
-/// Renders an Apple-style accent-colored segmented sub-tab button for vertical navigation bars.
+/// Renders an OpenBot monochrome segmented sub-tab button for vertical navigation bars.
 pub fn vertical_sub_tab_pill(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     active: bool,
-    accent_rgb: u32,
+    _accent_rgb: u32,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     let label_str: SharedString = label.into();
-    let hover_bg = pal.row_hover_rgba();
+    let hover_bg = ob.bg_control_hover();
+    let text_pri = ob.text_primary();
     div()
         .id(id)
         .cursor_pointer()
-        .px(px(13.0))
+        .px(px(12.0))
         .py(px(6.0))
-        .rounded(px(999.0))
+        .rounded(px(8.0))
         .when(active, |el| {
-            el.bg(rgb(accent_rgb))
-                .text_color(rgb(0xFFFFFF))
+            el.bg(ob.bg_control_active())
+                .border_1()
+                .border_color(ob.border_strong_hairline())
+                .text_color(text_pri)
                 .font_weight(FontWeight::SEMIBOLD)
         })
         .when(!active, |el| {
-            el.bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.06))
-                .text_color(rgb(pal.text_secondary))
-                .hover(move |s| s.bg(hover_bg))
+            el.text_color(ob.text_muted())
+                .hover(move |s| s.bg(hover_bg).text_color(text_pri))
         })
-        .text_size(px(12.0))
+        .text_size(px(12.5))
         .whitespace_nowrap()
         .child(label_str)
 }

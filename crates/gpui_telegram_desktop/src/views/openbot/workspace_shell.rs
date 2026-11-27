@@ -324,6 +324,9 @@ pub struct OpenBotWorkspaceShell {
     pub theme_sweep: Option<ThemeSweepState>,
     pub beam_wave: Option<BeamWaveState>,
     pub data_dir: Option<PathBuf>,
+    /// When `true`, `AppShell` already provides the outer `52px` `PageRail` and workspace card frame,
+    /// so `render_workspace_root()` suppresses its internal `page_rail` and `server_rail`.
+    pub embedded_in_app_shell: bool,
     pending_page_select: Arc<Mutex<Option<OpenBotPage>>>,
 }
 
@@ -396,8 +399,15 @@ impl OpenBotWorkspaceShell {
             theme_sweep: None,
             beam_wave: None,
             data_dir: None,
+            embedded_in_app_shell: false,
             pending_page_select: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Configures whether this workspace shell is embedded inside `AppShell`'s workspace card
+    /// (suppressing duplicate internal `PageRail` and `ServerRail`).
+    pub fn set_embedded_in_app_shell(&mut self, embedded: bool) {
+        self.embedded_in_app_shell = embedded;
     }
 
     /// Creates an `OpenBotWorkspaceShell` hydrated from `<data_dir>/openbot-*-v1.json` preference stores.
@@ -943,24 +953,6 @@ impl OpenBotWorkspaceShell {
             .rgba("--openbot-border")
             .unwrap_or(rgb(0x222222));
 
-        let pending_sink = Arc::clone(&self.pending_page_select);
-        let page_rail = render_page_rail(
-            &self.shell.page_rail,
-            &self.palette,
-            &self.usage_rings,
-            self.active_page,
-            self.reduced_motion,
-            move |page| {
-                *pending_sink.lock() = Some(page);
-            },
-        );
-        let server_rail = render_server_rail(
-            &self.shell.server_rail,
-            &self.palette,
-            &self.shell.server_rail.active_server_id,
-            self.platform,
-            self.window_width_px,
-        );
         let show_sidebar = self.active_page == OpenBotPage::Agents && !self.shell.sidebar.closed;
         let show_side_panel =
             self.active_page == OpenBotPage::Agents && self.side_panel.open && !self.side_panel.active_splits.is_empty();
@@ -970,10 +962,34 @@ impl OpenBotWorkspaceShell {
             .size_full()
             .flex()
             .flex_row()
-            .bg(bg_frame)
-            .overflow_hidden()
-            .child(page_rail)
-            .child(server_rail);
+            .bg(if self.embedded_in_app_shell {
+                bg_canvas
+            } else {
+                bg_frame
+            })
+            .overflow_hidden();
+
+        if !self.embedded_in_app_shell {
+            let pending_sink = Arc::clone(&self.pending_page_select);
+            let page_rail = render_page_rail(
+                &self.shell.page_rail,
+                &self.palette,
+                &self.usage_rings,
+                self.active_page,
+                self.reduced_motion,
+                move |page| {
+                    *pending_sink.lock() = Some(page);
+                },
+            );
+            let server_rail = render_server_rail(
+                &self.shell.server_rail,
+                &self.palette,
+                &self.shell.server_rail.active_server_id,
+                self.platform,
+                self.window_width_px,
+            );
+            root = root.child(page_rail).child(server_rail);
+        }
 
         if show_sidebar {
             root = root.child(render_workspace_sidebar(
@@ -1697,5 +1713,27 @@ mod tests {
             ActiveOpenBotTarget::Channel("chan-1".to_string())
         );
         assert!(shell.composer.in_channel);
+    }
+
+    #[std::prelude::v1::test]
+    fn embedded_in_app_shell_defaults_false_and_renders_all_pages_in_both_modes() {
+        let mut shell = OpenBotWorkspaceShell::new();
+        assert!(!shell.embedded_in_app_shell);
+
+        for page in OpenBotPage::ALL {
+            shell.select_page(page);
+            let _standalone_root = shell.render_workspace_root();
+        }
+
+        shell.set_embedded_in_app_shell(true);
+        assert!(shell.embedded_in_app_shell);
+
+        for page in OpenBotPage::ALL {
+            shell.select_page(page);
+            let _embedded_root = shell.render_workspace_root();
+        }
+
+        shell.set_embedded_in_app_shell(false);
+        assert!(!shell.embedded_in_app_shell);
     }
 }

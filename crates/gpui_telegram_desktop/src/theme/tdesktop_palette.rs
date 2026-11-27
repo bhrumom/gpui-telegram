@@ -5,8 +5,9 @@ use gpui::{
     hsla, linear_color_stop, linear_gradient, point, px, rgb, Background, BoxShadow, Rgba,
 };
 
+use super::openbot_palette::{OpenBotColorScheme, OpenBotPalette};
 use super::palette::PaletteTokens;
-use super::palette_presets::preset_palette;
+use super::palette_presets::{apply_openbot_chrome, preset_openbot_palette, preset_palette};
 use super::palette_schemes::{
     find_wallpaper_preset, parse_tdesktop_theme_colors, peer_color_index, rgba_from_hex_alpha,
     TdesktopThemeMode,
@@ -99,6 +100,36 @@ impl TdesktopThemePalette {
         bubble_radius_px: u32,
     ) -> Self {
         preset_palette(mode, accent, font_size_px, bubble_radius_px)
+    }
+
+    /// Constructs a semantic palette synced directly to OpenBot `383a35d2` monochrome dark/light chrome.
+    pub fn build_openbot(
+        mode: TdesktopThemeMode,
+        accent: u32,
+        font_size_px: u32,
+        bubble_radius_px: u32,
+    ) -> Self {
+        preset_openbot_palette(mode, accent, font_size_px, bubble_radius_px)
+    }
+
+    /// Overlays OpenBot `383a35d2` monochrome chrome onto `self` (idempotent; preserves `mode`,
+    /// `Classic` green bubbles, typography, scale, bubble radius, and wallpaper blur).
+    pub fn with_openbot_chrome(self) -> Self {
+        apply_openbot_chrome(self)
+    }
+
+    /// Maps `self.mode` (`Night | Tinted => Dark`, `Day | Classic => Light`) to [`OpenBotColorScheme`].
+    pub const fn openbot_scheme(&self) -> OpenBotColorScheme {
+        if self.mode.is_dark() {
+            OpenBotColorScheme::Dark
+        } else {
+            OpenBotColorScheme::Light
+        }
+    }
+
+    /// Returns the resolved OpenBot `383a35d2` [`OpenBotPalette`] matching `self.mode`.
+    pub fn openbot_palette(&self) -> OpenBotPalette {
+        OpenBotPalette::for_scheme(self.openbot_scheme())
     }
 
     /// Applies live interface zoom percentage (`100..=300`) to scale fixed-pixel UI tokens.

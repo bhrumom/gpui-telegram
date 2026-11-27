@@ -41,6 +41,54 @@ pub const SIDE_BROWSER_MAX_TABS: usize = INPUT_LIMITS.browser_tabs;
 pub const SIDE_QUESTION_MAX_TURNS: usize = INPUT_LIMITS.side_question_turns;
 /// Maximum answer length for an ephemeral side question (`32_000`).
 pub const SIDE_QUESTION_MAX_ANSWER: usize = INPUT_LIMITS.side_question_answer;
+/// OpenBot right side-panel header height in logical pixels (`38px`).
+pub const OPENBOT_SIDE_PANEL_HEADER_HEIGHT: f32 = 38.0;
+/// Centered 4-button `SidePanelLauncher` stack max width (`320px`).
+pub const OPENBOT_LAUNCHER_MAX_WIDTH: f32 = 320.0;
+/// Centered 4-button `SidePanelLauncher` button height (`36px`).
+pub const OPENBOT_LAUNCHER_BUTTON_HEIGHT: f32 = 36.0;
+
+/// Context-aware target kind for the 4th OpenBot launcher button & `Settings` pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidePanelSettingsTarget {
+    #[default]
+    Assistant,
+    Channel,
+    Contact,
+}
+
+impl SidePanelSettingsTarget {
+    pub const fn launcher_label(self, is_zh: bool) -> &'static str {
+        match (self, is_zh) {
+            (Self::Assistant, true) => "打开 助手设置",
+            (Self::Assistant, false) => "Open Agent settings",
+            (Self::Channel, true) => "打开 群聊设置",
+            (Self::Channel, false) => "Open Channel settings",
+            (Self::Contact, true) => "打开 联系人资料",
+            (Self::Contact, false) => "Open Contact profile",
+        }
+    }
+
+    pub const fn tab_label(self, is_zh: bool) -> &'static str {
+        match (self, is_zh) {
+            (Self::Assistant, true) => "助手设置",
+            (Self::Assistant, false) => "Agent settings",
+            (Self::Channel, true) => "群聊设置",
+            (Self::Channel, false) => "Channel settings",
+            (Self::Contact, true) => "联系人资料",
+            (Self::Contact, false) => "Contact",
+        }
+    }
+}
+
+/// Canonical 4-button OpenBot `SidePanelLauncher` pane list (`image_2.png` 1:1).
+pub const LAUNCHER_PRIMARY_PANES: [SidePanelPaneKind; 4] = [
+    SidePanelPaneKind::Browser,
+    SidePanelPaneKind::Files,
+    SidePanelPaneKind::Threads,
+    SidePanelPaneKind::Settings,
+];
 
 /// All 6 dockable OpenBot right side-panel panes (`SidePanel.tsx`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,6 +156,47 @@ impl SidePanelPaneKind {
             Self::Subagent => IconName::BotRobot,
         }
     }
+
+    pub const fn launcher_label(self, target: SidePanelSettingsTarget, is_zh: bool) -> &'static str {
+        match (self, is_zh) {
+            (Self::Browser, true) => "打开 浏览器",
+            (Self::Browser, false) => "Open Browser",
+            (Self::Files, true) => "打开 文件",
+            (Self::Files, false) => "Open Files",
+            (Self::Threads, true) => "打开 话题",
+            (Self::Threads, false) => "Open Threads",
+            (Self::Settings, _) => target.launcher_label(is_zh),
+            (Self::Question, true) => "打开 旁问",
+            (Self::Question, false) => "Open Side question",
+            (Self::Subagent, true) => "打开 子助手",
+            (Self::Subagent, false) => "Open Subagent",
+        }
+    }
+
+    pub const fn localized_tab_label(
+        self,
+        target: SidePanelSettingsTarget,
+        is_zh: bool,
+    ) -> &'static str {
+        match (self, is_zh) {
+            (Self::Browser, true) => "浏览器",
+            (Self::Browser, false) => "Browser",
+            (Self::Files, true) => "文件",
+            (Self::Files, false) => "Files",
+            (Self::Threads, true) => "话题",
+            (Self::Threads, false) => "Threads",
+            (Self::Settings, _) => target.tab_label(is_zh),
+            (Self::Question, true) => "旁问",
+            (Self::Question, false) => "Side question",
+            (Self::Subagent, true) => "子助手",
+            (Self::Subagent, false) => "Subagent",
+        }
+    }
+}
+
+/// Returns the canonical 4-button launcher pane order for the current peer target.
+pub fn launcher_panes_for_target(_target: SidePanelSettingsTarget) -> Vec<SidePanelPaneKind> {
+    LAUNCHER_PRIMARY_PANES.to_vec()
 }
 
 /// Strictly validates vertical split count (`<= 2`), lower split height (`>= 120px`),
@@ -491,6 +580,24 @@ impl SidePanelState {
             self.open = false;
         }
         self.active_splits.len() != before
+    }
+
+    /// Removes `pane` from active splits while keeping `self.open == true` so an empty
+    /// panel falls back cleanly to OpenBot's 4-button `SidePanelLauncher`.
+    pub fn close_pane_keep_launcher(&mut self, pane: SidePanelPaneKind) -> bool {
+        let before = self.active_splits.len();
+        self.active_splits.retain(|&p| p != pane);
+        if self.active_splits.is_empty() {
+            self.maximized = false;
+        }
+        self.active_splits.len() != before
+    }
+
+    /// Opens the right `SidePanel` directly onto the empty 4-button `SidePanelLauncher`.
+    pub fn open_empty_launcher(&mut self) {
+        self.open = true;
+        self.active_splits.clear();
+        self.maximized = false;
     }
 
     /// Toggles maximized mode and returns the new maximized state.
@@ -1197,25 +1304,125 @@ fn render_pane_content(
     }
 }
 
-/// Renders the complete vertically-splittable right `SidePanel` with 6-pane header tab bar,
-/// vertical split handle (`MAX_SIDE_SPLITS = 2`, `160px` / `120px` minimums), maximize/restore
-/// and close controls, and concrete visual renderers for all 6 dockable pane kinds.
+/// Renders the centered OpenBot 4-button `SidePanelLauncher` stack (`image_2.png` 1:1).
+pub fn render_side_panel_launcher_preview(
+    target: SidePanelSettingsTarget,
+    palette: &OpenBotPalette,
+    is_zh: bool,
+) -> Div {
+    let btn_bg = palette_color(palette, "--openbot-bg-control-hover", 0x242424);
+    let btn_hover = palette_color(palette, "--openbot-bg-control-active", 0x2a2a2a);
+    let text_primary = palette_color(palette, "--openbot-text-primary", 0xffffff);
+    let text_muted = palette_color(palette, "--openbot-text-muted", 0x979797);
+
+    let mut stack = div()
+        .id("openbot-side-panel-launcher")
+        .w_full()
+        .max_w(px(OPENBOT_LAUNCHER_MAX_WIDTH))
+        .mx_auto()
+        .p(px(24.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0));
+
+    for (idx, pane) in launcher_panes_for_target(target).into_iter().enumerate() {
+        stack = stack.child(
+            div()
+                .id(("openbot-side-launcher-btn", idx))
+                .w_full()
+                .h(px(OPENBOT_LAUNCHER_BUTTON_HEIGHT))
+                .px(px(16.0))
+                .rounded(px(8.0))
+                .bg(btn_bg)
+                .hover(move |s| s.bg(btn_hover))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_start()
+                .gap(px(12.0))
+                .child(tg_icon_rgba(pane.icon(), 14.0, text_muted))
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text_primary)
+                        .child(pane.launcher_label(target, is_zh)),
+                ),
+        );
+    }
+
+    div()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .child(stack)
+}
+
+/// Renders the complete vertically-splittable right `SidePanel` with active-pane header tab bar,
+/// centered 4-button `SidePanelLauncher` when open with zero active tabs, vertical split handle
+/// (`MAX_SIDE_SPLITS = 2`, `160px` / `120px` minimums), maximize/restore and close controls,
+/// and concrete visual renderers for all 6 dockable pane kinds.
 pub fn render_side_panel(
     state: &SidePanelState,
     palette: &OpenBotPalette,
     now_sec: f64,
 ) -> Div {
-    if !state.open || state.active_splits.is_empty() {
+    if !state.open {
         return div().w(px(0.0)).h_full();
     }
 
-    let surface = palette_color(palette, "--openbot-bg-surface", 0x212121);
+    let canvas = palette_color(palette, "--openbot-bg-canvas", 0x1a1a1a);
     let control = palette_color(palette, "--openbot-bg-control", 0x212121);
     let control_active = palette_color(palette, "--openbot-bg-control-active", 0x2a2a2a);
-    let border = palette_color(palette, "--openbot-border-strong", 0x333335);
+    let border = palette.border_hairline();
     let text_primary = palette_color(palette, "--openbot-text-primary", 0xffffff);
+    let text_secondary = palette_color(palette, "--openbot-text-secondary", 0xdcdcdc);
     let text_muted = palette_color(palette, "--openbot-text-muted", 0x979797);
-    let accent = palette_color(palette, "--openbot-accent", 0x007cf7);
+
+    let mut shell = div()
+        .h_full()
+        .flex()
+        .flex_row()
+        .bg(canvas)
+        .border_l_1()
+        .border_color(border);
+
+    if state.maximized {
+        shell = shell.flex_1().min_w(px(SETTINGS_PANEL_DEFAULT));
+    } else {
+        shell = shell.w(px(state
+            .width_px
+            .clamp(SETTINGS_PANEL_DEFAULT, SETTINGS_PANEL_MAX)));
+    }
+
+    if state.active_splits.is_empty() {
+        let target = if state.settings.is_channel {
+            SidePanelSettingsTarget::Channel
+        } else {
+            SidePanelSettingsTarget::Assistant
+        };
+        return shell
+            .child(
+                div()
+                    .id("openbot-side-panel-resizer")
+                    .w(px(DRAG_START_PX))
+                    .h_full()
+                    .cursor_col_resize(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(render_side_panel_launcher_preview(target, palette, true)),
+            );
+    }
 
     let mut header_tabs = div()
         .id("openbot-side-panel-tabs")
@@ -1226,42 +1433,45 @@ pub fn render_side_panel(
         .flex_1()
         .overflow_x_scroll();
 
-    for (idx, pane_kind) in SidePanelPaneKind::ALL.iter().copied().enumerate() {
-        let is_active = state.active_splits.contains(&pane_kind);
+    for (idx, pane_kind) in state.active_splits.iter().copied().enumerate() {
+        let is_primary = idx == 0;
         header_tabs = header_tabs.child(
             div()
                 .id(("openbot-side-pane-tab", idx))
+                .h(px(28.0))
                 .flex()
                 .items_center()
-                .gap(px(4.0))
-                .px(px(7.0))
-                .py(px(4.0))
+                .gap(px(5.0))
+                .px(px(8.0))
                 .rounded(px(8.0))
-                .bg(if is_active { control_active } else { control })
-                .border_1()
-                .border_color(if is_active { accent } else { border })
+                .bg(if is_primary { control_active } else { control })
                 .child(tg_icon_rgba(
                     pane_kind.icon(),
-                    12.0,
-                    if is_active { accent } else { text_muted },
+                    14.0,
+                    if is_primary { text_primary } else { text_muted },
                 ))
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(13.0))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_active { text_primary } else { text_muted })
+                        .text_color(if is_primary {
+                            text_primary
+                        } else {
+                            text_secondary
+                        })
                         .child(pane_kind.label()),
                 ),
         );
     }
 
     let header = div()
+        .h(px(OPENBOT_SIDE_PANEL_HEADER_HEIGHT))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(6.0))
+        .gap(px(4.0))
         .px(px(8.0))
-        .py(px(6.0))
         .border_b_1()
         .border_color(border)
         .child(header_tabs)
@@ -1363,29 +1573,13 @@ pub fn render_side_panel(
             );
     }
 
-    let mut shell = div()
-        .h_full()
-        .flex()
-        .flex_row()
-        .bg(surface)
-        .border_l_1()
-        .border_color(border);
-
-    if state.maximized {
-        shell = shell.flex_1().min_w(px(SETTINGS_PANEL_DEFAULT));
-    } else {
-        shell = shell.w(px(state
-            .width_px
-            .clamp(SETTINGS_PANEL_DEFAULT, SETTINGS_PANEL_MAX)));
-    }
-
     shell
         .child(
             div()
                 .id("openbot-side-panel-resizer")
                 .w(px(DRAG_START_PX))
                 .h_full()
-                .bg(border),
+                .cursor_col_resize(),
         )
         .child(
             div()
@@ -1397,4 +1591,68 @@ pub fn render_side_panel(
                 .child(header)
                 .child(stack),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn openbot_side_panel_launcher_four_buttons_and_targets() {
+        let panes = launcher_panes_for_target(SidePanelSettingsTarget::Assistant);
+        assert_eq!(
+            panes,
+            vec![
+                SidePanelPaneKind::Browser,
+                SidePanelPaneKind::Files,
+                SidePanelPaneKind::Threads,
+                SidePanelPaneKind::Settings,
+            ]
+        );
+        assert_eq!(
+            SidePanelPaneKind::Browser.launcher_label(SidePanelSettingsTarget::Assistant, true),
+            "打开 浏览器"
+        );
+        assert_eq!(
+            SidePanelPaneKind::Files.launcher_label(SidePanelSettingsTarget::Assistant, true),
+            "打开 文件"
+        );
+        assert_eq!(
+            SidePanelPaneKind::Threads.launcher_label(SidePanelSettingsTarget::Assistant, true),
+            "打开 话题"
+        );
+        assert_eq!(
+            SidePanelPaneKind::Settings.launcher_label(SidePanelSettingsTarget::Assistant, true),
+            "打开 助手设置"
+        );
+        assert_eq!(
+            SidePanelPaneKind::Settings.launcher_label(SidePanelSettingsTarget::Channel, true),
+            "打开 群聊设置"
+        );
+        assert_eq!(
+            SidePanelPaneKind::Settings.launcher_label(SidePanelSettingsTarget::Contact, true),
+            "打开 联系人资料"
+        );
+    }
+
+    #[std::prelude::v1::test]
+    fn openbot_side_panel_resize_split_and_close_to_launcher() {
+        let mut st = SidePanelState::new(vec![SidePanelPaneKind::Settings]).expect("valid state");
+        assert!(st.open);
+        assert_eq!(st.resize_width(200.0, Some(1200.0)), SETTINGS_PANEL_DEFAULT);
+        assert_eq!(st.resize_width(2400.0, Some(1200.0)), 1200.0 - CONVERSATION_PANEL_MIN);
+        assert_eq!(st.resize_width(2400.0, Some(3000.0)), SETTINGS_PANEL_MAX);
+
+        assert!(st.split_down(SidePanelPaneKind::Files).is_ok());
+        assert_eq!(st.active_splits.len(), MAX_SIDE_SPLITS);
+        assert!(st.split_down(SidePanelPaneKind::Browser).is_err());
+        assert!(st.set_split_share(0.1, Some(500.0)).is_err());
+        assert!(st.set_split_share(0.4, Some(500.0)).is_ok());
+
+        assert!(st.close_pane_keep_launcher(SidePanelPaneKind::Files));
+        assert!(st.close_pane_keep_launcher(SidePanelPaneKind::Settings));
+        assert!(st.open);
+        assert!(st.active_splits.is_empty());
+        assert!(!st.maximized);
+    }
 }

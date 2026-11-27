@@ -6,7 +6,7 @@ use gpui_telegram_client::CommunityRuntimeMode;
 use gpui_telegram_proto::community_contracts::{ActorKind, FeedTab};
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
 
 use super::shared_widgets::{format_badge_count, render_actor_avatar, render_actor_badge_row};
 use super::state::{CommunityPopover, CommunityRoute};
@@ -22,20 +22,31 @@ fn render_nav_item(
     cx: &mut Context<CommunityWorkspace>,
     on_click: impl Fn(&mut CommunityWorkspace, &mut Context<CommunityWorkspace>) + 'static,
 ) -> Stateful<Div> {
-    let hover_bg = pal.row_hover_rgba();
-    let active_bg = TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14);
-    let fg = if is_active { pal.accent } else { pal.text_primary };
-    let ic = if is_active { pal.accent } else { pal.text_secondary };
+    let ob = pal.openbot_palette();
+    let hover_bg = ob.bg_control_hover();
+    let active_bg = ob.bg_control_active();
+    let fg = if is_active {
+        ob.text_primary()
+    } else {
+        ob.text_muted()
+    };
+    let text_pri = ob.text_primary();
 
     div()
         .id(id)
         .cursor_pointer()
         .w_full()
-        .h(px(34.0))
+        .h(px(32.0))
         .px(px(10.0))
-        .rounded(px(9.0))
+        .rounded(px(8.0))
         .when(is_active, |el| el.bg(active_bg))
-        .hover(move |s| if is_active { s } else { s.bg(hover_bg) })
+        .hover(move |s| {
+            if is_active {
+                s
+            } else {
+                s.bg(hover_bg).text_color(text_pri)
+            }
+        })
         .flex()
         .items_center()
         .justify_between()
@@ -52,17 +63,17 @@ fn render_nav_item(
                 .items_center()
                 .gap(px(9.0))
                 .min_w(px(0.0))
-                .child(tg_icon(icon, 16.0, ic))
+                .child(tg_icon_rgba(icon, 15.0, fg))
                 .child(
                     div()
                         .truncate()
                         .text_size(px(13.0))
                         .font_weight(if is_active {
-                            FontWeight::SEMIBOLD
-                        } else {
                             FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
                         })
-                        .text_color(rgb(fg))
+                        .text_color(fg)
                         .child(label),
                 ),
         )
@@ -73,13 +84,13 @@ fn render_nav_item(
                     .h(px(18.0))
                     .px(px(5.0))
                     .rounded_full()
-                    .bg(rgb(pal.unread_badge_bg))
+                    .bg(ob.surface_light())
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(10.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(pal.unread_badge_fg))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ob.text_on_light())
                     .child(format_badge_count(badge)),
             )
         })
@@ -117,15 +128,16 @@ pub fn render_left_nav(
 
     let nav_w = pal.scaled_px(220.0).clamp(192.0, 260.0);
 
+    let ob = pal.openbot_palette();
     div()
         .id("community-left-nav")
         .w(px(nav_w))
         .flex_shrink_0()
         .h_full()
         .overflow_hidden()
-        .bg(rgb(pal.dialogs_bg))
+        .bg(ob.bg_sidebar())
         .border_r_1()
-        .border_color(pal.separator_rgba())
+        .border_color(ob.border_hairline())
         .flex()
         .flex_col()
         .justify_between()
@@ -136,7 +148,7 @@ pub fn render_left_nav(
                 .flex_1()
                 .min_h(px(0.0))
                 .p(px(10.0))
-                .gap(px(4.0))
+                .gap(px(3.0))
                 // Brand header
                 .child(
                     div()
@@ -153,13 +165,13 @@ pub fn render_left_nav(
                                 .flex()
                                 .items_center()
                                 .gap(px(7.0))
-                                .child(tg_icon(IconName::CommunityGlobe, 18.0, pal.accent))
+                                .child(tg_icon_rgba(IconName::CommunityGlobe, 16.0, ob.text_primary()))
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(px(14.5))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
                                         .child(tr_str(lang, "社区广场", "Community")),
                                 ),
                         )
@@ -168,11 +180,13 @@ pub fn render_left_nav(
                                 .flex_shrink_0()
                                 .px(px(6.0))
                                 .py(px(2.0))
-                                .rounded_full()
-                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
+                                .rounded(px(6.0))
+                                .bg(ob.bg_control_active())
+                                .border_1()
+                                .border_color(ob.border_hairline())
                                 .text_size(px(9.5))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(pal.accent))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
                                 .child("Reddit × X"),
                         ),
                 )
@@ -235,16 +249,16 @@ pub fn render_left_nav(
                         .mt(px(6.0))
                         .mb(px(4.0))
                         .h(px(34.0))
-                        .rounded_full()
-                        .bg(rgb(pal.accent))
-                        .hover(move |s| s.bg(rgb(pal.accent_hover)))
+                        .rounded(px(8.0))
+                        .bg(ob.surface_light())
+                        .hover(|s| s.opacity(0.84))
                         .flex()
                         .items_center()
                         .justify_center()
                         .gap(px(6.0))
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.active_button_fg))
+                        .text_color(ob.text_on_light())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -256,7 +270,7 @@ pub fn render_left_nav(
                                 this.open_composer_modal(cur_slug, cx);
                             }),
                         )
-                        .child(tg_icon(IconName::ComposePen, 14.0, pal.active_button_fg))
+                        .child(tg_icon_rgba(IconName::ComposePen, 14.0, ob.text_on_light()))
                         .child(tr_str(lang, "发布新帖", "New Post")),
                 )
                 // Scrollable Joined Communities + Pinned Lists

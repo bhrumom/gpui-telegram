@@ -31,7 +31,7 @@ use gpui_telegram_proto::creations::{
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::theme::TdesktopThemePalette;
-use crate::views::app_shell::modal_container::macos_primary_pill_btn;
+use apple_primitives::openbot_primary_cta_btn;
 
 pub use apple_primitives::EditableFieldState;
 pub use book_reader::{
@@ -1179,15 +1179,16 @@ impl ContentHubWorkspace {
     }
 }
 
-/// Shared Apple-style Ratings & Reviews panel rendered across Books, Music, Games, and App Store detail views.
+/// Shared OpenBot-styled Ratings & Reviews panel rendered across Books, Music, Games, and App Store detail views.
 pub(crate) fn render_community_reviews_panel(
     ws: &mut ContentHubWorkspace,
     creation_id: &str,
     can_review: bool,
-    accent_rgb: u32,
+    _accent_rgb: u32,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
     let pal = ws.palette;
+    let ob = pal.openbot_palette();
     let lang = ws.language_id.clone();
     let reviews = ws.active_reviews.clone();
     let draft_rating = ws.review_draft_rating.clamp(1, 5);
@@ -1218,7 +1219,9 @@ pub(crate) fn render_community_reviews_panel(
                 div()
                     .p(px(12.0))
                     .rounded(px(10.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.04))
+                    .bg(ob.bg_canvas())
+                    .border_1()
+                    .border_color(ob.border_hairline())
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1231,7 +1234,7 @@ pub(crate) fn render_community_reviews_panel(
                                 div()
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_muted())
                                     .child(tr_str(&lang, "打分：", "Tap to Rate:")),
                             )
                             .children((1u8..=5u8).map(|star| {
@@ -1241,7 +1244,7 @@ pub(crate) fn render_community_reviews_panel(
                                     .cursor_pointer()
                                     .px(px(4.0))
                                     .text_size(px(16.0))
-                                    .text_color(rgb(if filled { 0xFF9F0A } else { pal.text_secondary }))
+                                    .text_color(if filled { ob.warning() } else { ob.text_dim() })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -1293,11 +1296,11 @@ pub(crate) fn render_community_reviews_panel(
                             .child(
                                 div()
                                     .text_size(px(11.5))
-                                    .text_color(rgb(accent_rgb))
+                                    .text_color(ob.text_secondary())
                                     .child(notice.unwrap_or_default()),
                             )
                             .child(
-                                macos_primary_pill_btn(
+                                openbot_primary_cta_btn(
                                     "content-hub-review-submit-btn",
                                     tr_str(&lang, "发表评论", "Submit Review"),
                                     pal,
@@ -1343,7 +1346,7 @@ pub(crate) fn render_community_reviews_panel(
             el.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(pal.text_secondary))
+                    .text_color(ob.text_muted())
                     .child(tr_str(
                         &lang,
                         "暂无社区评价，欢迎留下第一条评论。",
@@ -1358,8 +1361,10 @@ pub(crate) fn render_community_reviews_panel(
                     .collect();
                 div()
                     .p(px(10.0))
-                    .rounded(px(9.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.04))
+                    .rounded(px(10.0))
+                    .bg(ob.bg_canvas())
+                    .border_1()
+                    .border_color(ob.border_hairline())
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
@@ -1372,7 +1377,7 @@ pub(crate) fn render_community_reviews_panel(
                                 div()
                                     .text_size(px(12.5))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_primary))
+                                    .text_color(ob.text_primary())
                                     .child(rev.title.clone().unwrap_or_else(|| {
                                         if rev.author_display_name.trim().is_empty() {
                                             format!("User {}", rev.user_id)
@@ -1384,14 +1389,14 @@ pub(crate) fn render_community_reviews_panel(
                             .child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(0xFF9F0A))
+                                    .text_color(ob.warning())
                                     .child(stars),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(12.0))
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(ob.text_secondary())
                             .child(rev.body.clone()),
                     )
             }))
@@ -1402,6 +1407,7 @@ pub(crate) fn render_community_reviews_panel(
 impl Render for ContentHubWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let show_music_bar = self.music_engine.current_track().is_some()
             || (self.active_section == ContentHubSection::Music
                 && self.active_game.is_none()
@@ -1424,7 +1430,7 @@ impl Render for ContentHubWorkspace {
         div()
             .id("content-hub-workspace")
             .size_full()
-            .bg(rgb(pal.stage_bg))
+            .bg(ob.bg_canvas())
             .flex()
             .flex_col()
             .overflow_hidden()

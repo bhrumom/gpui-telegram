@@ -10,12 +10,12 @@ use gpui_telegram_proto::creations::{
 };
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
+use crate::theme::{IconName, TdesktopThemePalette};
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_shelf_header, cover_artwork_box, creation_kind_accent,
-    creation_kind_label, empty_state_card_shell, filter_pill, parse_hex_color, rating_pill,
-    render_editable_field_box, review_status_badge, vertical_sub_tab_pill,
+    creation_kind_label, empty_state_card_shell, filter_pill, openbot_marketplace_nav_item,
+    openbot_marketplace_shell, openbot_page_header, openbot_primary_cta_btn, openbot_secondary_btn,
+    parse_hex_color, rating_pill, render_editable_field_box, review_status_badge,
 };
 use crate::views::content_hub::{
     render_community_reviews_panel, ContentHubEvent, ContentHubInputTarget, ContentHubSection,
@@ -103,18 +103,61 @@ fn render_today_editorial_card(
     item: &PublicCatalogItemDto,
     kicker: &str,
     installed: bool,
-    _pal: TdesktopThemePalette,
+    pal: TdesktopThemePalette,
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let card_hover = ob.bg_control_hover();
     let cid = item.creation_id.clone();
     let cid_cta = item.creation_id.clone();
     let item_open = item.clone();
     let item_cta = item.clone();
     let target_sec = ContentHubSection::from_creation_kind(item.kind);
     let accent = creation_kind_accent(item.kind);
-    let start = parse_hex_color(&item.cover.gradient_start_hex, accent);
-    let end = parse_hex_color(&item.cover.gradient_end_hex, 0x1C1C1E);
+
+    let cta_btn = if installed {
+        openbot_secondary_btn(
+            SharedString::from(format!("appstore-today-cta-{cid_cta}")),
+            tr_str(lang, "打开", "Open"),
+            pal,
+        )
+    } else {
+        openbot_primary_cta_btn(
+            SharedString::from(format!("appstore-today-cta-{cid_cta}")),
+            tr_str(lang, "获取", "Get"),
+            pal,
+        )
+    }
+    .flex_shrink_0()
+    .px(px(12.0))
+    .py(px(5.0))
+    .text_size(px(11.5))
+    .on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |_this, _, _, cx| {
+            cx.stop_propagation();
+            if !installed {
+                cx.emit(ContentHubEvent::UpsertCreationState {
+                    creation_id: cid_cta.clone(),
+                    req: UpsertCreationStateRequest {
+                        in_library: Some(true),
+                        ..Default::default()
+                    },
+                });
+            }
+            let action = match item_cta.kind {
+                CreationKind::Book => "read",
+                CreationKind::Music | CreationKind::Game => "play",
+                CreationKind::App => "open",
+            };
+            cx.emit(ContentHubEvent::OpenCreationDetail {
+                section: target_sec,
+                creation_id: cid_cta.clone(),
+                action: Some(action.to_string()),
+            });
+        }),
+    );
 
     div()
         .id(SharedString::from(format!("appstore-today-hero-{cid}")))
@@ -122,15 +165,12 @@ fn render_today_editorial_card(
         .flex_1()
         .min_w(px(280.0))
         .max_w_full()
-        .rounded(px(16.0))
+        .rounded(px(14.0))
         .overflow_hidden()
-        .bg(linear_gradient(
-            135.0,
-            linear_color_stop(rgb(start), 0.0),
-            linear_color_stop(rgb(end), 1.0),
-        ))
+        .bg(ob.bg_surface())
+        .hover(move |s| s.bg(card_hover))
         .border_1()
-        .border_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16))
+        .border_color(ob.border_strong_hairline())
         .flex()
         .flex_col()
         .justify_between()
@@ -157,37 +197,39 @@ fn render_today_editorial_card(
         )
         .child(
             div()
-                .p(px(20.0))
+                .p(px(18.0))
                 .flex()
                 .flex_col()
                 .gap(px(5.0))
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.80))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
                         .child(kicker.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(20.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(0xFFFFFF))
+                        .text_size(px(18.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
                         .child(item.title.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(12.5))
-                        .text_color(TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.86))
+                        .text_color(ob.text_secondary())
                         .child(item.summary.clone()),
                 ),
         )
-        // Frosted bottom app strip (authentic macOS App Store Today card footer)
+        // OpenBot monochrome bottom strip
         .child(
             div()
                 .px(px(16.0))
                 .py(px(12.0))
-                .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.34))
+                .bg(ob.bg_control_active())
+                .border_t_1()
+                .border_color(ob.border_hairline())
                 .flex()
                 .items_center()
                 .justify_between()
@@ -210,16 +252,14 @@ fn render_today_editorial_card(
                                     div()
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
+                                        .text_color(ob.text_primary())
                                         .truncate()
                                         .child(item.title.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(TdesktopThemePalette::rgba_with_alpha(
-                                            0xFFFFFF, 0.78,
-                                        ))
+                                        .text_color(ob.text_muted())
                                         .truncate()
                                         .child(format!(
                                             "{} · {}",
@@ -229,49 +269,7 @@ fn render_today_editorial_card(
                                 ),
                         ),
                 )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("appstore-today-cta-{cid_cta}")))
-                        .cursor_pointer()
-                        .flex_shrink_0()
-                        .px(px(14.0))
-                        .py(px(5.0))
-                        .rounded(px(999.0))
-                        .bg(rgb(0xFFFFFF))
-                        .text_size(px(11.5))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(APPSTORE_ACCENT))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                cx.stop_propagation();
-                                if !installed {
-                                    cx.emit(ContentHubEvent::UpsertCreationState {
-                                        creation_id: cid_cta.clone(),
-                                        req: UpsertCreationStateRequest {
-                                            in_library: Some(true),
-                                            ..Default::default()
-                                        },
-                                    });
-                                }
-                                let action = match item_cta.kind {
-                                    CreationKind::Book => "read",
-                                    CreationKind::Music | CreationKind::Game => "play",
-                                    CreationKind::App => "open",
-                                };
-                                cx.emit(ContentHubEvent::OpenCreationDetail {
-                                    section: target_sec,
-                                    creation_id: cid_cta.clone(),
-                                    action: Some(action.to_string()),
-                                });
-                            }),
-                        )
-                        .child(if installed {
-                            tr_str(lang, "打开", "Open")
-                        } else {
-                            tr_str(lang, "获取", "Get")
-                        }),
-                ),
+                .child(cta_btn),
         )
 }
 
@@ -282,24 +280,68 @@ fn render_app_store_row_card(
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
     let cid = item.creation_id.clone();
     let cid_btn = item.creation_id.clone();
     let item_open = item.clone();
     let item_btn = item.clone();
     let accent = creation_kind_accent(item.kind);
     let target_sec = ContentHubSection::from_creation_kind(item.kind);
-    let hover_bg = pal.row_hover_rgba();
+    let hover_bg = ob.bg_control_hover();
+
+    let action_btn = if installed {
+        openbot_secondary_btn(
+            SharedString::from(format!("appstore-get-btn-{cid_btn}")),
+            tr_str(lang, "打开", "Open"),
+            pal,
+        )
+    } else {
+        openbot_primary_cta_btn(
+            SharedString::from(format!("appstore-get-btn-{cid_btn}")),
+            tr_str(lang, "获取", "Get"),
+            pal,
+        )
+    }
+    .flex_shrink_0()
+    .px(px(11.0))
+    .py(px(5.0))
+    .text_size(px(11.5))
+    .on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |_this, _, _, cx| {
+            cx.stop_propagation();
+            if !installed {
+                cx.emit(ContentHubEvent::UpsertCreationState {
+                    creation_id: cid_btn.clone(),
+                    req: UpsertCreationStateRequest {
+                        in_library: Some(true),
+                        ..Default::default()
+                    },
+                });
+            }
+            let action = match item_btn.kind {
+                CreationKind::Book => "read",
+                CreationKind::Music | CreationKind::Game => "play",
+                CreationKind::App => "open",
+            };
+            cx.emit(ContentHubEvent::OpenCreationDetail {
+                section: target_sec,
+                creation_id: cid_btn.clone(),
+                action: Some(action.to_string()),
+            });
+        }),
+    );
 
     div()
         .id(SharedString::from(format!("appstore-row-{cid}")))
         .cursor_pointer()
         .w(px(292.0))
         .max_w_full()
-        .p(px(10.0))
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .p(px(12.0))
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
         .border_1()
-        .border_color(pal.separator_rgba())
+        .border_color(ob.frame_card_border())
         .hover(move |s| s.bg(hover_bg))
         .flex()
         .items_center()
@@ -337,14 +379,14 @@ fn render_app_store_row_card(
                     div()
                         .text_size(px(13.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.text_primary))
+                        .text_color(ob.text_primary())
                         .truncate()
                         .child(item.title.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(pal.text_secondary))
+                        .text_color(ob.text_muted())
                         .truncate()
                         .child(format!(
                             "{} · {}",
@@ -354,52 +396,7 @@ fn render_app_store_row_card(
                 )
                 .child(rating_pill(item.rating_avg, item.rating_count, pal)),
         )
-        .child(
-            div()
-                .id(SharedString::from(format!("appstore-get-btn-{cid_btn}")))
-                .cursor_pointer()
-                .px(px(12.0))
-                .py(px(5.0))
-                .rounded(px(999.0))
-                .bg(if installed {
-                    TdesktopThemePalette::rgba_with_alpha(APPSTORE_ACCENT, 0.16)
-                } else {
-                    rgb(APPSTORE_ACCENT)
-                })
-                .text_size(px(11.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(if installed { APPSTORE_ACCENT } else { 0xFFFFFF }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_this, _, _, cx| {
-                        cx.stop_propagation();
-                        if !installed {
-                            cx.emit(ContentHubEvent::UpsertCreationState {
-                                creation_id: cid_btn.clone(),
-                                req: UpsertCreationStateRequest {
-                                    in_library: Some(true),
-                                    ..Default::default()
-                                },
-                            });
-                        }
-                        let action = match item_btn.kind {
-                            CreationKind::Book => "read",
-                            CreationKind::Music | CreationKind::Game => "play",
-                            CreationKind::App => "open",
-                        };
-                        cx.emit(ContentHubEvent::OpenCreationDetail {
-                            section: target_sec,
-                            creation_id: cid_btn.clone(),
-                            action: Some(action.to_string()),
-                        });
-                    }),
-                )
-                .child(if installed {
-                    tr_str(lang, "打开", "Open")
-                } else {
-                    tr_str(lang, "获取", "Get")
-                }),
-        )
+        .child(action_btn)
 }
 
 fn render_app_detail_card(
@@ -408,6 +405,7 @@ fn render_app_detail_card(
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
     let pal = ws.palette;
+    let ob = pal.openbot_palette();
     let lang = ws.language_id.clone();
     let cid = detail.creation_id.clone();
     let app_payload = extract_app_payload(&detail);
@@ -423,6 +421,15 @@ fn render_app_detail_card(
 
     let cid_install = cid.clone();
     let linked_for_btn = linked_miniapp.clone();
+    let primary_label = if installed {
+        tr_str(&lang, "打开", "Open").to_string()
+    } else {
+        app_payload
+            .as_ref()
+            .map(|a| a.price_label.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| tr_str(&lang, "获取", "Get").to_string())
+    };
 
     div()
         .id("apple-appstore-detail-panel")
@@ -435,7 +442,7 @@ fn render_app_detail_card(
                 .items_center()
                 .justify_between()
                 .child(
-                    macos_secondary_pill_btn(
+                    openbot_secondary_btn(
                         "appstore-detail-back-btn",
                         tr_str(&lang, "← 返回 App Store", "← Back to App Store"),
                         pal,
@@ -467,13 +474,7 @@ fn render_app_detail_card(
                         .flex_wrap()
                         .items_center()
                         .gap(px(18.0))
-                        .child(cover_artwork_box(
-                            &detail.cover,
-                            88.0,
-                            88.0,
-                            20.0,
-                            APPSTORE_ACCENT,
-                        ))
+                        .child(cover_artwork_box(&detail.cover, 88.0, 88.0, 18.0, 0x3A3A3E))
                         .child(
                             div()
                                 .flex_1()
@@ -485,14 +486,14 @@ fn render_app_detail_card(
                                 .child(
                                     div()
                                         .text_size(px(22.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
                                         .child(detail.title.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(13.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_secondary())
                                         .child(if detail.subtitle.trim().is_empty() {
                                             detail.summary.clone()
                                         } else {
@@ -503,7 +504,7 @@ fn render_app_detail_card(
                                     div()
                                         .text_size(px(12.0))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(APPSTORE_ACCENT))
+                                        .text_color(ob.text_muted())
                                         .child(
                                             app_payload
                                                 .as_ref()
@@ -516,71 +517,49 @@ fn render_app_detail_card(
                                 ),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .id("appstore-detail-primary-btn")
-                                        .cursor_pointer()
-                                        .px(px(20.0))
-                                        .py(px(8.0))
-                                        .rounded(px(999.0))
-                                        .bg(rgb(APPSTORE_ACCENT))
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                if !installed {
-                                                    cx.emit(ContentHubEvent::UpsertCreationState {
-                                                        creation_id: cid_install.clone(),
-                                                        req: UpsertCreationStateRequest {
-                                                            in_library: Some(true),
-                                                            ..Default::default()
-                                                        },
-                                                    });
-                                                }
-                                                if let Some(ref linked) = linked_for_btn {
-                                                    if !linked.bot_username.trim().is_empty()
-                                                        || linked
-                                                            .web_url
-                                                            .as_deref()
-                                                            .is_some_and(|u| !u.trim().is_empty())
-                                                    {
-                                                        cx.emit(ContentHubEvent::LaunchMiniApp {
-                                                            bot_username: linked
-                                                                .bot_username
-                                                                .clone(),
-                                                            short_name: linked.short_name.clone(),
-                                                            web_url: linked.web_url.clone(),
-                                                        });
-                                                    }
-                                                }
-                                            }),
-                                        )
-                                        .child(if installed {
-                                            tr_str(&lang, "打开", "Open").to_string()
-                                        } else {
-                                            app_payload
-                                                .as_ref()
-                                                .map(|a| a.price_label.clone())
-                                                .filter(|s| !s.trim().is_empty())
-                                                .unwrap_or_else(|| {
-                                                    tr_str(&lang, "获取", "Get").to_string()
-                                                })
-                                        }),
+                            div().flex().items_center().gap(px(8.0)).child(
+                                openbot_primary_cta_btn(
+                                    "appstore-detail-primary-btn",
+                                    primary_label,
+                                    pal,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |_this, _, _, cx| {
+                                        if !installed {
+                                            cx.emit(ContentHubEvent::UpsertCreationState {
+                                                creation_id: cid_install.clone(),
+                                                req: UpsertCreationStateRequest {
+                                                    in_library: Some(true),
+                                                    ..Default::default()
+                                                },
+                                            });
+                                        }
+                                        if let Some(ref linked) = linked_for_btn {
+                                            if !linked.bot_username.trim().is_empty()
+                                                || linked
+                                                    .web_url
+                                                    .as_deref()
+                                                    .is_some_and(|u| !u.trim().is_empty())
+                                            {
+                                                cx.emit(ContentHubEvent::LaunchMiniApp {
+                                                    bot_username: linked.bot_username.clone(),
+                                                    short_name: linked.short_name.clone(),
+                                                    web_url: linked.web_url.clone(),
+                                                });
+                                            }
+                                        }
+                                    }),
                                 ),
+                            ),
                         ),
                 )
-                // Horizontal App Store metadata bar
+                // Horizontal metadata bar
                 .child(
                     div()
                         .pt(px(12.0))
                         .border_t_1()
-                        .border_color(pal.separator_rgba())
+                        .border_color(ob.border_hairline())
                         .flex()
                         .flex_wrap()
                         .items_center()
@@ -589,7 +568,7 @@ fn render_app_detail_card(
                         .child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_muted())
                                 .child(format!(
                                     "{}: {}",
                                     tr_str(&lang, "年龄分级", "Age"),
@@ -600,7 +579,7 @@ fn render_app_detail_card(
                             el.child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_muted())
                                     .child(format!(
                                         "{}: {} · {} · {}",
                                         tr_str(&lang, "版本", "Version"),
@@ -633,7 +612,7 @@ fn render_app_detail_card(
                         div()
                             .text_size(px(13.0))
                             .line_height(px(20.0))
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(ob.text_secondary())
                             .child(if ap.long_description.trim().is_empty() {
                                 detail.summary.clone()
                             } else {
@@ -645,7 +624,7 @@ fn render_app_detail_card(
                             div()
                                 .pt(px(8.0))
                                 .border_t_1()
-                                .border_color(pal.separator_rgba())
+                                .border_color(ob.border_hairline())
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
@@ -653,13 +632,13 @@ fn render_app_detail_card(
                                     div()
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_color(ob.text_primary())
                                         .child(tr_str(&lang, "新功能", "What's New")),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(12.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_secondary())
                                         .child(ap.release_notes.clone()),
                                 ),
                         )
@@ -675,14 +654,14 @@ fn render_app_detail_card(
                                     let tint = ss
                                         .accent_hex
                                         .as_deref()
-                                        .map(|h| parse_hex_color(h, APPSTORE_ACCENT))
-                                        .unwrap_or(APPSTORE_ACCENT);
+                                        .map(|h| parse_hex_color(h, 0x3A3A3E))
+                                        .unwrap_or(0x3A3A3E);
                                     div()
                                         .w(px(220.0))
                                         .rounded(px(12.0))
                                         .overflow_hidden()
                                         .border_1()
-                                        .border_color(pal.separator_rgba())
+                                        .border_color(ob.border_hairline())
                                         .flex()
                                         .flex_col()
                                         .child(
@@ -697,7 +676,7 @@ fn render_app_detail_card(
                                                 .items_center()
                                                 .justify_center()
                                                 .text_size(px(13.0))
-                                                .font_weight(FontWeight::BOLD)
+                                                .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(0xFFFFFF))
                                                 .child(ss.title.clone()),
                                         )
@@ -706,7 +685,7 @@ fn render_app_detail_card(
                                                 div()
                                                     .p(px(8.0))
                                                     .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
+                                                    .text_color(ob.text_muted())
                                                     .child(cap),
                                             )
                                         })
@@ -725,12 +704,11 @@ fn render_app_detail_card(
                                         .px(px(8.0))
                                         .py(px(3.0))
                                         .rounded(px(999.0))
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(
-                                            pal.text_primary,
-                                            0.07,
-                                        ))
+                                        .bg(ob.bg_control_active())
+                                        .border_1()
+                                        .border_color(ob.border_hairline())
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_secondary())
                                         .child(perm.clone())
                                 })),
                         )
@@ -829,330 +807,351 @@ pub fn render_app_store_hub_view(
         (CatalogSortMode::Newest, "store-sort-newest", "最新", "Newest"),
     ];
 
-    div()
-        .id("apple-appstore-hub-root")
-        .size_full()
+    let ob = pal.openbot_palette();
+    let hover_crumb = ob.bg_control();
+    let text_pri = ob.text_primary();
+    let header = if let Some(ref detail) = selected_detail {
+        let parent_btn = div()
+            .id("appstore-header-parent-crumb")
+            .cursor_pointer()
+            .px(px(6.0))
+            .py(px(3.0))
+            .rounded(px(6.0))
+            .text_size(px(13.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ob.text_muted())
+            .hover(move |s| s.bg(hover_crumb).text_color(text_pri))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.selected_creation_id = None;
+                    this.selected_catalog_item = None;
+                    this.selected_detail_creation = None;
+                    cx.notify();
+                }),
+            )
+            .child("App Store");
+        openbot_page_header(detail.title.clone(), Some(parent_btn), None, pal)
+    } else {
+        let refresh_btn = openbot_secondary_btn(
+            "appstore-refresh-btn",
+            tr_str(&lang, "刷新", "Refresh"),
+            pal,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _, _, cx| {
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::AppStore));
+            }),
+        )
+        .into_any_element();
+        openbot_page_header("App Store", None, Some(refresh_btn), pal)
+    };
+
+    let left_nav = div()
+        .w_full()
         .flex()
         .flex_col()
-        .overflow_hidden()
-        // Top Header + 7 App Store tabs + Search
+        .gap(px(14.0))
+        .child(
+            render_editable_field_box(
+                "content-hub-catalog-search-input",
+                &search_field,
+                tr_str(&lang, "搜索应用、小程序与作品…", "Search App Store…"),
+                search_focused,
+                false,
+                pal,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus_input(ContentHubInputTarget::CatalogSearch, cx);
+                }),
+            ),
+        )
         .child(
             div()
-                .flex_shrink_0()
-                .px(px(24.0))
-                .py(px(14.0))
-                .border_b_1()
-                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "商店", "Storefront")),
+                )
+                .children(APPSTORE_SUB_TABS.iter().map(|&(slug, zh, en)| {
+                    let count = match slug {
+                        "installed" => Some(installed_items.len()),
+                        "today" => Some(all_items.len()),
+                        _ => None,
+                    };
+                    openbot_marketplace_nav_item(
+                        SharedString::from(format!("appstore-tab-{slug}")),
+                        tr_str(&lang, zh, en),
+                        active_tab == slug,
+                        count,
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.active_sub_tab = slug.to_string();
+                            this.selected_creation_id = None;
+                            this.selected_catalog_item = None;
+                            this.selected_detail_creation = None;
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "排序", "Sort")),
+                )
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(tg_icon(IconName::HubAppStore, 22.0, APPSTORE_ACCENT))
-                                .child(
-                                    div()
-                                        .text_size(px(22.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child("App Store"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(6.0))
-                                .children(APPSTORE_SUB_TABS.iter().map(|&(slug, zh, en)| {
-                                    vertical_sub_tab_pill(
-                                        SharedString::from(format!("appstore-tab-{slug}")),
-                                        tr_str(&lang, zh, en),
-                                        active_tab == slug,
-                                        APPSTORE_ACCENT,
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.active_sub_tab = slug.to_string();
-                                            this.selected_creation_id = None;
-                                            this.selected_catalog_item = None;
-                                            this.selected_detail_creation = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div().w(px(220.0)).max_w_full().child(
-                                        render_editable_field_box(
-                                            "content-hub-catalog-search-input",
-                                            &search_field,
-                                            tr_str(&lang, "搜索应用、小程序与作品…", "Search App Store…"),
-                                            search_focused,
-                                            false,
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.focus_input(
-                                                    ContentHubInputTarget::CatalogSearch,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ),
-                                )
-                                .child(
-                                    macos_secondary_pill_btn(
-                                        "appstore-refresh-btn",
-                                        tr_str(&lang, "刷新", "Refresh"),
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::RefreshCatalog(
-                                                ContentHubSection::AppStore,
-                                            ));
-                                        }),
-                                    ),
-                                ),
-                        ),
-                )
-                .when(selected_detail.is_none(), |el| {
-                    el.child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .children(sort_options.iter().map(|&(mode, id, zh, en)| {
-                                        filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.sort_mode = mode;
-                                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                                        ContentHubSection::AppStore,
-                                                    ));
-                                                    cx.notify();
-                                                }),
-                                            )
-                                    })),
-                            ),
-                    )
-                }),
-        )
-        // Main Scrollable Storefront
-        .child(
-            div()
-                .id("apple-appstore-hub-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .overflow_y_scroll()
-                .p(px(24.0))
-                .flex()
-                .flex_col()
-                .gap(px(20.0))
-                .when_some(selected_detail.clone(), |el, detail| {
-                    el.child(render_app_detail_card(ws, detail, cx))
-                })
-                .when(selected_detail.is_none(), |el| {
-                    el
-                        // Today Editorial Hero Cards (authentic macOS App Store Today layout)
-                        .when(active_tab == "today" && !today_heroes.is_empty(), |inner| {
-                            inner
-                                .child(apple_shelf_header(
-                                    tr_str(&lang, "今日精选 · Today", "Today"),
-                                    Some(
-                                        tr_str(&lang, "编辑精选与热门上架", "Editor's Picks")
-                                            .to_string(),
-                                    ),
-                                    pal,
-                                ))
-                                .child(div().flex().flex_wrap().gap(px(16.0)).children(
-                                    today_heroes.iter().enumerate().map(|(idx, item)| {
-                                        let kicker = if idx == 0 {
-                                            tr_str(&lang, "今日推荐 · TODAY'S PICK", "TODAY'S PICK")
-                                        } else {
-                                            tr_str(&lang, "精品聚焦 · FEATURED", "FEATURED STORY")
-                                        };
-                                        let installed = ws
-                                            .my_creation_states
-                                            .get(&item.creation_id)
-                                            .is_some_and(|s| s.in_library);
-                                        render_today_editorial_card(
-                                            item, kicker, installed, pal, &lang, cx,
-                                        )
+                        .gap(px(6.0))
+                        .px(px(4.0))
+                        .children(sort_options.iter().map(|&(mode, id, zh, en)| {
+                            filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.sort_mode = mode;
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::AppStore,
+                                        ));
+                                        cx.notify();
                                     }),
-                                ))
-                        })
-                        // Category quick-jump tiles on Categories tab
-                        .when(active_tab == "categories", |inner| {
-                            let cats: &[(&str, &str, ContentHubSection, u32)] = &[
-                                ("图书 · Books", "Books", ContentHubSection::Books, 0xFF9500),
-                                ("音乐 · Music", "Music", ContentHubSection::Music, 0xFA2D48),
-                                ("游戏 · Games", "Games", ContentHubSection::Games, 0x5856D6),
-                            ];
-                            inner.child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                cats.iter().map(|&(zh, en, sec, accent)| {
-                                    div()
-                                        .id(SharedString::from(format!("appstore-cat-{sec:?}")))
-                                        .cursor_pointer()
-                                        .w(px(210.0))
-                                        .max_w_full()
-                                        .p(px(16.0))
-                                        .rounded(px(14.0))
-                                        .bg(TdesktopThemePalette::rgba_with_alpha(accent, 0.16))
-                                        .border_1()
-                                        .border_color(TdesktopThemePalette::rgba_with_alpha(
-                                            accent, 0.35,
-                                        ))
-                                        .text_size(px(14.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |_this, _, _, cx| {
-                                                cx.emit(ContentHubEvent::NavigateSection(sec));
-                                            }),
-                                        )
-                                        .child(tr_str(&lang, zh, en))
+                                )
+                        })),
+                ),
+        );
+
+    let body_scroll = div().id("apple-appstore-hub-scroll").child(
+        div()
+            .w_full()
+            .max_w(px(880.0))
+            .mx_auto()
+            .px(px(24.0))
+            .py(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(20.0))
+            .when_some(selected_detail.clone(), |el, detail| {
+                el.child(render_app_detail_card(ws, detail, cx))
+            })
+            .when(selected_detail.is_none(), |el| {
+                let tile_hover = ob.bg_control_hover();
+                el
+                    // Today Editorial Hero Cards (OpenBot monochrome editorial cards)
+                    .when(active_tab == "today" && !today_heroes.is_empty(), |inner| {
+                        inner
+                            .child(apple_shelf_header(
+                                tr_str(&lang, "今日精选 · Today", "Today"),
+                                Some(
+                                    tr_str(&lang, "编辑精选与热门上架", "Editor's Picks")
+                                        .to_string(),
+                                ),
+                                pal,
+                            ))
+                            .child(div().flex().flex_wrap().gap(px(14.0)).children(
+                                today_heroes.iter().enumerate().map(|(idx, item)| {
+                                    let kicker = if idx == 0 {
+                                        tr_str(&lang, "今日推荐 · TODAY'S PICK", "TODAY'S PICK")
+                                    } else {
+                                        tr_str(&lang, "精品聚焦 · FEATURED", "FEATURED STORY")
+                                    };
+                                    let installed = ws
+                                        .my_creation_states
+                                        .get(&item.creation_id)
+                                        .is_some_and(|s| s.in_library);
+                                    render_today_editorial_card(
+                                        item, kicker, installed, pal, &lang, cx,
+                                    )
                                 }),
                             ))
-                        })
-                        // Published Mini Apps shelf
-                        .when(
-                            !filtered_miniapps.is_empty() && active_tab != "installed",
-                            |inner| {
-                                inner
-                                    .child(apple_shelf_header(
-                                        tr_str(&lang, "精选 Mini Apps 与机器人应用", "Featured Mini Apps"),
-                                        Some(format!(
-                                            "{} {}",
-                                            filtered_miniapps.len(),
-                                            tr_str(&lang, "个小程序", "mini apps")
-                                        )),
-                                        pal,
-                                    ))
-                                    .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                        filtered_miniapps.iter().map(|app| {
-                                            let bot_un = app.bot_username.clone();
-                                            let short = app.short_name.clone();
-                                            let web_url = (!app.web_url.trim().is_empty())
-                                                .then(|| app.web_url.clone());
-                                            apple_grouped_card(pal)
-                                                .w(px(292.0))
-                                                .max_w_full()
-                                                .p(px(12.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap(px(10.0))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w(px(0.0))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap(px(2.0))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(13.5))
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(rgb(pal.text_primary))
-                                                                .truncate()
-                                                                .child(app.title.clone()),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(11.0))
-                                                                .text_color(rgb(pal.text_secondary))
-                                                                .truncate()
-                                                                .child(format!(
-                                                                    "@{} · {}",
-                                                                    app.bot_username,
-                                                                    app.description
-                                                                )),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(SharedString::from(format!(
-                                                            "appstore-launch-miniapp-{}-{}",
-                                                            app.bot_username, app.short_name
-                                                        )))
-                                                        .cursor_pointer()
-                                                        .flex_shrink_0()
-                                                        .px(px(12.0))
-                                                        .py(px(5.0))
-                                                        .rounded(px(999.0))
-                                                        .bg(rgb(APPSTORE_ACCENT))
-                                                        .text_size(px(11.0))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(rgb(0xFFFFFF))
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(move |_this, _, _, cx| {
-                                                                cx.emit(
-                                                                    ContentHubEvent::LaunchMiniApp {
-                                                                        bot_username: bot_un.clone(),
-                                                                        short_name: short.clone(),
-                                                                        web_url: web_url.clone(),
-                                                                    },
-                                                                );
-                                                            }),
-                                                        )
-                                                        .child(tr_str(&lang, "打开", "Open")),
-                                                )
+                    })
+                    // Monochrome Category quick-jump tiles on Categories tab
+                    .when(active_tab == "categories", |inner| {
+                        let cats: &[(&str, &str, ContentHubSection)] = &[
+                            ("图书 · Books", "Books", ContentHubSection::Books),
+                            ("音乐 · Music", "Music", ContentHubSection::Music),
+                            ("游戏 · Games", "Games", ContentHubSection::Games),
+                        ];
+                        inner.child(div().flex().flex_wrap().gap(px(12.0)).children(
+                            cats.iter().map(|&(zh, en, sec)| {
+                                div()
+                                    .id(SharedString::from(format!("appstore-cat-{sec:?}")))
+                                    .cursor_pointer()
+                                    .w(px(210.0))
+                                    .max_w_full()
+                                    .p(px(16.0))
+                                    .rounded(px(14.0))
+                                    .bg(ob.bg_surface())
+                                    .hover(move |s| s.bg(tile_hover))
+                                    .border_1()
+                                    .border_color(ob.frame_card_border())
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |_this, _, _, cx| {
+                                            cx.emit(ContentHubEvent::NavigateSection(sec));
                                         }),
-                                    ))
-                            },
-                        )
-                        // Unified Apps & Verticals Shelf
-                        .when(!tab_items.is_empty(), |inner| {
+                                    )
+                                    .child(tr_str(&lang, zh, en))
+                            }),
+                        ))
+                    })
+                    // Published Mini Apps shelf
+                    .when(
+                        !filtered_miniapps.is_empty() && active_tab != "installed",
+                        |inner| {
                             inner
                                 .child(apple_shelf_header(
-                                    if active_tab == "installed" {
-                                        tr_str(&lang, "已获取 / 已安装", "Installed & Saved")
-                                    } else {
-                                        tr_str(&lang, "应用与精选公开作品", "Apps & Featured Creations")
-                                    },
+                                    tr_str(
+                                        &lang,
+                                        "精选 Mini Apps 与机器人应用",
+                                        "Featured Mini Apps",
+                                    ),
                                     Some(format!(
                                         "{} {}",
-                                        tab_items.len(),
-                                        tr_str(&lang, "项", "items")
+                                        filtered_miniapps.len(),
+                                        tr_str(&lang, "个小程序", "mini apps")
                                     )),
                                     pal,
                                 ))
                                 .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                    tab_items.iter().map(|item| {
+                                    filtered_miniapps.iter().map(|app| {
+                                        let bot_un = app.bot_username.clone();
+                                        let short = app.short_name.clone();
+                                        let web_url = (!app.web_url.trim().is_empty())
+                                            .then(|| app.web_url.clone());
+                                        apple_grouped_card(pal)
+                                            .w(px(292.0))
+                                            .max_w_full()
+                                            .p(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(10.0))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(2.0))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.5))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(ob.text_primary())
+                                                            .truncate()
+                                                            .child(app.title.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.0))
+                                                            .text_color(ob.text_muted())
+                                                            .truncate()
+                                                            .child(format!(
+                                                                "@{} · {}",
+                                                                app.bot_username, app.description
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                openbot_primary_cta_btn(
+                                                    SharedString::from(format!(
+                                                        "appstore-launch-miniapp-{}-{}",
+                                                        app.bot_username, app.short_name
+                                                    )),
+                                                    tr_str(&lang, "打开", "Open"),
+                                                    pal,
+                                                )
+                                                .flex_shrink_0()
+                                                .px(px(11.0))
+                                                .py(px(5.0))
+                                                .text_size(px(11.5))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |_this, _, _, cx| {
+                                                        cx.emit(ContentHubEvent::LaunchMiniApp {
+                                                            bot_username: bot_un.clone(),
+                                                            short_name: short.clone(),
+                                                            web_url: web_url.clone(),
+                                                        });
+                                                    }),
+                                                ),
+                                            )
+                                    }),
+                                ))
+                        },
+                    )
+                    // Unified Apps & Verticals Shelf
+                    .when(!tab_items.is_empty(), |inner| {
+                        inner
+                            .child(apple_shelf_header(
+                                if active_tab == "installed" {
+                                    tr_str(&lang, "已获取 / 已安装", "Installed & Saved")
+                                } else {
+                                    tr_str(&lang, "应用与精选公开作品", "Apps & Featured Creations")
+                                },
+                                Some(format!(
+                                    "{} {}",
+                                    tab_items.len(),
+                                    tr_str(&lang, "项", "items")
+                                )),
+                                pal,
+                            ))
+                            .child(div().flex().flex_wrap().gap(px(12.0)).children(
+                                tab_items.iter().map(|item| {
+                                    let installed = ws
+                                        .my_creation_states
+                                        .get(&item.creation_id)
+                                        .is_some_and(|s| s.in_library);
+                                    render_app_store_row_card(item, installed, pal, &lang, cx)
+                                }),
+                            ))
+                    })
+                    // Cross-Vertical Spotlight (Books + Music + Games)
+                    .when(
+                        active_tab == "today" && !cross_vertical.is_empty(),
+                        |inner| {
+                            inner
+                                .child(apple_shelf_header(
+                                    tr_str(
+                                        &lang,
+                                        "跨板块精品推荐（图书 · 音乐 · 游戏）",
+                                        "Featured Across Books, Music & Games",
+                                    ),
+                                    Some(format!(
+                                        "{} {}",
+                                        cross_vertical.len(),
+                                        tr_str(&lang, "款精选", "picks")
+                                    )),
+                                    pal,
+                                ))
+                                .child(div().flex().flex_wrap().gap(px(12.0)).children(
+                                    cross_vertical.iter().map(|item| {
                                         let installed = ws
                                             .my_creation_states
                                             .get(&item.creation_id)
@@ -1160,70 +1159,50 @@ pub fn render_app_store_hub_view(
                                         render_app_store_row_card(item, installed, pal, &lang, cx)
                                     }),
                                 ))
-                        })
-                        // Cross-Vertical Spotlight (Books + Music + Games)
-                        .when(
-                            active_tab == "today" && !cross_vertical.is_empty(),
-                            |inner| {
-                                inner
-                                    .child(apple_shelf_header(
-                                        tr_str(
-                                            &lang,
-                                            "跨板块精品推荐（图书 · 音乐 · 游戏）",
-                                            "Featured Across Books, Music & Games",
-                                        ),
-                                        Some(format!(
-                                            "{} {}",
-                                            cross_vertical.len(),
-                                            tr_str(&lang, "款精选", "picks")
-                                        )),
-                                        pal,
-                                    ))
-                                    .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                        cross_vertical.iter().map(|item| {
-                                            let installed = ws
-                                                .my_creation_states
-                                                .get(&item.creation_id)
-                                                .is_some_and(|s| s.in_library);
-                                            render_app_store_row_card(
-                                                item, installed, pal, &lang, cx,
-                                            )
-                                        }),
-                                    ))
-                            },
+                        },
+                    )
+                    // Empty state when truly empty
+                    .when(tab_items.is_empty() && filtered_miniapps.is_empty(), |inner| {
+                        let cta = openbot_secondary_btn(
+                            "appstore-empty-refresh-btn",
+                            tr_str(&lang, "刷新 App Store", "Refresh App Store"),
+                            pal,
                         )
-                        // Empty state when truly empty
-                        .when(tab_items.is_empty() && filtered_miniapps.is_empty(), |inner| {
-                            let cta = macos_secondary_pill_btn(
-                                "appstore-empty-refresh-btn",
-                                tr_str(&lang, "刷新 App Store", "Refresh App Store"),
-                                pal,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                        ContentHubSection::AppStore,
-                                    ));
-                                }),
-                            );
-                            inner.child(empty_state_card_shell(
-                                IconName::HubAppStore,
-                                if active_tab == "installed" {
-                                    tr_str(&lang, "暂未获取任何应用或作品", "No Installed Items Yet")
-                                } else {
-                                    tr_str(&lang, "App Store 暂无上架条目", "No Store Listings Yet")
-                                },
-                                tr_str(
-                                    &lang,
-                                    "在「消息」中直接与 @CreatorStudioBot 或 @BotFather 对话即可创作并上架应用、Mini Apps 与作品。",
-                                    "Chat with @CreatorStudioBot or @BotFather directly in Messages to create and publish apps and Mini Apps.",
-                                ),
-                                cta,
-                                pal,
-                            ))
-                        })
-                }),
-        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _, _, cx| {
+                                cx.emit(ContentHubEvent::RefreshCatalog(
+                                    ContentHubSection::AppStore,
+                                ));
+                            }),
+                        );
+                        inner.child(empty_state_card_shell(
+                            IconName::HubAppStore,
+                            if active_tab == "installed" {
+                                tr_str(&lang, "暂未获取任何应用或作品", "No Installed Items Yet")
+                            } else {
+                                tr_str(&lang, "App Store 暂无上架条目", "No Store Listings Yet")
+                            },
+                            tr_str(
+                                &lang,
+                                "在「消息」中直接与 @CreatorStudioBot 或 @BotFather 对话即可创作并上架应用、Mini Apps 与作品。",
+                                "Chat with @CreatorStudioBot or @BotFather directly in Messages to create and publish apps and Mini Apps.",
+                            ),
+                            cta,
+                            pal,
+                        ))
+                    })
+            }),
+    );
+
+    div()
+        .id("apple-appstore-hub-root")
+        .size_full()
+        .bg(ob.bg_canvas())
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(header)
+        .child(openbot_marketplace_shell(left_nav, body_scroll, pal))
         .into_any_element()
 }

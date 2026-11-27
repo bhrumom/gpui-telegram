@@ -2193,3 +2193,337 @@ mod tests {
         assert!(!state.can_post());
     }
 }
+
+/// Interactive tucked-stack `AwaitingReplies` (`Subtasks`) section renderer for `.composer-stack` (`UI-F11` & `UI-F14`).
+#[allow(clippy::too_many_arguments)]
+pub fn render_tucked_awaiting_replies_section<V: 'static>(
+    entries: &[AwaitingReplyEntry],
+    collapsed: bool,
+    palette: &crate::theme::TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_toggle_collapse: impl Fn(&mut V, &mut Context<V>) + 'static,
+    on_stop_agent: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+    on_dismiss_all: impl Fn(&mut V, &mut Context<V>) + 'static,
+) -> Option<AnyElement> {
+    if entries.is_empty() {
+        return None;
+    }
+    let ob = palette.openbot_palette();
+    let is_zh = lang_id.starts_with("zh");
+    let settled = entries
+        .iter()
+        .filter(|e| e.state.is_settled())
+        .count();
+    let total = entries.len();
+    let all_done = settled == total;
+    let hover_bg = ob.hover();
+    let dismiss_hover = ob.bg_control_active();
+    let stop_hover = ob.bg_control_hover();
+
+    let header = div()
+        .id("composer-stack-subtasks-hdr")
+        .h(px(30.0))
+        .px(px(13.0))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover_bg))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                on_toggle_collapse(this, cx);
+            }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(crate::views::stage::openbot_stage_chrome::openbot_stage_icon(
+                    if collapsed {
+                        crate::views::stage::openbot_stage_chrome::OpenBotStageIcon::ChevronRight
+                    } else {
+                        crate::views::stage::openbot_stage_chrome::OpenBotStageIcon::ChevronDown
+                    },
+                    12.0,
+                    ob.text_muted(),
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_primary())
+                        .child(if is_zh {
+                            format!("子任务 ({settled}/{total})")
+                        } else {
+                            format!("Subtasks ({settled}/{total})")
+                        }),
+                ),
+        )
+        .when(all_done, |row| {
+            row.child(
+                div()
+                    .id("composer-stack-subtasks-dismiss")
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(5.0))
+                    .hover(move |s| s.bg(dismiss_hover))
+                    .text_size(px(11.0))
+                    .text_color(ob.text_muted())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            on_dismiss_all(this, cx);
+                        }),
+                    )
+                    .child(if is_zh { "清除" } else { "Dismiss" }),
+            )
+        });
+
+    let mut box_el = div()
+        .id("composer-stack-subtasks")
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(header);
+
+    if !collapsed {
+        let mut rows_el = div()
+            .id("composer-stack-subtasks-list")
+            .max_h(px(203.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for (idx, entry) in entries.iter().enumerate() {
+            let aid = entry.agent_id.clone();
+            let stop_cb = on_stop_agent.clone();
+            let is_active = entry.state.is_active();
+            let status_txt = match entry.state {
+                AwaitingReplyState::Working => if is_zh { "思考中" } else { "Working" },
+                AwaitingReplyState::Asked => if is_zh { "待响应" } else { "Asked" },
+                AwaitingReplyState::Replied => if is_zh { "已回复" } else { "Replied" },
+                AwaitingReplyState::Stopped => if is_zh { "已停止" } else { "Stopped" },
+                AwaitingReplyState::Failed => if is_zh { "失败" } else { "Failed" },
+            };
+            let status_col = match entry.state {
+                AwaitingReplyState::Replied => ob.success(),
+                AwaitingReplyState::Asked => ob.warning(),
+                AwaitingReplyState::Failed => ob.danger(),
+                _ => ob.text_muted(),
+            };
+            let mood = match entry.state {
+                AwaitingReplyState::Working => openbot_contracts::avatar::AvatarMood::Working,
+                AwaitingReplyState::Asked => openbot_contracts::avatar::AvatarMood::Waiting,
+                AwaitingReplyState::Failed => openbot_contracts::avatar::AvatarMood::Failed,
+                AwaitingReplyState::Replied => openbot_contracts::avatar::AvatarMood::Responded,
+                AwaitingReplyState::Stopped => openbot_contracts::avatar::AvatarMood::Idle,
+            };
+            rows_el = rows_el.child(
+                div()
+                    .id(("composer-stack-subtask-row", idx))
+                    .h(px(29.0))
+                    .px(px(13.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(crate::components::avatar::render_plush_bot_avatar(
+                        &entry.agent_name,
+                        None,
+                        None,
+                        None,
+                        16.0,
+                        mood,
+                        None,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(12.5))
+                            .text_color(ob.text_primary())
+                            .child(entry.agent_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.5))
+                            .text_color(status_col)
+                            .child(status_txt),
+                    )
+                    .when(is_active, |r| {
+                        r.child(
+                            div()
+                                .id(("composer-stack-subtask-stop", idx))
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(ob.bg_control())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(stop_hover))
+                                .text_size(px(11.0))
+                                .text_color(ob.text_muted())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        stop_cb(this, aid.clone(), cx);
+                                    }),
+                                )
+                                .child(if is_zh { "停止" } else { "Stop" }),
+                        )
+                    }),
+            );
+        }
+        box_el = box_el.child(rows_el);
+    }
+
+    Some(box_el.into_any_element())
+}
+
+/// Interactive tucked-stack `ChannelStoppedTasks` section renderer (`Continue` / `Resume all` / `Cancel`).
+#[allow(clippy::too_many_arguments)]
+pub fn render_tucked_stopped_tasks_section<V: 'static>(
+    items: &[StoppedChannelTaskBannerItem],
+    palette: &crate::theme::TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_continue_one: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+    on_resume_all: impl Fn(&mut V, &mut Context<V>) + 'static,
+    on_cancel_one: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+) -> Option<AnyElement> {
+    if items.is_empty() {
+        return None;
+    }
+    let ob = palette.openbot_palette();
+    let is_zh = lang_id.starts_with("zh");
+    let mut box_el = div()
+        .id("composer-stack-stopped-tasks")
+        .w_full()
+        .px(px(13.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.warning())
+                        .child(if is_zh {
+                            format!("已暂停任务 ({})", items.len())
+                        } else {
+                            format!("Stopped tasks ({})", items.len())
+                        }),
+                )
+                .when(items.len() > 1, |row| {
+                    row.child(
+                        div()
+                            .id("composer-stack-resume-all")
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .bg(ob.surface_light())
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_on_light())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    on_resume_all(this, cx);
+                                }),
+                            )
+                            .child(if is_zh { "全部继续" } else { "Resume all" }),
+                    )
+                }),
+        );
+
+    let cancel_hover = ob.hover();
+    for (idx, item) in items.iter().enumerate() {
+        let tid_cont = item.task_id.clone();
+        let tid_cancel = item.task_id.clone();
+        let cb_cont = on_continue_one.clone();
+        let cb_cancel = on_cancel_one.clone();
+        let label = item
+            .error
+            .clone()
+            .unwrap_or_else(|| item.task_id.clone());
+        box_el = box_el.child(
+            div()
+                .id(("composer-stack-stopped-row", idx))
+                .h(px(29.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(12.0))
+                        .text_color(ob.text_secondary())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .id(("composer-stack-stopped-cont", idx))
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(5.0))
+                        .bg(ob.surface_light())
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_on_light())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cb_cont(this, tid_cont.clone(), cx);
+                            }),
+                        )
+                        .child(if is_zh { "继续" } else { "Continue" }),
+                )
+                .child(
+                    div()
+                        .id(("composer-stack-stopped-cancel", idx))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(cancel_hover))
+                        .text_size(px(11.0))
+                        .text_color(ob.text_muted())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cb_cancel(this, tid_cancel.clone(), cx);
+                            }),
+                        )
+                        .child(if is_zh { "取消" } else { "Cancel" }),
+                ),
+        );
+    }
+
+    Some(box_el.into_any_element())
+}

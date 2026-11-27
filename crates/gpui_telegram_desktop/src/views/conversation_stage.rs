@@ -27,29 +27,38 @@ pub const STAGE_TOAST_BANNER_DURATION_MS: u64 = 2_000;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
+use crate::components::avatar::{render_plush_bot_avatar, ChannelAgentBrief};
 use crate::components::tool_permission_dock::{
     render_tool_permission_dock_inline, PendingToolApproval, ToolApprovalDecision,
     ToolPermissionDock,
 };
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{solid_bubble_takes_dark_text, TdesktopThemePalette};
+use crate::views::openbot::steps_and_trace::AgentStepEntry;
 use crate::views::stage::history_drag_area::HistoryDragArea;
 use crate::views::stage::history_view_highlight_manager::{
     ChatPaintHighlight, HistoryViewHighlightManager,
 };
+use crate::views::stage::openbot_stage_chrome::{
+    activity_str_to_openbot_mood, normalize_fabushi_plush_spec, openbot_stage_icon,
+    render_fabushi_plush_avatar, OpenBotStageIcon,
+};
 use crate::views::stage::pinned_bar::PinnedTracker;
 use crate::views::stage::rich_meta::MessageRichMeta;
 use crate::views::stage::stage_bubble::{
-    render_message_row_apple, BotAssistRenderContext, BubbleGroupLayout,
+    render_message_row_openbot, render_openbot_agent_step_list, BotAssistRenderContext,
+    BubbleGroupLayout, OpenBotBubbleExtra,
 };
 use crate::views::stage::stage_context_menu::ReactionOverlayMode;
 use crate::views::stage::stage_bars::{
-    render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
-    render_stage_search_bar, render_stage_top_bar_with_group, TopBarUiAction,
-    APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT, APPLE_STAGE_TOP_BAR_HEIGHT,
+    render_openbot_conversation_header, render_openbot_model_picker_popover,
+    render_openbot_pinned_messages_popover, render_pinned_banner_46px,
+    render_scroll_to_bottom_fab, render_stage_more_menu_overlay, render_stage_search_bar,
+    render_stage_top_bar_with_group, OpenBotHeaderProps, TopBarUiAction,
 };
 use crate::views::stage::wallpaper::{
     render_empty_history_placeholder, render_empty_no_chat_pill, render_loading_history_skeleton,
-    render_syncing_workspace_placeholder, render_themed_wallpaper,
+    render_openbot_agent_empty_state, render_openbot_channel_empty_state,
+    render_openbot_stage_backdrop, render_syncing_workspace_placeholder, render_themed_wallpaper,
 };
 pub use crate::views::stage::cards::*;
 
@@ -418,6 +427,16 @@ pub enum StageAction {
         decision: ToolApprovalDecision,
     },
     ToggleBotCompanion,
+    // Additive M3 OpenBot ConversationHeader intents (UI-F09)
+    OpenAssistantSettings,
+    OpenChannelSettings,
+    OpenContactProfile,
+    ToggleSidePanel,
+    NewThread,
+    SelectModel {
+        model_id: String,
+        thinking_level: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +567,27 @@ pub struct ConversationStage {
     pub is_loading_workspace: bool,
     /// Chat IDs whose history has been confirmed loaded from server or persistent cache in this session.
     pub loaded_history_chats: HashSet<u64>,
+    // M3 OpenBot ConversationHeader, AgentActivity, AgentSteps, ScrollRail & Group Channel state
+    pub external_header_hosted: bool,
+    pub pinned_popover_open: bool,
+    pub model_picker_open: bool,
+    pub active_thread_id: Option<String>,
+    pub thread_tabs: Vec<(String, String)>,
+    pub active_model_label: String,
+    pub active_thinking_effort: String,
+    pub available_models: Vec<String>,
+    pub bot_activity_started_at_ms: Option<u64>,
+    pub bot_activity_steps_expanded: bool,
+    pub live_agent_steps: Vec<AgentStepEntry>,
+    pub message_agent_steps: HashMap<u64, Vec<AgentStepEntry>>,
+    pub expanded_error_msg_ids: HashSet<u64>,
+    pub expanded_steps_msg_ids: HashSet<u64>,
+    pub expanded_long_msg_ids: HashSet<u64>,
+    pub scroll_rail_hovered: bool,
+    pub scroll_rail_hovered_turn_idx: Option<usize>,
+    pub group_member_briefs: Vec<ChannelAgentBrief>,
+    pub chat_bg_tint_hex: Option<String>,
+    pub explicit_bubble_accent_hex: Option<String>,
 }
 
 impl ConversationStage {
@@ -670,6 +710,26 @@ impl ConversationStage {
             is_loading_history: false,
             is_loading_workspace: false,
             loaded_history_chats: HashSet::new(),
+            external_header_hosted: false,
+            pinned_popover_open: false,
+            model_picker_open: false,
+            active_thread_id: None,
+            thread_tabs: Vec::new(),
+            active_model_label: String::new(),
+            active_thinking_effort: String::new(),
+            available_models: Vec::new(),
+            bot_activity_started_at_ms: None,
+            bot_activity_steps_expanded: false,
+            live_agent_steps: Vec::new(),
+            message_agent_steps: HashMap::new(),
+            expanded_error_msg_ids: HashSet::new(),
+            expanded_steps_msg_ids: HashSet::new(),
+            expanded_long_msg_ids: HashSet::new(),
+            scroll_rail_hovered: false,
+            scroll_rail_hovered_turn_idx: None,
+            group_member_briefs: Vec::new(),
+            chat_bg_tint_hex: None,
+            explicit_bubble_accent_hex: None,
         };
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
         stage
@@ -773,8 +833,104 @@ impl ConversationStage {
         self.group_member_tiles = tiles;
     }
 
+    pub fn set_group_member_briefs(&mut self, briefs: Vec<ChannelAgentBrief>) {
+        self.group_member_briefs = briefs;
+    }
+
     pub fn set_bot_hues_map(&mut self, map: HashMap<u64, String>) {
         self.bot_hues_by_user_id = map;
+    }
+
+    pub fn set_model_picker_state(
+        &mut self,
+        active_model: String,
+        effort: String,
+        models: Vec<String>,
+    ) {
+        self.active_model_label = active_model;
+        self.active_thinking_effort = effort;
+        self.available_models = models;
+    }
+
+    pub fn set_live_agent_steps(&mut self, steps: Vec<AgentStepEntry>) {
+        self.live_agent_steps = steps;
+    }
+
+    pub fn attach_steps_to_message(&mut self, msg_id: u64, steps: Vec<AgentStepEntry>) {
+        if steps.is_empty() {
+            self.message_agent_steps.remove(&msg_id);
+        } else {
+            self.message_agent_steps.insert(msg_id, steps);
+        }
+    }
+
+    pub fn close_openbot_popovers(&mut self) -> bool {
+        let mut closed = false;
+        if self.pinned_popover_open {
+            self.pinned_popover_open = false;
+            closed = true;
+        }
+        if self.model_picker_open {
+            self.model_picker_open = false;
+            closed = true;
+        }
+        if self.more_menu_open || self.ttl_submenu_open {
+            self.more_menu_open = false;
+            self.ttl_submenu_open = false;
+            closed = true;
+        }
+        if self.search_open {
+            self.search_open = false;
+            self.search_query.clear();
+            self.search_match_ids.clear();
+            closed = true;
+        }
+        closed
+    }
+
+    pub fn is_effective_group_chat(&self) -> bool {
+        self.is_group_chat
+            || self.chat_subtitle.contains("member")
+            || self.chat_subtitle.contains("subscriber")
+            || self.chat_subtitle == "group"
+            || self
+                .messages
+                .iter()
+                .filter(|m| m.direction == MessageDirection::Incoming)
+                .map(|m| m.sender_id)
+                .collect::<HashSet<_>>()
+                .len()
+                > 1
+    }
+
+    pub fn pinned_popover_entries(&self) -> Vec<(u64, String, String)> {
+        let mut out: Vec<(u64, String, String)> = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(cid) = self.active_chat_id {
+            if let Some(entries) = self.chat_pinned_entries.get(&cid) {
+                for e in entries.iter().rev() {
+                    if seen.insert(e.msg_id) {
+                        out.push((e.msg_id, e.sender_name.clone(), e.preview_text.clone()));
+                    }
+                }
+            }
+        }
+        for m in self.messages.iter().rev().filter(|m| m.is_pinned) {
+            if seen.insert(m.id) {
+                let snippet = match &m.content {
+                    MessageContent::Text { text, .. } => {
+                        text.lines().next().unwrap_or(text).to_string()
+                    }
+                    MessageContent::Media { caption, .. }
+                    | MessageContent::Album { caption, .. } => caption
+                        .clone()
+                        .unwrap_or_else(|| "Media".to_string()),
+                    _ => "Message".to_string(),
+                };
+                out.push((m.id, m.sender_name.clone(), snippet));
+            }
+        }
+        out
     }
 
     pub fn reset(&mut self) {
@@ -794,17 +950,33 @@ impl ConversationStage {
         self.is_bot_chat = false;
         self.bot_activity_state = "idle".to_string();
         self.bot_activity_detail = None;
+        self.bot_activity_started_at_ms = None;
+        self.bot_activity_steps_expanded = false;
+        self.live_agent_steps.clear();
+        self.message_agent_steps.clear();
+        self.expanded_error_msg_ids.clear();
+        self.expanded_steps_msg_ids.clear();
+        self.expanded_long_msg_ids.clear();
         self.is_viewer_owner_fabushi_bot = false;
         self.pending_bot_start = false;
         self.room_agent_states.clear();
         self.pending_stage_action = None;
         self.permission_dock.sync_requests(Vec::new());
         self.group_member_tiles.clear();
+        self.group_member_briefs.clear();
         self.bot_hues_by_user_id.clear();
         self.clear_all_bot_card_drafts();
         self.is_loading_history = false;
         self.is_loading_workspace = false;
         self.loaded_history_chats.clear();
+        self.pinned_popover_open = false;
+        self.model_picker_open = false;
+        self.active_thread_id = None;
+        self.thread_tabs.clear();
+        self.scroll_rail_hovered = false;
+        self.scroll_rail_hovered_turn_idx = None;
+        self.chat_bg_tint_hex = None;
+        self.explicit_bubble_accent_hex = None;
     }
 
     pub fn sync_measured_row_heights(&mut self) -> bool {
@@ -848,11 +1020,20 @@ impl ConversationStage {
 
     pub fn set_bot_activity(&mut self, state: &str, detail: Option<String>) {
         let trimmed = state.trim();
-        self.bot_activity_state = if trimmed.is_empty() {
+        let next_state = if trimmed.is_empty() {
             "idle".to_string()
         } else {
             trimmed.to_string()
         };
+        let was_idle = self.bot_activity_state.eq_ignore_ascii_case("idle");
+        let is_now_idle = next_state.eq_ignore_ascii_case("idle");
+        if is_now_idle {
+            self.bot_activity_started_at_ms = None;
+            self.bot_activity_steps_expanded = false;
+        } else if was_idle || self.bot_activity_started_at_ms.is_none() {
+            self.bot_activity_started_at_ms = Some(stage_now_ms());
+        }
+        self.bot_activity_state = next_state;
         self.bot_activity_detail = detail.filter(|d| !d.trim().is_empty());
     }
 
@@ -895,13 +1076,24 @@ impl ConversationStage {
             self.is_bot_chat = false;
             self.bot_activity_state = "idle".to_string();
             self.bot_activity_detail = None;
+            self.bot_activity_started_at_ms = None;
+            self.bot_activity_steps_expanded = false;
+            self.live_agent_steps.clear();
             self.is_viewer_owner_fabushi_bot = false;
             self.pending_bot_start = false;
             self.active_bot_card_field = None;
             self.bot_assist_ime_preedit = None;
             self.pending_bot_assist_action = None;
             self.group_member_tiles.clear();
+            self.group_member_briefs.clear();
             self.permission_dock.sync_requests(Vec::new());
+            self.active_thread_id = None;
+            self.thread_tabs.clear();
+            self.expanded_error_msg_ids.clear();
+            self.expanded_steps_msg_ids.clear();
+            self.expanded_long_msg_ids.clear();
+            self.chat_bg_tint_hex = None;
+            self.explicit_bubble_accent_hex = None;
         }
         self.active_chat_id = Some(chat_id);
         self.chat_title = title.to_string();
@@ -926,6 +1118,10 @@ impl ConversationStage {
         self.select_mode_active = false;
         self.more_menu_open = false;
         self.ttl_submenu_open = false;
+        self.pinned_popover_open = false;
+        self.model_picker_open = false;
+        self.scroll_rail_hovered = false;
+        self.scroll_rail_hovered_turn_idx = None;
         self.search_open = false;
         self.search_query.clear();
         self.search_match_ids.clear();
@@ -1015,34 +1211,34 @@ impl ConversationStage {
             .map(|m| m.id);
 
         let mut row_palette = self.palette;
-        if !is_group_chat && row_palette.is_apple_style() {
-            if let Some(ref fab) = self.active_fabushi_bot {
-                if TdesktopThemePalette::is_tinted_bot_hue(&fab.avatar_color) {
-                    let (bubble_fill, _, _) = TdesktopThemePalette::bot_hue_colors(
-                        &fab.avatar_color,
-                        row_palette.mode.is_dark(),
-                    );
-                    row_palette.msg_out_bg = bubble_fill;
-                    row_palette.msg_out_bg_top = bubble_fill;
-                    row_palette.msg_out_bg_bottom = bubble_fill;
+        // OpenBot UI-F10: Keep neutral monochrome outgoing bubbles (#242424 dark / #fcfcfc light)
+        // by default; only honor an explicit user chat-color override with WCAG contrast safety.
+        if row_palette.is_apple_style() {
+            if let Some(ref accent_hex) = self.explicit_bubble_accent_hex {
+                if let Some(rgb_u32) = crate::components::avatar::parse_fabushi_hex_color(accent_hex) {
+                    row_palette.msg_out_bg = rgb_u32;
+                    row_palette.msg_out_bg_top = rgb_u32;
+                    row_palette.msg_out_bg_bottom = rgb_u32;
+                    let dark_fg = solid_bubble_takes_dark_text(accent_hex);
+                    row_palette.msg_out_fg = if dark_fg { 0x141414 } else { 0xFFFFFF };
+                    row_palette.msg_out_secondary_fg = if dark_fg { 0x4A4A4F } else { 0xDCDCDC };
                 }
             }
         }
-        let is_dark = row_palette.mode.is_dark();
+        let is_direct_human = !is_group_chat
+            && !self.is_bot_chat
+            && self.active_fabushi_bot.is_none();
 
         for idx in start_idx..=end_idx.min(total_msgs.saturating_sub(1)) {
             let msg = &self.messages[idx];
             let (attached_prev, attached_next) = compute_attachment(&self.messages, idx);
             let is_outgoing = msg.direction == MessageDirection::Outgoing;
-            let show_group_author_pill = !is_outgoing && !attached_prev && is_group_chat;
             let group = BubbleGroupLayout {
                 attached_to_prev: attached_prev,
                 attached_to_next: attached_next,
-                // In Apple/Grok style we render the clickable hue-tinted `.sand-group-author` pill
-                // directly above the row so `stage_bubble.rs` doesn't render a duplicate plain label.
-                show_sender_name: false,
+                show_sender_name: !is_outgoing && !attached_prev && is_group_chat,
                 show_bottom_avatar: !is_outgoing && !attached_next,
-                show_tail: !attached_next,
+                show_tail: false,
                 reserve_avatar_column: !is_outgoing && is_group_chat,
             };
             let meta = self.message_meta.get(&msg.id);
@@ -1074,8 +1270,18 @@ impl ConversationStage {
             let is_last_outgoing = last_outgoing_id == Some(msg.id);
             let is_row_hovered =
                 self.hovered_message_id == Some(msg.id) || self.hovered_gutter_id == Some(msg.id);
+            let sender_hue_name = self
+                .bot_hues_by_user_id
+                .get(&msg.sender_id)
+                .map(String::as_str);
+            let sender_is_bot = self.bot_hues_by_user_id.contains_key(&msg.sender_id);
+            let turn_steps = self
+                .message_agent_steps
+                .get(&msg.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
 
-            let bubble_row = render_message_row_apple(
+            let bubble_row = render_message_row_openbot(
                 msg,
                 meta,
                 self.active_fabushi_bot.as_ref(),
@@ -1102,91 +1308,200 @@ impl ConversationStage {
                     active_field: self.active_bot_card_field.as_ref(),
                     ime_preedit: self.bot_assist_ime_preedit.as_deref(),
                 }),
+                OpenBotBubbleExtra {
+                    is_group_chat,
+                    is_direct_human,
+                    sender_hue_name,
+                    sender_is_bot,
+                    error_expanded: self.expanded_error_msg_ids.contains(&msg.id),
+                    steps_expanded: self.expanded_steps_msg_ids.contains(&msg.id),
+                    long_expanded: self.expanded_long_msg_ids.contains(&msg.id),
+                    turn_steps,
+                },
                 &row_palette,
                 &self.lang_id,
                 window,
                 cx,
                 |this, action, cx| this.handle_bubble_action(action, cx),
             );
-
-            if show_group_author_pill && !msg.sender_name.trim().is_empty() {
-                let sender_uid = msg.sender_id;
-                let sender_name = msg.sender_name.clone();
-                let is_known_bot = self.bot_hues_by_user_id.contains_key(&sender_uid);
-                let hue_name = self
-                    .bot_hues_by_user_id
-                    .get(&sender_uid)
-                    .map(String::as_str)
-                    .filter(|h| TdesktopThemePalette::is_tinted_bot_hue(h))
-                    .unwrap_or_else(|| TdesktopThemePalette::bot_hue_name_for_id(sender_uid));
-                let (dot_fill, pill_bg, pill_text) =
-                    TdesktopThemePalette::bot_hue_colors(hue_name, is_dark);
-                let pill_border = TdesktopThemePalette::rgba_with_alpha(pill_text, if is_dark { 0.24 } else { 0.18 });
-                let pill_hover = TdesktopThemePalette::rgba_with_alpha(pill_text, if is_dark { 0.22 } else { 0.14 });
-                let click_name = sender_name.clone();
-                let pill_row = div()
-                    .w_full()
-                    .pl(px(46.0))
-                    .pt(px(6.0))
-                    .pb(px(1.0))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .id(("sand-group-author-pill", msg.id))
-                            .cursor_pointer()
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded_full()
-                            .bg(rgb(pill_bg))
-                            .border_1()
-                            .border_color(pill_border)
-                            .hover(move |s| s.bg(pill_hover))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.pending_stage_action = Some(StageAction::OpenSenderDm {
-                                        user_id: sender_uid,
-                                        sender_name: click_name.clone(),
-                                    });
-                                    cx.notify();
-                                }),
-                            )
-                            .when(is_known_bot, |row| {
-                                row.child(
-                                    div()
-                                        .w(px(6.0))
-                                        .h(px(6.0))
-                                        .rounded_full()
-                                        .bg(rgb(dot_fill)),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pill_text))
-                                    .child(sender_name),
-                            ),
-                    );
-                message_rows.push(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .child(pill_row)
-                        .child(bubble_row)
-                        .into_any_element(),
-                );
-            } else {
-                message_rows.push(bubble_row);
-            }
+            message_rows.push(bubble_row);
         }
         message_rows
+    }
+
+    /// Interactive right-edge OpenBot `ChatScrollRail` minimap (`>= 3` messages).
+    fn render_scroll_rail_minimap(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.messages.len() < 3 {
+            return None;
+        }
+        // Collect exchange turn anchors (up to 48 ticks evenly sampled if huge history)
+        let mut turns: Vec<(u64, String, String)> = Vec::new();
+        for (i, msg) in self.messages.iter().enumerate() {
+            if matches!(msg.content, MessageContent::Service { .. }) {
+                continue;
+            }
+            if msg.direction == MessageDirection::Outgoing || turns.is_empty() {
+                let title_snip = match &msg.content {
+                    MessageContent::Text { text, .. } => {
+                        text.lines().next().unwrap_or(text).trim().to_string()
+                    }
+                    MessageContent::Media { caption, .. } | MessageContent::Album { caption, .. } => {
+                        caption.clone().unwrap_or_else(|| "Media".to_string())
+                    }
+                    _ => msg.sender_name.clone(),
+                };
+                let reply_snip = self
+                    .messages
+                    .get(i + 1)
+                    .filter(|next| next.direction == MessageDirection::Incoming)
+                    .map(|next| match &next.content {
+                        MessageContent::Text { text, .. } => {
+                            text.lines().take(2).collect::<Vec<_>>().join(" ")
+                        }
+                        _ => next.sender_name.clone(),
+                    })
+                    .unwrap_or_default();
+                turns.push((msg.id, title_snip, reply_snip));
+            }
+        }
+        if turns.len() < 2 {
+            return None;
+        }
+        let max_ticks = 40usize;
+        let sampled: Vec<(u64, String, String)> = if turns.len() <= max_ticks {
+            turns
+        } else {
+            let step = turns.len() as f32 / max_ticks as f32;
+            (0..max_ticks)
+                .map(|i| {
+                    let idx = ((i as f32 * step).floor() as usize).min(turns.len() - 1);
+                    turns[idx].clone()
+                })
+                .collect()
+        };
+
+        let ob = self.palette.openbot_palette();
+        let is_dark = self.palette.mode.is_dark();
+        let rail_hovered = self.scroll_rail_hovered;
+        let hovered_idx = self.scroll_rail_hovered_turn_idx;
+        let tooltip_entry = hovered_idx.and_then(|ix| sampled.get(ix)).cloned();
+        let tick_base_rgb = if is_dark { 0xFFFFFF_u32 } else { 0x141414_u32 };
+
+        let mut rail_col = div()
+            .id("openbot-scroll-rail")
+            .absolute()
+            .right(px(4.0))
+            .top(px(48.0))
+            .bottom(px(48.0))
+            .w(px(22.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .justify_center()
+            .gap(px(5.0))
+            .pr(px(4.0))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.scroll_rail_hovered = *hovered;
+                if !*hovered {
+                    this.scroll_rail_hovered_turn_idx = None;
+                }
+                cx.notify();
+            }));
+
+        for (idx, (msg_id, _, _)) in sampled.iter().enumerate() {
+            let id_jump = *msg_id;
+            let dist = hovered_idx.map(|h| h.abs_diff(idx));
+            let (tick_w, alpha) = match dist {
+                Some(0) => (16.0_f32, 0.95_f32),
+                Some(1) => (12.0, 0.56),
+                Some(2) => (10.0, 0.38),
+                _ if rail_hovered => (8.0, 0.26),
+                _ => (4.0, 0.18),
+            };
+            rail_col = rail_col.child(
+                div()
+                    .id(("scroll-rail-tick", idx))
+                    .h(px(6.0))
+                    .w(px(18.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .on_hover(cx.listener(move |this, h: &bool, _, cx| {
+                        if *h {
+                            this.scroll_rail_hovered = true;
+                            this.scroll_rail_hovered_turn_idx = Some(idx);
+                        } else if this.scroll_rail_hovered_turn_idx == Some(idx) {
+                            this.scroll_rail_hovered_turn_idx = None;
+                        }
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.jump_to_message(id_jump);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(tick_w))
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(TdesktopThemePalette::rgba_with_alpha(tick_base_rgb, alpha)),
+                    ),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(rail_col)
+                .when_some(tooltip_entry, |el, (_mid, title_snip, reply_snip)| {
+                    el.child(
+                        div()
+                            .id("openbot-scroll-rail-tooltip")
+                            .absolute()
+                            .right(px(30.0))
+                            .top(px(64.0))
+                            .w(px(260.0))
+                            .max_w(px(300.0))
+                            .p(px(10.0))
+                            .rounded(px(12.0))
+                            .bg(ob.bg_surface_raised())
+                            .border_1()
+                            .border_color(ob.border_strong_hairline())
+                            .shadow(self.palette.popover_shadows())
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
+                                    .child(title_snip),
+                            )
+                            .when(!reply_snip.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(11.5))
+                                        .text_color(ob.text_muted())
+                                        .child(reply_snip),
+                                )
+                            }),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_apple_sticky_date(&self, date_lbl: String, top_px: f32) -> AnyElement {
@@ -1288,31 +1603,15 @@ impl Render for ConversationStage {
             )
         };
         let pinned_info = self.pinned_banner_info();
-        let has_pinned_banner = pinned_info.is_some();
+        let pinned_entries = self.pinned_popover_entries();
         let show_top_chrome = has_active_chat
             || total_msgs > 0
             || self.show_bot_start_bar
             || self.bot_description_card.is_some();
-        let apple_top_bar_h = if has_active_chat
-            && !self.select_mode_active
-            && self.selected_message_ids.is_empty()
-        {
-            self.palette.scaled_px(APPLE_STAGE_TOP_BAR_HEIGHT)
-        } else {
-            self.palette.scaled_px(APPLE_STAGE_EMPTY_TOP_BAR_HEIGHT)
-        };
-        let apple_top_inset = if !show_top_chrome {
-            14.0
-        } else {
-            apple_top_bar_h
-                + if self.search_open { 44.0 } else { 0.0 }
-                + if has_pinned_banner { 46.0 } else { 0.0 }
-                + 12.0
-        };
         let sticky_date_pill = if is_apple {
             if raw_scroll_top > 24.0 {
                 self.sticky_date_label(start_idx)
-                    .map(|lbl| self.render_apple_sticky_date(lbl, apple_top_inset - 4.0))
+                    .map(|lbl| self.render_apple_sticky_date(lbl, 10.0))
             } else {
                 None
             }
@@ -1381,64 +1680,136 @@ impl Render for ConversationStage {
                 .size_full(),
             );
 
-        let mut top_chrome_children: Vec<AnyElement> = Vec::new();
-        if show_top_chrome {
-            let header_tiles = (!self.group_member_tiles.is_empty())
-                .then_some(self.group_member_tiles.as_slice());
-            top_chrome_children.push(render_stage_top_bar_with_group(
-                self.active_chat_id,
-                &self.chat_title,
-                &self.chat_subtitle,
-                &self.chat_avatar_initials,
-                self.chat_avatar_url.as_deref(),
-                self.active_fabushi_bot.as_ref(),
-                self.is_bot_chat,
-                is_group_chat,
-                header_tiles,
-                &self.bot_activity_state,
-                self.select_mode_active,
-                self.selected_message_ids.len(),
-                self.message_ttl_seconds,
-                self.search_open,
-                &self.search_query,
-                self.search_match_cursor,
-                self.search_match_ids.len(),
-                self.is_inspector_open,
-                self.is_bot_companion_open,
-                self.more_menu_open,
-                &self.palette,
-                &self.lang_id,
-                cx,
-                |this, action, cx| this.handle_topbar_action(action, cx),
-            ));
-            if self.search_open {
-                top_chrome_children.push(render_stage_search_bar(
+        if is_apple {
+            // UI-F09: Solid flex-flow top chrome (ZERO overlap with scrolling messages!).
+            // When desktop shell hosts the 38px ConversationHeader in #app-shell-top-chrome-strip,
+            // only mount #stage-multiselect-bar here if multi-select is active; otherwise mount
+            // the full 38px solid flex-flow ConversationHeader cleanly above transcript.
+            let in_multiselect = self.select_mode_active || !self.selected_message_ids.is_empty();
+            if in_multiselect {
+                let header_tiles = (!self.group_member_tiles.is_empty())
+                    .then_some(self.group_member_tiles.as_slice());
+                root = root.child(render_stage_top_bar_with_group(
+                    self.active_chat_id,
+                    &self.chat_title,
+                    &self.chat_subtitle,
+                    &self.chat_avatar_initials,
+                    self.chat_avatar_url.as_deref(),
+                    self.active_fabushi_bot.as_ref(),
+                    self.is_bot_chat,
+                    is_group_chat,
+                    header_tiles,
+                    &self.bot_activity_state,
+                    self.select_mode_active,
+                    self.selected_message_ids.len(),
+                    self.message_ttl_seconds,
+                    self.search_open,
                     &self.search_query,
                     self.search_match_cursor,
                     self.search_match_ids.len(),
+                    self.is_inspector_open,
+                    self.is_bot_companion_open,
+                    self.more_menu_open,
+                    &self.palette,
+                    &self.lang_id,
+                    cx,
+                    |this, action, cx| this.handle_topbar_action(action, cx),
+                ));
+            } else if !self.external_header_hosted && show_top_chrome {
+                let header_tiles = (!self.group_member_tiles.is_empty())
+                    .then_some(self.group_member_tiles.as_slice());
+                let props = OpenBotHeaderProps {
+                    chat_id: self.active_chat_id,
+                    title: &self.chat_title,
+                    subtitle: &self.chat_subtitle,
+                    initials: &self.chat_avatar_initials,
+                    avatar_url: self.chat_avatar_url.as_deref(),
+                    active_fabushi_bot: self.active_fabushi_bot.as_ref(),
+                    is_bot_chat: self.is_bot_chat,
+                    is_group_chat,
+                    group_member_tiles: header_tiles,
+                    group_member_briefs: &self.group_member_briefs,
+                    bot_activity_state: &self.bot_activity_state,
+                    active_thread_id: self.active_thread_id.as_deref(),
+                    thread_tabs: &self.thread_tabs,
+                    active_model_label: &self.active_model_label,
+                    active_thinking_effort: &self.active_thinking_effort,
+                    model_picker_open: self.model_picker_open,
+                    pinned_count: pinned_entries.len(),
+                    pinned_popover_open: self.pinned_popover_open,
+                    search_open: self.search_open,
+                    more_menu_open: self.more_menu_open,
+                    side_panel_open: self.is_inspector_open || self.is_bot_companion_open,
+                    right_panel_slot_open: false,
+                    external_hosted: false,
+                    available_width_px: stage_w,
+                    is_isolated_lock: false,
+                    message_ttl_seconds: self.message_ttl_seconds,
+                };
+                root = root.child(render_openbot_conversation_header(
+                    &props,
                     &self.palette,
                     &self.lang_id,
                     cx,
                     |this, action, cx| this.handle_topbar_action(action, cx),
                 ));
             }
-        }
-
-        if let Some((snippet, sender, thumb, count, active_idx)) = pinned_info {
-            top_chrome_children.push(render_pinned_banner_46px(
-                &snippet,
-                &sender,
-                thumb.as_deref(),
-                count,
-                active_idx,
-                &self.palette,
-                &self.lang_id,
-                cx,
-                |this, action, cx| this.handle_topbar_action(action, cx),
-            ));
-        }
-
-        if !is_apple {
+        } else {
+            let mut top_chrome_children: Vec<AnyElement> = Vec::new();
+            if show_top_chrome {
+                let header_tiles = (!self.group_member_tiles.is_empty())
+                    .then_some(self.group_member_tiles.as_slice());
+                top_chrome_children.push(render_stage_top_bar_with_group(
+                    self.active_chat_id,
+                    &self.chat_title,
+                    &self.chat_subtitle,
+                    &self.chat_avatar_initials,
+                    self.chat_avatar_url.as_deref(),
+                    self.active_fabushi_bot.as_ref(),
+                    self.is_bot_chat,
+                    is_group_chat,
+                    header_tiles,
+                    &self.bot_activity_state,
+                    self.select_mode_active,
+                    self.selected_message_ids.len(),
+                    self.message_ttl_seconds,
+                    self.search_open,
+                    &self.search_query,
+                    self.search_match_cursor,
+                    self.search_match_ids.len(),
+                    self.is_inspector_open,
+                    self.is_bot_companion_open,
+                    self.more_menu_open,
+                    &self.palette,
+                    &self.lang_id,
+                    cx,
+                    |this, action, cx| this.handle_topbar_action(action, cx),
+                ));
+                if self.search_open {
+                    top_chrome_children.push(render_stage_search_bar(
+                        &self.search_query,
+                        self.search_match_cursor,
+                        self.search_match_ids.len(),
+                        &self.palette,
+                        &self.lang_id,
+                        cx,
+                        |this, action, cx| this.handle_topbar_action(action, cx),
+                    ));
+                }
+            }
+            if let Some((snippet, sender, thumb, count, active_idx)) = pinned_info {
+                top_chrome_children.push(render_pinned_banner_46px(
+                    &snippet,
+                    &sender,
+                    thumb.as_deref(),
+                    count,
+                    active_idx,
+                    &self.palette,
+                    &self.lang_id,
+                    cx,
+                    |this, action, cx| this.handle_topbar_action(action, cx),
+                ));
+            }
             for child in top_chrome_children.drain(..) {
                 root = root.child(child);
             }
@@ -1526,15 +1897,19 @@ impl Render for ConversationStage {
                 .inset_0()
                 .size_full(),
             )
-            .child(render_themed_wallpaper(&self.palette))
+            .child(if is_apple {
+                render_openbot_stage_backdrop(&self.palette, self.chat_bg_tint_hex.as_deref())
+            } else {
+                render_themed_wallpaper(&self.palette)
+            })
             .child(
                 div()
                     .id("stage-messages-scroll")
                     .relative()
                     .size_full()
                     .px(px(12.0))
-                    .pt(px(if is_apple { apple_top_inset } else { 14.0 }))
-                    .pb(px(if is_apple { 28.0 } else { 46.0 }))
+                    .pt(px(if is_apple { 8.0 } else { 14.0 }))
+                    .pb(px(if is_apple { 24.0 } else { 46.0 }))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_mouse_down(
@@ -1558,6 +1933,28 @@ impl Render for ConversationStage {
                     .when(has_active_chat && total_msgs == 0 && bot_desc_card.is_none(), |el| {
                         if self.is_loading_history {
                             el.child(render_loading_history_skeleton(&self.palette, &self.lang_id))
+                        } else if is_apple && is_group_chat {
+                            let header_tiles = (!self.group_member_tiles.is_empty())
+                                .then_some(self.group_member_tiles.as_slice());
+                            el.child(render_openbot_channel_empty_state(
+                                self.active_chat_id.unwrap_or(0),
+                                &self.chat_title,
+                                &self.chat_subtitle,
+                                self.chat_avatar_url.as_deref(),
+                                header_tiles,
+                                &self.group_member_briefs,
+                                &self.palette,
+                                &self.lang_id,
+                            ))
+                        } else if is_apple && (self.is_bot_chat || self.active_fabushi_bot.is_some()) {
+                            el.child(render_openbot_agent_empty_state(
+                                self.active_chat_id.unwrap_or(0),
+                                &self.chat_title,
+                                self.bot_description_card.as_deref(),
+                                self.active_fabushi_bot.as_ref(),
+                                &self.palette,
+                                &self.lang_id,
+                            ))
                         } else {
                             el.child(render_empty_history_placeholder(&self.palette, &self.lang_id))
                         }
@@ -1571,6 +1968,7 @@ impl Render for ConversationStage {
                         self.active_room_agent_state(stage_now_ms() as i64).cloned(),
                         |el, live| {
                             let is_dark = self.palette.mode.is_dark();
+                            let ob = self.palette.openbot_palette();
                             let lang = self.lang_id.as_str();
                             let is_zh = lang.starts_with("zh");
                             let speaker_name = live
@@ -1582,142 +1980,117 @@ impl Render for ConversationStage {
                             let seed_hash = speaker_name
                                 .bytes()
                                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-                            let (speaker_fill, speaker_bg, speaker_fg) =
-                                TdesktopThemePalette::bot_hue_colors(
-                                    TdesktopThemePalette::bot_hue_name_for_id(seed_hash),
-                                    is_dark,
-                                );
-                            let (_, handoff_bg, handoff_fg) =
-                                TdesktopThemePalette::bot_hue_colors("purple", is_dark);
-                            let (_, ws_bg, ws_fg) =
-                                TdesktopThemePalette::bot_hue_colors("cyan", is_dark);
-                            let speaker_initial: String = speaker_name
-                                .chars()
-                                .filter(|c| !c.is_whitespace())
-                                .take(1)
-                                .collect::<String>()
-                                .to_uppercase();
+                            let hue_name = TdesktopThemePalette::bot_hue_name_for_id(seed_hash);
+                            let (_, _, speaker_fg) =
+                                TdesktopThemePalette::bot_hue_colors(hue_name, is_dark);
                             let handoff_trail = live.format_handoff_trail(lang);
-                            let ws_pulse = live.last_workspace_key.as_ref().map(|k| {
-                                if is_zh {
-                                    format!("共享工作区 #{} · {k}", live.workspace_revision)
-                                } else {
-                                    format!("Workspace #{} · {k}", live.workspace_revision)
-                                }
-                            });
-                            let speaker_line = if live.current_speaker.is_some() {
-                                if is_zh {
-                                    format!("{speaker_name} 正在发言…")
-                                } else {
-                                    format!("{speaker_name} is responding…")
-                                }
-                            } else if is_zh {
-                                "多智能体协作同步中…".to_string()
+                            let elapsed_secs = self
+                                .bot_activity_started_at_ms
+                                .map(|s| stage_now_ms().saturating_sub(s) / 1000)
+                                .unwrap_or(0);
+                            let status_suffix = if is_zh {
+                                "正在思考…".to_string()
                             } else {
-                                "Multi-agent room active…".to_string()
+                                "is thinking…".to_string()
                             };
+                            let mut workers: Vec<String> = vec![speaker_name.clone()];
+                            if let Some((ref from_a, ref to_a, _, _)) = live.last_handoff {
+                                if !workers.iter().any(|w| w == from_a) {
+                                    workers.push(from_a.clone());
+                                }
+                                if !workers.iter().any(|w| w == to_a) {
+                                    workers.push(to_a.clone());
+                                }
+                            }
+                            let avatar_stack = div()
+                                .flex()
+                                .items_center()
+                                .children(workers.iter().take(3).enumerate().map(|(i, name)| {
+                                    let h = name
+                                        .bytes()
+                                        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+                                    let (_, hue, color) = normalize_fabushi_plush_spec(
+                                        "",
+                                        TdesktopThemePalette::bot_hue_name_for_id(h),
+                                    );
+                                    div()
+                                        .when(i > 0, |d| d.ml(px(-10.0)))
+                                        .rounded_full()
+                                        .border_2()
+                                        .border_color(ob.bg_canvas())
+                                        .child(render_plush_bot_avatar(
+                                            name,
+                                            None,
+                                            hue,
+                                            color.as_deref(),
+                                            32.0,
+                                            openbot_contracts::avatar::AvatarMood::Working,
+                                            Some(openbot_contracts::avatar::AgentStepActivity::Working),
+                                        ))
+                                }));
+                            let shimmer_row = div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(speaker_fg))
+                                        .child(speaker_name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(ob.text_muted())
+                                        .child(status_suffix),
+                                )
+                                .when(elapsed_secs >= 5, |r| {
+                                    r.child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(ob.text_dim())
+                                            .child(format!("{}:{:02}", elapsed_secs / 60, elapsed_secs % 60)),
+                                    )
+                                })
+                                .with_animation(
+                                    "openbot-channel-activity-shimmer",
+                                    Animation::new(Duration::from_millis(2250))
+                                        .repeat()
+                                        .with_easing(pulsating_between(0.55, 1.0)),
+                                    |d, delta| d.opacity(delta),
+                                );
                             el.child(
                                 div()
                                     .id("stage-sand-activity-line")
                                     .w_full()
                                     .px(px(16.0))
-                                    .pt(px(8.0))
-                                    .pb(px(4.0))
+                                    .pt(px(10.0))
+                                    .pb(px(6.0))
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
-                                    .flex_wrap()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .px(px(9.0))
-                                            .py(px(4.0))
-                                            .rounded_full()
-                                            .bg(rgb(speaker_bg))
-                                            .border_1()
-                                            .border_color(TdesktopThemePalette::rgba_with_alpha(
-                                                speaker_fg, 0.24,
-                                            ))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .w(px(20.0))
-                                                    .h(px(20.0))
-                                                    .rounded_full()
-                                                    .bg(rgb(speaker_fill))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_size(px(10.0))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(0xFFFFFF))
-                                                    .child(if speaker_initial.is_empty() {
-                                                        "B".to_string()
-                                                    } else {
-                                                        speaker_initial
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(rgb(speaker_fg))
-                                                    .child(speaker_line),
-                                            )
-                                            .when(live.queued_count > 0, |row| {
-                                                row.child(
-                                                    div()
-                                                        .px(px(6.0))
-                                                        .py(px(1.0))
-                                                        .rounded_full()
-                                                        .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                            speaker_fg, 0.16,
-                                                        ))
-                                                        .text_size(px(10.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(rgb(speaker_fg))
-                                                        .child(if is_zh {
-                                                            format!("+{} 排队", live.queued_count)
-                                                        } else {
-                                                            format!("+{} queued", live.queued_count)
-                                                        }),
-                                                )
-                                            }),
-                                    )
+                                    .gap(px(8.0))
+                                    .child(avatar_stack)
+                                    .child(shimmer_row)
                                     .when_some(handoff_trail, |row, trail| {
                                         row.child(
                                             div()
-                                                .px(px(8.0))
-                                                .py(px(4.0))
-                                                .rounded_full()
-                                                .bg(rgb(handoff_bg))
-                                                .border_1()
-                                                .border_color(TdesktopThemePalette::rgba_with_alpha(
-                                                    handoff_fg, 0.24,
-                                                ))
                                                 .text_size(px(11.5))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(handoff_fg))
-                                                .child(trail),
+                                                .text_color(ob.text_dim())
+                                                .child(format!("· {trail}")),
                                         )
                                     })
-                                    .when_some(ws_pulse, |row, ws_lbl| {
+                                    .when(live.queued_count > 0, |row| {
                                         row.child(
                                             div()
-                                                .px(px(8.0))
-                                                .py(px(4.0))
-                                                .rounded_full()
-                                                .bg(rgb(ws_bg))
-                                                .border_1()
-                                                .border_color(TdesktopThemePalette::rgba_with_alpha(
-                                                    ws_fg, 0.24,
-                                                ))
                                                 .text_size(px(11.5))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(ws_fg))
-                                                .child(ws_lbl),
+                                                .text_color(ob.text_dim())
+                                                .child(if is_zh {
+                                                    format!("· +{} 排队", live.queued_count)
+                                                } else {
+                                                    format!("· +{} queued", live.queued_count)
+                                                }),
                                         )
                                     }),
                             )
@@ -1728,112 +2101,171 @@ impl Render for ConversationStage {
                             && !self.bot_activity_state.is_empty()
                             && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
                         |el| {
+                            let is_zh = self.lang_id.starts_with("zh");
                             let status_label = match self.bot_activity_state.as_str() {
                                 "tool" => self
                                     .bot_activity_detail
                                     .as_deref()
-                                    .map(|t| format!("正在调用工具: {t}"))
-                                    .unwrap_or_else(|| "正在执行工具...".to_string()),
+                                    .map(|t| {
+                                        if is_zh {
+                                            format!("正在使用 {t}…")
+                                        } else {
+                                            format!("Using {t}…")
+                                        }
+                                    })
+                                    .unwrap_or_else(|| {
+                                        if is_zh {
+                                            "正在执行工具…".to_string()
+                                        } else {
+                                            "Running tool…".to_string()
+                                        }
+                                    }),
                                 "writing" => self
                                     .bot_activity_detail
                                     .clone()
-                                    .unwrap_or_else(|| "正在组织回复...".to_string()),
+                                    .unwrap_or_else(|| {
+                                        if is_zh {
+                                            "正在回复…".to_string()
+                                        } else {
+                                            "Writing…".to_string()
+                                        }
+                                    }),
                                 _ => self
                                     .bot_activity_detail
                                     .clone()
-                                    .unwrap_or_else(|| "正在深度思考...".to_string()),
+                                    .unwrap_or_else(|| {
+                                        if is_zh {
+                                            "正在思考…".to_string()
+                                        } else {
+                                            "Thinking…".to_string()
+                                        }
+                                    }),
                             };
                             if is_apple {
-                                // Authentic Apple Messages incoming gray bubble with tail + 3 breathing dots
-                                let phase = ((stage_now_ms() / 320) % 3) as usize;
-                                let dot_alpha = |idx: usize| -> f32 {
-                                    match (idx + 3 - phase) % 3 {
-                                        0 => 0.92,
-                                        1 => 0.58,
-                                        _ => 0.34,
-                                    }
-                                };
-                                let dot_hex = self.palette.text_secondary;
-                                let show_detail = self.bot_activity_detail.is_some()
-                                    || self.bot_activity_state == "tool";
+                                let ob = self.palette.openbot_palette();
+                                let (mood, act) =
+                                    activity_str_to_openbot_mood(&self.bot_activity_state);
+                                let seed = format!(
+                                    "bot_{}_{}",
+                                    self.active_chat_id.unwrap_or(0),
+                                    self.chat_title
+                                );
+                                let plush = render_fabushi_plush_avatar(
+                                    self.active_fabushi_bot.as_ref(),
+                                    &seed,
+                                    32.0,
+                                    mood,
+                                    act,
+                                );
+                                let elapsed_secs = self
+                                    .bot_activity_started_at_ms
+                                    .map(|s| stage_now_ms().saturating_sub(s) / 1000)
+                                    .unwrap_or(0);
+                                let has_live_steps = !self.live_agent_steps.is_empty();
+                                let steps_open = self.bot_activity_steps_expanded;
+                                let hover_bg = ob.hover();
                                 el.child(
                                     div()
                                         .id("stage-bot-thinking-indicator")
                                         .w_full()
                                         .px(px(16.0))
-                                        .pt(px(10.0))
-                                        .pb(px(4.0))
+                                        .pt(px(12.0))
+                                        .pb(px(8.0))
                                         .flex_shrink_0()
                                         .flex()
                                         .flex_col()
                                         .items_start()
-                                        .gap(px(4.0))
+                                        .gap(px(6.0))
                                         .child(
                                             div()
-                                                .relative()
                                                 .flex()
-                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                                .child(plush)
                                                 .child(
                                                     div()
-                                                        .absolute()
-                                                        .bottom(px(0.0))
-                                                        .left(px(-6.0))
-                                                        .child(tg_icon(
-                                                            IconName::BubbleTailIn,
-                                                            16.0,
-                                                            self.palette.msg_in_bg,
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .relative()
-                                                        .px(px(14.0))
-                                                        .py(px(11.0))
-                                                        .rounded(px(18.0))
-                                                        .bg(rgb(self.palette.msg_in_bg))
                                                         .flex()
                                                         .items_center()
-                                                        .gap(px(5.0))
+                                                        .gap(px(6.0))
                                                         .child(
                                                             div()
-                                                                .w(px(7.5))
-                                                                .h(px(7.5))
-                                                                .rounded_full()
-                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                                    dot_hex,
-                                                                    dot_alpha(0),
-                                                                )),
+                                                                .text_size(px(13.0))
+                                                                .font_weight(FontWeight::MEDIUM)
+                                                                .text_color(ob.text_muted())
+                                                                .child(status_label)
+                                                                .with_animation(
+                                                                    "openbot-agent-activity-shimmer",
+                                                                    Animation::new(Duration::from_millis(2250))
+                                                                        .repeat()
+                                                                        .with_easing(pulsating_between(0.48, 1.0)),
+                                                                    |d, delta| d.opacity(delta),
+                                                                ),
                                                         )
-                                                        .child(
-                                                            div()
-                                                                .w(px(7.5))
-                                                                .h(px(7.5))
-                                                                .rounded_full()
-                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                                    dot_hex,
-                                                                    dot_alpha(1),
-                                                                )),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .w(px(7.5))
-                                                                .h(px(7.5))
-                                                                .rounded_full()
-                                                                .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                                    dot_hex,
-                                                                    dot_alpha(2),
-                                                                )),
-                                                        ),
+                                                        .when(elapsed_secs >= 5, |row| {
+                                                            row.child(
+                                                                div()
+                                                                    .text_size(px(12.0))
+                                                                    .text_color(ob.text_dim())
+                                                                    .child(format!(
+                                                                        "{}:{:02}",
+                                                                        elapsed_secs / 60,
+                                                                        elapsed_secs % 60
+                                                                    )),
+                                                            )
+                                                        })
+                                                        .when(has_live_steps, |row| {
+                                                            row.child(
+                                                                div()
+                                                                    .id("stage-live-steps-toggle")
+                                                                    .h(px(22.0))
+                                                                    .px(px(6.0))
+                                                                    .rounded(px(6.0))
+                                                                    .hover(move |s| s.bg(hover_bg))
+                                                                    .cursor_pointer()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(3.0))
+                                                                    .on_mouse_down(
+                                                                        MouseButton::Left,
+                                                                        cx.listener(|this, _, _, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.bot_activity_steps_expanded =
+                                                                                !this.bot_activity_steps_expanded;
+                                                                            cx.notify();
+                                                                        }),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(11.5))
+                                                                            .text_color(ob.text_dim())
+                                                                            .child(format!(
+                                                                                "{}",
+                                                                                self.live_agent_steps.len()
+                                                                            )),
+                                                                    )
+                                                                    .child(openbot_stage_icon(
+                                                                        if steps_open {
+                                                                            OpenBotStageIcon::ChevronDown
+                                                                        } else {
+                                                                            OpenBotStageIcon::ChevronRight
+                                                                        },
+                                                                        11.5,
+                                                                        ob.text_dim(),
+                                                                    )),
+                                                            )
+                                                        }),
                                                 ),
                                         )
-                                        .when(show_detail, |col| {
+                                        .when(has_live_steps && steps_open, |col| {
                                             col.child(
-                                                div()
-                                                    .pl(px(6.0))
-                                                    .text_size(px(11.5))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(rgb(self.palette.text_secondary))
-                                                    .child(status_label),
+                                                div().pl(px(40.0)).w_full().child(
+                                                    render_openbot_agent_step_list(
+                                                        0,
+                                                        &self.live_agent_steps,
+                                                        &self.palette,
+                                                        &self.lang_id,
+                                                    ),
+                                                ),
                                             )
                                         }),
                                 )
@@ -1906,22 +2338,19 @@ impl Render for ConversationStage {
                         el.child(div().id("stage-bottom-spacer").w_full().h(px(bottom_spacer_height)).flex_shrink_0())
                     }),
             )
+            .when(is_apple && self.search_open, |el| {
+                el.child(render_stage_search_bar(
+                    &self.search_query,
+                    self.search_match_cursor,
+                    self.search_match_ids.len(),
+                    &self.palette,
+                    &self.lang_id,
+                    cx,
+                    |this, action, cx| this.handle_topbar_action(action, cx),
+                ))
+            })
             .when(is_apple, |el| {
-                // Soft bottom feather gradient blending transcript seamlessly into the floating capsule composer
-                let bottom_feather = linear_gradient(
-                    180.0,
-                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.0), 0.0),
-                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.90), 1.0),
-                );
-                el.child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(14.0))
-                        .bg(bottom_feather),
-                )
+                el.when_some(self.render_scroll_rail_minimap(cx), |d, rail| d.child(rail))
             })
             .when_some(sticky_date_pill, |el, pill| el.child(pill))
             .when_some(toast_pill, |el, pill| el.child(pill))
@@ -1960,51 +2389,9 @@ impl Render for ConversationStage {
             root = root.child(dock_el);
         }
 
-        if is_apple {
-            if !top_chrome_children.is_empty() {
-                let seamless_apple_header = has_active_chat
-                    && !self.select_mode_active
-                    && self.selected_message_ids.is_empty()
-                    && !self.search_open
-                    && !has_pinned_banner;
-                let (feather_alpha, feather_h) = if seamless_apple_header {
-                    (if self.palette.mode.is_dark() { 0.55 } else { 0.62 }, 20.0)
-                } else {
-                    (0.90, 18.0)
-                };
-                let top_feather = linear_gradient(
-                    180.0,
-                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, feather_alpha), 0.0),
-                    linear_color_stop(TdesktopThemePalette::rgba_with_alpha(self.palette.stage_bg, 0.0), 1.0),
-                );
-                root = root.child(
-                    div()
-                        .id("stage-floating-top-chrome")
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .flex_col()
-                        .children(top_chrome_children)
-                        .child(div().w_full().h(px(feather_h)).bg(top_feather)),
-                );
-            } else {
-                // Allow dragging the macOS window from the empty right-pane titlebar zone
-                root = root.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(52.0))
-                        .window_control_area(WindowControlArea::Drag),
-                );
-            }
-        }
-
         if self.show_bot_start_bar {
             let pal = self.palette;
+            let ob = pal.openbot_palette();
             let lang = self.lang_id.as_str();
             root = root.child(
                 div()
@@ -2013,7 +2400,7 @@ impl Render for ConversationStage {
                     .h(px(52.0))
                     .flex_shrink_0()
                     .px(px(16.0))
-                    .bg(rgb(pal.composer_bg))
+                    .bg(if is_apple { ob.bg_canvas() } else { rgb(pal.composer_bg).into() })
                     .when(!is_apple, |el| el.border_t_1().border_color(rgb(pal.border_fg)))
                     .flex()
                     .items_center()
@@ -2023,16 +2410,17 @@ impl Render for ConversationStage {
                             .id("stage-bot-start-btn")
                             .cursor_pointer()
                             .w_full()
+                            .max_w(px(if is_apple { 320.0 } else { 9999.0 }))
                             .h(px(36.0))
                             .rounded(px(if is_apple { 18.0 } else { 8.0 }))
-                            .bg(rgb(pal.accent))
-                            .hover(move |s| s.bg(rgb(pal.accent_hover)))
+                            .bg(if is_apple { ob.surface_light() } else { rgb(pal.accent).into() })
+                            .hover(move |s| s.opacity(0.88))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(13.5))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0xFFFFFF))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if is_apple { ob.text_on_light() } else { rgb(0xFFFFFF).into() })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -2058,6 +2446,28 @@ impl Render for ConversationStage {
                 self.is_peer_blocked,
                 self.message_ttl_seconds,
                 self.ttl_submenu_open,
+                &self.palette,
+                &self.lang_id,
+                cx,
+                |this, action, cx| this.handle_topbar_action(action, cx),
+            ));
+        }
+
+        if is_apple && self.pinned_popover_open && has_active_chat {
+            root = root.child(render_openbot_pinned_messages_popover(
+                &pinned_entries,
+                &self.palette,
+                &self.lang_id,
+                cx,
+                |this, action, cx| this.handle_topbar_action(action, cx),
+            ));
+        }
+
+        if is_apple && self.model_picker_open && has_active_chat {
+            root = root.child(render_openbot_model_picker_popover(
+                &self.active_model_label,
+                &self.active_thinking_effort,
+                &self.available_models,
                 &self.palette,
                 &self.lang_id,
                 cx,

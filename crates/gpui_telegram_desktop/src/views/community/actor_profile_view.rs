@@ -1278,7 +1278,7 @@ fn render_bot_citizenship_card(
                     .flex_wrap()
                     .gap(px(5.0))
                     .children(actor.bot_capabilities.iter().map(|cap| {
-                        render_flair_chip(cap, Some("#3B82F6"), &pal)
+                        render_flair_chip(cap, None, &pal)
                     })),
             )
         })
@@ -1660,7 +1660,7 @@ fn render_profile_tab_body(
                             } else {
                                 tr_str(lang, "成员", "Member")
                             },
-                            if is_mod { Some("#10B981") } else { Some("#3B82F6") },
+                            if is_mod { Some("#10B981") } else { None },
                             &pal,
                         ))
                 }))

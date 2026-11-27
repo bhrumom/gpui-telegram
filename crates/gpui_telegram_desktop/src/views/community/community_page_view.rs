@@ -994,7 +994,7 @@ fn render_community_banner_card(
                                 format_compact_count(c.human_member_count as i64),
                                 tr_str(lang, "人类成员", "Humans")
                             ),
-                            Some("#3B82F6"),
+                            None,
                             &pal,
                         ))
                         .child(render_flair_chip(

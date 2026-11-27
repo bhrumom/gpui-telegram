@@ -13,7 +13,6 @@ use gpui_telegram_proto::creations::{
 };
 
 use crate::i18n::tr_str;
-use crate::theme::TdesktopThemePalette;
 use crate::views::content_hub::apple_primitives::{
     cover_artwork_box, format_duration_ms,
 };
@@ -218,12 +217,13 @@ fn resolve_now_playing_cover(ws: &ContentHubWorkspace, creation_id: Option<&str>
     }
 }
 
-/// Renders the persistent Apple Music Now-Playing transport bar + collapsible Lyrics / Queue drawer.
+/// Renders the persistent OpenBot-styled Music Now-Playing transport bar + collapsible Lyrics / Queue drawer.
 pub fn render_music_player_bar(
     ws: &mut ContentHubWorkspace,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
     let pal = ws.palette;
+    let ob = pal.openbot_palette();
     let lang = ws.language_id.clone();
     let snap = ws.music_engine.snapshot();
     let current_track = ws.music_engine.current_track().cloned();
@@ -243,7 +243,6 @@ pub fn render_music_player_bar(
     let dur_ms = snap.duration_ms.max(1);
     let progress_frac = (snap.position_ms as f32 / dur_ms as f32).clamp(0.0, 1.0);
 
-    // 24 compact waveform bars sampled from current track (or deterministic fallback heights)
     let waveform_bars: Vec<f32> = if let Some(ref tr) = current_track {
         if !tr.waveform_bars.is_empty() {
             let step = (tr.waveform_bars.len() as f32 / 24.0).max(1.0);
@@ -274,6 +273,7 @@ pub fn render_music_player_bar(
         .as_ref()
         .map(|t| t.lyrics.clone())
         .unwrap_or_default();
+    let hover_bg = ob.bg_control_hover();
 
     div()
         .id("apple-music-player-dock")
@@ -288,9 +288,9 @@ pub fn render_music_player_bar(
                     .id("music-player-aux-drawer")
                     .w_full()
                     .max_h(px(210.0))
-                    .bg(pal.card_surface_rgba())
+                    .bg(ob.bg_surface())
                     .border_t_1()
-                    .border_color(pal.separator_rgba())
+                    .border_color(ob.border_hairline())
                     .px(px(20.0))
                     .py(px(12.0))
                     .flex()
@@ -304,8 +304,8 @@ pub fn render_music_player_bar(
                             .child(
                                 div()
                                     .text_size(px(13.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(pal.text_primary))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
                                     .child(if show_lyrics {
                                         tr_str(&lang, "实时歌词 · Synced Lyrics", "Synced Lyrics")
                                     } else {
@@ -317,10 +317,11 @@ pub fn render_music_player_bar(
                                     .id("music-aux-drawer-close")
                                     .cursor_pointer()
                                     .px(px(8.0))
-                                    .py(px(2.0))
+                                    .py(px(3.0))
                                     .rounded(px(6.0))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_muted())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -340,13 +341,13 @@ pub fn render_music_player_bar(
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
-                            .gap(px(5.0))
+                            .gap(px(4.0))
                             .when(show_lyrics, |list| {
                                 if track_lyrics.is_empty() {
                                     list.child(
                                         div()
                                             .text_size(px(12.0))
-                                            .text_color(rgb(pal.text_secondary))
+                                            .text_color(ob.text_muted())
                                             .child(tr_str(
                                                 &lang,
                                                 "当前曲目为纯音乐或未附带时间轴歌词。",
@@ -364,16 +365,14 @@ pub fn render_music_player_bar(
                                                 )))
                                                 .cursor_pointer()
                                                 .px(px(10.0))
-                                                .py(px(4.0))
-                                                .rounded(px(7.0))
+                                                .py(px(5.0))
+                                                .rounded(px(8.0))
                                                 .bg(if is_active {
-                                                    TdesktopThemePalette::rgba_with_alpha(
-                                                        MUSIC_ACCENT,
-                                                        0.16,
-                                                    )
+                                                    ob.bg_control_active()
                                                 } else {
                                                     rgba(0x00000000)
                                                 })
+                                                .hover(move |s| s.bg(hover_bg))
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(10.0))
@@ -390,8 +389,8 @@ pub fn render_music_player_bar(
                                                 .child(
                                                     div()
                                                         .w(px(38.0))
-                                                        .text_size(px(10.0))
-                                                        .text_color(rgb(pal.text_secondary))
+                                                        .text_size(px(10.5))
+                                                        .text_color(ob.text_muted())
                                                         .child(format_duration_ms(ts_ms)),
                                                 )
                                                 .child(
@@ -402,15 +401,15 @@ pub fn render_music_player_bar(
                                                             12.5
                                                         }))
                                                         .font_weight(if is_active {
-                                                            FontWeight::BOLD
+                                                            FontWeight::SEMIBOLD
                                                         } else {
                                                             FontWeight::NORMAL
                                                         })
-                                                        .text_color(rgb(if is_active {
-                                                            MUSIC_ACCENT
+                                                        .text_color(if is_active {
+                                                            ob.text_primary()
                                                         } else {
-                                                            pal.text_primary
-                                                        }))
+                                                            ob.text_secondary()
+                                                        })
                                                         .child(line.text.clone()),
                                                 )
                                         },
@@ -422,7 +421,7 @@ pub fn render_music_player_bar(
                                     list.child(
                                         div()
                                             .text_size(px(12.0))
-                                            .text_color(rgb(pal.text_secondary))
+                                            .text_color(ob.text_muted())
                                             .child(tr_str(
                                                 &lang,
                                                 "播放队列为空，在乐库中选择专辑开始播放。",
@@ -432,7 +431,6 @@ pub fn render_music_player_bar(
                                 } else {
                                     list.children(queue.iter().enumerate().map(|(idx, tr)| {
                                         let is_cur = snap.current_index == Some(idx);
-                                        let hover_bg = pal.row_hover_rgba();
                                         div()
                                             .id(SharedString::from(format!(
                                                 "music-queue-row-{idx}"
@@ -440,12 +438,9 @@ pub fn render_music_player_bar(
                                             .cursor_pointer()
                                             .px(px(10.0))
                                             .py(px(5.0))
-                                            .rounded(px(7.0))
+                                            .rounded(px(8.0))
                                             .bg(if is_cur {
-                                                TdesktopThemePalette::rgba_with_alpha(
-                                                    MUSIC_ACCENT,
-                                                    0.14,
-                                                )
+                                                ob.bg_control_active()
                                             } else {
                                                 rgba(0x00000000)
                                             })
@@ -470,11 +465,11 @@ pub fn render_music_player_bar(
                                                     } else {
                                                         FontWeight::NORMAL
                                                     })
-                                                    .text_color(rgb(if is_cur {
-                                                        MUSIC_ACCENT
+                                                    .text_color(if is_cur {
+                                                        ob.text_primary()
                                                     } else {
-                                                        pal.text_primary
-                                                    }))
+                                                        ob.text_secondary()
+                                                    })
                                                     .child(format!(
                                                         "{}. {} — {}",
                                                         idx + 1,
@@ -485,7 +480,7 @@ pub fn render_music_player_bar(
                                             .child(
                                                 div()
                                                     .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
+                                                    .text_color(ob.text_muted())
                                                     .child(format_duration_ms(tr.duration_ms)),
                                             )
                                     }))
@@ -494,7 +489,7 @@ pub fn render_music_player_bar(
                     ),
             )
         })
-        // Main Apple Music Transport Bar
+        // Main OpenBot Monochrome Transport Bar
         .child(
             div()
                 .id("apple-music-player-bar")
@@ -503,9 +498,9 @@ pub fn render_music_player_bar(
                 .h(px(70.0))
                 .px(px(18.0))
                 .overflow_hidden()
-                .bg(pal.card_surface_rgba())
+                .bg(ob.bg_surface())
                 .border_t_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .flex()
                 .items_center()
                 .justify_between()
@@ -518,7 +513,7 @@ pub fn render_music_player_bar(
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .child(cover_artwork_box(&cover, 42.0, 42.0, 7.0, MUSIC_ACCENT))
+                        .child(cover_artwork_box(&cover, 42.0, 42.0, 8.0, 0x4E3840))
                         .child(
                             div()
                                 .flex_1()
@@ -530,7 +525,7 @@ pub fn render_music_player_bar(
                                     div()
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_color(ob.text_primary())
                                         .truncate()
                                         .child(
                                             current_track
@@ -545,7 +540,7 @@ pub fn render_music_player_bar(
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .truncate()
                                         .child(
                                             current_track
@@ -570,12 +565,13 @@ pub fn render_music_player_bar(
                                     .px(px(6.0))
                                     .py(px(4.0))
                                     .rounded(px(6.0))
+                                    .hover(move |s| s.bg(hover_bg))
                                     .text_size(px(14.0))
-                                    .text_color(rgb(if is_loved {
-                                        MUSIC_ACCENT
+                                    .text_color(if is_loved {
+                                        ob.text_primary()
                                     } else {
-                                        pal.text_secondary
-                                    }))
+                                        ob.text_muted()
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |_this, _, _, cx| {
@@ -593,7 +589,7 @@ pub fn render_music_player_bar(
                             )
                         }),
                 )
-                // Center: Transport buttons + Interactive 5-bit Waveform Scrubber
+                // Center: Transport buttons + Interactive Waveform Scrubber
                 .child(
                     div()
                         .flex_1()
@@ -616,20 +612,18 @@ pub fn render_music_player_bar(
                                         .py(px(3.0))
                                         .rounded(px(6.0))
                                         .bg(if snap.shuffle {
-                                            TdesktopThemePalette::rgba_with_alpha(
-                                                MUSIC_ACCENT,
-                                                0.18,
-                                            )
+                                            ob.bg_control_active()
                                         } else {
                                             rgba(0x00000000)
                                         })
+                                        .hover(move |s| s.bg(hover_bg))
                                         .text_size(px(11.0))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(if snap.shuffle {
-                                            MUSIC_ACCENT
+                                        .text_color(if snap.shuffle {
+                                            ob.text_primary()
                                         } else {
-                                            pal.text_secondary
-                                        }))
+                                            ob.text_muted()
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -647,8 +641,9 @@ pub fn render_music_player_bar(
                                         .px(px(8.0))
                                         .py(px(3.0))
                                         .rounded(px(6.0))
+                                        .hover(move |s| s.bg(hover_bg))
                                         .text_size(px(13.0))
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_color(ob.text_primary())
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -666,13 +661,14 @@ pub fn render_music_player_bar(
                                         .w(px(32.0))
                                         .h(px(32.0))
                                         .rounded(px(999.0))
-                                        .bg(rgb(MUSIC_ACCENT))
+                                        .bg(ob.surface_light())
+                                        .hover(|s| s.opacity(0.84))
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xFFFFFF))
+                                        .text_color(ob.text_on_light())
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -690,8 +686,9 @@ pub fn render_music_player_bar(
                                         .px(px(8.0))
                                         .py(px(3.0))
                                         .rounded(px(6.0))
+                                        .hover(move |s| s.bg(hover_bg))
                                         .text_size(px(13.0))
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_color(ob.text_primary())
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -710,22 +707,20 @@ pub fn render_music_player_bar(
                                         .py(px(3.0))
                                         .rounded(px(6.0))
                                         .bg(if snap.repeat_mode != MusicRepeatMode::Off {
-                                            TdesktopThemePalette::rgba_with_alpha(
-                                                MUSIC_ACCENT,
-                                                0.18,
-                                            )
+                                            ob.bg_control_active()
                                         } else {
                                             rgba(0x00000000)
                                         })
+                                        .hover(move |s| s.bg(hover_bg))
                                         .text_size(px(11.0))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(
+                                        .text_color(
                                             if snap.repeat_mode != MusicRepeatMode::Off {
-                                                MUSIC_ACCENT
+                                                ob.text_primary()
                                             } else {
-                                                pal.text_secondary
+                                                ob.text_muted()
                                             },
-                                        ))
+                                        )
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -748,7 +743,7 @@ pub fn render_music_player_bar(
                                     div()
                                         .w(px(36.0))
                                         .text_size(px(10.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(format_duration_ms(snap.position_ms)),
                                 )
                                 .child(
@@ -793,12 +788,9 @@ pub fn render_music_player_bar(
                                                             .h(px(h_px))
                                                             .rounded(px(2.0))
                                                             .bg(if played {
-                                                                rgb(MUSIC_ACCENT)
+                                                                ob.surface_light()
                                                             } else {
-                                                                TdesktopThemePalette::rgba_with_alpha(
-                                                                    pal.text_secondary,
-                                                                    0.34,
-                                                                )
+                                                                ob.bg_control_active()
                                                             }),
                                                     )
                                             },
@@ -808,7 +800,7 @@ pub fn render_music_player_bar(
                                     div()
                                         .w(px(36.0))
                                         .text_size(px(10.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(format_duration_ms(snap.duration_ms)),
                                 ),
                         ),
@@ -826,9 +818,10 @@ pub fn render_music_player_bar(
                                 .px(px(6.0))
                                 .py(px(3.0))
                                 .rounded(px(6.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.06))
+                                .bg(ob.bg_control())
+                                .hover(move |s| s.bg(hover_bg))
                                 .text_size(px(11.0))
-                                .text_color(rgb(pal.text_primary))
+                                .text_color(ob.text_primary())
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
@@ -844,13 +837,13 @@ pub fn render_music_player_bar(
                                 .w(px(44.0))
                                 .h(px(4.0))
                                 .rounded(px(999.0))
-                                .bg(pal.separator_rgba())
+                                .bg(ob.bg_control_active())
                                 .overflow_hidden()
                                 .child(
                                     div()
                                         .h_full()
                                         .w(relative(snap.volume.clamp(0.0, 1.0)))
-                                        .bg(rgb(MUSIC_ACCENT)),
+                                        .bg(ob.surface_light()),
                                 ),
                         )
                         .child(
@@ -860,9 +853,10 @@ pub fn render_music_player_bar(
                                 .px(px(6.0))
                                 .py(px(3.0))
                                 .rounded(px(6.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.06))
+                                .bg(ob.bg_control())
+                                .hover(move |s| s.bg(hover_bg))
                                 .text_size(px(11.0))
-                                .text_color(rgb(pal.text_primary))
+                                .text_color(ob.text_primary())
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
@@ -879,19 +873,21 @@ pub fn render_music_player_bar(
                                 .cursor_pointer()
                                 .px(px(9.0))
                                 .py(px(4.0))
-                                .rounded(px(7.0))
+                                .rounded(px(8.0))
                                 .bg(if show_lyrics {
-                                    rgb(MUSIC_ACCENT)
+                                    ob.surface_light()
                                 } else {
-                                    TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.07)
+                                    ob.bg_control()
                                 })
+                                .border_1()
+                                .border_color(ob.border_hairline())
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(if show_lyrics {
-                                    0xFFFFFF
+                                .text_color(if show_lyrics {
+                                    ob.text_on_light()
                                 } else {
-                                    pal.text_primary
-                                }))
+                                    ob.text_primary()
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
@@ -910,19 +906,21 @@ pub fn render_music_player_bar(
                                 .cursor_pointer()
                                 .px(px(9.0))
                                 .py(px(4.0))
-                                .rounded(px(7.0))
+                                .rounded(px(8.0))
                                 .bg(if show_queue {
-                                    rgb(MUSIC_ACCENT)
+                                    ob.surface_light()
                                 } else {
-                                    TdesktopThemePalette::rgba_with_alpha(pal.text_primary, 0.07)
+                                    ob.bg_control()
                                 })
+                                .border_1()
+                                .border_color(ob.border_hairline())
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(if show_queue {
-                                    0xFFFFFF
+                                .text_color(if show_queue {
+                                    ob.text_on_light()
                                 } else {
-                                    pal.text_primary
-                                }))
+                                    ob.text_primary()
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {

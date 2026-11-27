@@ -1,10 +1,10 @@
 use crate::i18n::tr_str;
-use crate::theme::assets::{IconName, tg_icon};
+use crate::theme::assets::{IconName, tg_icon_rgba};
 use crate::theme::palette::TdesktopThemePalette;
 use crate::views::boxes::delete_messages_box::DeleteMessagesBox;
 use crate::views::boxes::modal_theme::{
-    modal_card, modal_error_banner, modal_field, modal_footer_cancel, modal_header,
-    modal_toggle_chip, DialogClose, DialogMut,
+    modal_error_banner, modal_field, modal_toggle_chip, openbot_confirm_dialog_shell, DialogClose,
+    DialogMut,
 };
 use crate::views::boxes::modal_types::{ActiveTextField, ModalActionOutcome};
 use crate::views::boxes::pin_messages_box::{PinChatType, PinMessagesBox};
@@ -21,6 +21,7 @@ pub fn render_delete_messages<V: 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let pal = dlg.palette;
+    let ob = pal.openbot_palette();
     let lang = &dlg.language_id;
     let box_model = DeleteMessagesBox::new_selected(
         message_ids.iter().map(|&id| id as i64).collect(),
@@ -28,19 +29,16 @@ pub fn render_delete_messages<V: 'static>(
     );
     let count = box_model.selected_count().max(1);
     let revoke = dlg.flag_a;
+    let danger_hover = rgb(if ob.scheme.is_dark() { 0xFD5D67 } else { 0xF04A53 });
 
-    modal_card(390.0, pal)
-        .child(modal_header(
-            IconName::DeleteTrash,
-            tr_str(lang, "删除消息", "Delete Messages"),
-            pal,
-            on_close,
-            cx,
-        ))
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
         .child(
             div()
                 .text_size(px(13.5))
-                .text_color(rgb(pal.text_primary))
+                .text_color(ob.text_secondary())
                 .child(format!(
                     "{} {} {}?",
                     tr_str(lang, "确定要删除这", "Are you sure you want to delete"),
@@ -58,39 +56,46 @@ pub fn render_delete_messages<V: 'static>(
             },
             cx,
         ))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.0))
-                .child(modal_footer_cancel(lang, pal, on_close, cx))
-                .child(
-                    div()
-                        .cursor_pointer()
-                        .px(px(16.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.danger))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                let d = access(this);
-                                let ids = message_ids.clone();
-                                d.pending_outcome = Some(ModalActionOutcome::ConfirmDeleteMessages {
-                                    message_ids: ids,
-                                    revoke_for_everyone: d.flag_a,
-                                });
-                                on_close(this);
-                                cx.notify();
-                            }),
-                        )
-                        .child(tr_str(lang, "删除", "Delete").to_string()),
-                ),
+        .into_any_element();
+
+    let confirm_btn = div()
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.danger())
+        .hover(move |s| s.bg(danger_hover))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(0xFFFFFF))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                let d = access(this);
+                let ids = message_ids.clone();
+                d.pending_outcome = Some(ModalActionOutcome::ConfirmDeleteMessages {
+                    message_ids: ids,
+                    revoke_for_everyone: d.flag_a,
+                });
+                on_close(this);
+                cx.notify();
+            }),
         )
-        .into_any_element()
+        .child(tr_str(lang, "删除", "Delete").to_string())
+        .into_any_element();
+
+    openbot_confirm_dialog_shell(
+        IconName::DeleteTrash,
+        tr_str(lang, "删除消息", "Delete Messages"),
+        true,
+        pal,
+        body,
+        confirm_btn,
+        lang,
+        on_close,
+        cx,
+    )
+    .into_any_element()
 }
 
 pub fn render_pin_message<V: 'static>(
@@ -103,6 +108,7 @@ pub fn render_pin_message<V: 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let pal = dlg.palette;
+    let ob = pal.openbot_palette();
     let lang = &dlg.language_id;
     let chat_type = if is_group {
         PinChatType::Group
@@ -110,19 +116,16 @@ pub fn render_pin_message<V: 'static>(
         PinChatType::PrivateUser
     };
     let pin_box = PinMessagesBox::new(message_id, chat_type, peer_name.clone());
+    let primary_hover = rgb(if ob.scheme.is_dark() { 0xDCDCDC } else { 0x2C2C2E });
 
-    modal_card(390.0, pal)
-        .child(modal_header(
-            IconName::Pin,
-            tr_str(lang, "置顶消息", "Pin Message"),
-            pal,
-            on_close,
-            cx,
-        ))
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
         .child(
             div()
                 .text_size(px(13.5))
-                .text_color(rgb(pal.text_primary))
+                .text_color(ob.text_secondary())
                 .child(if lang.starts_with("zh") {
                     if is_group {
                         "确定要在该群组中置顶此消息吗？".to_string()
@@ -151,39 +154,46 @@ pub fn render_pin_message<V: 'static>(
             },
             cx,
         ))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.0))
-                .child(modal_footer_cancel(lang, pal, on_close, cx))
-                .child(
-                    div()
-                        .cursor_pointer()
-                        .px(px(16.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.accent))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                let d = access(this);
-                                d.pending_outcome = Some(ModalActionOutcome::ConfirmPinMessage {
-                                    message_id,
-                                    notify_members: d.flag_a,
-                                    pin_for_both: d.flag_b,
-                                });
-                                on_close(this);
-                                cx.notify();
-                            }),
-                        )
-                        .child(tr_str(lang, "置顶", "Pin").to_string()),
-                ),
+        .into_any_element();
+
+    let confirm_btn = div()
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.surface_light())
+        .hover(move |s| s.bg(primary_hover))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(ob.text_on_light())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                let d = access(this);
+                d.pending_outcome = Some(ModalActionOutcome::ConfirmPinMessage {
+                    message_id,
+                    notify_members: d.flag_a,
+                    pin_for_both: d.flag_b,
+                });
+                on_close(this);
+                cx.notify();
+            }),
         )
-        .into_any_element()
+        .child(tr_str(lang, "置顶", "Pin").to_string())
+        .into_any_element();
+
+    openbot_confirm_dialog_shell(
+        IconName::Pin,
+        tr_str(lang, "置顶消息", "Pin Message"),
+        false,
+        pal,
+        body,
+        confirm_btn,
+        lang,
+        on_close,
+        cx,
+    )
+    .into_any_element()
 }
 
 pub fn render_report_message<V: 'static>(
@@ -195,6 +205,7 @@ pub fn render_report_message<V: 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let pal = dlg.palette;
+    let ob = pal.openbot_palette();
     let lang = &dlg.language_id;
     let reasons = [
         ReportReason::Spam,
@@ -207,15 +218,18 @@ pub fn render_report_message<V: 'static>(
         ReportReason::Other,
     ];
     let selected = dlg.selected_report_reason;
+    let danger_soft = ob.rgba("--openbot-danger-soft").unwrap_or_else(|| {
+        TdesktopThemePalette::rgba_with_alpha(
+            if ob.scheme.is_dark() { 0xFD2F3B } else { 0xE8222D },
+            0.16,
+        )
+    });
+    let danger_hover = rgb(if ob.scheme.is_dark() { 0xFD5D67 } else { 0xF04A53 });
 
-    modal_card(420.0, pal)
-        .child(modal_header(
-            IconName::MoreVertical,
-            &format!("{} {}", tr_str(lang, "举报", "Report"), peer_name),
-            pal,
-            on_close,
-            cx,
-        ))
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
         .child(
             div()
                 .flex()
@@ -223,23 +237,25 @@ pub fn render_report_message<V: 'static>(
                 .gap(px(6.0))
                 .children(reasons.into_iter().map(|reason| {
                     let active = selected == Some(reason);
+                    let chip_hover = ob.bg_control_hover();
                     div()
                         .cursor_pointer()
                         .px(px(10.0))
                         .py(px(6.0))
                         .rounded(px(8.0))
-                        .bg(if active {
-                            TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.2)
-                        } else {
-                            rgb(pal.input_bg)
-                        })
+                        .bg(if active { danger_soft } else { ob.bg_control() })
+                        .hover(move |s| s.bg(if active { danger_soft } else { chip_hover }))
                         .border_1()
-                        .border_color(rgb(if active { pal.danger } else { pal.border_fg }))
+                        .border_color(if active {
+                            ob.danger()
+                        } else {
+                            ob.border_hairline()
+                        })
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .text_size(px(12.0))
-                        .text_color(rgb(pal.text_primary))
+                        .text_color(ob.text_primary())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _e, _w, cx| {
@@ -249,10 +265,10 @@ pub fn render_report_message<V: 'static>(
                                 cx.notify();
                             }),
                         )
-                        .child(tg_icon(
+                        .child(tg_icon_rgba(
                             IconName::SelectCheck,
                             12.0,
-                            if active { pal.danger } else { pal.text_secondary },
+                            if active { ob.danger() } else { ob.text_dim() },
                         ))
                         .child(if lang.starts_with("zh") {
                             match reason {
@@ -281,52 +297,64 @@ pub fn render_report_message<V: 'static>(
             cx,
         ))
         .child(modal_error_banner(dlg.validation_error.as_ref(), pal))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.0))
-                .child(modal_footer_cancel(lang, pal, on_close, cx))
-                .child(
-                    div()
-                        .cursor_pointer()
-                        .px(px(16.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.danger))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                let d = access(this);
-                                let mut rb = ReportMessagesBox::new(0, Vec::new());
-                                if let Some(r) = d.selected_report_reason {
-                                    rb.select_reason(r);
-                                }
-                                rb.set_comment(&d.primary_input);
-                                if !rb.can_submit() {
-                                    d.validation_error = Some(
-                                        tr_str(&d.language_id, "请选择举报原因（若选“其他”请填写说明）", "Select a report reason (and comment for Other)").into(),
-                                    );
-                                    cx.notify();
-                                    return;
-                                }
-                                let reason = d.selected_report_reason.unwrap_or(ReportReason::Spam);
-                                d.pending_outcome = Some(ModalActionOutcome::SubmitReport {
-                                    message_ids: message_ids.clone(),
-                                    reason,
-                                    comment: rb.comment,
-                                });
-                                on_close(this);
-                                cx.notify();
-                            }),
+        .into_any_element();
+
+    let confirm_btn = div()
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.danger())
+        .hover(move |s| s.bg(danger_hover))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(0xFFFFFF))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                let d = access(this);
+                let mut rb = ReportMessagesBox::new(0, Vec::new());
+                if let Some(r) = d.selected_report_reason {
+                    rb.select_reason(r);
+                }
+                rb.set_comment(&d.primary_input);
+                if !rb.can_submit() {
+                    d.validation_error = Some(
+                        tr_str(
+                            &d.language_id,
+                            "请选择举报原因（若选“其他”请填写说明）",
+                            "Select a report reason (and comment for Other)",
                         )
-                        .child(tr_str(lang, "提交举报", "Report").to_string()),
-                ),
+                        .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                let reason = d.selected_report_reason.unwrap_or(ReportReason::Spam);
+                d.pending_outcome = Some(ModalActionOutcome::SubmitReport {
+                    message_ids: message_ids.clone(),
+                    reason,
+                    comment: rb.comment,
+                });
+                on_close(this);
+                cx.notify();
+            }),
         )
-        .into_any_element()
+        .child(tr_str(lang, "提交举报", "Report").to_string())
+        .into_any_element();
+
+    openbot_confirm_dialog_shell(
+        IconName::MoreVertical,
+        &format!("{} {}", tr_str(lang, "举报", "Report"), peer_name),
+        true,
+        pal,
+        body,
+        confirm_btn,
+        lang,
+        on_close,
+        cx,
+    )
+    .into_any_element()
 }
 
 pub fn render_clear_chat_history<V: 'static>(
@@ -337,25 +365,26 @@ pub fn render_clear_chat_history<V: 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let pal = dlg.palette;
+    let ob = pal.openbot_palette();
     let lang = &dlg.language_id;
     let also_for_peer = dlg.flag_a;
+    let danger_hover = rgb(if ob.scheme.is_dark() { 0xFD5D67 } else { 0xF04A53 });
 
-    modal_card(390.0, pal)
-        .child(modal_header(
-            IconName::DeleteTrash,
-            tr_str(lang, "清空聊天记录", "Clear History"),
-            pal,
-            on_close,
-            cx,
-        ))
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
         .child(
             div()
                 .text_size(px(13.5))
-                .text_color(rgb(pal.text_primary))
+                .text_color(ob.text_secondary())
                 .child(if lang.starts_with("zh") {
                     format!("确定要清空与「{}」的所有聊天记录吗？此操作无法撤销。", peer_name)
                 } else {
-                    format!("Are you sure you want to clear all message history with \"{}\"?", peer_name)
+                    format!(
+                        "Are you sure you want to clear all message history with \"{}\"?",
+                        peer_name
+                    )
                 }),
         )
         .child(modal_toggle_chip(
@@ -368,38 +397,45 @@ pub fn render_clear_chat_history<V: 'static>(
             },
             cx,
         ))
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.0))
-                .child(modal_footer_cancel(lang, pal, on_close, cx))
-                .child(
-                    div()
-                        .id("modal-confirm-clear-history-btn")
-                        .cursor_pointer()
-                        .px(px(16.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.danger))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                let d = access(this);
-                                d.pending_outcome = Some(ModalActionOutcome::ConfirmClearChatHistory {
-                                    also_for_peer: d.flag_a,
-                                });
-                                on_close(this);
-                                cx.notify();
-                            }),
-                        )
-                        .child(tr_str(lang, "清空", "Clear").to_string()),
-                ),
+        .into_any_element();
+
+    let confirm_btn = div()
+        .id("modal-confirm-clear-history-btn")
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.danger())
+        .hover(move |s| s.bg(danger_hover))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(0xFFFFFF))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                let d = access(this);
+                d.pending_outcome = Some(ModalActionOutcome::ConfirmClearChatHistory {
+                    also_for_peer: d.flag_a,
+                });
+                on_close(this);
+                cx.notify();
+            }),
         )
-        .into_any_element()
+        .child(tr_str(lang, "清空", "Clear").to_string())
+        .into_any_element();
+
+    openbot_confirm_dialog_shell(
+        IconName::DeleteTrash,
+        tr_str(lang, "清空聊天记录", "Clear History"),
+        true,
+        pal,
+        body,
+        confirm_btn,
+        lang,
+        on_close,
+        cx,
+    )
+    .into_any_element()
 }
 
 pub fn render_leave_or_delete_chat<V: 'static>(
@@ -411,7 +447,9 @@ pub fn render_leave_or_delete_chat<V: 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let pal = dlg.palette;
+    let ob = pal.openbot_palette();
     let lang = &dlg.language_id;
+    let danger_hover = rgb(if ob.scheme.is_dark() { 0xFD5D67 } else { 0xF04A53 });
     let header_title = if is_group {
         tr_str(lang, "退出并删除群组", "Leave Group")
     } else {
@@ -423,58 +461,55 @@ pub fn render_leave_or_delete_chat<V: 'static>(
         tr_str(lang, "删除", "Delete")
     };
 
-    modal_card(390.0, pal)
-        .child(modal_header(
-            IconName::DeleteTrash,
-            header_title,
-            pal,
-            on_close,
-            cx,
-        ))
-        .child(
-            div()
-                .text_size(px(13.5))
-                .text_color(rgb(pal.text_primary))
-                .child(if lang.starts_with("zh") {
-                    if is_group {
-                        format!("确定要退出群组「{}」并从会话列表移除吗？", peer_name)
-                    } else {
-                        format!("确定要删除与「{}」的对话及全部消息记录吗？", peer_name)
-                    }
-                } else if is_group {
-                    format!("Are you sure you want to leave \"{}\"?", peer_name)
-                } else {
-                    format!("Are you sure you want to delete the chat with \"{}\"?", peer_name)
-                }),
+    let body = div()
+        .text_size(px(13.5))
+        .text_color(ob.text_secondary())
+        .child(if lang.starts_with("zh") {
+            if is_group {
+                format!("确定要退出群组「{}」并从会话列表移除吗？", peer_name)
+            } else {
+                format!("确定要删除与「{}」的对话及全部消息记录吗？", peer_name)
+            }
+        } else if is_group {
+            format!("Are you sure you want to leave \"{}\"?", peer_name)
+        } else {
+            format!("Are you sure you want to delete the chat with \"{}\"?", peer_name)
+        })
+        .into_any_element();
+
+    let confirm_btn = div()
+        .id("modal-confirm-delete-chat-btn")
+        .cursor_pointer()
+        .px(px(16.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(ob.danger())
+        .hover(move |s| s.bg(danger_hover))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(0xFFFFFF))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| {
+                let d = access(this);
+                d.pending_outcome = Some(ModalActionOutcome::ConfirmLeaveOrDeleteChat);
+                on_close(this);
+                cx.notify();
+            }),
         )
-        .child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.0))
-                .child(modal_footer_cancel(lang, pal, on_close, cx))
-                .child(
-                    div()
-                        .id("modal-confirm-delete-chat-btn")
-                        .cursor_pointer()
-                        .px(px(16.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(pal.danger))
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(pal.active_button_fg))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _e, _w, cx| {
-                                let d = access(this);
-                                d.pending_outcome = Some(ModalActionOutcome::ConfirmLeaveOrDeleteChat);
-                                on_close(this);
-                                cx.notify();
-                            }),
-                        )
-                        .child(confirm_label.to_string()),
-                ),
-        )
-        .into_any_element()
+        .child(confirm_label.to_string())
+        .into_any_element();
+
+    openbot_confirm_dialog_shell(
+        IconName::DeleteTrash,
+        header_title,
+        true,
+        pal,
+        body,
+        confirm_btn,
+        lang,
+        on_close,
+        cx,
+    )
+    .into_any_element()
 }

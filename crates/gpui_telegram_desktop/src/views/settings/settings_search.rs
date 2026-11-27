@@ -1,7 +1,7 @@
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::{tg_icon_rgba, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_card, settings_container, settings_empty_state,
@@ -38,7 +38,7 @@ impl SettingsSearch {
             recent_entry_ids: Vec::new(),
             selected_index: 0,
             is_visible: true,
-            palette: TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x3390ec, 14, 12),
+            palette: TdesktopThemePalette::build_openbot(TdesktopThemeMode::Night, 0, 14, 12),
             language_id: "en".into(),
             pending_selected_section: None,
         }
@@ -158,14 +158,31 @@ impl SettingsSearch {
         self.results = if q.is_empty() {
             self.all_entries.clone()
         } else {
-            self.all_entries.iter().filter(|item| {
-                let (zh_title, zh_sub) = Self::localized_labels(item, "zh-CN");
-                item.title.to_lowercase().contains(&q)
-                    || item.subtitle.to_lowercase().contains(&q)
-                    || zh_title.to_lowercase().contains(&q)
-                    || zh_sub.to_lowercase().contains(&q)
-                    || item.keywords.iter().any(|k| k.to_lowercase().contains(&q))
-            }).cloned().collect()
+            let mut scored: Vec<(u8, usize, SearchResultItem)> = self
+                .all_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    let (zh_title, zh_sub) = Self::localized_labels(item, "zh-CN");
+                    let t_en = item.title.to_lowercase();
+                    let t_zh = zh_title.to_lowercase();
+                    let rank = if t_en.starts_with(&q) || t_zh.starts_with(&q) {
+                        0
+                    } else if t_en.contains(&q) || t_zh.contains(&q) {
+                        1
+                    } else if item.subtitle.to_lowercase().contains(&q)
+                        || zh_sub.to_lowercase().contains(&q)
+                        || item.keywords.iter().any(|k| k.to_lowercase().contains(&q))
+                    {
+                        2
+                    } else {
+                        3
+                    };
+                    (rank < 3).then_some((rank, idx, item.clone()))
+                })
+                .collect();
+            scored.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+            scored.into_iter().map(|(_, _, item)| item).collect()
         };
         self.selected_index = 0;
     }
@@ -191,54 +208,178 @@ impl Default for SettingsSearch {
 impl Render for SettingsSearch {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_visible { return div().into_any_element(); }
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let sel_idx = self.selected_index;
         let query_empty = self.query.is_empty();
+        let hover_row = ob.hover();
+        let hover_chip = ob.bg_control_hover();
 
-        settings_container(pal.clone())
+        settings_container(pal)
             .child(
-                div().flex().flex_row().items_center().justify_between().w_full().px(px(12.0)).py(px(9.0)).rounded(px(8.0))
-                    .bg(rgb(pal.input_bg)).border_1().border_color(rgb(pal.border_fg))
-                    .child(div().flex().flex_row().items_center().gap(px(8.0))
-                        .child(tg_icon(IconName::Search, 15.0, pal.icon_fg))
-                        .child(div().text_sm().text_color(rgb(if query_empty { pal.text_secondary } else { pal.text_primary }))
-                            .child(if query_empty { tr_str(&lang, "搜索设置...", "Search settings...").to_string() } else { self.query.clone() })))
-                    .when(!query_empty, |el| el.child(div().cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.set_query(""); cx.notify(); })).child(tg_icon(IconName::Close, 13.0, pal.icon_fg)))),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .rounded_full()
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_strong_hairline())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(tg_icon_rgba(IconName::Search, 14.0, ob.text_muted()))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if query_empty {
+                                        ob.text_muted()
+                                    } else {
+                                        ob.text_primary()
+                                    })
+                                    .child(if query_empty {
+                                        tr_str(&lang, "搜索设置...", "Search settings...").to_string()
+                                    } else {
+                                        self.query.clone()
+                                    }),
+                            ),
+                    )
+                    .when(!query_empty, |el| {
+                        el.child(
+                            div()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_query("");
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(tg_icon_rgba(IconName::Close, 13.0, ob.text_muted())),
+                        )
+                    }),
             )
-            .child(div().flex().flex_row().flex_wrap().gap(px(6.0)).children([
-                ("", tr_str(&lang, "全部", "All")),
-                ("privacy", tr_str(&lang, "隐私", "privacy")),
-                ("theme", tr_str(&lang, "主题", "theme")),
-                ("storage", tr_str(&lang, "存储", "storage")),
-                ("stars", tr_str(&lang, "星币", "stars")),
-                ("mic", tr_str(&lang, "通话", "mic")),
-                ("language", tr_str(&lang, "语言", "language")),
-            ].into_iter().map(|(q, lbl)| {
-                let active = self.query == q;
-                div().px(px(10.0)).py(px(4.0)).rounded_full().bg(rgb(if active { pal.accent } else { pal.card_bg })).border_1().border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                    .text_xs().text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { this.set_query(q); cx.notify(); })).child(lbl.to_string())
-            })))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(6.0))
+                    .children(
+                        [
+                            ("", tr_str(&lang, "全部", "All")),
+                            ("privacy", tr_str(&lang, "隐私", "privacy")),
+                            ("theme", tr_str(&lang, "主题", "theme")),
+                            ("storage", tr_str(&lang, "存储", "storage")),
+                            ("stars", tr_str(&lang, "星币", "stars")),
+                            ("mic", tr_str(&lang, "通话", "mic")),
+                            ("language", tr_str(&lang, "语言", "language")),
+                        ]
+                        .into_iter()
+                        .map(|(q, lbl)| {
+                            let active = self.query == q;
+                            let active_bg = ob.surface_light();
+                            div()
+                                .px(px(10.0))
+                                .py(px(5.0))
+                                .rounded_full()
+                                .bg(if active {
+                                    active_bg
+                                } else {
+                                    ob.bg_surface()
+                                })
+                                .border_1()
+                                .border_color(if active {
+                                    active_bg
+                                } else {
+                                    ob.frame_card_border()
+                                })
+                                .hover(move |s| {
+                                    s.bg(if active {
+                                        active_bg
+                                    } else {
+                                        hover_chip
+                                    })
+                                })
+                                .text_xs()
+                                .font_weight(if active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(if active {
+                                    ob.text_on_light()
+                                } else {
+                                    ob.text_secondary()
+                                })
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.set_query(q);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(lbl.to_string())
+                        }),
+                    ),
+            )
             .child(if self.results.is_empty() {
-                settings_empty_state(IconName::Search, tr_str(&lang, "未找到匹配设置", "No matching settings found."), pal).into_any_element()
+                settings_empty_state(
+                    IconName::Search,
+                    tr_str(&lang, "未找到匹配设置", "No matching settings found."),
+                    pal,
+                )
+                .into_any_element()
             } else {
-                settings_card(pal.clone()).children(self.results.iter().enumerate().map(|(idx, res)| {
-                    let is_sel = idx == sel_idx;
-                    let sec = res.section;
-                    let rid = res.id.clone();
-                    let (disp_title, disp_sub) = Self::localized_labels(res, &lang);
-                    div().flex().flex_col().px(px(10.0)).py(px(8.0)).rounded(px(8.0))
-                        .bg(rgb(if is_sel { pal.dialogs_hover_bg } else { pal.card_bg })).cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                            this.selected_index = idx;
-                            this.pending_selected_section = Some(sec);
-                            this.bump_recent_entry(&rid);
-                            cx.notify();
-                        }))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(pal.text_primary)).child(disp_title.to_string()))
-                        .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(disp_sub.to_string()))
-                })).into_any_element()
+                settings_card(pal)
+                    .children(self.results.iter().enumerate().map(|(idx, res)| {
+                        let is_sel = idx == sel_idx;
+                        let sec = res.section;
+                        let rid = res.id.clone();
+                        let (disp_title, disp_sub) = Self::localized_labels(res, &lang);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .when(is_sel, |el| el.bg(ob.bg_control_hover()))
+                            .hover(move |s| s.bg(hover_row))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.selected_index = idx;
+                                    this.pending_selected_section = Some(sec);
+                                    this.bump_recent_entry(&rid);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_primary())
+                                    .child(disp_title.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(ob.text_muted())
+                                    .child(disp_sub.to_string()),
+                            )
+                    }))
+                    .into_any_element()
             })
             .into_any_element()
     }

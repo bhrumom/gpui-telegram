@@ -420,23 +420,30 @@ pub fn render_game_runtime_sheet(
         GameEngineKind::MiniAppHtml => "Mini App HTML",
     };
 
+    let ob = pal.openbot_palette();
+    let warn_soft = gpui::Rgba { a: 0.14, ..ob.warning() };
+    let danger_soft = gpui::Rgba { a: 0.14, ..ob.danger() };
+    let succ_soft = gpui::Rgba { a: 0.14, ..ob.success() };
+    let banner_border_win = gpui::Rgba { a: 0.36, ..ob.success() };
+    let banner_border_loss = gpui::Rgba { a: 0.36, ..ob.danger() };
+
     div()
         .id("apple-game-runtime-sheet")
         .size_full()
-        .bg(rgb(pal.stage_bg))
+        .bg(ob.bg_canvas())
         .flex()
         .flex_col()
         .overflow_hidden()
-        // Top Apple Arcade Game HUD bar
+        // Top OpenBot monochrome Game HUD bar
         .child(
             div()
                 .flex_shrink_0()
                 .w_full()
                 .px(px(20.0))
-                .py(px(12.0))
-                .bg(pal.card_surface_rgba())
+                .py(px(10.0))
+                .bg(ob.bg_surface())
                 .border_b_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -476,15 +483,15 @@ pub fn render_game_runtime_sheet(
                                 .flex_col()
                                 .child(
                                     div()
-                                        .text_size(px(15.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
+                                        .text_size(px(14.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
                                         .child(session.title.clone()),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(format!("{} · {}", engine_label, session.developer)),
                                 ),
                         ),
@@ -501,10 +508,12 @@ pub fn render_game_runtime_sheet(
                                 .px(px(10.0))
                                 .py(px(4.0))
                                 .rounded(px(8.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(GAMES_ACCENT, 0.16))
+                                .bg(ob.bg_control_active())
+                                .border_1()
+                                .border_color(ob.border_hairline())
                                 .text_size(px(12.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(GAMES_ACCENT))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
                                 .child(format!("{} {}", tr_str(&lang, "得分", "SCORE"), snap.score)),
                         )
                         .child(
@@ -512,10 +521,10 @@ pub fn render_game_runtime_sheet(
                                 .px(px(10.0))
                                 .py(px(4.0))
                                 .rounded(px(8.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(0xFF9F0A, 0.14))
+                                .bg(warn_soft)
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xFF9F0A))
+                                .text_color(ob.warning())
                                 .child(format!(
                                     "{} {}",
                                     tr_str(&lang, "最高", "BEST"),
@@ -528,9 +537,9 @@ pub fn render_game_runtime_sheet(
                                     .px(px(9.0))
                                     .py(px(4.0))
                                     .rounded(px(8.0))
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(0xFF453A, 0.14))
+                                    .bg(danger_soft)
                                     .text_size(px(12.0))
-                                    .text_color(rgb(0xFF453A))
+                                    .text_color(ob.danger())
                                     .child(format!("♥ {}/{}", snap.lives, snap.max_lives)),
                             )
                         })
@@ -540,17 +549,17 @@ pub fn render_game_runtime_sheet(
                                     .px(px(8.0))
                                     .py(px(4.0))
                                     .rounded(px(8.0))
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(0x30D158, 0.16))
+                                    .bg(succ_soft)
                                     .text_size(px(12.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0x30D158))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.success())
                                     .child(format!("x{}", snap.combo)),
                             )
                         })
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_muted())
                                 .child(format_duration_ms(snap.elapsed_ms)),
                         ),
                 )
@@ -647,16 +656,18 @@ pub fn render_game_runtime_sheet(
                 // Win / GameOver banner
                 .when(is_finished, |el| {
                     let won = snap.status == GameStatus::Won;
-                    let banner_col = if won { 0x30D158 } else { 0xFF453A };
+                    let banner_fg = if won { ob.success() } else { ob.danger() };
+                    let banner_bg = if won { succ_soft } else { danger_soft };
+                    let banner_border = if won { banner_border_win } else { banner_border_loss };
                     el.child(
                         div()
                             .w_full()
                             .max_w(px(560.0))
                             .p(px(16.0))
                             .rounded(px(14.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(banner_col, 0.16))
+                            .bg(banner_bg)
                             .border_1()
-                            .border_color(TdesktopThemePalette::rgba_with_alpha(banner_col, 0.45))
+                            .border_color(banner_border)
                             .flex()
                             .items_center()
                             .justify_between()
@@ -669,8 +680,8 @@ pub fn render_game_runtime_sheet(
                                     .child(
                                         div()
                                             .text_size(px(16.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(banner_col))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(banner_fg)
                                             .child(if won {
                                                 tr_str(&lang, "🎉 恭喜通关！", "🎉 Victory!")
                                             } else {
@@ -680,7 +691,7 @@ pub fn render_game_runtime_sheet(
                                     .child(
                                         div()
                                             .text_size(px(12.0))
-                                            .text_color(rgb(pal.text_primary))
+                                            .text_color(ob.text_primary())
                                             .child(format!(
                                                 "{}: {} · {}: {}",
                                                 tr_str(&lang, "本局得分", "Final Score"),

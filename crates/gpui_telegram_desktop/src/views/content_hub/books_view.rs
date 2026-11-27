@@ -9,12 +9,12 @@ use gpui_telegram_proto::creations::{
 };
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::macos_secondary_pill_btn;
+use crate::theme::{IconName, TdesktopThemePalette};
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_progress_bar, apple_shelf_header, cover_artwork_box,
-    empty_state_card_shell, filter_pill, hero_banner, rating_pill, render_editable_field_box,
-    review_status_badge, vertical_sub_tab_pill,
+    empty_state_card_shell, filter_pill, hero_banner, openbot_marketplace_nav_item,
+    openbot_marketplace_shell, openbot_page_header, openbot_primary_cta_btn, openbot_secondary_btn,
+    rating_pill, render_editable_field_box, review_status_badge,
 };
 use crate::views::content_hub::book_reader::BookReaderState;
 use crate::views::content_hub::{
@@ -22,7 +22,7 @@ use crate::views::content_hub::{
     ContentHubWorkspace,
 };
 
-const BOOKS_ACCENT: u32 = 0xFF9500;
+const BOOKS_COVER_FALLBACK: u32 = 0x52463A;
 
 /// Canonical sub-tabs inside Apple Books (`BooksHubView`).
 pub const BOOKS_SUB_TABS: &[(&str, &str, &str)] = &[
@@ -64,6 +64,8 @@ fn render_book_cover_card_2_3(
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> Stateful<Div> {
+    let ob = pal.openbot_palette();
+    let card_hover = ob.bg_control_hover();
     let cid = item.creation_id.clone();
     let item_clone = item.clone();
     let genre_tag = item.genres.first().cloned().unwrap_or_default();
@@ -71,13 +73,14 @@ fn render_book_cover_card_2_3(
         .id(SharedString::from(format!("books-card-{cid}")))
         .cursor_pointer()
         .w(px(156.0))
-        .rounded(px(12.0))
-        .bg(pal.card_surface_rgba())
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
+        .hover(move |s| s.bg(card_hover))
         .border_1()
         .border_color(if is_selected {
-            TdesktopThemePalette::rgba_with_alpha(BOOKS_ACCENT, 0.85)
+            ob.border_strong_hairline()
         } else {
-            pal.separator_rgba()
+            ob.frame_card_border()
         })
         .p(px(10.0))
         .flex()
@@ -103,13 +106,19 @@ fn render_book_cover_card_2_3(
                 cx.notify();
             }),
         )
-        // Classic Apple Books 2:3 cover artwork (136x204) with book spine highlight
+        // 2:3 cover artwork (136x204) with subtle spine highlight
         .child(
             div()
                 .relative()
                 .w(px(136.0))
                 .h(px(204.0))
-                .child(cover_artwork_box(&item.cover, 136.0, 204.0, 8.0, BOOKS_ACCENT))
+                .child(cover_artwork_box(
+                    &item.cover,
+                    136.0,
+                    204.0,
+                    8.0,
+                    BOOKS_COVER_FALLBACK,
+                ))
                 .child(
                     div()
                         .absolute()
@@ -128,7 +137,7 @@ fn render_book_cover_card_2_3(
                             .px(px(6.0))
                             .py(px(2.0))
                             .rounded(px(999.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.58))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(0x000000, 0.62))
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(0xFFFFFF))
@@ -145,14 +154,14 @@ fn render_book_cover_card_2_3(
                     div()
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.text_primary))
+                        .text_color(ob.text_primary())
                         .truncate()
                         .child(item.title.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(pal.text_secondary))
+                        .text_color(ob.text_muted())
                         .truncate()
                         .child(item.author_display_name.clone()),
                 )
@@ -168,7 +177,7 @@ fn render_book_cover_card_2_3(
                             el.child(
                                 div()
                                     .text_size(px(10.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_muted())
                                     .truncate()
                                     .child(genre_tag),
                             )
@@ -181,11 +190,11 @@ fn render_book_cover_card_2_3(
                     .flex()
                     .flex_col()
                     .gap(px(3.0))
-                    .child(apple_progress_bar(pct / 100.0, BOOKS_ACCENT, pal))
+                    .child(apple_progress_bar(pct / 100.0, BOOKS_COVER_FALLBACK, pal))
                     .child(
                         div()
                             .text_size(px(10.0))
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(ob.text_muted())
                             .child(format!("{:.0}%", pct.clamp(0.0, 100.0))),
                     ),
             )
@@ -198,6 +207,7 @@ fn render_book_detail_card(
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
     let pal = ws.palette;
+    let ob = pal.openbot_palette();
     let lang = ws.language_id.clone();
     let payload = extract_book_payload(&detail);
     let cid = detail.creation_id.clone();
@@ -225,7 +235,7 @@ fn render_book_detail_card(
                 .items_center()
                 .justify_between()
                 .child(
-                    macos_secondary_pill_btn(
+                    openbot_secondary_btn(
                         "books-detail-back-btn",
                         tr_str(&lang, "← 返回图书", "← Back to Books"),
                         pal,
@@ -244,7 +254,7 @@ fn render_book_detail_card(
                     el.child(review_status_badge(detail.review_status, &lang, pal))
                 }),
         )
-        // Book Hero Card (Apple Books product header)
+        // Book Hero Card (OpenBot monochrome editorial product header)
         .child(
             apple_grouped_card(pal)
                 .p(px(20.0))
@@ -252,7 +262,13 @@ fn render_book_detail_card(
                 .flex_wrap()
                 .items_start()
                 .gap(px(20.0))
-                .child(cover_artwork_box(&detail.cover, 140.0, 210.0, 10.0, BOOKS_ACCENT))
+                .child(cover_artwork_box(
+                    &detail.cover,
+                    140.0,
+                    210.0,
+                    10.0,
+                    BOOKS_COVER_FALLBACK,
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -269,23 +285,23 @@ fn render_book_detail_card(
                             el.child(
                                 div()
                                     .text_size(px(11.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(BOOKS_ACCENT))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_muted())
                                     .child(label),
                             )
                         })
                         .child(
                             div()
                                 .text_size(px(22.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(pal.text_primary))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
                                 .child(detail.title.clone()),
                         )
                         .when(!detail.subtitle.trim().is_empty(), |el| {
                             el.child(
                                 div()
                                     .text_size(px(14.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_secondary())
                                     .child(detail.subtitle.clone()),
                             )
                         })
@@ -293,7 +309,7 @@ fn render_book_detail_card(
                             div()
                                 .text_size(px(13.0))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(BOOKS_ACCENT))
+                                .text_color(ob.text_secondary())
                                 .child(if payload.author.trim().is_empty() {
                                     detail.author_display_name.clone()
                                 } else {
@@ -311,7 +327,7 @@ fn render_book_detail_card(
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(format!(
                                             "{} {} · ~{} {} · {} {}",
                                             payload.chapters.len().max(1),
@@ -328,9 +344,9 @@ fn render_book_detail_card(
                                         .py(px(1.0))
                                         .rounded(px(5.0))
                                         .border_1()
-                                        .border_color(pal.separator_rgba())
+                                        .border_color(ob.border_hairline())
                                         .text_size(px(10.0))
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(ob.text_muted())
                                         .child(detail.age_rating.clone()),
                                 ),
                         )
@@ -342,11 +358,15 @@ fn render_book_detail_card(
                                     .flex()
                                     .flex_col()
                                     .gap(px(4.0))
-                                    .child(apple_progress_bar(progress / 100.0, BOOKS_ACCENT, pal))
+                                    .child(apple_progress_bar(
+                                        progress / 100.0,
+                                        BOOKS_COVER_FALLBACK,
+                                        pal,
+                                    ))
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .text_color(rgb(pal.text_secondary))
+                                            .text_color(ob.text_muted())
                                             .child(format!(
                                                 "{} {:.0}%",
                                                 tr_str(&lang, "阅读进度", "Reading progress"),
@@ -364,46 +384,40 @@ fn render_book_detail_card(
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    div()
-                                        .id("books-detail-open-reader-btn")
-                                        .cursor_pointer()
-                                        .px(px(18.0))
-                                        .py(px(8.0))
-                                        .rounded(px(999.0))
-                                        .bg(rgb(BOOKS_ACCENT))
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                let saved = this
-                                                    .my_creation_states
-                                                    .get(&detail_for_read.creation_id);
-                                                let reader = BookReaderState::open(
-                                                    &detail_for_read,
-                                                    payload_for_read.clone(),
-                                                    saved,
-                                                    this.palette,
-                                                );
-                                                let req = reader.to_upsert_state_request();
-                                                let id = reader.creation_id.clone();
-                                                this.book_reader = Some(reader);
-                                                cx.emit(ContentHubEvent::UpsertCreationState {
-                                                    creation_id: id,
-                                                    req,
-                                                });
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(if progress > 0.0 {
+                                    openbot_primary_cta_btn(
+                                        "books-detail-open-reader-btn",
+                                        if progress > 0.0 {
                                             tr_str(&lang, "继续阅读", "Continue Reading")
                                         } else {
                                             tr_str(&lang, "开始阅读", "Read Now")
+                                        },
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            let saved = this
+                                                .my_creation_states
+                                                .get(&detail_for_read.creation_id);
+                                            let reader = BookReaderState::open(
+                                                &detail_for_read,
+                                                payload_for_read.clone(),
+                                                saved,
+                                                this.palette,
+                                            );
+                                            let req = reader.to_upsert_state_request();
+                                            let id = reader.creation_id.clone();
+                                            this.book_reader = Some(reader);
+                                            cx.emit(ContentHubEvent::UpsertCreationState {
+                                                creation_id: id,
+                                                req,
+                                            });
+                                            cx.notify();
                                         }),
+                                    ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "books-detail-toggle-library-btn",
                                         if in_library {
                                             tr_str(&lang, "✓ 已在书库", "✓ In Library")
@@ -426,7 +440,7 @@ fn render_book_detail_card(
                                     ),
                                 )
                                 .child(
-                                    macos_secondary_pill_btn(
+                                    openbot_secondary_btn(
                                         "books-detail-toggle-fav-btn",
                                         if favorite {
                                             tr_str(&lang, "♥ 已收藏", "♥ Loved")
@@ -455,7 +469,7 @@ fn render_book_detail_card(
                                 .pt(px(8.0))
                                 .text_size(px(13.0))
                                 .line_height(px(20.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_color(ob.text_secondary())
                                 .child(if !payload.blurb.trim().is_empty() {
                                     payload.blurb.clone()
                                 } else {
@@ -473,7 +487,7 @@ fn render_book_detail_card(
                     .p(px(16.0))
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .child(apple_shelf_header(
                         tr_str(&lang, "章节目录", "Table of Contents"),
                         Some(format!(
@@ -486,7 +500,7 @@ fn render_book_detail_card(
                     .children(payload.chapters.iter().enumerate().map(|(idx, ch)| {
                         let d = detail_toc.clone();
                         let p = payload_toc.clone();
-                        let hover_bg = pal.row_hover_rgba();
+                        let hover_bg = ob.bg_control_hover();
                         div()
                             .id(SharedString::from(format!("books-detail-ch-{idx}")))
                             .cursor_pointer()
@@ -526,14 +540,14 @@ fn render_book_detail_card(
                                     .truncate()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(pal.text_primary))
+                                    .text_color(ob.text_primary())
                                     .child(format!("{}. {}", ch.chapter_number, ch.title)),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_muted())
                                     .child(format!(
                                         "{} {}",
                                         ch.pages.len().max(1),
@@ -548,7 +562,7 @@ fn render_book_detail_card(
             ws,
             &cid,
             is_published_public,
-            BOOKS_ACCENT,
+            BOOKS_COVER_FALLBACK,
             cx,
         ))
         .into_any_element()
@@ -622,237 +636,246 @@ pub fn render_books_hub_view(
         (CatalogSortMode::Newest, "books-sort-newest", "最新", "Newest"),
     ];
 
-    div()
-        .id("apple-books-hub-root")
-        .size_full()
+    let ob = pal.openbot_palette();
+    let root_label = tr_str(&lang, "图书", "Books");
+    let hover_crumb = ob.bg_control();
+    let text_pri = ob.text_primary();
+    let header = if let Some(ref detail) = selected_detail {
+        let parent_btn = div()
+            .id("books-header-parent-crumb")
+            .cursor_pointer()
+            .px(px(6.0))
+            .py(px(3.0))
+            .rounded(px(6.0))
+            .text_size(px(13.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(ob.text_muted())
+            .hover(move |s| s.bg(hover_crumb).text_color(text_pri))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.selected_creation_id = None;
+                    this.selected_catalog_item = None;
+                    this.selected_detail_creation = None;
+                    cx.notify();
+                }),
+            )
+            .child(root_label);
+        openbot_page_header(detail.title.clone(), Some(parent_btn), None, pal)
+    } else {
+        let refresh_btn = openbot_secondary_btn(
+            "books-refresh-btn",
+            tr_str(&lang, "刷新", "Refresh"),
+            pal,
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _, _, cx| {
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Books));
+            }),
+        )
+        .into_any_element();
+        openbot_page_header(root_label, None, Some(refresh_btn), pal)
+    };
+
+    let left_nav = div()
+        .w_full()
         .flex()
         .flex_col()
-        .overflow_hidden()
-        // Top Apple Books Header + Segmented Sub-Navigation + Search
+        .gap(px(14.0))
+        .child(
+            render_editable_field_box(
+                "content-hub-catalog-search-input",
+                &search_field,
+                tr_str(&lang, "搜索书库与书城…", "Search Books…"),
+                search_focused,
+                false,
+                pal,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus_input(ContentHubInputTarget::CatalogSearch, cx);
+                }),
+            ),
+        )
         .child(
             div()
-                .flex_shrink_0()
-                .px(px(24.0))
-                .py(px(14.0))
-                .border_b_1()
-                .border_color(pal.separator_rgba())
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "浏览", "Browse")),
+                )
+                .children(BOOKS_SUB_TABS.iter().map(|&(slug, zh, en)| {
+                    let count = match slug {
+                        "reading_now" => Some(reading_now_items.len()),
+                        "library" => Some(library_items.len()),
+                        "book_store" => Some(filtered_books.len()),
+                        _ => None,
+                    };
+                    openbot_marketplace_nav_item(
+                        SharedString::from(format!("books-tab-{slug}")),
+                        tr_str(&lang, zh, en),
+                        active_tab == slug,
+                        count,
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.active_sub_tab = slug.to_string();
+                            this.selected_creation_id = None;
+                            this.selected_catalog_item = None;
+                            this.selected_detail_creation = None;
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "分类", "Genres")),
+                )
+                .child(
+                    openbot_marketplace_nav_item(
+                        "books-genre-all",
+                        tr_str(&lang, "全部分类", "All Genres"),
+                        selected_genre.is_none(),
+                        Some(ws.books_catalog.len()),
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.selected_genre_filter = None;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .children(genres.iter().take(8).map(|g| {
+                    let g_val = g.clone();
+                    let active = selected_genre
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(&g_val));
+                    openbot_marketplace_nav_item(
+                        SharedString::from(format!("books-genre-{g_val}")),
+                        g_val.clone(),
+                        active,
+                        None,
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.selected_genre_filter = Some(g_val.clone());
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .child(tr_str(&lang, "排序", "Sort")),
+                )
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(tg_icon(IconName::HubBooks, 22.0, BOOKS_ACCENT))
-                                .child(
-                                    div()
-                                        .text_size(px(22.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(tr_str(&lang, "图书", "Books")),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(6.0))
-                                .children(BOOKS_SUB_TABS.iter().map(|&(slug, zh, en)| {
-                                    vertical_sub_tab_pill(
-                                        SharedString::from(format!("books-tab-{slug}")),
-                                        tr_str(&lang, zh, en),
-                                        active_tab == slug,
-                                        BOOKS_ACCENT,
-                                        pal,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.active_sub_tab = slug.to_string();
-                                            this.selected_creation_id = None;
-                                            this.selected_catalog_item = None;
-                                            this.selected_detail_creation = None;
-                                            cx.notify();
-                                        }),
-                                    )
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div().w(px(220.0)).max_w_full().child(
-                                        render_editable_field_box(
-                                            "content-hub-catalog-search-input",
-                                            &search_field,
-                                            tr_str(&lang, "搜索书库与书城…", "Search Books…"),
-                                            search_focused,
-                                            false,
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.focus_input(
-                                                    ContentHubInputTarget::CatalogSearch,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ),
-                                ),
-                        ),
-                )
-                .when(selected_detail.is_none(), |el| {
-                    el.child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        filter_pill(
-                                            "books-genre-all",
-                                            tr_str(&lang, "全部分类", "All Genres"),
-                                            selected_genre.is_none(),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.selected_genre_filter = None;
-                                                cx.notify();
-                                            }),
-                                        ),
-                                    )
-                                    .children(genres.iter().take(6).map(|g| {
-                                        let g_val = g.clone();
-                                        let active = selected_genre
-                                            .as_deref()
-                                            .is_some_and(|s| s.eq_ignore_ascii_case(&g_val));
-                                        filter_pill(
-                                            SharedString::from(format!("books-genre-{g_val}")),
-                                            g_val.clone(),
-                                            active,
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.selected_genre_filter = Some(g_val.clone());
-                                                cx.notify();
-                                            }),
-                                        )
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .children(sort_options.iter().map(|&(mode, id, zh, en)| {
-                                        filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.sort_mode = mode;
-                                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                                        ContentHubSection::Books,
-                                                    ));
-                                                    cx.notify();
-                                                }),
-                                            )
-                                    }))
-                                    .child(
-                                        macos_secondary_pill_btn(
-                                            "books-refresh-btn",
-                                            tr_str(&lang, "刷新", "Refresh"),
-                                            pal,
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|_this, _, _, cx| {
-                                                cx.emit(ContentHubEvent::RefreshCatalog(
-                                                    ContentHubSection::Books,
-                                                ));
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    )
-                }),
-        )
-        // Main scrollable content
-        .child(
-            div()
-                .id("apple-books-hub-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .overflow_y_scroll()
-                .p(px(24.0))
-                .flex()
-                .flex_col()
-                .gap(px(20.0))
-                .when_some(selected_detail.clone(), |el, detail| {
-                    el.child(render_book_detail_card(ws, detail, cx))
-                })
-                .when(selected_detail.is_none(), |el| {
-                    let display_list: Vec<(PublicCatalogItemDto, Option<f32>, bool)> =
-                        match active_tab {
-                            "library" => library_items
-                                .iter()
-                                .map(|(b, pct)| (b.clone(), Some(*pct), true))
-                                .collect(),
-                            _ => filtered_books
-                                .iter()
-                                .map(|b| {
-                                    let st = ws.my_creation_states.get(&b.creation_id);
-                                    (
-                                        b.clone(),
-                                        st.filter(|s| s.progress_percent > 0.0)
-                                            .map(|s| s.progress_percent),
-                                        st.is_some_and(|s| s.in_library),
-                                    )
-                                })
-                                .collect(),
-                        };
+                        .gap(px(6.0))
+                        .px(px(4.0))
+                        .children(sort_options.iter().map(|&(mode, id, zh, en)| {
+                            filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.sort_mode = mode;
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::Books,
+                                        ));
+                                        cx.notify();
+                                    }),
+                                )
+                        })),
+                ),
+        );
 
-                    el.child(hero_banner(
-                        "apple-books-hero-banner",
-                        tr_str(&lang, "APPLE BOOKS · 精选阅读", "APPLE BOOKS · EDITORIAL"),
-                        tr_str(&lang, "发现精选公开图书", "Read Stories Crafted by Creators"),
-                        tr_str(
-                            &lang,
-                            "沉浸式四主题阅读器、多章节目录、云端进度与书签同步。",
-                            "Light, Sepia, Gray & Night themes, chapter TOC, and cloud-synced bookmarks.",
-                        ),
-                        "#FF9500",
-                        "#FF5E3A",
-                        IconName::HubBooks,
-                        pal,
-                    ))
-                    .when(active_tab == "reading_now" && !reading_now_items.is_empty(), |inner| {
+    let body_scroll = div().id("apple-books-hub-scroll").child(
+        div()
+            .w_full()
+            .max_w(px(880.0))
+            .mx_auto()
+            .px(px(24.0))
+            .py(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(20.0))
+            .when_some(selected_detail.clone(), |el, detail| {
+                el.child(render_book_detail_card(ws, detail, cx))
+            })
+            .when(selected_detail.is_none(), |el| {
+                let display_list: Vec<(PublicCatalogItemDto, Option<f32>, bool)> = match active_tab
+                {
+                    "library" => library_items
+                        .iter()
+                        .map(|(b, pct)| (b.clone(), Some(*pct), true))
+                        .collect(),
+                    _ => filtered_books
+                        .iter()
+                        .map(|b| {
+                            let st = ws.my_creation_states.get(&b.creation_id);
+                            (
+                                b.clone(),
+                                st.filter(|s| s.progress_percent > 0.0)
+                                    .map(|s| s.progress_percent),
+                                st.is_some_and(|s| s.in_library),
+                            )
+                        })
+                        .collect(),
+                };
+
+                el.child(hero_banner(
+                    "apple-books-hero-banner",
+                    tr_str(&lang, "图书 · 精选阅读", "BOOKS · EDITORIAL"),
+                    tr_str(&lang, "发现精选公开图书", "Read Stories Crafted by Creators"),
+                    tr_str(
+                        &lang,
+                        "沉浸式四主题阅读器、多章节目录、云端进度与书签同步。",
+                        "Light, Sepia, Gray & Night themes, chapter TOC, and cloud-synced bookmarks.",
+                    ),
+                    "#212121",
+                    "#1A1A1A",
+                    IconName::HubBooks,
+                    pal,
+                ))
+                .when(
+                    active_tab == "reading_now" && !reading_now_items.is_empty(),
+                    |inner| {
                         inner
                             .child(apple_shelf_header(
                                 tr_str(&lang, "继续阅读", "Continue Reading"),
@@ -878,62 +901,77 @@ pub fn render_books_hub_view(
                                     )
                                 }),
                             ))
-                    })
-                    .child(apple_shelf_header(
-                        match active_tab {
-                            "library" => tr_str(&lang, "我的书库", "Your Library"),
-                            "book_store" => tr_str(&lang, "书城精选", "Top Books in Store"),
-                            _ => tr_str(&lang, "精选上架书单", "Featured Published Books"),
+                    },
+                )
+                .child(apple_shelf_header(
+                    match active_tab {
+                        "library" => tr_str(&lang, "我的书库", "Your Library"),
+                        "book_store" => tr_str(&lang, "书城精选", "Top Books in Store"),
+                        _ => tr_str(&lang, "精选上架书单", "Featured Published Books"),
+                    },
+                    Some(format!(
+                        "{} {}",
+                        display_list.len(),
+                        tr_str(&lang, "本", "titles")
+                    )),
+                    pal,
+                ))
+                .when(display_list.is_empty(), |inner| {
+                    let cta = openbot_secondary_btn(
+                        "books-empty-refresh-btn",
+                        tr_str(&lang, "刷新书城", "Refresh Books"),
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _, _, cx| {
+                            cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Books));
+                        }),
+                    );
+                    inner.child(empty_state_card_shell(
+                        IconName::HubBooks,
+                        if active_tab == "library" {
+                            tr_str(&lang, "书库为空", "Your Library is Empty")
+                        } else {
+                            tr_str(&lang, "暂无公开上架图书", "No Published Books Yet")
                         },
-                        Some(format!("{} {}", display_list.len(), tr_str(&lang, "本", "titles"))),
+                        tr_str(
+                            &lang,
+                            "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布图书，审核上架后会显示在这里。",
+                            "Chat with @CreatorStudioBot directly in Messages to create and publish books. Published titles appear here.",
+                        ),
+                        cta,
                         pal,
                     ))
-                    .when(display_list.is_empty(), |inner| {
-                        let cta = macos_secondary_pill_btn(
-                            "books-empty-refresh-btn",
-                            tr_str(&lang, "刷新书城", "Refresh Books"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Books));
-                            }),
-                        );
-                        inner.child(empty_state_card_shell(
-                            IconName::HubBooks,
-                            if active_tab == "library" {
-                                tr_str(&lang, "书库为空", "Your Library is Empty")
-                            } else {
-                                tr_str(&lang, "暂无公开上架图书", "No Published Books Yet")
-                            },
-                            tr_str(
+                })
+                .when(!display_list.is_empty(), |inner| {
+                    inner.child(div().flex().flex_wrap().gap(px(14.0)).children(
+                        display_list.iter().map(|(item, pct, in_lib)| {
+                            let is_sel =
+                                selected_id.as_deref() == Some(item.creation_id.as_str());
+                            render_book_cover_card_2_3(
+                                item,
+                                *pct,
+                                *in_lib,
+                                is_sel,
+                                pal,
                                 &lang,
-                                "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布图书，审核上架后会显示在这里。",
-                                "Chat with @CreatorStudioBot directly in Messages to create and publish books. Published titles appear here.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-                    .when(!display_list.is_empty(), |inner| {
-                        inner.child(div().flex().flex_wrap().gap(px(14.0)).children(
-                            display_list.iter().map(|(item, pct, in_lib)| {
-                                let is_sel =
-                                    selected_id.as_deref() == Some(item.creation_id.as_str());
-                                render_book_cover_card_2_3(
-                                    item,
-                                    *pct,
-                                    *in_lib,
-                                    is_sel,
-                                    pal,
-                                    &lang,
-                                    cx,
-                                )
-                            }),
-                        ))
-                    })
-                }),
-        )
+                                cx,
+                            )
+                        }),
+                    ))
+                })
+            }),
+    );
+
+    div()
+        .id("apple-books-hub-root")
+        .size_full()
+        .bg(ob.bg_canvas())
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .child(header)
+        .child(openbot_marketplace_shell(left_nav, body_scroll, pal))
         .into_any_element()
 }

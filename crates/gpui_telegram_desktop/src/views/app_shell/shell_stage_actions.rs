@@ -1178,6 +1178,10 @@ impl AppShell {
         self.sync_composer_and_inspector_miniapp_state(cx);
         self.sync_active_bot_computer_to_inspector(cx);
         self.sync_fabushi_bots_to_views(cx);
+        self.sync_bot_published_creations_to_inspector(cx);
+        if self.theme_state.palette.is_apple_style() {
+            self.sync_unified_side_panel_flags(cx);
+        }
         if !self.composer.read(cx).is_compose_isolated {
             self.sync_composer_mention_candidates(chat_id, None, cx);
         }
@@ -1650,6 +1654,7 @@ impl AppShell {
                     }
                 }
                 shell.sync_fabushi_bots_to_views(cx);
+                shell.sync_bot_published_creations_to_inspector(cx);
                 cx.notify();
             });
         })
@@ -2156,7 +2161,14 @@ impl AppShell {
             self.upload_and_send_paths(paths, cx);
         }
         if open_prof.is_some() {
-            self.set_inspector_open(true, cx);
+            if self.theme_state.palette.is_apple_style() {
+                self.open_unified_side_panel_pane(
+                    crate::views::openbot::side_panel::SidePanelPaneKind::Settings,
+                    cx,
+                );
+            } else {
+                self.set_inspector_open(true, cx);
+            }
         }
         if clear_hist {
             let peer_name = self.stage.read(cx).chat_title.clone();
@@ -2371,6 +2383,70 @@ impl AppShell {
                 }
                 StageAction::ToggleBotCompanion => {
                     self.toggle_bot_companion_panel(None, cx);
+                }
+                StageAction::OpenAssistantSettings
+                | StageAction::OpenChannelSettings
+                | StageAction::OpenContactProfile => {
+                    if self.theme_state.palette.is_apple_style() {
+                        self.open_unified_side_panel_pane(
+                            crate::views::openbot::side_panel::SidePanelPaneKind::Settings,
+                            cx,
+                        );
+                    } else {
+                        self.set_inspector_open(true, cx);
+                    }
+                }
+                StageAction::ToggleSidePanel => {
+                    if self.theme_state.palette.is_apple_style() {
+                        self.toggle_unified_side_panel(cx);
+                    } else {
+                        let currently_open = self.inspector.read(cx).is_open;
+                        self.set_inspector_open(!currently_open, cx);
+                    }
+                }
+                StageAction::NewThread => {
+                    let next_idx = self.stage.read(cx).thread_tabs.len() + 1;
+                    let tid = format!("thread-{next_idx}");
+                    let label = if lang.starts_with("zh") {
+                        format!("新对话 #{next_idx}")
+                    } else {
+                        format!("Thread #{next_idx}")
+                    };
+                    self.stage.update(cx, |st, scx| {
+                        st.thread_tabs.push((tid.clone(), label.clone()));
+                        st.active_thread_id = Some(tid);
+                        scx.notify();
+                    });
+                    self.composer.update(cx, |c, ccx| {
+                        c.clear();
+                        c.is_input_focused = true;
+                        ccx.notify();
+                    });
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(
+                            cid,
+                            tr_str(lang, "已创建新对话分支", "Created new thread").to_string(),
+                            1800,
+                            cx,
+                        );
+                    }
+                }
+                StageAction::SelectModel {
+                    model_id,
+                    thinking_level,
+                } => {
+                    let summary = match thinking_level.as_deref() {
+                        Some(eff) if !eff.is_empty() => format!("{model_id} · {eff}"),
+                        _ => model_id,
+                    };
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(
+                            cid,
+                            format!("{}: {summary}", tr_str(lang, "已切换模型", "Model")),
+                            1800,
+                            cx,
+                        );
+                    }
                 }
                 StageAction::DecideToolApproval {
                     approval_id,

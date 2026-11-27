@@ -14,12 +14,13 @@ use crate::theme::palette::TdesktopThemePalette;
 use crate::views::drawer::bot_computer_inspector::{
     render_bot_agent_and_computer_tab, render_bot_avatar_editor_popover,
     render_bot_computers_subpage, render_bot_config_editor, render_bot_profile_main,
-    render_bot_settings_tab,
+    render_bot_settings_tab, render_openbot_bot_settings_root, render_openbot_bot_subpage,
 };
 use crate::views::drawer::inspector_panels::{
     render_contact_profile_panel, render_members_panel_with_picker,
-    render_settings_and_stats_panel, render_shared_media_panel, segmented_active_bg,
-    segmented_pill_shadow,
+    render_openbot_channel_settings_root, render_openbot_channel_subpage,
+    render_openbot_contact_profile_root, render_settings_and_stats_panel,
+    render_shared_media_panel, segmented_active_bg, segmented_pill_shadow,
 };
 use crate::views::drawer::inspector_tabs::*;
 use crate::views::drawer::statistics::info_statistics_inner_widget::ChartDataPoint;
@@ -27,6 +28,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_telegram_proto::miniapp_contracts::CLASSIC_INITIALS_AVATAR_SHAPE;
 use gpui_telegram_proto::{BotComputerProfileDto, ComputerNodeDto, ComputerRunPolicy};
+use openbot_contracts::avatar::BloubExpression;
 
 pub const DRAWER_WIDTH: f32 = 320.0;
 pub const CONTEXT_INSPECTOR_WIDTH: f32 = DRAWER_WIDTH;
@@ -34,6 +36,7 @@ pub const HEADER_HEIGHT: f32 = 54.0;
 pub const CONTEXT_INSPECTOR_HEADER_HEIGHT: f32 = HEADER_HEIGHT;
 pub const AVATAR_SIZE: f32 = 80.0;
 pub const CONTEXT_INSPECTOR_AVATAR_SIZE: f32 = AVATAR_SIZE;
+pub const OPENBOT_SIDE_PANEL_DEFAULT_WIDTH: f32 = 360.0;
 pub const INSPECTOR_COPIED_FEEDBACK_DURATION_MS: u64 = 2_000;
 
 /// A contact or Fabushi AI Bot eligible to be added to the active group chat from the Inspector.
@@ -210,6 +213,49 @@ pub struct ContextInspector {
     pub bot_fusion: BotFusionSnapshot,
     pub memory_draft: String,
     pub memory_input: Option<Entity<TextInputController>>,
+    // M4 OpenBot Unified SidePanel hosting & embedded Bot/Channel/Contact settings state
+    pub embedded_in_side_panel: bool,
+    pub openbot_subpage: Option<OpenBotSettingsSubpage>,
+    pub pending_openbot_action: Option<OpenBotInspectorAction>,
+    pub pending_confirm_guard: Option<OpenBotConfirmGuard>,
+    pub openbot_text_focus: Option<OpenBotInspectorTextField>,
+    pub openbot_text_input: Option<Entity<TextInputController>>,
+    pub bot_draft_name: String,
+    pub bot_draft_title: String,
+    pub bot_draft_description: String,
+    pub bot_avatar_style_flat: bool,
+    pub bot_avatar_expression: BloubExpression,
+    pub bot_avatar_custom_photo: Option<String>,
+    pub bot_chat_bubble_color: Option<String>,
+    pub bot_backup_models_auto: bool,
+    pub bot_backup_models: Vec<String>,
+    pub bot_backup_model_draft: String,
+    pub bot_access_level: String,
+    pub bot_computer_use: bool,
+    pub bot_allow_automation: bool,
+    pub bot_additional_folders: Vec<String>,
+    pub bot_excluded_folders: Vec<String>,
+    pub bot_folder_draft: String,
+    pub bot_folder_draft_excluded: bool,
+    pub bot_busy_mode: String,
+    pub bot_data_tables: Vec<(String, usize)>,
+    pub published_creations: Vec<BotPublishedCreationSummary>,
+    // M4 OpenBot ChannelSettingsPane state
+    pub channel_picture_editor_open: bool,
+    pub channel_icon_name: Option<String>,
+    pub channel_icon_hue: u16,
+    pub channel_custom_image: Option<String>,
+    pub channel_draft_name: String,
+    pub channel_draft_title: String,
+    pub channel_draft_instructions: String,
+    pub channel_browser_access: ChannelBrowserAccess,
+    pub channel_context_isolated: bool,
+    pub channel_archived: bool,
+    pub channel_lead_user_id: Option<u64>,
+    pub channel_memories: Vec<String>,
+    pub channel_memory_draft: String,
+    pub channel_folders: Vec<String>,
+    pub channel_folder_draft: String,
 }
 
 impl ContextInspector {
@@ -267,6 +313,47 @@ impl ContextInspector {
             bot_fusion: BotFusionSnapshot::default(),
             memory_draft: String::new(),
             memory_input: None,
+            embedded_in_side_panel: false,
+            openbot_subpage: None,
+            pending_openbot_action: None,
+            pending_confirm_guard: None,
+            openbot_text_focus: None,
+            openbot_text_input: None,
+            bot_draft_name: String::new(),
+            bot_draft_title: String::new(),
+            bot_draft_description: String::new(),
+            bot_avatar_style_flat: false,
+            bot_avatar_expression: BloubExpression::Neutre,
+            bot_avatar_custom_photo: None,
+            bot_chat_bubble_color: None,
+            bot_backup_models_auto: true,
+            bot_backup_models: Vec::new(),
+            bot_backup_model_draft: String::new(),
+            bot_access_level: "ask".to_string(),
+            bot_computer_use: true,
+            bot_allow_automation: true,
+            bot_additional_folders: Vec::new(),
+            bot_excluded_folders: Vec::new(),
+            bot_folder_draft: String::new(),
+            bot_folder_draft_excluded: false,
+            bot_busy_mode: "steer".to_string(),
+            bot_data_tables: Vec::new(),
+            published_creations: Vec::new(),
+            channel_picture_editor_open: false,
+            channel_icon_name: None,
+            channel_icon_hue: 215,
+            channel_custom_image: None,
+            channel_draft_name: String::new(),
+            channel_draft_title: String::new(),
+            channel_draft_instructions: String::new(),
+            channel_browser_access: ChannelBrowserAccess::Everyone,
+            channel_context_isolated: false,
+            channel_archived: false,
+            channel_lead_user_id: None,
+            channel_memories: Vec::new(),
+            channel_memory_draft: String::new(),
+            channel_folders: Vec::new(),
+            channel_folder_draft: String::new(),
         }
     }
 
@@ -374,6 +461,45 @@ impl ContextInspector {
         self.add_member_query.clear();
         self.add_member_candidates.clear();
         self.pending_add_member_user_id = None;
+        self.openbot_subpage = None;
+        self.pending_openbot_action = None;
+        self.pending_confirm_guard = None;
+        self.openbot_text_focus = None;
+        self.bot_draft_name.clear();
+        self.bot_draft_title.clear();
+        self.bot_draft_description.clear();
+        self.bot_avatar_style_flat = false;
+        self.bot_avatar_expression = BloubExpression::Neutre;
+        self.bot_avatar_custom_photo = None;
+        self.bot_chat_bubble_color = None;
+        self.bot_backup_models_auto = true;
+        self.bot_backup_models.clear();
+        self.bot_backup_model_draft.clear();
+        self.bot_access_level = "ask".to_string();
+        self.bot_computer_use = true;
+        self.bot_allow_automation = true;
+        self.bot_additional_folders.clear();
+        self.bot_excluded_folders.clear();
+        self.bot_folder_draft.clear();
+        self.bot_folder_draft_excluded = false;
+        self.bot_busy_mode = "steer".to_string();
+        self.bot_data_tables.clear();
+        self.published_creations.clear();
+        self.channel_picture_editor_open = false;
+        self.channel_icon_name = None;
+        self.channel_icon_hue = 215;
+        self.channel_custom_image = None;
+        self.channel_draft_name.clear();
+        self.channel_draft_title.clear();
+        self.channel_draft_instructions.clear();
+        self.channel_browser_access = ChannelBrowserAccess::Everyone;
+        self.channel_context_isolated = false;
+        self.channel_archived = false;
+        self.channel_lead_user_id = None;
+        self.channel_memories.clear();
+        self.channel_memory_draft.clear();
+        self.channel_folders.clear();
+        self.channel_folder_draft.clear();
     }
 
     pub fn open_add_member_picker(&mut self, candidates: Vec<AddMemberCandidate>) {
@@ -421,7 +547,198 @@ impl ContextInspector {
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) { self.palette = palette; }
     pub fn set_language(&mut self, lang: impl Into<String>) { self.language_id = lang.into(); }
     pub fn take_action(&mut self) -> Option<InspectorAction> { self.pending_action.take() }
+    pub fn take_openbot_action(&mut self) -> Option<OpenBotInspectorAction> {
+        self.pending_openbot_action.take()
+    }
     pub fn take_pending_leave_chat(&mut self) -> bool { std::mem::take(&mut self.pending_leave_chat) }
+
+    pub fn sync_published_creations(&mut self, creations: Vec<BotPublishedCreationSummary>) {
+        self.published_creations = creations;
+    }
+
+    /// Closes transient popovers/confirm guards owned by the embedded OpenBot inspector.
+    pub fn close_openbot_popovers(&mut self) -> bool {
+        let mut closed = false;
+        if self.avatar_editor_open {
+            self.avatar_editor_open = false;
+            closed = true;
+        }
+        if self.channel_picture_editor_open {
+            self.channel_picture_editor_open = false;
+            closed = true;
+        }
+        if self.pending_confirm_guard.is_some() {
+            self.pending_confirm_guard = None;
+            closed = true;
+        }
+        if self.add_member_picker_open {
+            self.close_add_member_picker();
+            closed = true;
+        }
+        closed
+    }
+
+    pub fn navigate_back_subpage(&mut self) -> bool {
+        if self.openbot_subpage.is_some() {
+            self.openbot_subpage = None;
+            self.pending_confirm_guard = None;
+            self.openbot_text_focus = None;
+            self.bot_config_focus = BotConfigFocusField::None;
+            return true;
+        }
+        if self.subpage != InspectorSubpage::Main {
+            self.subpage = InspectorSubpage::Main;
+            self.bot_config_focus = BotConfigFocusField::None;
+            self.pending_action = Some(InspectorAction::CloseBotComputersSubpage);
+            return true;
+        }
+        false
+    }
+
+    pub fn focus_openbot_text_field(
+        &mut self,
+        field: OpenBotInspectorTextField,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_bot_inputs(cx);
+        self.bot_config_focus = BotConfigFocusField::None;
+        self.add_member_search_focused = false;
+        self.openbot_text_focus = Some(field);
+        if let Some(ref ctrl) = self.openbot_text_input {
+            ctrl.update(cx, |c, _| c.clear_preedit());
+        }
+        cx.notify();
+    }
+
+    pub fn openbot_input_preedit(&self, cx: &App) -> Option<String> {
+        self.openbot_text_input
+            .as_ref()
+            .and_then(|c| c.read(cx).ime_preedit.clone())
+    }
+
+    /// Commits edited Bot identity fields (`name`, `title`, `description`) via `PatchFabushiBot`.
+    pub fn commit_bot_identity_draft(&mut self) -> bool {
+        let name = self.bot_draft_name.trim().to_string();
+        let title = self.bot_draft_title.trim().to_string();
+        let desc = self.bot_draft_description.trim().to_string();
+        self.openbot_text_focus = None;
+        if let Some(ref fab) = self.active_fabushi_bot {
+            let bot_id = fab.bot_user_id.max(0) as u64;
+            if bot_id > 0 {
+                if !name.is_empty() {
+                    self.profile.name = name.clone();
+                }
+                self.profile.bio = desc.clone();
+                self.pending_action = Some(InspectorAction::PatchFabushiBot {
+                    bot_id,
+                    req: gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                        display_name: (!name.is_empty()).then_some(name),
+                        title: Some(title),
+                        description: Some(desc),
+                        ..Default::default()
+                    },
+                });
+                return true;
+            }
+        }
+        if !name.is_empty() || !desc.is_empty() {
+            self.pending_action = Some(InspectorAction::OpenEditPeer);
+            return true;
+        }
+        false
+    }
+
+    /// Commits edited Group/Channel Name, Title & Instructions via `OpenBotInspectorAction::UpdateChatInfo`.
+    pub fn commit_channel_identity_draft(&mut self) -> bool {
+        if self.channel_archived {
+            return false;
+        }
+        let name = self.channel_draft_name.trim().to_string();
+        let title = self.channel_draft_title.trim().to_string();
+        let instructions = self.channel_draft_instructions.trim().to_string();
+        self.openbot_text_focus = None;
+        if name.is_empty() {
+            return false;
+        }
+        let about = if !title.is_empty() && !instructions.is_empty() {
+            format!("{title}\n{instructions}")
+        } else if !instructions.is_empty() {
+            instructions
+        } else {
+            title
+        };
+        self.profile.name = name.clone();
+        self.profile.bio = about.clone();
+        self.pending_openbot_action = Some(OpenBotInspectorAction::UpdateChatInfo {
+            title: name,
+            about,
+        });
+        true
+    }
+
+    pub fn add_bot_backup_model_from_draft(&mut self) -> bool {
+        let model = self.bot_backup_model_draft.trim().to_string();
+        if model.is_empty() || self.bot_backup_models.len() >= 8 {
+            return false;
+        }
+        if !self.bot_backup_models.iter().any(|m| m.eq_ignore_ascii_case(&model)) {
+            self.bot_backup_models.push(model);
+        }
+        self.bot_backup_model_draft.clear();
+        self.openbot_text_focus = None;
+        true
+    }
+
+    pub fn add_bot_folder_from_draft(&mut self) -> bool {
+        let path = self.bot_folder_draft.trim().to_string();
+        if path.is_empty() {
+            return false;
+        }
+        let target = if self.bot_folder_draft_excluded {
+            &mut self.bot_excluded_folders
+        } else {
+            &mut self.bot_additional_folders
+        };
+        if target.len() >= 8 {
+            return false;
+        }
+        if !target.iter().any(|p| p == &path) {
+            target.push(path);
+        }
+        self.bot_folder_draft.clear();
+        self.openbot_text_focus = None;
+        true
+    }
+
+    pub fn add_channel_memory_from_draft(&mut self) -> bool {
+        if self.channel_archived {
+            return false;
+        }
+        let text = self.channel_memory_draft.trim().to_string();
+        if text.is_empty() || self.channel_memories.len() >= 32 {
+            return false;
+        }
+        self.channel_memories.insert(0, text);
+        self.channel_memory_draft.clear();
+        self.openbot_text_focus = None;
+        true
+    }
+
+    pub fn add_channel_folder_from_draft(&mut self) -> bool {
+        if self.channel_archived {
+            return false;
+        }
+        let path = self.channel_folder_draft.trim().to_string();
+        if path.is_empty() || self.channel_folders.len() >= 8 {
+            return false;
+        }
+        if !self.channel_folders.iter().any(|p| p == &path) {
+            self.channel_folders.push(path);
+        }
+        self.channel_folder_draft.clear();
+        self.openbot_text_focus = None;
+        true
+    }
 
     pub fn clear_copied_feedback(&mut self) {
         self.copied_feedback_gen = self.copied_feedback_gen.wrapping_add(1);
@@ -465,6 +782,28 @@ impl ContextInspector {
                 BotConfigFocusField::CodingWorkspace | BotConfigFocusField::CodingModel
             );
         if let Some(ref b) = bot {
+            if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotName) {
+                self.bot_draft_name = if b.display_name.trim().is_empty() {
+                    self.profile.name.clone()
+                } else {
+                    b.display_name.clone()
+                };
+            }
+            if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotTitle) {
+                self.bot_draft_title = b.title.clone();
+            }
+            if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotDescription) {
+                self.bot_draft_description = if b.description.trim().is_empty() {
+                    self.profile.bio.clone()
+                } else {
+                    b.description.clone()
+                };
+            }
+            self.bot_access_level = match b.approval_mode.trim().to_ascii_lowercase().as_str() {
+                "autonomous" | "full" => "full".to_string(),
+                "strict" | "workspace" => "workspace".to_string(),
+                _ => "ask".to_string(),
+            };
             if let Some(ref cfg) = b.coding_agent {
                 if self.coding_draft_bot_id != b.bot_user_id || !editing_coding {
                     self.coding_draft_bot_id = b.bot_user_id;
@@ -538,6 +877,26 @@ impl ContextInspector {
         self.profile.bio = subtitle.to_string();
         self.profile.avatar_initials = initials.to_string();
         self.profile.avatar_color = color;
+        if self.openbot_text_focus != Some(OpenBotInspectorTextField::ChannelName)
+            && self.channel_draft_name.is_empty()
+        {
+            self.channel_draft_name = name.to_string();
+        }
+        if self.openbot_text_focus != Some(OpenBotInspectorTextField::ChannelInstructions)
+            && self.channel_draft_instructions.is_empty()
+        {
+            self.channel_draft_instructions = subtitle.to_string();
+        }
+        if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotName)
+            && self.bot_draft_name.is_empty()
+        {
+            self.bot_draft_name = name.to_string();
+        }
+        if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotDescription)
+            && self.bot_draft_description.is_empty()
+        {
+            self.bot_draft_description = subtitle.to_string();
+        }
     }
 
     pub fn sync_profile_details(&mut self, username: String, phone: String, status: String, avatar_path: Option<String>, facts: Vec<(String, String)>) {
@@ -607,7 +966,22 @@ impl ContextInspector {
     }
 
     pub fn sync_members(&mut self, members: Vec<MemberItem>, invite_link: String, is_group_or_channel: bool) {
-        self.members.members = members; self.members.invite_link = invite_link; self.members.is_group_or_channel = is_group_or_channel;
+        if self.channel_lead_user_id.is_none() {
+            self.channel_lead_user_id = members
+                .iter()
+                .find(|m| {
+                    m.role.eq_ignore_ascii_case("owner")
+                        || m.role.eq_ignore_ascii_case("admin")
+                        || m.role.eq_ignore_ascii_case("lead")
+                        || m.role == "群主"
+                        || m.role == "主理人"
+                })
+                .or_else(|| members.first())
+                .map(|m| m.id);
+        }
+        self.members.members = members;
+        self.members.invite_link = invite_link;
+        self.members.is_group_or_channel = is_group_or_channel;
     }
 
     pub fn sync_channel_statistics(&mut self, boost_level: u32, current: u32, target: u32, bars: Vec<ChartDataPoint>) {
@@ -632,6 +1006,9 @@ impl ContextInspector {
         }
         if self.memory_input.is_none() {
             self.memory_input = Some(cx.new(|_| TextInputController::new()));
+        }
+        if self.openbot_text_input.is_none() {
+            self.openbot_text_input = Some(cx.new(|_| TextInputController::new()));
         }
     }
 
@@ -739,13 +1116,16 @@ impl ContextInspector {
     pub fn is_add_member_search_active(&self) -> bool {
         self.is_open
             && !self.profile.is_bot
-            && self.active_tab == InspectorTab::Members
+            && (self.active_tab == InspectorTab::Members || self.embedded_in_side_panel)
             && self.add_member_picker_open
             && self.add_member_search_focused
     }
 
     pub fn is_bot_input_active(&self) -> bool {
         if self.is_add_member_search_active() {
+            return true;
+        }
+        if self.is_open && self.openbot_text_focus.is_some() {
             return true;
         }
         self.is_open
@@ -756,7 +1136,8 @@ impl ContextInspector {
                     self.bot_config_focus,
                     BotConfigFocusField::Persona | BotConfigFocusField::Model
                 ))
-                || (self.subpage == InspectorSubpage::Main
+                || ((self.subpage == InspectorSubpage::Main
+                    || self.openbot_subpage == Some(OpenBotSettingsSubpage::Memories))
                     && matches!(
                         self.bot_config_focus,
                         BotConfigFocusField::CodingWorkspace
@@ -768,6 +1149,9 @@ impl ContextInspector {
     fn active_bot_controller(&self) -> Option<&Entity<TextInputController>> {
         if self.is_add_member_search_active() {
             return self.add_member_search_input.as_ref();
+        }
+        if self.openbot_text_focus.is_some() {
+            return self.openbot_text_input.as_ref();
         }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => self.persona_input.as_ref(),
@@ -783,6 +1167,21 @@ impl ContextInspector {
         if self.is_add_member_search_active() {
             return &self.add_member_query;
         }
+        if let Some(field) = self.openbot_text_focus {
+            return match field {
+                OpenBotInspectorTextField::BotName => &self.bot_draft_name,
+                OpenBotInspectorTextField::BotTitle => &self.bot_draft_title,
+                OpenBotInspectorTextField::BotDescription => &self.bot_draft_description,
+                OpenBotInspectorTextField::BotInstructions => &self.bot_draft_persona,
+                OpenBotInspectorTextField::BotBackupModelDraft => &self.bot_backup_model_draft,
+                OpenBotInspectorTextField::BotFolderDraft => &self.bot_folder_draft,
+                OpenBotInspectorTextField::ChannelName => &self.channel_draft_name,
+                OpenBotInspectorTextField::ChannelTitle => &self.channel_draft_title,
+                OpenBotInspectorTextField::ChannelInstructions => &self.channel_draft_instructions,
+                OpenBotInspectorTextField::ChannelMemoryDraft => &self.channel_memory_draft,
+                OpenBotInspectorTextField::ChannelFolderDraft => &self.channel_folder_draft,
+            };
+        }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => &self.bot_draft_persona,
             BotConfigFocusField::Model => &self.bot_draft_model,
@@ -796,6 +1195,23 @@ impl ContextInspector {
     fn active_bot_draft_mut(&mut self) -> Option<&mut String> {
         if self.is_add_member_search_active() {
             return Some(&mut self.add_member_query);
+        }
+        if let Some(field) = self.openbot_text_focus {
+            return Some(match field {
+                OpenBotInspectorTextField::BotName => &mut self.bot_draft_name,
+                OpenBotInspectorTextField::BotTitle => &mut self.bot_draft_title,
+                OpenBotInspectorTextField::BotDescription => &mut self.bot_draft_description,
+                OpenBotInspectorTextField::BotInstructions => &mut self.bot_draft_persona,
+                OpenBotInspectorTextField::BotBackupModelDraft => &mut self.bot_backup_model_draft,
+                OpenBotInspectorTextField::BotFolderDraft => &mut self.bot_folder_draft,
+                OpenBotInspectorTextField::ChannelName => &mut self.channel_draft_name,
+                OpenBotInspectorTextField::ChannelTitle => &mut self.channel_draft_title,
+                OpenBotInspectorTextField::ChannelInstructions => {
+                    &mut self.channel_draft_instructions
+                }
+                OpenBotInspectorTextField::ChannelMemoryDraft => &mut self.channel_memory_draft,
+                OpenBotInspectorTextField::ChannelFolderDraft => &mut self.channel_folder_draft,
+            });
         }
         match self.bot_config_focus {
             BotConfigFocusField::Persona => Some(&mut self.bot_draft_persona),
@@ -893,6 +1309,41 @@ impl ContextInspector {
                     }
                     return true;
                 }
+                if let Some(field) = self.openbot_text_focus {
+                    match field {
+                        OpenBotInspectorTextField::BotDescription => {
+                            self.bot_draft_description.push('\n');
+                        }
+                        OpenBotInspectorTextField::BotInstructions => {
+                            self.bot_draft_persona.push('\n');
+                        }
+                        OpenBotInspectorTextField::ChannelInstructions => {
+                            self.channel_draft_instructions.push('\n');
+                        }
+                        OpenBotInspectorTextField::BotName
+                        | OpenBotInspectorTextField::BotTitle => {
+                            self.commit_bot_identity_draft();
+                        }
+                        OpenBotInspectorTextField::BotBackupModelDraft => {
+                            self.add_bot_backup_model_from_draft();
+                        }
+                        OpenBotInspectorTextField::BotFolderDraft => {
+                            self.add_bot_folder_from_draft();
+                        }
+                        OpenBotInspectorTextField::ChannelName
+                        | OpenBotInspectorTextField::ChannelTitle => {
+                            self.commit_channel_identity_draft();
+                        }
+                        OpenBotInspectorTextField::ChannelMemoryDraft => {
+                            self.add_channel_memory_from_draft();
+                        }
+                        OpenBotInspectorTextField::ChannelFolderDraft => {
+                            self.add_channel_folder_from_draft();
+                        }
+                    }
+                    cx.notify();
+                    return true;
+                }
                 if self.bot_config_focus == BotConfigFocusField::MemoryDraft {
                     if !self.submit_memory_draft() {
                         self.bot_config_focus = BotConfigFocusField::None;
@@ -907,6 +1358,11 @@ impl ContextInspector {
                     self.bot_config_focus = BotConfigFocusField::None;
                     cx.notify();
                 }
+                true
+            }
+            "escape" if self.openbot_text_focus.is_some() => {
+                self.openbot_text_focus = None;
+                cx.notify();
                 true
             }
             "escape" if self.bot_config_focus == BotConfigFocusField::MemoryDraft => {
@@ -964,6 +1420,8 @@ impl ContextInspector {
             self.model_input.clone(),
             self.coding_workspace_input.clone(),
             self.coding_model_input.clone(),
+            self.memory_input.clone(),
+            self.openbot_text_input.clone(),
         ];
         for ctrl in controllers.into_iter().flatten() {
             if ctrl.read(cx).ime_preedit.is_some() {
@@ -980,6 +1438,7 @@ impl ContextInspector {
 
     pub fn blur_bot_input(&mut self) {
         self.bot_config_focus = BotConfigFocusField::None;
+        self.openbot_text_focus = None;
         self.add_member_search_focused = false;
     }
 }
@@ -1009,6 +1468,129 @@ impl Render for ContextInspector {
         } else {
             InspectorSubpage::Main
         };
+        if self.embedded_in_side_panel {
+            self.ensure_bot_inputs(cx);
+            let lang = self.language_id.as_str();
+            let ob = pal.openbot_palette();
+            let subpage = if self.profile.is_bot && allow_owner_subpages {
+                self.subpage
+            } else {
+                InspectorSubpage::Main
+            };
+            let ob_sub = self.openbot_subpage;
+            let in_subpage = subpage != InspectorSubpage::Main || ob_sub.is_some();
+
+            let subpage_title: Option<&str> = if let Some(s) = ob_sub {
+                Some(s.title(lang))
+            } else {
+                match subpage {
+                    InspectorSubpage::ComputersList => Some(tr_str(lang, "远程电脑", "Computers")),
+                    InspectorSubpage::BotConfigEditor => Some(tr_str(lang, "模型与配置", "Model & Config")),
+                    InspectorSubpage::Main => None,
+                }
+            };
+
+            let body: AnyElement = if let Some(ob_s) = ob_sub {
+                if ob_s == OpenBotSettingsSubpage::SharedMedia {
+                    render_shared_media_panel(&self.shared_media, pal, lang, cx)
+                } else if self.profile.is_bot {
+                    render_openbot_bot_subpage(self, ob_s, pal, lang, cx)
+                } else if self.members.is_group_or_channel {
+                    render_openbot_channel_subpage(self, ob_s, pal, lang, cx)
+                } else {
+                    render_shared_media_panel(&self.shared_media, pal, lang, cx)
+                }
+            } else if self.profile.is_bot {
+                match subpage {
+                    InspectorSubpage::Main => render_openbot_bot_settings_root(self, pal, lang, cx),
+                    InspectorSubpage::ComputersList => {
+                        render_bot_computers_subpage(self, pal, lang, cx)
+                    }
+                    InspectorSubpage::BotConfigEditor => {
+                        render_bot_config_editor(self, pal, lang, cx)
+                    }
+                }
+            } else if self.members.is_group_or_channel {
+                render_openbot_channel_settings_root(self, pal, lang, cx)
+            } else {
+                render_openbot_contact_profile_root(self, pal, lang, cx)
+            };
+
+            return div()
+                .id("openbot-embedded-settings-root")
+                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .h_full()
+                .bg(ob.bg_canvas())
+                .flex()
+                .flex_col()
+                .when(in_subpage, |col| {
+                    let title = subpage_title.unwrap_or("").to_string();
+                    col.child(
+                        div()
+                            .id("openbot-settings-subpage-header")
+                            .h(px(39.0))
+                            .flex_shrink_0()
+                            .px(px(10.0))
+                            .border_b_1()
+                            .border_color(ob.border_hairline())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .id("inspector-breadcrumb-root")
+                                    .cursor_pointer()
+                                    .h(px(28.0))
+                                    .px(px(6.0))
+                                    .rounded(px(6.0))
+                                    .hover(|s| s.bg(ob.hover()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .text_size(px(13.0))
+                                    .text_color(ob.text_secondary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.navigate_back_subpage();
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(crate::theme::tg_icon_rgba(
+                                        IconName::BackArrow,
+                                        14.0,
+                                        ob.text_muted(),
+                                    ))
+                                    .child(tr_str(lang, "返回", "Back")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .child(div().w(px(48.0))),
+                    )
+                })
+                .child(
+                    div()
+                        .id("inspector-tab-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .px(px(15.0))
+                        .pt(px(16.0))
+                        .pb(px(28.0))
+                        .overflow_y_scroll()
+                        .child(body),
+                )
+                .into_any_element();
+        }
+
         if (self.profile.is_bot
             && (subpage == InspectorSubpage::BotConfigEditor
                 || (subpage == InspectorSubpage::Main
@@ -1575,5 +2157,71 @@ impl ContextInspector {
                     pal.text_secondary
                 },
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn context_inspector_preserves_legacy_consts_and_resets_openbot_m4_state() {
+        assert_eq!(DRAWER_WIDTH, 320.0);
+        assert_eq!(CONTEXT_INSPECTOR_WIDTH, 320.0);
+        assert_eq!(HEADER_HEIGHT, 54.0);
+        assert_eq!(CONTEXT_INSPECTOR_HEADER_HEIGHT, 54.0);
+        assert_eq!(AVATAR_SIZE, 80.0);
+        assert_eq!(CONTEXT_INSPECTOR_AVATAR_SIZE, 80.0);
+        assert_eq!(OPENBOT_SIDE_PANEL_DEFAULT_WIDTH, 360.0);
+
+        let mut insp = ContextInspector::new();
+        assert!(!insp.embedded_in_side_panel);
+        assert!(insp.openbot_subpage.is_none());
+
+        insp.embedded_in_side_panel = true;
+        insp.openbot_subpage = Some(OpenBotSettingsSubpage::Permissions);
+        insp.pending_confirm_guard = Some(OpenBotConfirmGuard::WidenPermissionsFull);
+        insp.openbot_text_focus = Some(OpenBotInspectorTextField::BotName);
+        insp.avatar_editor_open = true;
+        insp.channel_picture_editor_open = true;
+        assert!(insp.close_openbot_popovers());
+        assert!(!insp.avatar_editor_open);
+        assert!(!insp.channel_picture_editor_open);
+        assert!(insp.pending_confirm_guard.is_none());
+
+        insp.clear_peer_facts();
+        assert!(insp.embedded_in_side_panel);
+        assert!(insp.openbot_subpage.is_none());
+        assert!(insp.openbot_text_focus.is_none());
+    }
+
+    #[std::prelude::v1::test]
+    fn context_inspector_backup_models_and_channel_memory_caps() {
+        let mut insp = ContextInspector::new();
+        for idx in 0..10 {
+            insp.bot_backup_model_draft = format!("gpt-5-backup-{idx}");
+            let added = insp.add_bot_backup_model_from_draft();
+            if idx < 8 {
+                assert!(added);
+            } else {
+                assert!(!added);
+            }
+        }
+        assert_eq!(insp.bot_backup_models.len(), 8);
+
+        for idx in 0..35 {
+            insp.channel_memory_draft = format!("rule-{idx}");
+            let added = insp.add_channel_memory_from_draft();
+            if idx < 32 {
+                assert!(added);
+            } else {
+                assert!(!added);
+            }
+        }
+        assert_eq!(insp.channel_memories.len(), 32);
+
+        insp.channel_archived = true;
+        insp.channel_draft_name = "Archived Group".to_string();
+        assert!(!insp.commit_channel_identity_draft());
     }
 }

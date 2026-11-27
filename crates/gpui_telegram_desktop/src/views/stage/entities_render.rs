@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use crate::i18n::tr_key_or;
 use super::entities::{parse_rich_blocks, push_sanitized_no_breaks, RichBlock, RichEntity, StyledSegment};
+use super::openbot_stage_chrome::{
+    openbot_stage_icon, render_openbot_reference_chip, OpenBotStageIcon,
+};
 use std::ops::Range;
 
 #[derive(Debug, Clone)]
@@ -148,58 +151,53 @@ pub fn render_rich_message_body<V: 'static>(
                 let act = on_action.clone();
                 let is_copied = copied_code_msg == Some(msg_id);
                 let is_apple = palette.is_apple_style();
+                let ob = palette.openbot_palette();
                 let lang_label = if language.is_empty() {
                     "code".to_string()
                 } else {
                     language
                 };
                 let code_font = palette.scaled_px((palette.font_size_px as f32 - 1.5).max(11.5));
-                let block_bg: Rgba = if is_apple_out {
-                    TdesktopThemePalette::rgba_with_alpha(0x000000, 0.24)
-                } else if is_apple {
+                let block_bg: Rgba = if is_apple {
                     if palette.mode.is_dark() {
-                        rgb(0x161618).into()
+                        rgb(0x141414).into()
                     } else {
-                        rgb(0x1C1C1E).into()
+                        rgb(0xF8F8FA).into()
                     }
                 } else {
                     rgb(palette.code_bg).into()
                 };
-                let block_border: Rgba = if is_apple_out {
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18)
-                } else if is_apple {
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.10)
+                let block_border: Rgba = if is_apple {
+                    ob.border_hairline()
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.55)
                 };
-                let hdr_bg: Rgba = if is_apple_out {
-                    TdesktopThemePalette::rgba_with_alpha(0x000000, 0.16)
-                } else if is_apple {
-                    rgb(0x262629).into()
+                let hdr_bg: Rgba = if is_apple {
+                    if palette.mode.is_dark() {
+                        rgb(0x212121).into()
+                    } else {
+                        rgb(0xECECEE).into()
+                    }
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.35)
                 };
-                let hdr_fg = if is_apple_out {
-                    rgb(palette.msg_out_secondary_fg)
-                } else if is_apple {
-                    rgb(0x98989D)
+                let hdr_fg: Rgba = if is_apple {
+                    ob.text_muted()
                 } else {
-                    rgb(palette.text_secondary)
+                    rgb(palette.text_secondary).into()
                 };
-                let code_text_fg = if is_apple_out {
-                    rgb(palette.msg_out_fg)
-                } else if is_apple {
-                    rgb(0xF2F2F7)
+                let code_text_fg: Rgba = if is_apple {
+                    ob.text_secondary()
                 } else {
-                    rgb(palette.code_fg)
+                    rgb(palette.code_fg).into()
                 };
-                let copy_fg = if is_apple_out {
-                    palette.msg_out_fg
+                let copy_fg: Rgba = if is_apple {
+                    if is_copied { ob.success() } else { ob.text_muted() }
                 } else {
-                    palette.accent
+                    rgb(palette.accent).into()
                 };
-                let copy_hover = if is_apple_out {
-                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.18)
+                let copy_hover: Rgba = if is_apple {
+                    ob.hover()
                 } else {
                     TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.18)
                 };
@@ -209,7 +207,7 @@ pub fn render_rich_message_body<V: 'static>(
                         .flex_col()
                         .w_full()
                         .min_w(px(0.0))
-                        .my(px(3.0))
+                        .my(px(4.0))
                         .rounded(px(if is_apple { 10.0 } else { 8.0 }))
                         .bg(block_bg)
                         .border_1()
@@ -217,40 +215,51 @@ pub fn render_rich_message_body<V: 'static>(
                         .overflow_hidden()
                         .child(
                             div()
+                                .h(px(if is_apple { 34.0 } else { 28.0 }))
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .px(px(10.0))
-                                .py(px(4.0))
+                                .px(px(12.0))
                                 .bg(hdr_bg)
+                                .border_b_1()
+                                .border_color(block_border)
                                 .child(
                                     div()
-                                        .text_size(px(11.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
                                         .text_color(hdr_fg)
                                         .child(lang_label),
                                 )
                                 .child(
                                     div()
                                         .id(SharedString::from(format!("copy-code-{}-{}", msg_id, block_idx)))
+                                        .h(px(26.0))
                                         .flex()
                                         .items_center()
                                         .gap(px(4.0))
-                                        .px(px(6.0))
-                                        .py(px(2.0))
-                                        .rounded(px(4.0))
+                                        .px(px(7.0))
+                                        .rounded(px(6.0))
                                         .cursor_pointer()
                                         .hover(move |s| s.bg(copy_hover))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .on_click(cx.listener(move |this, _ev, _window, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(code_copy.clone()));
                                             act(this, RichTextAction::CopyCode(code_copy.clone()), cx);
                                         }))
-                                        .child(tg_icon(IconName::Copy, 12.0, copy_fg))
+                                        .child(openbot_stage_icon(
+                                            if is_copied {
+                                                OpenBotStageIcon::Check
+                                            } else {
+                                                OpenBotStageIcon::Copy
+                                            },
+                                            12.5,
+                                            copy_fg,
+                                        ))
                                         .child(
                                             div()
-                                                .text_size(px(11.0))
+                                                .text_size(px(11.5))
                                                 .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(copy_fg))
+                                                .text_color(copy_fg)
                                                 .child(if is_copied {
                                                     tr_key_or(lang_id, "lng_copied", "Copied")
                                                 } else {
@@ -263,10 +272,10 @@ pub fn render_rich_message_body<V: 'static>(
                             div()
                                 .w_full()
                                 .min_w(px(0.0))
-                                .px(px(palette.scaled_px(10.0)))
-                                .py(px(palette.scaled_px(8.0)))
+                                .px(px(palette.scaled_px(12.0)))
+                                .py(px(palette.scaled_px(10.0)))
                                 .text_size(px(code_font))
-                                .line_height(px(code_font + 5.0))
+                                .line_height(px(code_font + 5.5))
                                 .text_color(code_text_fg)
                                 .child(code),
                         ),
@@ -351,6 +360,92 @@ pub fn render_rich_message_body<V: 'static>(
                             )
                         }),
                 );
+            }
+            RichBlock::Table { headers, rows } => {
+                let ob = palette.openbot_palette();
+                let border_c: Rgba = if palette.is_apple_style() {
+                    ob.border_hairline()
+                } else {
+                    rgb(palette.border_fg).into()
+                };
+                let hdr_bg: Rgba = if palette.is_apple_style() {
+                    if palette.mode.is_dark() { rgb(0x1C1C1E).into() } else { rgb(0xF0F0F2).into() }
+                } else {
+                    TdesktopThemePalette::rgba_with_alpha(palette.border_fg, 0.28)
+                };
+                let cell_font = (font_px - 1.0).max(12.0);
+                let cell_lh = (cell_font * 1.38).round();
+                let mut header_row = div()
+                    .w_full()
+                    .bg(hdr_bg)
+                    .border_b_1()
+                    .border_color(border_c)
+                    .flex();
+                for (c_idx, cell_segs) in headers.into_iter().enumerate() {
+                    header_row = header_row.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(72.0))
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .when(c_idx > 0, |el| el.border_l_1().border_color(border_c))
+                            .child(render_inline_segments(
+                                msg_id,
+                                block_idx * 1000 + 500 + c_idx,
+                                cell_segs,
+                                cell_font,
+                                cell_lh,
+                                Some(FontWeight::SEMIBOLD),
+                                revealed_spoilers,
+                                palette,
+                                is_apple_out,
+                                cx,
+                                on_action.clone(),
+                            )),
+                    );
+                }
+                let mut table_box = div()
+                    .id(SharedString::from(format!("gfm-table-{}-{}", msg_id, block_idx)))
+                    .w_full()
+                    .my(px(4.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(border_c)
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(header_row);
+                for (r_idx, row_cells) in rows.into_iter().enumerate() {
+                    let mut row_div = div()
+                        .w_full()
+                        .when(r_idx > 0, |el| el.border_t_1().border_color(border_c))
+                        .flex();
+                    for (c_idx, cell_segs) in row_cells.into_iter().enumerate() {
+                        row_div = row_div.child(
+                            div()
+                                .flex_1()
+                                .min_w(px(72.0))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .when(c_idx > 0, |el| el.border_l_1().border_color(border_c))
+                                .child(render_inline_segments(
+                                    msg_id,
+                                    block_idx * 1000 + 600 + r_idx * 32 + c_idx,
+                                    cell_segs,
+                                    cell_font,
+                                    cell_lh,
+                                    None,
+                                    revealed_spoilers,
+                                    palette,
+                                    is_apple_out,
+                                    cx,
+                                    on_action.clone(),
+                                )),
+                        );
+                    }
+                    table_box = table_box.child(row_div);
+                }
+                col = col.child(table_box);
             }
         }
     }
@@ -452,6 +547,114 @@ fn render_inline_segments<V: 'static>(
     if segs.is_empty() {
         return div().w_full().h(px(6.0)).flex_shrink_0().into_any_element();
     }
+
+    if palette.is_apple_style() && segs.iter().any(|s| s.flags.reference_chip.is_some()) {
+        let mut row = div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(4.0));
+        let mut run_buf: Vec<StyledSegment> = Vec::new();
+        let mut chunk_idx = 0usize;
+        for (s_idx, seg) in segs.into_iter().enumerate() {
+            if let Some((kind, id, label)) = seg.flags.reference_chip.clone() {
+                if !run_buf.is_empty() {
+                    let flush = std::mem::take(&mut run_buf);
+                    row = row.child(render_inline_text_run(
+                        msg_id,
+                        block_key + chunk_idx,
+                        flush,
+                        font_px,
+                        line_height_px,
+                        default_weight,
+                        revealed_spoilers,
+                        palette,
+                        is_apple_out,
+                        cx,
+                        on_action.clone(),
+                    ));
+                    chunk_idx += 1;
+                }
+                let act = on_action.clone();
+                let click_action = match kind.as_str() {
+                    "skill" | "workflow" | "routine" | "mcp" => RichTextAction::ClickBotCommand(
+                        if label.starts_with('$') {
+                            label.clone()
+                        } else {
+                            format!("${kind}:{id}")
+                        },
+                    ),
+                    "agent" | "bot" => RichTextAction::ClickMention(format!("@{label}")),
+                    "everyone" => RichTextAction::ClickMention("@everyone".to_string()),
+                    _ => RichTextAction::ClickBotCommand(format!("openbot_ref:{kind}:{id}:{label}")),
+                };
+                let chip = render_openbot_reference_chip(
+                    SharedString::from(format!("msg-ref-chip-{}-{}-{}", msg_id, block_key, s_idx)),
+                    &kind,
+                    &label,
+                    palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        act(this, click_action.clone(), cx);
+                    }),
+                );
+                row = row.child(chip);
+            } else {
+                run_buf.push(seg);
+            }
+        }
+        if !run_buf.is_empty() {
+            row = row.child(render_inline_text_run(
+                msg_id,
+                block_key + chunk_idx,
+                run_buf,
+                font_px,
+                line_height_px,
+                default_weight,
+                revealed_spoilers,
+                palette,
+                is_apple_out,
+                cx,
+                on_action,
+            ));
+        }
+        return row.into_any_element();
+    }
+
+    render_inline_text_run(
+        msg_id,
+        block_key,
+        segs,
+        font_px,
+        line_height_px,
+        default_weight,
+        revealed_spoilers,
+        palette,
+        is_apple_out,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_inline_text_run<V: 'static>(
+    msg_id: u64,
+    block_key: usize,
+    segs: Vec<StyledSegment>,
+    font_px: f32,
+    line_height_px: f32,
+    default_weight: Option<FontWeight>,
+    revealed_spoilers: &HashSet<(u64, usize)>,
+    palette: &TdesktopThemePalette,
+    is_apple_out: bool,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, RichTextAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
 
     let base_fg_hex = if is_apple_out {
         palette.msg_out_fg

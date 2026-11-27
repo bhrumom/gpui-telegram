@@ -12,14 +12,11 @@ use gpui_telegram_proto::creations::{
 
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
-use crate::views::app_shell::modal_container::{
-    macos_primary_pill_btn, macos_secondary_pill_btn,
-};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, apple_hairline, cover_artwork_box, creation_kind_accent,
-    creation_kind_label, filter_pill, render_editable_field_box, review_status_badge,
-    EditableFieldState,
+    creation_kind_label, filter_pill, openbot_primary_cta_btn, openbot_secondary_btn,
+    render_editable_field_box, review_status_badge, EditableFieldState,
 };
 use crate::views::content_hub::{ContentHubEvent, ContentHubWorkspace};
 
@@ -1147,6 +1144,7 @@ fn render_field_row(
     state: &PublishReviewModalState,
     pal: TdesktopThemePalette,
 ) -> Div {
+    let ob = pal.openbot_palette();
     let field = state.field(target);
     let focused = state.focused_field == Some(target);
     let multiline = target.is_multiline();
@@ -1158,7 +1156,7 @@ fn render_field_row(
             div()
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(pal.text_secondary))
+                .text_color(ob.text_secondary())
                 .child(label.to_string()),
         )
         .child(
@@ -1185,6 +1183,8 @@ pub fn render_publish_review_modal_body(
         let h = hub.read(cx);
         (h.palette, h.language_id.clone(), h.publish_modal.clone())
     };
+    let ob = pal.openbot_palette();
+    let hover_close = ob.hover();
     let reviewer_allowed = modal.reviewer_access == ReviewerAccessState::Allowed;
     let show_queue = modal.is_showing_reviewer_queue();
     let hub_close = hub.clone();
@@ -1203,7 +1203,7 @@ pub fn render_publish_review_modal_body(
                 .px(px(20.0))
                 .py(px(14.0))
                 .border_b_1()
-                .border_color(pal.separator_rgba())
+                .border_color(ob.border_hairline())
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -1214,12 +1214,22 @@ pub fn render_publish_review_modal_body(
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .child(tg_icon(IconName::HubPublish, 18.0, pal.accent))
                         .child(
                             div()
-                                .text_size(px(16.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(pal.text_primary))
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .rounded_full()
+                                .bg(ob.bg_control_active())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(tg_icon_rgba(IconName::HubPublish, 15.0, ob.text_primary())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
                                 .child(tr_str(&lang, "推送审核上架", "Publish & Review")),
                         )
                         .when(reviewer_allowed, |el| {
@@ -1271,8 +1281,8 @@ pub fn render_publish_review_modal_body(
                         .cursor_pointer()
                         .w(px(28.0))
                         .h(px(28.0))
-                        .rounded(px(7.0))
-                        .hover(move |s| s.bg(pal.row_hover_rgba()))
+                        .rounded_full()
+                        .hover(move |s| s.bg(hover_close))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1285,7 +1295,7 @@ pub fn render_publish_review_modal_body(
                                 }
                             });
                         })
-                        .child(tg_icon(IconName::Close, 15.0, pal.icon_fg)),
+                        .child(tg_icon_rgba(IconName::Close, 14.0, ob.text_muted())),
                 ),
         )
         .child(if show_queue {
@@ -1302,6 +1312,11 @@ fn render_creator_submit_tab(
     pal: TdesktopThemePalette,
     lang: &str,
 ) -> AnyElement {
+    let ob = pal.openbot_palette();
+    let succ_soft = gpui::Rgba { a: 0.14, ..ob.success() };
+    let succ_border = gpui::Rgba { a: 0.30, ..ob.success() };
+    let danger_soft = gpui::Rgba { a: 0.14, ..ob.danger() };
+    let danger_border = gpui::Rgba { a: 0.32, ..ob.danger() };
     let hub_vis_pub = hub.clone();
     let hub_vis_unlisted = hub.clone();
     let hub_save = hub.clone();
@@ -1348,7 +1363,7 @@ fn render_creator_submit_tab(
                                             .truncate()
                                             .text_size(px(13.0))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(pal.text_primary))
+                                            .text_color(ob.text_primary())
                                             .child(format!(
                                                 "{} · {}",
                                                 creation_kind_label(base.kind, lang),
@@ -1358,7 +1373,7 @@ fn render_creator_submit_tab(
                                     .child(
                                         div()
                                             .text_size(px(11.0))
-                                            .text_color(rgb(pal.text_secondary))
+                                            .text_color(ob.text_muted())
                                             .child(format!("Cloud Revision #{}", base.cloud_revision)),
                                     ),
                             ),
@@ -1422,7 +1437,7 @@ fn render_creator_submit_tab(
                     div()
                         .text_size(px(12.0))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(pal.text_secondary))
+                        .text_color(ob.text_secondary())
                         .child(tr_str(lang, "上架可见性", "Catalog Visibility")),
                 )
                 .child(
@@ -1475,15 +1490,15 @@ fn render_creator_submit_tab(
                 .p(px(12.0))
                 .rounded(px(10.0))
                 .bg(if modal.validation_errors.is_empty() {
-                    TdesktopThemePalette::rgba_with_alpha(0x30D158, 0.12)
+                    succ_soft
                 } else {
-                    TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.12)
+                    danger_soft
                 })
                 .border_1()
                 .border_color(if modal.validation_errors.is_empty() {
-                    TdesktopThemePalette::rgba_with_alpha(0x30D158, 0.32)
+                    succ_border
                 } else {
-                    TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.35)
+                    danger_border
                 })
                 .flex()
                 .flex_col()
@@ -1492,11 +1507,11 @@ fn render_creator_submit_tab(
                     div()
                         .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(if modal.validation_errors.is_empty() {
-                            0x30D158
+                        .text_color(if modal.validation_errors.is_empty() {
+                            ob.success()
                         } else {
-                            pal.danger
-                        }))
+                            ob.danger()
+                        })
                         .child(if modal.validation_errors.is_empty() {
                             tr_str(lang, "✓ 实时审核校验通过，可立即提交审核", "✓ Live review validation passed")
                         } else {
@@ -1506,7 +1521,7 @@ fn render_creator_submit_tab(
                 .children(modal.validation_errors.iter().map(|err| {
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(pal.danger))
+                        .text_color(ob.danger())
                         .child(format!("• {err}"))
                 })),
         )
@@ -1515,9 +1530,9 @@ fn render_creator_submit_tab(
                 div()
                     .p(px(10.0))
                     .rounded(px(8.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.15))
+                    .bg(danger_soft)
                     .text_size(px(12.0))
-                    .text_color(rgb(pal.danger))
+                    .text_color(ob.danger())
                     .child(err.clone()),
             )
         })
@@ -1526,9 +1541,9 @@ fn render_creator_submit_tab(
                 div()
                     .p(px(10.0))
                     .rounded(px(8.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(0x30D158, 0.14))
+                    .bg(succ_soft)
                     .text_size(px(12.0))
-                    .text_color(rgb(0x30D158))
+                    .text_color(ob.success())
                     .child(note.clone()),
             )
         })
@@ -1540,7 +1555,7 @@ fn render_creator_submit_tab(
                 .justify_end()
                 .gap(px(10.0))
                 .child(
-                    macos_secondary_pill_btn(
+                    openbot_secondary_btn(
                         "publish-modal-save-draft-btn",
                         tr_str(lang, "保存草稿", "Save Draft"),
                         pal,
@@ -1567,7 +1582,7 @@ fn render_creator_submit_tab(
                     }),
                 )
                 .child(
-                    macos_primary_pill_btn(
+                    openbot_primary_cta_btn(
                         "publish-modal-submit-review-btn",
                         if modal.is_submitting {
                             tr_str(lang, "提交中…", "Submitting…")
@@ -1616,7 +1631,7 @@ fn render_creator_submit_tab(
                         div()
                             .text_size(px(12.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(ob.text_muted())
                             .child(tr_str(lang, "审核审计记录", "Audit History")),
                     )
                     .children(modal.audit_trail.iter().take(6).map(|entry| {
@@ -1629,10 +1644,10 @@ fn render_creator_submit_tab(
                         div()
                             .px(px(10.0))
                             .py(px(6.0))
-                            .rounded(px(7.0))
-                            .bg(pal.row_hover_rgba())
+                            .rounded(px(8.0))
+                            .bg(ob.bg_control())
                             .text_size(px(11.0))
-                            .text_color(rgb(pal.text_secondary))
+                            .text_color(ob.text_secondary())
                             .child(line)
                     })),
             )
@@ -1646,6 +1661,8 @@ fn render_reviewer_queue_tab(
     pal: TdesktopThemePalette,
     lang: &str,
 ) -> AnyElement {
+    let ob = pal.openbot_palette();
+    let danger_soft = gpui::Rgba { a: 0.14, ..ob.danger() };
     let selected_id = modal
         .selected_review_id
         .clone()
@@ -1671,7 +1688,7 @@ fn render_reviewer_queue_tab(
                     div()
                         .text_size(px(13.0))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(pal.text_primary))
+                        .text_color(ob.text_primary())
                         .child(format!(
                             "{} ({})",
                             tr_str(lang, "待审核作品", "Pending Review Submissions"),
@@ -1679,7 +1696,7 @@ fn render_reviewer_queue_tab(
                         )),
                 )
                 .child(
-                    macos_secondary_pill_btn(
+                    openbot_secondary_btn(
                         "reviewer-queue-refresh-btn",
                         tr_str(lang, "刷新队列", "Refresh Queue"),
                         pal,
@@ -1696,8 +1713,12 @@ fn render_reviewer_queue_tab(
                 apple_grouped_card(pal).p(px(20.0)).child(
                     div()
                         .text_size(px(13.0))
-                        .text_color(rgb(pal.text_secondary))
-                        .child(tr_str(lang, "当前没有待审核的作品。", "No pending submissions in the review queue.")),
+                        .text_color(ob.text_muted())
+                        .child(tr_str(
+                            lang,
+                            "当前没有待审核的作品。",
+                            "No pending submissions in the review queue.",
+                        )),
                 ),
             )
         })
@@ -1718,9 +1739,7 @@ fn render_reviewer_queue_tab(
 
             apple_grouped_card(pal)
                 .p(px(12.0))
-                .when(is_sel, |c| {
-                    c.border_color(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.72))
-                })
+                .when(is_sel, |c| c.border_color(ob.border_strong_hairline()))
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
@@ -1757,14 +1776,14 @@ fn render_reviewer_queue_tab(
                                                 .truncate()
                                                 .text_size(px(14.0))
                                                 .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(pal.text_primary))
+                                                .text_color(ob.text_primary())
                                                 .child(item.title.clone()),
                                         )
                                         .child(
                                             div()
                                                 .truncate()
                                                 .text_size(px(11.0))
-                                                .text_color(rgb(pal.text_secondary))
+                                                .text_color(ob.text_muted())
                                                 .child(format!(
                                                     "{} · {} · {}",
                                                     creation_kind_label(item.kind, lang),
@@ -1789,7 +1808,7 @@ fn render_reviewer_queue_tab(
                                 .px(px(10.0))
                                 .py(px(5.0))
                                 .rounded(px(8.0))
-                                .bg(rgb(0x30D158))
+                                .bg(ob.success())
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(0xFFFFFF))
@@ -1814,34 +1833,32 @@ fn render_reviewer_queue_tab(
                                 .child(tr_str(lang, "通过并公开上架", "Approve (Public)")),
                         )
                         .child(
-                            div()
-                                .id(SharedString::from(format!("reviewer-approve-unlisted-{cid}")))
-                                .cursor_pointer()
-                                .px(px(10.0))
-                                .py(px(5.0))
-                                .rounded(px(8.0))
-                                .bg(pal.row_hover_rgba())
-                                .text_size(px(12.0))
-                                .text_color(rgb(pal.text_primary))
-                                .when(modal.is_submitting, |el| el.opacity(0.55))
-                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                    hub_unl.update(cx, |h, hcx| {
-                                        if h.publish_modal.is_submitting {
-                                            return;
-                                        }
-                                        let req = h
-                                            .publish_modal
-                                            .build_approve_request(CreationVisibility::Unlisted);
-                                        h.publish_modal.is_submitting = true;
-                                        h.publish_modal.reviewer_error = None;
-                                        hcx.emit(ContentHubEvent::SubmitReviewDecision {
-                                            creation_id: cid_unl.clone(),
-                                            req,
-                                        });
-                                        hcx.notify();
+                            openbot_secondary_btn(
+                                SharedString::from(format!("reviewer-approve-unlisted-{cid}")),
+                                tr_str(lang, "通过 (仅链接可见)", "Approve (Unlisted)"),
+                                pal,
+                            )
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .text_size(px(12.0))
+                            .when(modal.is_submitting, |el| el.opacity(0.55))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                hub_unl.update(cx, |h, hcx| {
+                                    if h.publish_modal.is_submitting {
+                                        return;
+                                    }
+                                    let req = h
+                                        .publish_modal
+                                        .build_approve_request(CreationVisibility::Unlisted);
+                                    h.publish_modal.is_submitting = true;
+                                    h.publish_modal.reviewer_error = None;
+                                    hcx.emit(ContentHubEvent::SubmitReviewDecision {
+                                        creation_id: cid_unl.clone(),
+                                        req,
                                     });
-                                })
-                                .child(tr_str(lang, "通过 (仅链接可见)", "Approve (Unlisted)")),
+                                    hcx.notify();
+                                });
+                            }),
                         )
                         .child(
                             div()
@@ -1850,10 +1867,10 @@ fn render_reviewer_queue_tab(
                                 .px(px(10.0))
                                 .py(px(5.0))
                                 .rounded(px(8.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
+                                .bg(danger_soft)
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(pal.danger))
+                                .text_color(ob.danger())
                                 .when(modal.is_submitting, |el| el.opacity(0.55))
                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                     hub_rej.update(cx, |h, hcx| {
@@ -1897,7 +1914,7 @@ fn render_reviewer_queue_tab(
             el.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(pal.danger))
+                    .text_color(ob.danger())
                     .child(err.clone()),
             )
         })

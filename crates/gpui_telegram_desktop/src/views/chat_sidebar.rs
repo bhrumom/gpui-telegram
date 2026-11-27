@@ -212,6 +212,58 @@ pub const SEARCH_BAR_RADIUS: f32 = SEARCH_RADIUS;
 pub const SEARCH_HEADER_HEIGHT: f32 = 48.0;
 pub const DIALOG_NAME_LEFT: f32 = 68.0;
 
+// OpenBot `383a35d2` sidebar geometry & hysteresis constants (`UI-F05`..`UI-F06`)
+pub const OPENBOT_SIDEBAR_DEFAULT_WIDTH: f32 = 280.0;
+pub const OPENBOT_SIDEBAR_MIN_WIDTH: f32 = 128.0;
+pub const OPENBOT_SIDEBAR_MAX_WIDTH: f32 = 400.0;
+pub const OPENBOT_SIDEBAR_COMPACT_WIDTH: f32 = 88.0;
+pub const OPENBOT_SIDEBAR_COLLAPSE_THRESHOLD: f32 = 110.0;
+pub const OPENBOT_SIDEBAR_EXPAND_THRESHOLD: f32 = 118.0;
+pub const OPENBOT_TOPBAR_HEIGHT: f32 = 38.0;
+pub const OPENBOT_SEARCH_HEIGHT: f32 = 32.0;
+pub const OPENBOT_TABS_HEIGHT: f32 = 32.0;
+pub const OPENBOT_HIDE_TIMESTAMP_WIDTH: f32 = 210.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SidebarListShowFilter {
+    #[default]
+    All,
+    Agents,
+    Channels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SidebarChatSortOrder {
+    #[default]
+    Manual,
+    Recent,
+    UnreadGroup,
+    UnreadFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SidebarListFilterState {
+    pub show: SidebarListShowFilter,
+    pub unread_only: bool,
+    pub working_only: bool,
+    pub muted_only: bool,
+    pub sort_order: SidebarChatSortOrder,
+}
+
+impl SidebarListFilterState {
+    pub fn is_active(&self) -> bool {
+        self.show != SidebarListShowFilter::All
+            || self.unread_only
+            || self.working_only
+            || self.muted_only
+            || self.sort_order != SidebarChatSortOrder::Manual
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub const TELEGRAM_SEARCH_CATEGORIES: &[(&str, &str)] = &[
     ("Chats", "聊天"),
     ("Channels", "频道"),
@@ -334,6 +386,24 @@ pub struct ChatSidebar {
     pub is_loading_dialogs: bool,
     /// True once dialogs have been hydrated from local cache or authoritative server response.
     pub has_synced_dialogs: bool,
+
+    // OpenBot `383a35d2` sidebar chrome, hysteresis, filters, tabs & navigation triggers (`UI-F05`..`UI-F06`)
+    pub openbot_width: f32,
+    pub is_sidebar_closed: bool,
+    pub is_new_menu_open: bool,
+    pub is_filter_menu_open: bool,
+    pub is_tabs_edit_menu_open: bool,
+    pub list_filter: SidebarListFilterState,
+    pub hidden_tab_ids: std::collections::HashSet<String>,
+    pub can_navigate_back: bool,
+    pub can_navigate_forward: bool,
+    pub external_topbar_hosted: bool,
+    pub pending_nav_back: bool,
+    pub pending_nav_forward: bool,
+    pub pending_open_global_search: bool,
+    pub pending_open_create_agent_studio: bool,
+    pub pending_open_new_group: bool,
+    pub pending_open_new_folder: bool,
 }
 
 impl ChatSidebar {
@@ -430,6 +500,22 @@ impl ChatSidebar {
             has_leading_app_sidebar: false,
             is_loading_dialogs: false,
             has_synced_dialogs: false,
+            openbot_width: OPENBOT_SIDEBAR_DEFAULT_WIDTH,
+            is_sidebar_closed: false,
+            is_new_menu_open: false,
+            is_filter_menu_open: false,
+            is_tabs_edit_menu_open: false,
+            list_filter: SidebarListFilterState::default(),
+            hidden_tab_ids: std::collections::HashSet::new(),
+            can_navigate_back: false,
+            can_navigate_forward: false,
+            external_topbar_hosted: false,
+            pending_nav_back: false,
+            pending_nav_forward: false,
+            pending_open_global_search: false,
+            pending_open_create_agent_studio: false,
+            pending_open_new_group: false,
+            pending_open_new_folder: false,
         }
     }
 
@@ -458,11 +544,116 @@ impl ChatSidebar {
         }
     }
 
+    /// Rendered pixel width respecting OpenBot edge-framed geometry (`280px` default, `88px` compact, `0px` closed).
+    pub fn rendered_sidebar_width(&self) -> f32 {
+        if self.is_sidebar_closed {
+            return 0.0;
+        }
+        if self.has_leading_app_sidebar && self.palette.is_apple_style() {
+            if self.is_collapsed {
+                OPENBOT_SIDEBAR_COMPACT_WIDTH
+            } else {
+                self.openbot_width
+                    .clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH)
+            }
+        } else {
+            self.effective_width()
+        }
+    }
+
+    /// Applies OpenBot `110px` collapse / `118px` expand resize hysteresis across `[128, 400]`.
+    pub fn apply_openbot_drag_width(&mut self, drag_px: f32) {
+        if self.is_sidebar_closed {
+            self.is_sidebar_closed = false;
+        }
+        if self.is_collapsed {
+            if drag_px >= OPENBOT_SIDEBAR_EXPAND_THRESHOLD {
+                self.set_collapsed(false);
+                self.openbot_width = drag_px.clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH);
+                self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
+            }
+        } else if drag_px < OPENBOT_SIDEBAR_COLLAPSE_THRESHOLD {
+            self.set_collapsed(true);
+            self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
+        } else {
+            self.openbot_width = drag_px.clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH);
+        }
+    }
+
+    /// Resets OpenBot sidebar width to `280.0` (double-click on resize handle).
+    pub fn reset_openbot_width(&mut self) {
+        self.is_sidebar_closed = false;
+        if self.is_collapsed {
+            self.set_collapsed(false);
+            self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
+        }
+        self.openbot_width = OPENBOT_SIDEBAR_DEFAULT_WIDTH;
+    }
+
+    /// Toggles full `0px` closed sidebar (`Cmd+B`), syncing `is_collapsed` for existing shortcut invariants.
+    pub fn toggle_closed_from_user(&mut self) {
+        self.is_sidebar_closed = !self.is_sidebar_closed;
+        self.set_collapsed(self.is_sidebar_closed);
+        self.close_openbot_popovers();
+        self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
+    }
+
+    /// Toggles OpenBot compact `88px` <-> expanded `280px` (top-right `PanelLeft` button).
+    pub fn toggle_openbot_compact_from_user(&mut self) {
+        if self.is_sidebar_closed {
+            self.is_sidebar_closed = false;
+            self.set_collapsed(false);
+            self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
+            return;
+        }
+        self.toggle_collapsed_from_user();
+    }
+
+    /// Dismisses any transient OpenBot sidebar popover menus (`+`, filter, edit-tabs, context menu).
+    pub fn close_openbot_popovers(&mut self) -> bool {
+        let was = self.is_new_menu_open
+            || self.is_filter_menu_open
+            || self.is_tabs_edit_menu_open
+            || self.context_menu.is_some();
+        self.is_new_menu_open = false;
+        self.is_filter_menu_open = false;
+        self.is_tabs_edit_menu_open = false;
+        self.context_menu = None;
+        was
+    }
+
+    pub fn take_pending_nav_back(&mut self) -> bool {
+        std::mem::take(&mut self.pending_nav_back)
+    }
+
+    pub fn take_pending_nav_forward(&mut self) -> bool {
+        std::mem::take(&mut self.pending_nav_forward)
+    }
+
+    pub fn take_pending_open_global_search(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_global_search)
+    }
+
+    pub fn take_pending_open_create_agent_studio(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_create_agent_studio)
+    }
+
+    pub fn take_pending_open_new_group(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_new_group)
+    }
+
+    pub fn take_pending_open_new_folder(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_new_folder)
+    }
+
     pub fn set_collapsed(&mut self, collapsed: bool) {
         self.is_collapsed = collapsed;
         self.hovered_rail_item = None;
         self.hovered_rail_dialog_id = None;
         self.is_account_popover_open = false;
+        self.is_new_menu_open = false;
+        self.is_filter_menu_open = false;
+        self.is_tabs_edit_menu_open = false;
         if collapsed {
             self.cancel_compose_mode();
             self.context_menu = None;
@@ -471,12 +662,14 @@ impl ChatSidebar {
     }
 
     pub fn toggle_collapsed_from_user(&mut self) {
+        self.is_sidebar_closed = false;
         self.set_collapsed(!self.is_collapsed);
         self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
     }
 
     pub(crate) fn expand_from_user_if_collapsed(&mut self) {
-        if self.is_collapsed {
+        if self.is_collapsed || self.is_sidebar_closed {
+            self.is_sidebar_closed = false;
             self.set_collapsed(false);
             self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
         }
@@ -554,6 +747,18 @@ impl ChatSidebar {
         self.standalone_active_destination = NavDestination::Chats;
         self.active_folder = "All".to_string();
         self.active_chat_id = None;
+        self.is_new_menu_open = false;
+        self.is_filter_menu_open = false;
+        self.is_tabs_edit_menu_open = false;
+        self.list_filter.clear();
+        self.can_navigate_back = false;
+        self.can_navigate_forward = false;
+        self.pending_nav_back = false;
+        self.pending_nav_forward = false;
+        self.pending_open_global_search = false;
+        self.pending_open_create_agent_studio = false;
+        self.pending_open_new_group = false;
+        self.pending_open_new_folder = false;
     }
 
     pub fn open_contacts_modal(&mut self) {

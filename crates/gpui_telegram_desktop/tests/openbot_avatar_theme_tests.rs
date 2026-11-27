@@ -737,3 +737,430 @@ fn all_six_m2_ui_probes_and_baseline_avatar_tdesktop_non_regression() {
         assert_eq!(p.mode, mode);
     }
 }
+
+#[test]
+fn m1_ui_f01_openbot_tokens_typed_accessors_oklab_and_chrome_sync() {
+    use gpui::rgb;
+    use gpui_telegram_desktop::theme::{
+        CHAT_COLOR_PRESETS, OPENBOT_BADGE_NEW_DARK, OPENBOT_BADGE_NEW_LIGHT, OPENBOT_FELT_AMBER,
+        OPENBOT_FELT_CREAM, OPENBOT_FELT_PLUM, OPENBOT_FELT_RASPBERRY,
+        readable_chat_background_for_dark, solid_bubble_takes_dark_text,
+    };
+
+    let dark = OpenBotPalette::dark();
+    assert_eq!(dark.token_count(), 58);
+    assert_eq!(dark.window_glass_tokens().len(), 15);
+    assert_eq!(dark.bg_frame(), rgb(0x0D0D0D));
+    assert_eq!(dark.bg_canvas(), rgb(0x1A1A1A));
+    assert_eq!(dark.bg_sidebar(), rgb(0x1A1A1A));
+    assert_eq!(dark.bg_surface(), rgb(0x212121));
+    assert_eq!(dark.bg_surface_raised(), rgb(0x242424));
+    assert_eq!(dark.bg_control(), rgb(0x212121));
+    assert_eq!(dark.bg_control_hover(), rgb(0x242424));
+    assert_eq!(dark.bg_control_active(), rgb(0x2A2A2A));
+    assert_eq!(dark.border_hairline(), rgb(0x262626));
+    assert_eq!(dark.border_strong_hairline(), rgb(0x323232));
+    assert_eq!(dark.text_primary(), rgb(0xFFFFFF));
+    assert_eq!(dark.text_secondary(), rgb(0xDCDCDC));
+    assert_eq!(dark.text_muted(), rgb(0x979797));
+    assert_eq!(dark.text_dim(), rgb(0x6A6A6A));
+    assert_eq!(dark.surface_light(), rgb(0xF0F0F0));
+    assert_eq!(dark.text_on_light(), rgb(0x141414));
+    assert_eq!(dark.accent(), rgb(0x007CF7));
+    assert_eq!(dark.accent_hover(), rgb(0x1F8FFF));
+    assert_eq!(dark.accent_text(), rgb(0x42A0FF));
+    assert_eq!(dark.success(), rgb(0x31CF76));
+    assert_eq!(dark.warning(), rgb(0xFF9412));
+    assert_eq!(dark.danger(), rgb(0xFD2F3B));
+    assert_eq!(dark.unread_surface(), rgb(0x74B9FF));
+    assert_eq!(dark.unread_text(), rgb(0x07131F));
+    assert_eq!(dark.badge_new(), rgb(0xFF1E5E));
+    assert_eq!(dark.felt_plum(), (rgb(0x705083), rgb(0x4A285C)));
+    assert_eq!(dark.felt_amber(), (rgb(0xFF9511), rgb(0xCB680C)));
+    assert_eq!(dark.felt_raspberry(), (rgb(0xF52070), rgb(0xB40641)));
+    assert_eq!(dark.felt_cream(), rgb(0xF6EFE2));
+    assert!((dark.border().a - 0.035).abs() < 1e-3);
+    assert!((dark.border_strong().a - 0.045).abs() < 1e-3);
+    assert!((dark.hover().a - 0.06).abs() < 1e-3);
+    assert!((dark.text_readable().a - 0.52).abs() < 1e-3);
+    assert!((dark.accent_soft().a - 0.16).abs() < 1e-3);
+
+    let light = OpenBotPalette::light();
+    assert_eq!(light.token_count(), 58);
+    assert_eq!(light.bg_frame(), rgb(0xE8E8EB));
+    assert_eq!(light.bg_canvas(), rgb(0xF5F5F6));
+    assert_eq!(light.bg_sidebar(), rgb(0xF5F5F6));
+    assert_eq!(light.bg_surface(), rgb(0xFFFFFF));
+    assert_eq!(light.bg_surface_raised(), rgb(0xFCFCFC));
+    assert_eq!(light.bg_control_hover(), rgb(0xF0F0F2));
+    assert_eq!(light.bg_control_active(), rgb(0xE8E8EB));
+    assert_eq!(light.border_hairline(), rgb(0xE8E8EB));
+    assert_eq!(light.border_strong_hairline(), rgb(0xDCDCE0));
+    assert_eq!(light.text_primary(), rgb(0x141414));
+    assert_eq!(light.text_muted(), rgb(0x6B6B70));
+    assert_eq!(light.surface_light(), rgb(0x1C1C1E));
+    assert_eq!(light.text_on_light(), rgb(0xFFFFFF));
+    assert_eq!(light.badge_new(), rgb(0xE0004A));
+
+    assert_eq!(OPENBOT_BADGE_NEW_DARK, "#ff1e5e");
+    assert_eq!(OPENBOT_BADGE_NEW_LIGHT, "#e0004a");
+    assert_eq!(OPENBOT_FELT_PLUM, ("#705083", "#4a285c"));
+    assert_eq!(OPENBOT_FELT_AMBER, ("#ff9511", "#cb680c"));
+    assert_eq!(OPENBOT_FELT_RASPBERRY, ("#f52070", "#b40641"));
+    assert_eq!(OPENBOT_FELT_CREAM, "#f6efe2");
+    assert_eq!(CHAT_COLOR_PRESETS.len(), 11);
+
+    assert_eq!(
+        readable_chat_background_for_dark("#f75d59", true).unwrap(),
+        "#442321"
+    );
+    assert_eq!(
+        readable_chat_background_for_dark("#f75d59", false).unwrap(),
+        "#fceae8"
+    );
+    assert_eq!(dark.readable_chat_background("#f75d59").unwrap(), "#442321");
+    assert_eq!(
+        light.readable_chat_background("#f75d59").unwrap(),
+        "#fceae8"
+    );
+    assert!(solid_bubble_takes_dark_text("#e5a50a"));
+    assert!(!solid_bubble_takes_dark_text("#007cf7"));
+
+    // TdesktopThemePalette OpenBot sync: zero legacy harsh Telegram/Apple blue active fills
+    let ob_dark = TdesktopThemePalette::build_openbot(TdesktopThemeMode::Night, 0, 15, 16)
+        .with_ui_scale(125)
+        .with_blur_wallpaper(true);
+    assert_eq!(ob_dark.openbot_scheme(), OpenBotColorScheme::Dark);
+    assert_eq!(ob_dark.openbot_palette().bg_frame(), rgb(0x0D0D0D));
+    assert_eq!(ob_dark.window_bg, 0x0D0D0D);
+    assert_eq!(ob_dark.dialogs_bg, 0x1A1A1A);
+    assert_eq!(ob_dark.stage_bg, 0x1A1A1A);
+    assert_eq!(ob_dark.dialogs_active_bg, 0x212121);
+    assert_eq!(ob_dark.dialogs_hover_bg, 0x242424);
+    assert_eq!(ob_dark.msg_in_bg, 0x212121);
+    assert_eq!(ob_dark.msg_out_bg, 0x242424);
+    assert_eq!(ob_dark.border_fg, 0x262626);
+    assert_eq!(ob_dark.unread_badge_bg, 0x705083);
+    assert_eq!(ob_dark.unread_badge_fg, 0xF6EFE2);
+    assert_eq!(ob_dark.font_size_px, 15);
+    assert_eq!(ob_dark.bubble_radius_px, 16);
+    assert_eq!(ob_dark.ui_scale_pct, 125);
+    assert!(ob_dark.blur_wallpaper);
+    assert_ne!(ob_dark.dialogs_active_bg, 0x007AFF);
+    assert_ne!(ob_dark.dialogs_active_bg, 0x0A84FF);
+    assert_eq!(ob_dark.with_openbot_chrome(), ob_dark);
+
+    let ob_light = TdesktopThemePalette::build_openbot(TdesktopThemeMode::Day, 0, 14, 18);
+    assert_eq!(ob_light.openbot_scheme(), OpenBotColorScheme::Light);
+    assert_eq!(ob_light.openbot_palette().bg_frame(), rgb(0xE8E8EB));
+    assert_eq!(ob_light.window_bg, 0xE8E8EB);
+    assert_eq!(ob_light.dialogs_bg, 0xF5F5F6);
+    assert_eq!(ob_light.dialogs_active_bg, 0xE8E8EB);
+    assert_eq!(ob_light.msg_in_bg, 0xFFFFFF);
+    assert_eq!(ob_light.msg_out_bg, 0xFCFCFC);
+    assert_eq!(ob_light.msg_out_fg, 0x141414);
+    assert_ne!(ob_light.dialogs_active_bg, 0x1680F3);
+    assert_eq!(ob_light.with_openbot_chrome(), ob_light);
+
+    let ob_classic = TdesktopThemePalette::build_openbot(TdesktopThemeMode::Classic, 0, 14, 12);
+    assert_eq!(ob_classic.openbot_scheme(), OpenBotColorScheme::Light);
+    assert_eq!(ob_classic.msg_out_bg, 0xEFFDDE);
+    assert_eq!(ob_classic.dialogs_active_bg, 0xE8E8EB);
+}
+
+#[test]
+fn m1_ui_f02_plush_bot_default_routing_felt_badges_and_channel_avatar() {
+    use gpui_telegram_desktop::components::avatar::{
+        FeltStatusBadgeState, GrokBotAvatarProps, legacy_shape_to_bloub_shape,
+        render_channel_avatar, render_felt_status_badge, render_grok_bot_avatar,
+        render_plush_bot_avatar, render_plush_bot_avatar_with_controller,
+    };
+    use openbot_contracts::avatar::{
+        ACTIVITY_HOLD_MS, AgentStepActivity, AvatarHue, AvatarMood, BloubShape,
+    };
+
+    // Legacy shape mappings & deterministic fallback for generic blob/teardrop/empty
+    assert_eq!(legacy_shape_to_bloub_shape("pebble"), Some(BloubShape::Galet));
+    assert_eq!(
+        legacy_shape_to_bloub_shape("squircle"),
+        Some(BloubShape::Squircle)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("tablet"),
+        Some(BloubShape::Capsule)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("hex"),
+        Some(BloubShape::Hexagone)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("hexagon"),
+        Some(BloubShape::Hexagone)
+    );
+    assert_eq!(legacy_shape_to_bloub_shape("cloud"), Some(BloubShape::Nuage));
+    assert_eq!(
+        legacy_shape_to_bloub_shape("wedge"),
+        Some(BloubShape::Triangle)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("diamond"),
+        Some(BloubShape::Losange)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("circle"),
+        Some(BloubShape::Cercle)
+    );
+    assert_eq!(
+        legacy_shape_to_bloub_shape("shield"),
+        Some(BloubShape::Pentagone)
+    );
+    assert_eq!(legacy_shape_to_bloub_shape("blob"), None);
+    assert_eq!(legacy_shape_to_bloub_shape("teardrop"), None);
+    assert_eq!(legacy_shape_to_bloub_shape(""), None);
+    assert_eq!(legacy_shape_to_bloub_shape("plush"), None);
+
+    // All 13 silhouettes, 7 moods, and 8 tool activities render via PlushFeltRenderer
+    for shape in BloubShape::ALL {
+        let mut r = PlushFeltRenderer::for_seed_with_activity(
+            "bot-alpha",
+            Some(shape),
+            Some(AvatarHue::Violet),
+            None,
+            AvatarMood::Idle,
+            None,
+        );
+        let sample = r.sample_plush_frame(0.0, true);
+        assert_eq!(sample.shape, bloub_shape_to_engine(shape));
+        let _div = render_plush_bot_avatar(
+            "bot-alpha",
+            Some(shape),
+            Some(AvatarHue::Violet),
+            None,
+            40.0,
+            AvatarMood::Idle,
+            None,
+        );
+    }
+    for mood in [
+        AvatarMood::Idle,
+        AvatarMood::Working,
+        AvatarMood::Waiting,
+        AvatarMood::Failed,
+        AvatarMood::Responded,
+        AvatarMood::Connecting,
+        AvatarMood::Asleep,
+    ] {
+        let _div = render_plush_bot_avatar("bot-mood", None, None, Some("#3b93f0"), 36.0, mood, None);
+    }
+    for act in [
+        AgentStepActivity::Searching,
+        AgentStepActivity::Browsing,
+        AgentStepActivity::Reading,
+        AgentStepActivity::Running,
+        AgentStepActivity::Editing,
+        AgentStepActivity::Delegating,
+        AgentStepActivity::Working,
+        AgentStepActivity::Reviewing,
+    ] {
+        let _div = render_plush_bot_avatar(
+            "bot-activity",
+            None,
+            None,
+            None,
+            36.0,
+            AvatarMood::Working,
+            Some(act),
+        );
+    }
+
+    // 1400ms ACTIVITY_HOLD_MS enforced through render_plush_bot_avatar_with_controller
+    let mut ctrl = AgentAvatarController::new("bot-hold");
+    let mut props = AgentAvatarProps::new("bot-hold")
+        .with_size(46.0)
+        .with_mood(AvatarMood::Working);
+    props.activity = Some(AgentStepActivity::Searching);
+    let _el0 = render_plush_bot_avatar_with_controller(&props, &mut ctrl, 1_000);
+    assert_eq!(ctrl.held_activity, Some(AgentStepActivity::Searching));
+
+    props.activity = Some(AgentStepActivity::Editing);
+    let _el1 = render_plush_bot_avatar_with_controller(&props, &mut ctrl, 1_500);
+    assert_eq!(ctrl.held_activity, Some(AgentStepActivity::Searching));
+
+    let _el2 = render_plush_bot_avatar_with_controller(
+        &props,
+        &mut ctrl,
+        1_000 + u64::from(ACTIVITY_HOLD_MS),
+    );
+    assert_eq!(ctrl.held_activity, Some(AgentStepActivity::Editing));
+
+    // Legacy & escape-hatch dispatch in render_grok_bot_avatar & render_fabushi_shape_avatar
+    for shape in [
+        "blob",
+        "pebble",
+        "squircle",
+        "tablet",
+        "wedge",
+        "hex",
+        "cloud",
+        "teardrop",
+        "",
+        "plush:nexo",
+        "plush:poulpe",
+        "bloub:squircle",
+        "grok2d:blob",
+    ] {
+        let _g = render_grok_bot_avatar(
+            GrokBotAvatarProps::new("bot-42", shape, "purple", 36.0)
+                .with_state(GrokPersonaState::Searching),
+        );
+        let _f = render_fabushi_shape_avatar(shape, 0x8B5CF6, "Bot 42", 36.0);
+    }
+
+    // Felt status badges (all 5 states + 3-ball hopping curve)
+    assert_eq!(working_ball_hop_sample(0, 0), (0.0, 7.0, 7.0));
+    assert_eq!(working_ball_hop_sample(0, 1), (0.0, 7.0, 7.0));
+    assert_eq!(working_ball_hop_sample(0, 2), (0.0, 7.0, 7.0));
+    let (dy_peak, _, _) = working_ball_hop_sample(245, 0);
+    assert!(dy_peak < -1.2 && dy_peak >= -1.76, "dy_peak={dy_peak}");
+    let (dy_stagger, _, _) = working_ball_hop_sample(245, 2);
+    assert!(dy_stagger > dy_peak, "ball 2 must lag behind ball 0");
+
+    for state in [
+        FeltStatusBadgeState::Working3Balls,
+        FeltStatusBadgeState::UnreadPlum(5),
+        FeltStatusBadgeState::WaitingAmber,
+        FeltStatusBadgeState::RespondedGreen,
+        FeltStatusBadgeState::ErrorRaspberry,
+    ] {
+        let _dark_b = render_felt_status_badge(state, 0x1A1A1A, true, 240);
+        let _light_b = render_felt_status_badge(state, 0xF5F5F6, false, 0);
+    }
+
+    // ChannelAvatar across 0/1/2/3/4/5/13 members in Cluster & Row layouts + custom icon
+    for n in [0usize, 1, 2, 3, 4, 5, 13] {
+        let members: Vec<ChannelMember> = (0..n)
+            .map(|idx| ChannelMember {
+                agent_id: format!("ch-agent-{idx}"),
+            })
+            .collect();
+        let briefs: Vec<ChannelAgentBrief> = (0..n)
+            .map(|idx| ChannelAgentBrief {
+                id: format!("ch-agent-{idx}"),
+                avatar_seed: Some(format!("ch-agent-{idx}")),
+                avatar_hue: None,
+                avatar_color: None,
+                avatar_url: None,
+            })
+            .collect();
+        let _cluster = render_channel_avatar(
+            &members,
+            &briefs,
+            ChannelAvatarLayout::Cluster,
+            None,
+            None,
+            false,
+            46.0,
+            Some(SidebarPlushRingKind::Default),
+            true,
+            0.0,
+        );
+        let _row = render_channel_avatar(
+            &members,
+            &briefs,
+            ChannelAvatarLayout::Row,
+            None,
+            None,
+            false,
+            18.0,
+            None,
+            true,
+            0.0,
+        );
+    }
+    let custom_icon = ChannelIcon {
+        name: "Sparkles".to_string(),
+        hue: AvatarHue::Blue.degrees(),
+    };
+    let _icon_tile = render_channel_avatar(
+        &[],
+        &[],
+        ChannelAvatarLayout::Cluster,
+        Some(&custom_icon),
+        None,
+        false,
+        46.0,
+        None,
+        true,
+        0.0,
+    );
+}
+
+#[test]
+fn m1_ui_f04_page_rail_width_pins_persistence_and_more_menu_highlight() {
+    use gpui_telegram_desktop::views::apple_sidebar::{
+        AppleAppSidebar, AppleSidebarSection, COLLAPSED_WIDTH, DEFAULT_PINNED_SECTIONS,
+        EXPANDED_WIDTH, OPENBOT_PAGE_RAIL_WIDTH, PAGE_RAIL_PINS_FILE, PINNABLE_SECTIONS,
+        load_page_rail_pins, sanitize_pinned_sections, save_page_rail_pins,
+    };
+
+    assert!((OPENBOT_PAGE_RAIL_WIDTH - 52.0).abs() < f32::EPSILON);
+    assert!((EXPANDED_WIDTH - 52.0).abs() < f32::EPSILON);
+    assert!((COLLAPSED_WIDTH - 52.0).abs() < f32::EPSILON);
+    assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 5);
+    assert_eq!(PINNABLE_SECTIONS.len(), 16);
+    assert!(!AppleSidebarSection::Chats.is_pinnable());
+
+    for sec in PINNABLE_SECTIONS {
+        assert!(sec.is_pinnable());
+        assert!(!sec.localized_label("zh-CN").is_empty());
+        assert!(!sec.localized_label("en").is_empty());
+        assert!(sec.element_id().starts_with("apple-sidebar-nav-"));
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        load_page_rail_pins(tmp.path()),
+        DEFAULT_PINNED_SECTIONS.to_vec()
+    );
+
+    let sanitized = sanitize_pinned_sections(vec![
+        AppleSidebarSection::Chats,
+        AppleSidebarSection::Workflows,
+        AppleSidebarSection::Usage,
+        AppleSidebarSection::Workflows,
+    ]);
+    assert_eq!(
+        sanitized,
+        vec![AppleSidebarSection::Workflows, AppleSidebarSection::Usage]
+    );
+
+    save_page_rail_pins(tmp.path(), &sanitized).expect("save pins");
+    assert_eq!(load_page_rail_pins(tmp.path()), sanitized);
+
+    // Explicit empty [] preserved on reload
+    save_page_rail_pins(tmp.path(), &[]).expect("save empty pins");
+    assert!(load_page_rail_pins(tmp.path()).is_empty());
+
+    // Corrupt file recovers to defaults
+    fs::write(tmp.path().join(PAGE_RAIL_PINS_FILE), b"corrupt{").expect("corrupt");
+    assert_eq!(
+        load_page_rail_pins(tmp.path()),
+        DEFAULT_PINNED_SECTIONS.to_vec()
+    );
+
+    let mut rail = AppleAppSidebar::new_with_pins(
+        TdesktopThemePalette::build_openbot(TdesktopThemeMode::Night, 0, 14, 18),
+        "zh-CN",
+        DEFAULT_PINNED_SECTIONS.to_vec(),
+    );
+    assert!((rail.effective_width() - 52.0).abs() < f32::EPSILON);
+    assert!(!rail.current_in_more_menu());
+
+    rail.set_highlighted_destination(Some(AppleSidebarSection::McpTools));
+    assert!(rail.current_in_more_menu());
+
+    rail.set_narrow_hidden(true);
+    assert!((rail.effective_width() - 0.0).abs() < f32::EPSILON);
+    rail.set_narrow_hidden(false);
+    assert!((rail.effective_width() - 52.0).abs() < f32::EPSILON);
+}

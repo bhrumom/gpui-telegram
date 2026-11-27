@@ -422,3 +422,208 @@ pub fn render_loading_history_skeleton(
         )
         .into_any_element()
 }
+
+/// Renders OpenBot's optional OKLab-clamped chat canvas background (defaulting cleanly to `#1a1a1a` / `#f5f5f6`).
+pub fn render_openbot_stage_backdrop(
+    palette: &TdesktopThemePalette,
+    custom_chat_color_hex: Option<&str>,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
+    let bg_rgba = custom_chat_color_hex
+        .and_then(|hex| crate::theme::readable_chat_background_for_dark(hex, is_dark).ok())
+        .and_then(|clamped| crate::theme::openbot_palette::parse_css_color_to_rgba(&clamped))
+        .unwrap_or_else(|| ob.bg_canvas());
+    div()
+        .id("openbot-stage-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(bg_rgba)
+        .into_any_element()
+}
+
+/// Renders OpenBot's `AgentChatEmptyState` (`64px` 3D plush hero + heading + bio + sample preview).
+pub fn render_openbot_agent_empty_state(
+    chat_id: u64,
+    agent_name: &str,
+    description: Option<&str>,
+    active_fabushi_bot: Option<&gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let is_zh = lang_id.starts_with("zh");
+    let seed = format!("bot_{}_{}", chat_id, agent_name);
+    let plush = super::openbot_stage_chrome::render_fabushi_plush_avatar(
+        active_fabushi_bot,
+        &seed,
+        64.0,
+        openbot_contracts::avatar::AvatarMood::Idle,
+        None,
+    );
+    let heading = if is_zh {
+        format!("{} 已准备就绪", agent_name)
+    } else {
+        format!("{} is ready", agent_name)
+    };
+    let bio = description
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            active_fabushi_bot
+                .map(|f| f.description.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| {
+            if is_zh {
+                "在下方输入任务、使用 $ 技能或 @ 引用上下文开始协作。".to_string()
+            } else {
+                "Send a prompt below, trigger a $ skill, or @ reference context to begin.".to_string()
+            }
+        });
+    let sample_prompt = if is_zh {
+        "帮我梳理今天待办并总结重点"
+    } else {
+        "Summarize today's priorities and draft a quick plan"
+    };
+
+    div()
+        .id("openbot-agent-empty-state")
+        .flex_1()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(28.0))
+        .child(
+            div()
+                .w_full()
+                .max_w(px(460.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(12.0))
+                .child(plush)
+                .child(
+                    div()
+                        .text_size(px(24.0))
+                        .line_height(px(30.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
+                        .child(heading),
+                )
+                .child(
+                    div()
+                        .max_w(px(400.0))
+                        .text_size(px(14.0))
+                        .line_height(px(20.0))
+                        .text_color(ob.text_muted())
+                        .child(bio),
+                )
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .px(px(14.0))
+                        .py(px(9.0))
+                        .rounded(px(22.0))
+                        .bg(ob.bg_surface_raised())
+                        .border_1()
+                        .border_color(ob.border_hairline())
+                        .opacity(0.75)
+                        .text_size(px(13.0))
+                        .text_color(ob.text_secondary())
+                        .child(sample_prompt),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Renders OpenBot's `ChannelEmptyState` (`44px` `ChannelAvatar::Row`, `20px` name, subtitle, roster hint).
+pub fn render_openbot_channel_empty_state(
+    chat_id: u64,
+    channel_name: &str,
+    subtitle: &str,
+    avatar_url: Option<&str>,
+    group_member_tiles: Option<&[(String, u32)]>,
+    group_member_briefs: &[crate::components::avatar::ChannelAgentBrief],
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let is_zh = lang_id.starts_with("zh");
+    let is_dark = palette.mode.is_dark();
+    let (members, agents) = super::openbot_stage_chrome::build_channel_avatar_inputs(
+        chat_id,
+        group_member_tiles,
+        group_member_briefs,
+    );
+    let member_count = members.len();
+    let roster_hint = if member_count == 0 {
+        if is_zh {
+            "在频道设置中添加助手或成员即可开始多方协作。".to_string()
+        } else {
+            "Add agents in channel settings to start collaborating.".to_string()
+        }
+    } else if is_zh {
+        format!("共 {} 位成员 · 使用 @提及 指定回复或 @everyone 通知全部", member_count)
+    } else {
+        format!("{} members · Mention @agent to assign or @everyone to broadcast", member_count)
+    };
+    let clean_sub = subtitle.trim();
+
+    div()
+        .id("openbot-channel-empty-state")
+        .flex_1()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(28.0))
+        .child(
+            div()
+                .w_full()
+                .max_w(px(440.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .child(crate::components::avatar::render_channel_avatar(
+                    &members,
+                    &agents,
+                    crate::components::avatar::ChannelAvatarLayout::Row,
+                    None,
+                    avatar_url.filter(|u| !u.trim().is_empty()),
+                    false,
+                    44.0,
+                    None,
+                    is_dark,
+                    0.0,
+                ))
+                .child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(px(20.0))
+                        .line_height(px(26.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
+                        .child(channel_name.to_string()),
+                )
+                .when(!clean_sub.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(ob.text_muted())
+                            .child(clean_sub.to_string()),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(px(13.0))
+                        .text_color(ob.text_dim())
+                        .child(roster_hint),
+                ),
+        )
+        .into_any_element()
+}

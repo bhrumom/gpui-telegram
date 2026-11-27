@@ -3,11 +3,15 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+use std::collections::HashSet;
+
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
+use crate::views::chat_sidebar::OPENBOT_TABS_HEIGHT;
 use crate::views::sidebar::dialogs_quick_action::{DialogsQuickAction, QuickDialogAction};
 use crate::views::sidebar::dialogs_row_view::SidebarContextAction;
 use crate::views::sidebar::dialogs_three_state_icon::DialogsThreeStateIcon;
+use crate::views::sidebar::openbot_sidebar_chrome::{openbot_vector_icon, OpenBotChromeIcon};
 use crate::views::sidebar::ui::dialogs_quick_action::QuickDialogActionType;
 use crate::views::sidebar::ui::dialogs_quick_action_context::DialogsQuickActionContextUi;
 use crate::views::sidebar::ui::dialogs_topics_view::DialogsTopicsViewUi;
@@ -25,6 +29,298 @@ pub fn localize_folder_label(folder: &str, lang_id: &str) -> String {
     }
 }
 
+/// Renders OpenBot's exact `32px` flat underline `SidebarTabs` (`全部` + `未读` + visible folders)
+/// with the right-aligned `28x28` `SlidersHorizontal` tab-visibility trigger.
+#[allow(clippy::too_many_arguments)]
+pub fn render_openbot_sidebar_tabs<V: 'static>(
+    folders: &[(String, u32)],
+    total_unread_count: u32,
+    active_folder: &str,
+    hidden_tab_ids: &HashSet<String>,
+    is_edit_menu_open: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_select_folder: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+    on_toggle_edit_menu: impl Fn(&mut V, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let text_pri = ob.text_primary();
+    let text_sec = ob.text_secondary();
+    let text_muted = ob.text_muted();
+    let hover_bg = ob.hover();
+    let badge_idle_bg = ob.bg_control_active();
+    let badge_active_bg = ob.accent();
+
+    // Always lead with "All", then "Unread" (visible by default unless hidden), then other visible folders.
+    let mut visible_tabs: Vec<(String, u32)> = Vec::new();
+    visible_tabs.push(("All".to_string(), 0));
+    if !hidden_tab_ids.contains("Unread") {
+        let unread_n = folders
+            .iter()
+            .find(|(f, _)| f == "Unread")
+            .map(|(_, c)| *c)
+            .unwrap_or(total_unread_count);
+        visible_tabs.push(("Unread".to_string(), unread_n));
+    }
+    for (folder, unread) in folders {
+        if folder == "All" || folder == "Unread" {
+            continue;
+        }
+        if !hidden_tab_ids.contains(folder) {
+            visible_tabs.push((folder.clone(), *unread));
+        }
+    }
+
+    let tabs: Vec<AnyElement> = visible_tabs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (folder, unread))| {
+            let is_active = folder == active_folder;
+            let fname = folder.clone();
+            let display_label = localize_folder_label(&folder, lang_id);
+            let cb = on_select_folder.clone();
+            let show_badge = folder != "All" && unread > 0;
+            div()
+                .id(("sidebar-folder-tab", idx as u64))
+                .cursor_pointer()
+                .relative()
+                .h(px(OPENBOT_TABS_HEIGHT))
+                .flex_shrink_0()
+                .px(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if is_active { text_pri } else { text_muted })
+                .hover(move |s| if is_active { s } else { s.text_color(text_pri) })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        cb(this, fname.clone(), cx);
+                    }),
+                )
+                .child(display_label)
+                .when(show_badge, |el| {
+                    el.child(
+                        div()
+                            .h(px(18.0))
+                            .min_w(px(18.0))
+                            .px(px(4.0))
+                            .rounded_full()
+                            .bg(if is_active { badge_active_bg } else { badge_idle_bg })
+                            .text_color(if is_active { rgb(0xFFFFFF) } else { text_sec })
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if unread > 99 {
+                                "99+".to_string()
+                            } else {
+                                unread.to_string()
+                            }),
+                    )
+                })
+                .when(is_active, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(text_pri),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .id("openbot-sidebar-tabs")
+        .mx(px(4.0))
+        .mb(px(4.0))
+        .pr(px(4.0))
+        .h(px(OPENBOT_TABS_HEIGHT))
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(hover_bg)
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_x_hidden()
+                .flex()
+                .items_center()
+                .children(tabs),
+        )
+        .child(
+            div()
+                .id("openbot-sidebar-tabs-edit-btn")
+                .cursor_pointer()
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .when(is_edit_menu_open, |el| el.bg(badge_idle_bg))
+                .hover(move |s| s.bg(hover_bg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        on_toggle_edit_menu(this, cx);
+                    }),
+                )
+                .child(openbot_vector_icon(
+                    OpenBotChromeIcon::SlidersHorizontal,
+                    15.0,
+                    if is_edit_menu_open { text_pri } else { text_muted },
+                )),
+        )
+        .into_any_element()
+}
+
+/// Renders the `SlidersHorizontal` tab-visibility checkbox popover (show/hide `未读` & folders).
+#[allow(clippy::too_many_arguments)]
+pub fn render_openbot_tabs_edit_popover<V: 'static>(
+    available_folders: &[(String, u32)],
+    hidden_tab_ids: &HashSet<String>,
+    external_topbar_hosted: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_toggle_tab_visibility: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+    on_dismiss: impl Fn(&mut V, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let surface = ob.bg_surface();
+    let border = ob.border_strong_hairline();
+    let sep = ob.border_hairline();
+    let hover = ob.bg_control_hover();
+    let text_pri = ob.text_primary();
+    let text_muted = ob.text_muted();
+    let top_px = if external_topbar_hosted { 84.0 } else { 120.0 };
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    let unread_visible = !hidden_tab_ids.contains("Unread");
+    let cb_unread = on_toggle_tab_visibility.clone();
+    rows.push(
+        div()
+            .id("openbot-tab-vis-unread")
+            .cursor_pointer()
+            .h(px(30.0))
+            .px(px(8.0))
+            .rounded(px(7.0))
+            .hover(move |s| s.bg(hover))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    cb_unread(this, "Unread".to_string(), cx);
+                }),
+            )
+            .child(div().w(px(14.0)).flex().items_center().justify_center().when(unread_visible, |el| {
+                el.child(openbot_vector_icon(OpenBotChromeIcon::Check, 13.0, text_pri))
+            }))
+            .child(div().text_size(px(12.5)).text_color(text_pri).child(tr_str(lang_id, "未读", "Unread")))
+            .into_any_element(),
+    );
+
+    let extra_folders: Vec<&(String, u32)> = available_folders
+        .iter()
+        .filter(|(f, _)| f != "All" && f != "Unread")
+        .collect();
+    if !extra_folders.is_empty() {
+        rows.push(div().h(px(1.0)).mx(px(6.0)).my(px(4.0)).bg(sep).into_any_element());
+        for (idx, (folder, count)) in extra_folders.into_iter().enumerate() {
+            let visible = !hidden_tab_ids.contains(folder);
+            let fname = folder.clone();
+            let cb = on_toggle_tab_visibility.clone();
+            let label = localize_folder_label(folder, lang_id);
+            rows.push(
+                div()
+                    .id(("openbot-tab-vis-folder", idx as u64))
+                    .cursor_pointer()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(7.0))
+                    .hover(move |s| s.bg(hover))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            cb(this, fname.clone(), cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().w(px(14.0)).flex().items_center().justify_center().when(visible, |el| {
+                                el.child(openbot_vector_icon(OpenBotChromeIcon::Check, 13.0, text_pri))
+                            }))
+                            .child(div().text_size(px(12.5)).text_color(text_pri).child(label)),
+                    )
+                    .when(*count > 0, |el| {
+                        el.child(div().text_size(px(11.0)).text_color(text_muted).child(count.to_string()))
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
+
+    div()
+        .id("openbot-tabs-edit-backdrop")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                on_dismiss(this, cx);
+            }),
+        )
+        .child(
+            deferred(
+                div()
+                    .id("openbot-tabs-edit-popover")
+                    .absolute()
+                    .right(px(8.0))
+                    .top(px(top_px))
+                    .w(px(196.0))
+                    .p(px(5.0))
+                    .rounded(px(12.0))
+                    .bg(surface)
+                    .border_1()
+                    .border_color(border)
+                    .shadow(palette.popover_shadows())
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .children(rows),
+            )
+            .with_priority(38),
+        )
+        .into_any_element()
+}
+
 pub fn render_folder_tabs_strip<V: 'static>(
     folders: &[(String, u32)],
     active_folder: &str,
@@ -37,17 +333,13 @@ pub fn render_folder_tabs_strip<V: 'static>(
     let is_apple = palette.is_apple_style();
 
     if is_apple {
-        let idle_bg = if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.055)
-        };
-        let idle_hover_bg = if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.13)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.095)
-        };
-        let text_hover = rgb(palette.text_primary);
+        let ob = palette.openbot_palette();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+        let hover_bg = ob.hover();
+        let badge_idle_bg = ob.bg_control_active();
+        let badge_active_bg = ob.accent();
         let tabs: Vec<AnyElement> = folders
             .iter()
             .enumerate()
@@ -60,36 +352,17 @@ pub fn render_folder_tabs_strip<V: 'static>(
                 div()
                     .id(("sidebar-folder-tab", idx as u64))
                     .cursor_pointer()
-                    .h(px(palette.scaled_px(24.0)))
+                    .relative()
+                    .h(px(OPENBOT_TABS_HEIGHT))
                     .flex_shrink_0()
-                    .px(px(palette.scaled_px(9.0)))
-                    .rounded_full()
-                    .bg(if is_active {
-                        rgb(palette.accent)
-                    } else {
-                        idle_bg
-                    })
-                    .hover(move |s| {
-                        if is_active {
-                            s
-                        } else {
-                            s.bg(idle_hover_bg).text_color(text_hover)
-                        }
-                    })
+                    .px(px(6.0))
                     .flex()
                     .items_center()
-                    .gap(px(palette.scaled_px(4.0)))
-                    .text_size(px(palette.scaled_px(11.5)))
-                    .font_weight(if is_active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(if is_active {
-                        rgb(0xFFFFFF)
-                    } else {
-                        rgb(palette.text_secondary)
-                    })
+                    .gap(px(4.0))
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if is_active { text_pri } else { text_muted })
+                    .hover(move |s| if is_active { s } else { s.text_color(text_pri) })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
@@ -97,29 +370,33 @@ pub fn render_folder_tabs_strip<V: 'static>(
                         }),
                     )
                     .child(display_label)
-                    .when(*unread > 0, |el| {
+                    .when(*unread > 0 && folder != "All", |el| {
                         el.child(
                             div()
-                                .h(px(palette.scaled_px(15.0)))
-                                .min_w(px(palette.scaled_px(15.0)))
-                                .px(px(palette.scaled_px(4.0)))
+                                .h(px(18.0))
+                                .min_w(px(18.0))
+                                .px(px(4.0))
                                 .rounded_full()
-                                .bg(if is_active {
-                                    TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.25)
-                                } else {
-                                    TdesktopThemePalette::rgba_with_alpha(palette.text_secondary, 0.18)
-                                })
-                                .text_color(if is_active {
-                                    rgb(0xFFFFFF)
-                                } else {
-                                    rgb(palette.text_secondary)
-                                })
-                                .text_size(px(palette.scaled_px(9.5)))
-                                .font_weight(FontWeight::BOLD)
+                                .bg(if is_active { badge_active_bg } else { badge_idle_bg })
+                                .text_color(if is_active { rgb(0xFFFFFF) } else { text_sec })
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .child(format!("{}", unread)),
+                        )
+                    })
+                    .when(is_active, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.0))
+                                .rounded_full()
+                                .bg(text_pri),
                         )
                     })
                     .into_any_element()
@@ -127,16 +404,14 @@ pub fn render_folder_tabs_strip<V: 'static>(
             .collect();
 
         return div()
-            .h(px(palette.scaled_px(34.0)))
+            .mx(px(4.0))
+            .mb(px(4.0))
+            .h(px(OPENBOT_TABS_HEIGHT))
             .flex_shrink_0()
-            .w_full()
-            .px(px(palette.scaled_px(12.0)))
-            .pb(px(palette.scaled_px(6.0)))
+            .border_b_1()
+            .border_color(hover_bg)
             .flex()
             .items_center()
-            .gap(px(palette.scaled_px(5.0)))
-            .border_b_1()
-            .border_color(palette.separator_rgba())
             .overflow_x_hidden()
             .children(tabs)
             .into_any_element();
@@ -218,14 +493,20 @@ pub fn render_forum_topics_subtree<V: 'static>(
 ) -> AnyElement {
     let forum_id = topics.forum_id;
     let is_apple = palette.is_apple_style();
+    let ob = palette.openbot_palette();
     let hover_bg = if is_apple {
-        if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
-        }
+        ob.hover()
     } else {
         rgb(palette.dialogs_hover_bg)
+    };
+    let active_bg = if is_apple {
+        if palette.mode.is_dark() {
+            ob.bg_surface()
+        } else {
+            rgb(0xE8E8EB)
+        }
+    } else {
+        rgb(palette.dialogs_active_bg)
     };
     let rows: Vec<AnyElement> = topics
         .topics
@@ -235,6 +516,20 @@ pub fn render_forum_topics_subtree<V: 'static>(
             let tid = topic.topic_id;
             let is_sel = selected_topic == Some((forum_id, tid));
             let cb = on_select_topic.clone();
+            let title_fg = if is_apple {
+                ob.text_primary()
+            } else if is_sel {
+                rgb(0xFFFFFF)
+            } else {
+                rgb(palette.text_primary)
+            };
+            let icon_col = if is_apple {
+                if is_sel { ob.text_primary() } else { ob.text_muted() }
+            } else if is_sel {
+                rgb(0xFFFFFF)
+            } else {
+                rgb(palette.accent)
+            };
             div()
                 .id(("sidebar-topic-row", tid))
                 .cursor_pointer()
@@ -243,7 +538,7 @@ pub fn render_forum_topics_subtree<V: 'static>(
                 .pl(px(58.0))
                 .pr(px(10.0))
                 .when(is_apple, |el| el.rounded(px(8.0)))
-                .when(is_sel, |el| el.bg(rgb(palette.dialogs_active_bg)))
+                .when(is_sel, |el| el.bg(active_bg))
                 .when(!is_sel && !is_apple, |el| el.bg(rgb(palette.dialogs_bg)))
                 .hover(move |s| if is_sel { s } else { s.bg(hover_bg) })
                 .flex()
@@ -254,31 +549,26 @@ pub fn render_forum_topics_subtree<V: 'static>(
                 }))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .items_center()
                         .gap(px(6.0))
                         .overflow_hidden()
-                        .child(tg_icon(
-                            IconName::FolderChat,
-                            12.0,
-                            if is_sel { 0xFFFFFF } else { palette.accent },
-                        ))
+                        .child(tg_icon_rgba(IconName::FolderChat, 12.0, icon_col))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .text_size(px(12.5))
-                                .text_color(if is_sel {
-                                    rgb(0xFFFFFF)
-                                } else {
-                                    rgb(palette.text_primary)
-                                })
+                                .text_color(title_fg)
                                 .child(topic.title.clone()),
                         )
                         .when(topic.is_closed, |el| {
-                            el.child(tg_icon(
-                                IconName::Lock,
-                                11.0,
-                                if is_sel { 0xFFFFFF } else { palette.icon_fg },
-                            ))
+                            el.child(tg_icon_rgba(IconName::Lock, 11.0, icon_col))
                         }),
                 )
                 .when(topic.unread_count > 0, |el| {
@@ -288,7 +578,9 @@ pub fn render_forum_topics_subtree<V: 'static>(
                             .min_w(px(16.0))
                             .px(px(4.0))
                             .rounded_full()
-                            .bg(if is_sel {
+                            .bg(if is_apple {
+                                ob.bg_control_active()
+                            } else if is_sel {
                                 TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.25)
                             } else {
                                 rgb(palette.unread_badge_bg)
@@ -298,7 +590,11 @@ pub fn render_forum_topics_subtree<V: 'static>(
                             .justify_center()
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(palette.unread_badge_fg))
+                            .text_color(if is_apple {
+                                ob.text_secondary()
+                            } else {
+                                rgb(palette.unread_badge_fg)
+                            })
                             .child(format!("{}", topic.unread_count)),
                     )
                 })
@@ -307,11 +603,8 @@ pub fn render_forum_topics_subtree<V: 'static>(
         .collect();
     div()
         .w_full()
-        .border_b_1()
-        .border_color(if is_apple {
-            palette.separator_rgba()
-        } else {
-            rgb(palette.border_fg)
+        .when(!is_apple, |el| {
+            el.border_b_1().border_color(rgb(palette.border_fg))
         })
         .flex()
         .flex_col()
@@ -337,27 +630,21 @@ pub fn render_dialog_context_menu<V: 'static>(
     let _ctx_pin = DialogsQuickActionContextUi::new(dialog_id, QuickDialogActionType::Pin);
 
     let is_apple = palette.is_apple_style();
+    let ob = palette.openbot_palette();
     let x = f32::from(anchor.x).clamp(8.0, 92.0);
     let y = f32::from(anchor.y).clamp(56.0, 420.0);
     let hover = if is_apple {
-        if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.05)
-        }
+        ob.bg_control_hover()
     } else {
         rgb(palette.menu_hover_bg)
     };
     let menu_bg = if is_apple {
-        TdesktopThemePalette::rgba_with_alpha(
-            palette.menu_bg,
-            if palette.mode.is_dark() { 0.94 } else { 0.96 },
-        )
+        ob.bg_surface()
     } else {
         rgb(palette.menu_bg)
     };
     let menu_border = if is_apple {
-        palette.separator_rgba()
+        ob.border_strong_hairline()
     } else {
         rgb(palette.border_fg)
     };
@@ -379,13 +666,25 @@ pub fn render_dialog_context_menu<V: 'static>(
                     .h(px(1.0))
                     .mx(px(6.0))
                     .my(px(3.0))
-                    .bg(menu_border)
+                    .bg(if is_apple { ob.border_hairline() } else { menu_border })
                     .into_any_element(),
             );
         }
         let cb = on_action.clone();
-        let fg = if danger { palette.danger } else { palette.text_primary };
-        let ic = if danger { palette.danger } else { palette.icon_fg };
+        let fg = if danger {
+            if is_apple { ob.danger() } else { rgb(palette.danger) }
+        } else if is_apple {
+            ob.text_primary()
+        } else {
+            rgb(palette.text_primary)
+        };
+        let ic = if danger {
+            if is_apple { ob.danger() } else { rgb(palette.danger) }
+        } else if is_apple {
+            ob.text_muted()
+        } else {
+            rgb(palette.icon_fg)
+        };
         rows.push(
             div()
                 .id(("sidebar-ctx-item", idx as u64))
@@ -401,8 +700,8 @@ pub fn render_dialog_context_menu<V: 'static>(
                     cx.stop_propagation();
                     cb(this, act, cx);
                 }))
-                .child(tg_icon(icon, 14.0, ic))
-                .child(div().text_size(px(12.5)).text_color(rgb(fg)).child(label))
+                .child(tg_icon_rgba(icon, 14.0, ic))
+                .child(div().text_size(px(12.5)).text_color(fg).child(label))
                 .into_any_element(),
         );
     }

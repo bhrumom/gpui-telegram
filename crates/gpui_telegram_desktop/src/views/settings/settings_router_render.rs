@@ -1,19 +1,76 @@
-//! Rendering implementation for `SettingsRouter` modal overlay, header navigation bar,
-//! lazy active section mounting, and interface language selector.
+//! Rendering implementation for `SettingsRouter` OpenBot 2-column searchable settings page,
+//! left navigation rail with instant cross-tab search, breadcrumb top bar, lazy active section
+//! mounting, and interface language selector.
 
 use super::settings_router::SettingsRouter;
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName};
+use crate::theme::{tg_icon_rgba, IconName};
 use crate::views::app_shell::modal_container::{macos_modal_backdrop_rgba, macos_modal_card};
 use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, rgb, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    div, px, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
 
+struct SettingsNavGroup {
+    zh: &'static str,
+    en: &'static str,
+    sections: &'static [SettingsSectionType],
+}
+
+const SETTINGS_NAV_GROUPS: &[SettingsNavGroup] = &[
+    SettingsNavGroup {
+        zh: "常规",
+        en: "General",
+        sections: &[
+            SettingsSectionType::Main,
+            SettingsSectionType::Information,
+            SettingsSectionType::Chat,
+            SettingsSectionType::Folders,
+            SettingsSectionType::Notifications,
+            SettingsSectionType::Calls,
+            SettingsSectionType::Language,
+        ],
+    },
+    SettingsNavGroup {
+        zh: "隐私与安全",
+        en: "Privacy & Security",
+        sections: &[
+            SettingsSectionType::PrivacySecurity,
+            SettingsSectionType::ActiveSessions,
+            SettingsSectionType::LocalPasscode,
+            SettingsSectionType::Passkeys,
+            SettingsSectionType::BlockedPeers,
+            SettingsSectionType::GlobalTtl,
+            SettingsSectionType::Websites,
+        ],
+    },
+    SettingsNavGroup {
+        zh: "AI 与工作区",
+        en: "AI & Workspace",
+        sections: &[
+            SettingsSectionType::AiProviders,
+            SettingsSectionType::Computers,
+            SettingsSectionType::Shortcuts,
+            SettingsSectionType::Business,
+        ],
+    },
+    SettingsNavGroup {
+        zh: "存储与账户",
+        en: "System & Account",
+        sections: &[
+            SettingsSectionType::Advanced,
+            SettingsSectionType::LocalStorage,
+            SettingsSectionType::PowerSaving,
+            SettingsSectionType::Premium,
+            SettingsSectionType::Credits,
+        ],
+    },
+];
+
 impl SettingsRouter {
-    /// Renders an individual language card that selects `lang_code` on click.
+    /// Renders an individual OpenBot-styled language card (`12px` radius, `64px` min-height).
     fn render_language_option(
         &self,
         lang_code: &'static str,
@@ -25,28 +82,33 @@ impl SettingsRouter {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let pal = self.palette;
+        let ob = pal.openbot_palette();
+        let hover_bg = ob.bg_control_hover();
+        let badge_bg = if is_selected {
+            ob.surface_light()
+        } else {
+            ob.bg_control_active()
+        };
         let badge_fg = if is_selected {
-            pal.active_button_fg
+            ob.text_on_light()
         } else {
-            pal.text_primary
+            ob.text_primary()
         };
-        let badge_icon_fg = if is_selected {
-            pal.active_button_fg
-        } else {
-            pal.accent
-        };
+
         div()
             .cursor_pointer()
-            .p(px(pal.scaled_px(16.0)))
-            .rounded(px(pal.scaled_px(10.0)))
-            .bg(rgb(pal.card_bg))
+            .min_h(px(pal.scaled_px(64.0)))
+            .px(px(pal.scaled_px(16.0)))
+            .py(px(pal.scaled_px(12.0)))
+            .rounded(px(pal.scaled_px(12.0)))
+            .bg(ob.bg_surface())
             .border_1()
             .border_color(if is_selected {
-                rgb(pal.accent)
+                ob.border_strong_hairline()
             } else {
-                rgb(pal.border_fg)
+                ob.frame_card_border()
             })
-            .hover(move |s| s.bg(rgb(pal.hover_bg)))
+            .hover(move |s| s.bg(hover_bg))
             .flex()
             .items_center()
             .justify_between()
@@ -64,24 +126,20 @@ impl SettingsRouter {
                     .child(
                         div()
                             .px(px(pal.scaled_px(10.0)))
-                            .py(px(pal.scaled_px(7.0)))
+                            .py(px(pal.scaled_px(6.0)))
                             .rounded(px(pal.scaled_px(8.0)))
-                            .bg(rgb(if is_selected { pal.accent } else { pal.input_bg }))
+                            .bg(badge_bg)
                             .border_1()
-                            .border_color(rgb(if is_selected {
-                                pal.accent
-                            } else {
-                                pal.border_fg
-                            }))
+                            .border_color(ob.border_hairline())
                             .flex()
                             .items_center()
                             .gap(px(pal.scaled_px(5.0)))
-                            .child(tg_icon(IconName::Translate, pal.scaled_px(13.0), badge_icon_fg))
+                            .child(tg_icon_rgba(IconName::Translate, pal.scaled_px(13.0), badge_fg))
                             .child(
                                 div()
                                     .text_size(px(pal.scaled_px(12.0)))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(badge_fg))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(badge_fg)
                                     .child(badge_code),
                             ),
                     )
@@ -89,17 +147,18 @@ impl SettingsRouter {
                         div()
                             .flex()
                             .flex_col()
+                            .gap(px(2.0))
                             .child(
                                 div()
-                                    .text_size(px(pal.scaled_px(15.0)))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(pal.text_primary))
+                                    .text_size(px(pal.scaled_px(14.0)))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_primary())
                                     .child(title),
                             )
                             .child(
                                 div()
                                     .text_size(px(pal.scaled_px(12.0)))
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(ob.text_muted())
                                     .child(subtitle),
                             ),
                     ),
@@ -110,16 +169,20 @@ impl SettingsRouter {
                     .items_center()
                     .gap(px(pal.scaled_px(6.0)))
                     .when(is_selected, |el| {
-                        el.child(tg_icon(IconName::SelectCheck, pal.scaled_px(14.0), pal.accent))
+                        el.child(tg_icon_rgba(
+                            IconName::SelectCheck,
+                            pal.scaled_px(14.0),
+                            ob.text_primary(),
+                        ))
                     })
                     .child(
                         div()
-                            .text_size(px(pal.scaled_px(14.0)))
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(pal.scaled_px(13.0)))
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(if is_selected {
-                                rgb(pal.accent)
+                                ob.text_primary()
                             } else {
-                                rgb(pal.text_secondary)
+                                ob.text_muted()
                             })
                             .child(status_label),
                     ),
@@ -130,30 +193,45 @@ impl SettingsRouter {
     pub(super) fn render_language_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_zh = self.is_chinese_locale;
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.lang_id;
         div()
             .flex()
             .flex_col()
             .gap(px(pal.scaled_px(16.0)))
-            .p(px(pal.scaled_px(24.0)))
+            .py(px(pal.scaled_px(8.0)))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(pal.scaled_px(8.0)))
-                    .child(tg_icon(IconName::Translate, pal.scaled_px(20.0), pal.accent))
+                    .gap(px(pal.scaled_px(10.0)))
                     .child(
                         div()
-                            .text_size(px(pal.scaled_px(20.0)))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(pal.text_primary))
+                            .w(px(pal.scaled_px(32.0)))
+                            .h(px(pal.scaled_px(32.0)))
+                            .rounded_full()
+                            .bg(ob.bg_control_active())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(tg_icon_rgba(
+                                IconName::Translate,
+                                pal.scaled_px(16.0),
+                                ob.text_primary(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(pal.scaled_px(18.0)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_primary())
                             .child(tr_str(lang, "界面语言设置", "Interface Language Settings")),
                     ),
             )
             .child(
                 div()
                     .text_size(px(pal.scaled_px(13.0)))
-                    .text_color(rgb(pal.text_secondary))
+                    .text_color(ob.text_muted())
                     .child(if is_zh {
                         "选择应用的默认显示语言。修改后将即时生效并持久化。"
                     } else {
@@ -164,7 +242,7 @@ impl SettingsRouter {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(pal.scaled_px(12.0)))
+                    .gap(px(pal.scaled_px(10.0)))
                     .child(self.render_language_option(
                         "zh-CN",
                         "ZH",
@@ -224,26 +302,374 @@ impl SettingsRouter {
         }
     }
 
-    /// Renders the settings navigation header bar and scrollable active section viewport.
+    /// Maps sub-sections (like `NotificationsType` / `NotificationsReactions`) to their highlighted nav item.
+    fn nav_highlight_section(&self) -> SettingsSectionType {
+        match self.settings_section {
+            SettingsSectionType::NotificationsType
+            | SettingsSectionType::NotificationsReactions => SettingsSectionType::Notifications,
+            other => other,
+        }
+    }
+
+    /// Renders OpenBot's `220px` left navigation rail with title, instant search pill,
+    /// ranked search results / 4 grouped navigation sections, and monochrome footer.
+    fn render_left_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
+        let zh = self.is_chinese_locale;
+        let lang = self.lang_id;
+        let active_nav = self.nav_highlight_section();
+        let query_trimmed = self.nav_search_query.trim().to_string();
+        let has_query = !query_trimmed.is_empty();
+        let search_focused = self.nav_search_focused;
+        let hover_row = ob.hover();
+        let hover_ctrl = ob.bg_control_hover();
+        let active_bg = ob.bg_control_hover();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+
+        let nav_body: AnyElement = if has_query {
+            let hits = self.ranked_nav_search_results();
+            let sel_idx = self.nav_search_selected_index;
+            if hits.is_empty() {
+                div()
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(18.0))
+                    .text_size(px(12.5))
+                    .text_color(text_muted)
+                    .child(tr_str(lang, "无匹配设置项", "No matching settings"))
+                    .into_any_element()
+            } else {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(hits.into_iter().enumerate().map(|(idx, hit)| {
+                        let is_sel = idx == sel_idx;
+                        let target = hit.section;
+                        let title = if zh { hit.title_zh } else { hit.title_en };
+                        let desc = if zh { hit.desc_zh } else { hit.desc_en };
+                        div()
+                            .id(("settings-nav-hit", idx))
+                            .cursor_pointer()
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(8.0))
+                            .when(is_sel, |el| el.bg(active_bg))
+                            .hover(move |s| s.bg(hover_row))
+                            .flex()
+                            .items_start()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.nav_search_query.clear();
+                                    this.nav_search_selected_index = 0;
+                                    this.nav_search_focused = false;
+                                    this.navigate_to(target, false, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .pt(px(2.0))
+                                    .child(tg_icon_rgba(
+                                        target.icon_name(),
+                                        14.0,
+                                        if is_sel { text_pri } else { text_muted },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .truncate()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(text_muted)
+                                            .truncate()
+                                            .child(desc),
+                                    ),
+                            )
+                    }))
+                    .into_any_element()
+            }
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .children(SETTINGS_NAV_GROUPS.iter().map(|group| {
+                    let group_label = if zh { group.zh } else { group.en };
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .px(px(10.0))
+                                .pb(px(3.0))
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text_muted)
+                                .child(group_label),
+                        )
+                        .children(group.sections.iter().copied().map(|sec| {
+                            let is_active = active_nav == sec;
+                            let label = sec.display_title_localized(zh);
+                            div()
+                                .id(gpui::SharedString::from(format!("settings-nav-item-{sec:?}")))
+                                .cursor_pointer()
+                                .w_full()
+                                .h(px(30.0))
+                                .px(px(10.0))
+                                .rounded(px(8.0))
+                                .when(is_active, |el| el.bg(active_bg))
+                                .hover(move |s| s.bg(if is_active { active_bg } else { hover_row }))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.navigate_to(sec, false, cx);
+                                    }),
+                                )
+                                .child(tg_icon_rgba(
+                                    sec.icon_name(),
+                                    14.0,
+                                    if is_active { text_pri } else { text_muted },
+                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .font_weight(if is_active {
+                                            FontWeight::MEDIUM
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .text_color(if is_active { text_pri } else { text_sec })
+                                        .child(label),
+                                )
+                        }))
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .w(px(220.0))
+            .flex_shrink_0()
+            .h_full()
+            .bg(ob.bg_sidebar())
+            .border_r_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .pt(px(16.0))
+                    .pb(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(text_pri)
+                            .child(tr_str(lang, "设置", "Settings")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-nav-search-field")
+                            .cursor_pointer()
+                            .w_full()
+                            .h(px(32.0))
+                            .px(px(10.0))
+                            .rounded_full()
+                            .bg(ob.bg_control())
+                            .border_1()
+                            .border_color(if search_focused {
+                                ob.text_muted()
+                            } else {
+                                ob.border_strong_hairline()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.nav_search_focused = true;
+                                    this.sync_active_input_key(cx);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(tg_icon_rgba(IconName::Search, 13.0, text_muted))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .text_color(if self.nav_search_query.is_empty() {
+                                                text_muted
+                                            } else {
+                                                text_pri
+                                            })
+                                            .child(if self.nav_search_query.is_empty() {
+                                                tr_str(lang, "搜索设置...", "Search settings...")
+                                                    .to_string()
+                                            } else {
+                                                self.nav_search_query.clone()
+                                            }),
+                                    ),
+                            )
+                            .when(!self.nav_search_query.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .cursor_pointer()
+                                        .w(px(18.0))
+                                        .h(px(18.0))
+                                        .rounded_full()
+                                        .hover(move |s| s.bg(hover_ctrl))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.nav_search_query.clear();
+                                                this.nav_search_selected_index = 0;
+                                                cx.notify();
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(tg_icon_rgba(IconName::Close, 11.0, text_muted)),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-nav-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .px(px(8.0))
+                    .pb(px(12.0))
+                    .child(nav_body),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px(px(8.0))
+                    .py(px(8.0))
+                    .border_t_1()
+                    .border_color(ob.border_hairline())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .flex_1()
+                            .h(px(28.0))
+                            .px(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_control())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .hover(move |s| s.bg(hover_ctrl))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(5.0))
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_language(cx);
+                                }),
+                            )
+                            .child(tg_icon_rgba(IconName::Translate, 12.0, text_muted))
+                            .child(tr_str(lang, "中文 / EN", "EN / 中文")),
+                    )
+                    .child(
+                        div()
+                            .cursor_pointer()
+                            .h(px(28.0))
+                            .px(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(if self.settings_section == SettingsSectionType::Search {
+                                active_bg
+                            } else {
+                                ob.bg_control()
+                            })
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .hover(move |s| s.bg(hover_ctrl))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.navigate_to(SettingsSectionType::Search, false, cx);
+                                }),
+                            )
+                            .child(tg_icon_rgba(IconName::Search, 12.0, text_muted)),
+                    ),
+            )
+    }
+
+    /// Renders OpenBot's 2-column searchable settings frame (`220px` left nav + `48px` top bar
+    /// with breadcrumb trail & top-right circular `×` close button + `960px` max centered canvas).
     fn render_settings_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_root = self.settings_section.is_root();
         let zh = self.is_chinese_locale;
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.lang_id;
         let title = self.settings_section.display_title_localized(zh);
         let section_icon = self.settings_section.icon_name();
-
-        let back_label = if is_root {
-            tr_str(lang, "返回对话", "Back to Chats").to_string()
-        } else if let Some(&prev) = self.settings_stack.last() {
-            if zh {
-                format!("返回 {}", prev.display_title_localized(true))
-            } else {
-                prev.display_title_localized(false).to_string()
-            }
-        } else {
-            tr_str(lang, "返回", "Back").to_string()
-        };
+        let hover_bg = ob.hover();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
 
         let crumbs = self.settings_section.breadcrumb_path();
 
@@ -252,211 +678,142 @@ impl SettingsRouter {
             .min_w(px(0.0))
             .h_full()
             .overflow_hidden()
-            .bg(rgb(pal.window_bg))
+            .bg(ob.bg_canvas())
             .flex()
-            .flex_col()
+            .flex_row()
+            .child(self.render_left_nav(cx))
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .bg(ob.bg_canvas())
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(pal.scaled_px(20.0)))
-                    .py(px(pal.scaled_px(12.0)))
-                    .bg(rgb(pal.topbar_bg))
-                    .border_b_1()
-                    .border_color(pal.separator_rgba())
+                    .flex_col()
                     .child(
                         div()
+                            .h(px(48.0))
+                            .flex_shrink_0()
+                            .w_full()
+                            .px(px(20.0))
+                            .border_b_1()
+                            .border_color(ob.border_hairline())
                             .flex()
                             .items_center()
-                            .gap(px(pal.scaled_px(12.0)))
+                            .justify_between()
+                            .gap(px(12.0))
                             .child(
                                 div()
-                                    .cursor_pointer()
                                     .flex()
                                     .items_center()
-                                    .gap(px(pal.scaled_px(6.0)))
-                                    .px(px(pal.scaled_px(12.0)))
-                                    .py(px(pal.scaled_px(6.0)))
-                                    .rounded_full()
-                                    .bg(if is_root {
-                                        rgb(pal.accent)
-                                    } else {
-                                        rgb(pal.input_bg)
-                                    })
-                                    .hover(move |s| {
-                                        s.bg(if is_root {
-                                            rgb(pal.accent_hover)
-                                        } else {
-                                            rgb(pal.hover_bg)
-                                        })
-                                    })
-                                    .text_size(px(pal.scaled_px(13.0)))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(if is_root {
-                                        rgb(pal.active_button_fg)
-                                    } else {
-                                        rgb(pal.text_primary)
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.navigate_back(cx);
-                                        }),
-                                    )
-                                    .child(tg_icon(
-                                        IconName::BackArrow,
-                                        pal.scaled_px(14.0),
-                                        if is_root {
-                                            pal.active_button_fg
-                                        } else {
-                                            pal.icon_fg
-                                        },
-                                    ))
-                                    .child(back_label),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(pal.scaled_px(2.0)))
-                                    .when(crumbs.len() > 1, |el| {
+                                    .gap(px(8.0))
+                                    .min_w(px(0.0))
+                                    .when(!is_root || !self.settings_stack.is_empty(), |el| {
                                         el.child(
                                             div()
+                                                .cursor_pointer()
+                                                .h(px(28.0))
+                                                .px(px(8.0))
+                                                .rounded(px(8.0))
+                                                .hover(move |s| s.bg(hover_bg).text_color(text_pri))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(pal.scaled_px(4.0)))
-                                                .children(crumbs.into_iter().enumerate().map(
-                                                    |(idx, sec)| {
-                                                        let is_current =
-                                                            sec == self.settings_section;
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(pal.scaled_px(4.0)))
-                                                            .when(idx > 0, |sep| {
-                                                                sep.child(
-                                                                    div()
-                                                                        .text_size(px(pal.scaled_px(11.0)))
-                                                                        .text_color(rgb(
-                                                                            pal.text_secondary,
-                                                                        ))
-                                                                        .child("›"),
-                                                                )
-                                                            })
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(pal.scaled_px(11.0)))
-                                                                    .text_color(if is_current {
-                                                                        rgb(pal.accent)
-                                                                    } else {
-                                                                        rgb(pal.text_secondary)
-                                                                    })
-                                                                    .cursor_pointer()
-                                                                    .hover(move |s| {
-                                                                        s.text_color(rgb(
-                                                                            pal.text_primary,
-                                                                        ))
-                                                                    })
-                                                                    .on_mouse_down(
-                                                                        MouseButton::Left,
-                                                                        cx.listener(
-                                                                            move |this, _, _, cx| {
-                                                                                this.navigate_to(
-                                                                                    sec, false, cx,
-                                                                                );
-                                                                            },
-                                                                        ),
-                                                                    )
-                                                                    .child(
-                                                                        sec.display_title_localized(
-                                                                            zh,
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                    },
-                                                )),
+                                                .gap(px(4.0))
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(text_sec)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.navigate_back(cx);
+                                                    }),
+                                                )
+                                                .child(tg_icon_rgba(
+                                                    IconName::BackArrow,
+                                                    13.0,
+                                                    text_muted,
+                                                ))
+                                                .child(tr_str(lang, "返回", "Back")),
                                         )
                                     })
-                                    .child(
+                                    .child(if crumbs.len() > 1 {
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(pal.scaled_px(8.0)))
-                                            .child(tg_icon(section_icon, pal.scaled_px(18.0), pal.accent))
+                                            .gap(px(6.0))
+                                            .children(crumbs.into_iter().enumerate().map(
+                                                |(idx, sec)| {
+                                                    let is_current = sec == self.settings_section;
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .when(idx > 0, |sep| {
+                                                            sep.child(
+                                                                div()
+                                                                    .text_size(px(12.5))
+                                                                    .text_color(text_muted)
+                                                                    .child("›"),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(13.5))
+                                                                .font_weight(if is_current {
+                                                                    FontWeight::SEMIBOLD
+                                                                } else {
+                                                                    FontWeight::NORMAL
+                                                                })
+                                                                .text_color(if is_current {
+                                                                    text_pri
+                                                                } else {
+                                                                    text_muted
+                                                                })
+                                                                .cursor_pointer()
+                                                                .hover(move |s| {
+                                                                    s.text_color(text_pri)
+                                                                })
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            this.navigate_to(
+                                                                                sec, false, cx,
+                                                                            );
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(
+                                                                    sec.display_title_localized(zh),
+                                                                ),
+                                                        )
+                                                },
+                                            ))
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(tg_icon_rgba(section_icon, 15.0, text_muted))
                                             .child(
                                                 div()
-                                                    .text_size(px(pal.scaled_px(16.0)))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(pal.text_primary))
+                                                    .text_size(px(14.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(text_pri)
                                                     .child(title),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(pal.scaled_px(8.0)))
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .px(px(pal.scaled_px(11.0)))
-                                    .py(px(pal.scaled_px(6.0)))
-                                    .rounded_full()
-                                    .bg(rgb(pal.input_bg))
-                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(pal.scaled_px(5.0)))
-                                    .text_size(px(pal.scaled_px(12.5)))
-                                    .text_color(rgb(pal.text_primary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.navigate_to(
-                                                SettingsSectionType::Search,
-                                                false,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(tg_icon(IconName::Search, pal.scaled_px(13.0), pal.icon_fg))
-                                    .child(tr_str(lang, "搜索", "Search")),
-                            )
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .px(px(pal.scaled_px(11.0)))
-                                    .py(px(pal.scaled_px(6.0)))
-                                    .rounded_full()
-                                    .bg(rgb(pal.input_bg))
-                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(pal.scaled_px(5.0)))
-                                    .text_size(px(pal.scaled_px(12.5)))
-                                    .text_color(rgb(pal.accent))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.toggle_language(cx);
-                                        }),
-                                    )
-                                    .child(tg_icon(IconName::Translate, pal.scaled_px(13.0), pal.accent))
-                                    .child(tr_str(lang, "中文", "English")),
+                                            )
+                                            .into_any_element()
+                                    }),
                             )
                             .child(
                                 div()
                                     .id("settings-modal-close-btn")
                                     .cursor_pointer()
-                                    .w(px(pal.scaled_px(28.0)))
-                                    .h(px(pal.scaled_px(28.0)))
+                                    .w(px(28.0))
+                                    .h(px(28.0))
                                     .rounded_full()
-                                    .bg(rgb(pal.input_bg))
-                                    .hover(move |s| s.bg(rgb(pal.hover_bg)))
+                                    .hover(move |s| s.bg(hover_bg))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -466,16 +823,26 @@ impl SettingsRouter {
                                             this.close(cx);
                                         }),
                                     )
-                                    .child(tg_icon(IconName::Close, pal.scaled_px(13.0), pal.icon_fg)),
+                                    .child(tg_icon_rgba(IconName::Close, 14.0, text_muted)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-scroll-view")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(960.0))
+                                    .mx_auto()
+                                    .px(px(24.0))
+                                    .py(px(16.0))
+                                    .pb(px(32.0))
+                                    .child(self.render_active_section(cx)),
                             ),
                     ),
-            )
-            .child(
-                div()
-                    .id("settings-scroll-view")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(self.render_active_section(cx)),
             )
     }
 }
@@ -483,35 +850,55 @@ impl SettingsRouter {
 impl Render for SettingsRouter {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
-        let is_computers = self.settings_section == SettingsSectionType::Computers;
-        let (box_w, box_h) = if is_computers {
-            (
-                pal.scaled_px(960.0).min(1160.0),
-                pal.scaled_px(660.0).min(860.0),
-            )
-        } else {
-            (
-                pal.scaled_px(540.0).min(880.0),
-                pal.scaled_px(650.0).min(840.0),
-            )
-        };
-        let panel_body: AnyElement = if is_computers {
-            let standalone = self.standalone_computers_mode;
+        let ob = pal.openbot_palette();
+        let is_standalone_computers =
+            self.settings_section == SettingsSectionType::Computers && self.standalone_computers_mode;
+        let panel_body: AnyElement = if is_standalone_computers {
             let comp = self.ensure_computers(cx);
-            if comp.read(cx).standalone_mode != standalone {
-                comp.update(cx, |sc, _| sc.standalone_mode = standalone);
+            if !comp.read(cx).standalone_mode {
+                comp.update(cx, |sc, _| sc.standalone_mode = true);
             }
             comp.into_any_element()
         } else {
+            if let Some(ref comp) = self.settings_computers {
+                if comp.read(cx).standalone_mode {
+                    comp.update(cx, |sc, _| sc.standalone_mode = false);
+                }
+            }
             self.render_settings_panel(cx).into_any_element()
         };
+
+        let mut modal_box = macos_modal_card("telegram-settings-modal-box", pal)
+            .bg(ob.bg_canvas())
+            .max_w_full()
+            .max_h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(panel_body);
+
+        if is_standalone_computers {
+            let box_w = pal.scaled_px(960.0).min(1160.0);
+            let box_h = pal.scaled_px(660.0).min(860.0);
+            modal_box = modal_box.w(px(box_w)).h(px(box_h));
+        } else {
+            modal_box = modal_box
+                .w_full()
+                .max_w(px(1180.0))
+                .h_full()
+                .max_h(px(860.0));
+        }
+
         div()
             .id("telegram-settings-modal-backdrop")
             .absolute()
             .top_0()
             .left_0()
             .size_full()
-            .p(px(16.0))
+            .p(px(20.0))
             .occlude()
             .bg(macos_modal_backdrop_rgba(pal))
             .flex()
@@ -523,19 +910,6 @@ impl Render for SettingsRouter {
                     this.close(cx);
                 }),
             )
-            .child(
-                macos_modal_card("telegram-settings-modal-box", pal)
-                    .w(px(box_w))
-                    .h(px(box_h))
-                    .max_w_full()
-                    .max_h_full()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(panel_body),
-            )
+            .child(modal_box)
     }
 }

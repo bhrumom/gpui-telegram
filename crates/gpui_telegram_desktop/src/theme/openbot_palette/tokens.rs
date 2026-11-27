@@ -763,6 +763,239 @@ impl OpenBotPalette {
     pub fn token_count(&self) -> usize {
         self.tokens.len()
     }
+
+    #[inline]
+    fn hex_rgba(hex: u32, alpha: f32) -> Rgba {
+        let mut color = gpui::rgb(hex);
+        color.a = alpha;
+        color
+    }
+
+    #[inline]
+    fn token_rgba_or(&self, name: &str, dark_hex: u32, light_hex: u32) -> Rgba {
+        self.rgba(name).unwrap_or_else(|| {
+            gpui::rgb(if self.scheme.is_dark() {
+                dark_hex
+            } else {
+                light_hex
+            })
+        })
+    }
+
+    #[inline]
+    fn token_rgba_alpha_or(
+        &self,
+        name: &str,
+        dark_hex: u32,
+        dark_alpha: f32,
+        light_hex: u32,
+        light_alpha: f32,
+    ) -> Rgba {
+        self.rgba(name).unwrap_or_else(|| {
+            if self.scheme.is_dark() {
+                Self::hex_rgba(dark_hex, dark_alpha)
+            } else {
+                Self::hex_rgba(light_hex, light_alpha)
+            }
+        })
+    }
+
+    /// Outer window frame (`#0d0d0d` dark / `#e8e8eb` light).
+    pub fn bg_frame(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-frame", 0x0D0D0D, 0xE8E8EB)
+    }
+
+    /// Main inset workspace canvas (`#1a1a1a` dark / `#f5f5f6` light).
+    pub fn bg_canvas(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-canvas", 0x1A1A1A, 0xF5F5F6)
+    }
+
+    /// Chat sidebar surface (`#1a1a1a` dark / `#f5f5f6` light).
+    pub fn bg_sidebar(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-sidebar", 0x1A1A1A, 0xF5F5F6)
+    }
+
+    /// Primary elevated card/menu/control surface (`#212121` dark / `#ffffff` light).
+    pub fn bg_surface(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-surface", 0x212121, 0xFFFFFF)
+    }
+
+    /// Raised card / own-bubble neutral surface (`#242424` dark / `#fcfcfc` light).
+    pub fn bg_surface_raised(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-surface-raised", 0x242424, 0xFCFCFC)
+    }
+
+    /// Default interactive control background (`#212121` dark / `#ffffff` light).
+    pub fn bg_control(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-control", 0x212121, 0xFFFFFF)
+    }
+
+    /// Hovered control background (`#242424` dark / `#f0f0f2` light).
+    pub fn bg_control_hover(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-control-hover", 0x242424, 0xF0F0F2)
+    }
+
+    /// Active/selected control background (`#2a2a2a` dark / `#e8e8eb` light).
+    pub fn bg_control_active(&self) -> Rgba {
+        self.token_rgba_or("--openbot-bg-control-active", 0x2A2A2A, 0xE8E8EB)
+    }
+
+    /// Subtle translucent border (`rgba(255,255,255,0.035)` dark / `rgba(20,20,20,0.07)` light).
+    pub fn border(&self) -> Rgba {
+        self.token_rgba_alpha_or("--openbot-border", 0xFFFFFF, 0.035, 0x141414, 0.07)
+    }
+
+    /// Stronger translucent border (`rgba(255,255,255,0.045)` dark / `rgba(20,20,20,0.10)` light).
+    pub fn border_strong(&self) -> Rgba {
+        self.token_rgba_alpha_or("--openbot-border-strong", 0xFFFFFF, 0.045, 0x141414, 0.10)
+    }
+
+    /// Crisp opaque 1px hairline border (`#262626` dark / `#e8e8eb` light).
+    pub fn border_hairline(&self) -> Rgba {
+        gpui::rgb(if self.scheme.is_dark() {
+            OPENBOT_BORDER_SOLID_DARK_HEX
+        } else {
+            OPENBOT_BORDER_SOLID_LIGHT_HEX
+        })
+    }
+
+    /// Crisp opaque 1px popover/card border (`#323232` dark / `#dcdce0` light).
+    pub fn border_strong_hairline(&self) -> Rgba {
+        gpui::rgb(if self.scheme.is_dark() {
+            OPENBOT_BORDER_STRONG_SOLID_DARK_HEX
+        } else {
+            OPENBOT_BORDER_STRONG_SOLID_LIGHT_HEX
+        })
+    }
+
+    /// Crisp opaque 1px frame-to-card / surface border (`#262626` dark / `#dcdce0` light)
+    /// providing clear edge separation against both `#0d0d0d` dark and `#e8e8eb` light frames.
+    pub fn frame_card_border(&self) -> Rgba {
+        gpui::rgb(if self.scheme.is_dark() {
+            OPENBOT_BORDER_SOLID_DARK_HEX
+        } else {
+            OPENBOT_BORDER_STRONG_SOLID_LIGHT_HEX
+        })
+    }
+
+    /// Translucent hover wash (`rgba(255,255,255,0.06)` dark / `rgba(20,20,20,0.05)` light).
+    pub fn hover(&self) -> Rgba {
+        self.token_rgba_alpha_or("--openbot-hover", 0xFFFFFF, 0.06, 0x141414, 0.05)
+    }
+
+    /// Primary foreground ink (`#ffffff` dark / `#141414` light).
+    pub fn text_primary(&self) -> Rgba {
+        self.token_rgba_or("--openbot-text-primary", 0xFFFFFF, 0x141414)
+    }
+
+    /// Secondary foreground ink (`#dcdcdc` dark / `#3a3a3c` light).
+    pub fn text_secondary(&self) -> Rgba {
+        self.token_rgba_or("--openbot-text-secondary", 0xDCDCDC, 0x3A3A3C)
+    }
+
+    /// Muted label/icon ink (`#979797` dark / `#6b6b70` light).
+    pub fn text_muted(&self) -> Rgba {
+        self.token_rgba_or("--openbot-text-muted", 0x979797, 0x6B6B70)
+    }
+
+    /// Dim hint/timestamp ink (`#6a6a6a` dark / `#8e8e93` light).
+    pub fn text_dim(&self) -> Rgba {
+        self.token_rgba_or("--openbot-text-dim", 0x6A6A6A, 0x8E8E93)
+    }
+
+    /// Translucent readable body text (`rgba(255,255,255,0.52)` dark / `rgba(20,20,20,0.60)` light).
+    pub fn text_readable(&self) -> Rgba {
+        self.token_rgba_alpha_or("--openbot-text-readable", 0xFFFFFF, 0.52, 0x141414, 0.60)
+    }
+
+    /// High-contrast monochrome primary CTA surface (`#f0f0f0` dark / `#1c1c1e` light).
+    pub fn surface_light(&self) -> Rgba {
+        self.token_rgba_or("--openbot-surface-light", 0xF0F0F0, 0x1C1C1E)
+    }
+
+    /// High-contrast text on `surface_light()` (`#141414` dark / `#ffffff` light).
+    pub fn text_on_light(&self) -> Rgba {
+        self.token_rgba_or("--openbot-text-on-light", 0x141414, 0xFFFFFF)
+    }
+
+    /// Brand blue accent (`#007cf7`).
+    pub fn accent(&self) -> Rgba {
+        self.token_rgba_or("--openbot-accent", 0x007CF7, 0x007CF7)
+    }
+
+    /// Hovered accent (`#1f8fff` dark / `#006ad4` light).
+    pub fn accent_hover(&self) -> Rgba {
+        self.token_rgba_or("--openbot-accent-hover", 0x1F8FFF, 0x006AD4)
+    }
+
+    /// Readable accent text (`#42a0ff` dark / `#0064c8` light).
+    pub fn accent_text(&self) -> Rgba {
+        self.token_rgba_or("--openbot-accent-text", 0x42A0FF, 0x0064C8)
+    }
+
+    /// Soft accent wash (`rgba(0,124,247,0.16)` dark / `rgba(0,124,247,0.12)` light).
+    pub fn accent_soft(&self) -> Rgba {
+        self.token_rgba_alpha_or("--openbot-accent-soft", 0x007CF7, 0.16, 0x007CF7, 0.12)
+    }
+
+    /// Success green (`#31cf76` dark / `#1fa85a` light).
+    pub fn success(&self) -> Rgba {
+        self.token_rgba_or("--openbot-success", 0x31CF76, 0x1FA85A)
+    }
+
+    /// Warning amber (`#ff9412` dark / `#f08a00` light).
+    pub fn warning(&self) -> Rgba {
+        self.token_rgba_or("--openbot-warning", 0xFF9412, 0xF08A00)
+    }
+
+    /// Danger red (`#fd2f3b` dark / `#e8222d` light).
+    pub fn danger(&self) -> Rgba {
+        self.token_rgba_or("--openbot-danger", 0xFD2F3B, 0xE8222D)
+    }
+
+    /// Unread indicator surface (`#74b9ff`).
+    pub fn unread_surface(&self) -> Rgba {
+        gpui::rgb(0x74B9FF)
+    }
+
+    /// Unread indicator foreground text (`#07131f`).
+    pub fn unread_text(&self) -> Rgba {
+        gpui::rgb(0x07131F)
+    }
+
+    /// Update / "new" notice dot (`#ff1e5e` dark / `#e0004a` light).
+    pub fn badge_new(&self) -> Rgba {
+        gpui::rgb(if self.scheme.is_dark() {
+            0xFF1E5E
+        } else {
+            0xE0004A
+        })
+    }
+
+    /// Felt unread plum gradient stops `(#705083, #4a285c)`.
+    pub fn felt_plum(&self) -> (Rgba, Rgba) {
+        (gpui::rgb(0x705083), gpui::rgb(0x4A285C))
+    }
+
+    /// Felt waiting amber gradient stops `(#ff9511, #cb680c)`.
+    pub fn felt_amber(&self) -> (Rgba, Rgba) {
+        (gpui::rgb(0xFF9511), gpui::rgb(0xCB680C))
+    }
+
+    /// Felt error raspberry gradient stops `(#f52070, #b40641)`.
+    pub fn felt_raspberry(&self) -> (Rgba, Rgba) {
+        (gpui::rgb(0xF52070), gpui::rgb(0xB40641))
+    }
+
+    /// Felt badge cream foreground (`#f6efe2`).
+    pub fn felt_cream(&self) -> Rgba {
+        gpui::rgb(0xF6EFE2)
+    }
+
+    /// Computes the OKLab-clamped readable chat background for `hex` in this palette's scheme.
+    pub fn readable_chat_background(&self, hex: &str) -> Result<String, ThemePaletteError> {
+        readable_chat_background(hex, self.scheme)
+    }
 }
 
 impl OpenBotPalette {
@@ -1008,6 +1241,21 @@ pub fn readable_chat_background(
     Ok(format!("#{ro:02x}{go:02x}{bo:02x}"))
 }
 
+/// Convenience wrapper for [`readable_chat_background`] accepting `is_dark: bool`.
+pub fn readable_chat_background_for_dark(
+    hex: &str,
+    is_dark: bool,
+) -> Result<String, ThemePaletteError> {
+    readable_chat_background(
+        hex,
+        if is_dark {
+            OpenBotColorScheme::Dark
+        } else {
+            OpenBotColorScheme::Light
+        },
+    )
+}
+
 /// Validates `color` (`#RRGGBB` or `#RRGGBBAA`) and checks WCAG white-text contrast
 /// (`1.05 / (L + 0.05) < 3.0`, `own-bubble.ts:L43-L50`).
 pub fn try_solid_bubble_takes_dark_text(color: &str) -> Result<bool, ThemePaletteError> {
@@ -1064,10 +1312,18 @@ pub const OPENBOT_FELT_CREAM: &str = "#f6efe2";
 pub const OPENBOT_FELT_CREAM_STROKE: &str = "#efe4d2";
 pub const OPENBOT_ACTION_BG: &str = "#f0f0f0";
 pub const OPENBOT_ACTION_FG: &str = "#141414";
+pub const OPENBOT_ACTION_LIGHT_BG: &str = "#1c1c1e";
+pub const OPENBOT_ACTION_LIGHT_FG: &str = "#ffffff";
 pub const OPENBOT_PAPER_BG: &str = "#f0f0f0";
 pub const OPENBOT_PAPER_TEXT: &str = "#141414";
 pub const OPENBOT_UNREAD_SURFACE: &str = "#74b9ff";
 pub const OPENBOT_UNREAD_TEXT: &str = "#07131f";
+pub const OPENBOT_BADGE_NEW_DARK: &str = "#ff1e5e";
+pub const OPENBOT_BADGE_NEW_LIGHT: &str = "#e0004a";
+pub const OPENBOT_BORDER_SOLID_DARK_HEX: u32 = 0x262626;
+pub const OPENBOT_BORDER_STRONG_SOLID_DARK_HEX: u32 = 0x323232;
+pub const OPENBOT_BORDER_SOLID_LIGHT_HEX: u32 = 0xE8E8EB;
+pub const OPENBOT_BORDER_STRONG_SOLID_LIGHT_HEX: u32 = 0xDCDCE0;
 
 /// Provider & chart series brand tokens (`tokens.css:L136-L152`, `tokens-light.css:L57-L64`).
 pub const OPENBOT_PROVIDER_CLAUDE: &str = "#d97757";
@@ -1417,4 +1673,23 @@ pub fn is_file_reference(value: &str) -> bool {
             | "yaml"
             | "zsh"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_card_border_provides_crisp_light_contrast_and_preserves_hairline_tokens() {
+        let dark = OpenBotPalette::for_scheme(OpenBotColorScheme::Dark);
+        let light = OpenBotPalette::for_scheme(OpenBotColorScheme::Light);
+
+        assert_eq!(dark.token_count(), 58);
+        assert_eq!(light.token_count(), 58);
+        assert_eq!(dark.border_hairline(), gpui::rgb(0x262626));
+        assert_eq!(light.border_hairline(), gpui::rgb(0xE8E8EB));
+        assert_eq!(dark.frame_card_border(), gpui::rgb(0x262626));
+        assert_eq!(light.frame_card_border(), gpui::rgb(0xDCDCE0));
+        assert_ne!(light.frame_card_border(), light.bg_frame());
+    }
 }

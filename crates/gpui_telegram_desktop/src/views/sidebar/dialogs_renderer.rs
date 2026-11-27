@@ -4,11 +4,13 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{
     AddContactKind, DialogItemModel, SEARCH_HEADER_HEIGHT, SEARCH_HEIGHT, SEARCH_RADIUS,
 };
-use crate::views::sidebar::dialogs_row_view::{render_dialog_avatar, SidebarDialogMeta};
+use crate::views::sidebar::dialogs_row_view::{
+    render_openbot_dialog_avatar_with_badge, SidebarDialogMeta,
+};
 use crate::views::sidebar::ui::dialogs_stories_list::DialogsStoriesListUi;
 use crate::views::sidebar::ui::dialogs_suggestions::DialogsSuggestionsUi;
 
@@ -353,8 +355,9 @@ pub fn render_plus_dropdown<V: 'static>(
         .into_any_element()
 }
 
-/// Renders the macOS Apple Messages 3-column Pinned Chats avatar grid (up to 9 pinned chats)
-/// followed by a delicate translucent hairline divider.
+/// Renders OpenBot's compact centered 3-column `SidebarPinnedGroup` (`max-width: 236px`,
+/// `72x102px` tiles, `56x56px` 3D plush/cluster avatars + felt status badges, `8px` gap).
+/// Returns `None` when `pinned_dialogs` is empty (zero empty chrome or divider).
 pub fn render_pinned_chats_grid<V: 'static>(
     pinned_dialogs: &[(DialogItemModel, SidebarDialogMeta)],
     active_id: Option<u64>,
@@ -363,190 +366,140 @@ pub fn render_pinned_chats_grid<V: 'static>(
     on_select: impl Fn(&mut V, u64, &mut Context<V>) + Clone + 'static,
     on_context: impl Fn(&mut V, u64, Point<Pixels>, &mut Context<V>) + Clone + 'static,
 ) -> Option<AnyElement> {
+    render_pinned_chats_grid_localized(
+        pinned_dialogs,
+        active_id,
+        palette,
+        "zh-CN",
+        cx,
+        on_select,
+        on_context,
+    )
+}
+
+/// Localized variant of [`render_pinned_chats_grid`] for OpenBot `SidebarPinnedGroup`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_pinned_chats_grid_localized<V: 'static>(
+    pinned_dialogs: &[(DialogItemModel, SidebarDialogMeta)],
+    active_id: Option<u64>,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_select: impl Fn(&mut V, u64, &mut Context<V>) + Clone + 'static,
+    on_context: impl Fn(&mut V, u64, Point<Pixels>, &mut Context<V>) + Clone + 'static,
+) -> Option<AnyElement> {
     if pinned_dialogs.is_empty() {
         return None;
     }
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
     let shown = &pinned_dialogs[..pinned_dialogs.len().min(9)];
-    let total = shown.len();
-    let avatar_size_px = palette.scaled_px(54.0);
-    let ring_size_px = palette.scaled_px(60.0);
-    let hover_bg = if palette.mode.is_dark() {
-        TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
-    } else {
-        TdesktopThemePalette::rgba_with_alpha(0x000000, 0.04)
-    };
-    let badge_border = rgb(palette.dialogs_bg);
-    let online_border = palette.sidebar_bg_rgba();
+    let avatar_size_px = palette.scaled_px(56.0);
+    let hover_bg = ob.hover();
+    let active_bg = if is_dark { ob.bg_surface() } else { rgb(0xE8E8EB) };
+    let text_pri = ob.text_primary();
 
-    let mut rows: Vec<AnyElement> = Vec::new();
-    for chunk in shown.chunks(3) {
-        let mut cells: Vec<AnyElement> = chunk
-            .iter()
-            .map(|(item, meta)| {
-                let did = item.id;
-                let is_selected = active_id == Some(did);
-                let sel_cb = on_select.clone();
-                let ctx_cb = on_context.clone();
-                let avatar = render_dialog_avatar(
-                    item,
-                    meta,
-                    palette,
-                    avatar_size_px,
-                    palette.dialogs_bg,
-                    online_border,
-                );
-                let badge_bg = if item.is_muted {
-                    rgb(palette.muted_badge_bg)
-                } else {
-                    rgb(palette.accent)
-                };
-                let count_label = if item.unread_count > 99 {
-                    "99+".to_string()
-                } else {
-                    item.unread_count.to_string()
-                };
+    let tiles: Vec<AnyElement> = shown
+        .iter()
+        .map(|(item, meta)| {
+            let did = item.id;
+            let is_selected = active_id == Some(did);
+            let sel_cb = on_select.clone();
+            let ctx_cb = on_context.clone();
+            let tile_surface_hex = if is_selected {
+                if is_dark { 0x212121 } else { 0xE8E8EB }
+            } else if is_dark {
+                0x1A1A1A
+            } else {
+                0xF5F5F6
+            };
+            let avatar = render_openbot_dialog_avatar_with_badge(
+                item,
+                meta,
+                palette,
+                avatar_size_px,
+                tile_surface_hex,
+                is_selected,
+                lang_id,
+            );
 
-                let mut tile = div()
-                    .id(("sidebar-pinned-tile", did))
-                    .cursor_pointer()
-                    .min_w(px(0.0))
-                    .px(px(2.0))
-                    .py(px(3.0))
-                    .rounded(px(10.0))
-                    .hover(move |s| s.bg(hover_bg))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _w, cx| {
-                            sel_cb(this, did, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                            ctx_cb(this, did, ev.position, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(ring_size_px))
-                            .h(px(ring_size_px))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(is_selected, |el| {
-                                el.border_2().border_color(rgb(palette.accent))
-                            })
-                            .child(avatar)
-                            .when(item.unread_count > 0, |el| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-1.0))
-                                        .right(px(-1.0))
-                                        .min_w(px(palette.scaled_px(18.0)))
-                                        .h(px(palette.scaled_px(18.0)))
-                                        .px(px(4.5))
-                                        .rounded_full()
-                                        .bg(badge_bg)
-                                        .border_2()
-                                        .border_color(badge_border)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(px(palette.scaled_px(10.0)))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .child(count_label),
-                                )
-                            })
-                            .when(item.unread_count == 0 && meta.is_unread_marked, |el| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(1.0))
-                                        .right(px(1.0))
-                                        .w(px(palette.scaled_px(11.0)))
-                                        .h(px(palette.scaled_px(11.0)))
-                                        .rounded_full()
-                                        .bg(badge_bg)
-                                        .border_2()
-                                        .border_color(badge_border),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(palette.scaled_px(5.0)))
-                            .w_full()
-                            .max_w(px(palette.scaled_px(76.0)))
-                            .text_center()
-                            .truncate()
-                            .text_size(px(palette.scaled_px(11.5)))
-                            .font_weight(if is_selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::MEDIUM
-                            })
-                            .text_color(if is_selected {
-                                rgb(palette.accent)
-                            } else {
-                                rgb(palette.text_primary)
-                            })
-                            .child(item.peer_name.clone()),
-                    );
-
-                if total >= 3 {
-                    tile = tile.flex_1();
-                } else {
-                    tile = tile.w(px(palette.scaled_px(82.0)));
-                }
-                tile.into_any_element()
-            })
-            .collect();
-
-        if total >= 3 && cells.len() < 3 {
-            for _ in cells.len()..3 {
-                cells.push(div().flex_1().min_w(px(0.0)).into_any_element());
-            }
-        }
-
-        let row = div()
-            .w_full()
-            .flex()
-            .items_start()
-            .when(total < 3, |el| el.justify_center().gap(px(12.0)))
-            .when(total >= 3, |el| el.justify_between().gap(px(4.0)))
-            .children(cells);
-        rows.push(row.into_any_element());
-    }
+            div()
+                .id(("sidebar-pinned-tile", did))
+                .cursor_pointer()
+                .w(px(72.0))
+                .h(px(102.0))
+                .flex_shrink_0()
+                .px(px(2.0))
+                .py(px(4.0))
+                .rounded(px(8.0))
+                .when(is_selected, |el| el.bg(active_bg))
+                .hover(move |s| if is_selected { s } else { s.bg(hover_bg) })
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_start()
+                .gap(px(5.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        sel_cb(this, did, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        ctx_cb(this, did, ev.position, cx);
+                    }),
+                )
+                .child(avatar)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_center()
+                                .text_size(px(13.0))
+                                .line_height(px(16.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text_pri)
+                                .child(item.peer_name.clone()),
+                        ),
+                )
+                .into_any_element()
+        })
+        .collect();
 
     Some(
         div()
             .id("sidebar-pinned-chats-grid")
             .w_full()
             .flex_shrink_0()
+            .pt(px(4.0))
+            .pb(px(4.0))
             .flex()
-            .flex_col()
+            .justify_center()
             .child(
                 div()
                     .w_full()
-                    .py(px(palette.scaled_px(10.0)))
-                    .px(px(palette.scaled_px(12.0)))
+                    .max_w(px(236.0))
+                    .mx_auto()
+                    .p(px(2.0))
                     .flex()
-                    .flex_col()
-                    .gap(px(palette.scaled_px(10.0)))
-                    .children(rows),
-            )
-            .child(
-                div()
-                    .mx(px(palette.scaled_px(12.0)))
-                    .h(px(1.0))
-                    .bg(palette.separator_rgba()),
+                    .flex_wrap()
+                    .justify_center()
+                    .content_start()
+                    .gap(px(8.0))
+                    .children(tiles),
             )
             .into_any_element(),
     )
@@ -731,6 +684,7 @@ pub fn render_archived_header_row<V: 'static>(
         return None;
     }
     let is_apple = palette.is_apple_style();
+    let ob = palette.openbot_palette();
     let preview: String = archived_dialogs
         .iter()
         .take(3)
@@ -740,11 +694,7 @@ pub fn render_archived_header_row<V: 'static>(
     let total_unread: u32 = archived_dialogs.iter().map(|d| d.unread_count).sum();
     let chev = if is_expanded { IconName::ChevronDown } else { IconName::ChevronRight };
     let hover = if is_apple {
-        if palette.mode.is_dark() {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.06)
-        } else {
-            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.045)
-        }
+        ob.hover()
     } else {
         rgb(palette.dialogs_hover_bg)
     };
@@ -755,9 +705,9 @@ pub fn render_archived_header_row<V: 'static>(
             .h(px(56.0))
             .flex_shrink_0()
             .w_full()
-            .px(px(10.0))
+            .px(px(8.0))
             .py(px(6.0))
-            .when(is_apple, |el| el.rounded(px(10.0)))
+            .when(is_apple, |el| el.rounded(px(8.0)))
             .when(!is_apple, |el| {
                 el.bg(rgb(palette.dialogs_bg))
                     .border_b_1()
@@ -766,7 +716,7 @@ pub fn render_archived_header_row<V: 'static>(
             .hover(move |s| s.bg(hover))
             .flex()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(10.0))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _w, cx| {
                 on_toggle_archived(this, cx);
             }))
@@ -776,11 +726,15 @@ pub fn render_archived_header_row<V: 'static>(
                     .h(px(40.0))
                     .flex_shrink_0()
                     .rounded_full()
-                    .bg(rgb(palette.muted_badge_bg))
+                    .bg(if is_apple { ob.bg_control_active() } else { rgb(palette.muted_badge_bg) })
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(tg_icon(IconName::ArchivedChats, 19.0, 0xFFFFFF)),
+                    .child(tg_icon_rgba(
+                        IconName::ArchivedChats,
+                        18.0,
+                        if is_apple { ob.text_secondary() } else { rgb(0xFFFFFF) },
+                    )),
             )
             .child(
                 div()
@@ -795,8 +749,18 @@ pub fn render_archived_header_row<V: 'static>(
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette.text_primary)).child(tr_str(lang_id, "已归档对话", "Archived Chats")))
-                            .child(tg_icon(chev, 12.0, palette.icon_fg)),
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if is_apple { ob.text_primary() } else { rgb(palette.text_primary) })
+                                    .child(tr_str(lang_id, "已归档对话", "Archived Chats")),
+                            )
+                            .child(tg_icon_rgba(
+                                chev,
+                                12.0,
+                                if is_apple { ob.text_muted() } else { rgb(palette.icon_fg) },
+                            )),
                     )
                     .child(
                         div()
@@ -804,21 +768,31 @@ pub fn render_archived_header_row<V: 'static>(
                             .items_center()
                             .justify_between()
                             .gap(px(6.0))
-                            .child(div().flex_1().min_w(px(0.0)).truncate().text_size(px(12.0)).text_color(rgb(palette.text_secondary)).child(preview))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.5))
+                                    .text_color(if is_apple { ob.text_muted() } else { rgb(palette.text_secondary) })
+                                    .child(preview),
+                            )
                             .when(total_unread > 0, |el| {
                                 el.child(
                                     div()
-                                        .h(px(17.0))
-                                        .min_w(px(17.0))
+                                        .h(px(18.0))
+                                        .min_w(px(18.0))
                                         .px(px(5.0))
                                         .rounded_full()
-                                        .bg(rgb(palette.muted_badge_bg))
+                                        .bg(if is_apple { ob.bg_control_active() } else { rgb(palette.muted_badge_bg) })
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_size(px(10.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(palette.unread_badge_fg))
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(if is_apple { ob.text_secondary() } else { rgb(palette.unread_badge_fg) })
                                         .child(format!("{}", total_unread)),
                                 )
                             }),

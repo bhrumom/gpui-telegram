@@ -23,7 +23,7 @@ use crate::components::ui::text_input_controller::{
     delete_prev_word, pop_last_char, sanitize_paste_text,
 };
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::stage::entities_render::RichTextAction;
 
 use super::actor_profile_view::{render_actor_profile_view, render_edit_profile_modal};
@@ -104,7 +104,7 @@ impl CommunityWorkspace {
         let mut ws = Self {
             facade,
             media_base_url,
-            palette,
+            palette: super::shared_widgets::community_openbot_palette(palette),
             language_id: language_id.into(),
             state,
             feed_scroll_handle: ScrollHandle::new(),
@@ -130,7 +130,7 @@ impl CommunityWorkspace {
     }
 
     pub fn set_palette(&mut self, palette: TdesktopThemePalette) {
-        self.palette = palette;
+        self.palette = super::shared_widgets::community_openbot_palette(palette);
     }
 
     pub fn set_language(&mut self, lang_id: impl Into<String>) {
@@ -143,7 +143,7 @@ impl CommunityWorkspace {
         lang_id: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        self.palette = palette;
+        self.palette = super::shared_widgets::community_openbot_palette(palette);
         self.language_id = lang_id.into();
         cx.notify();
     }
@@ -3876,32 +3876,35 @@ impl CommunityWorkspace {
         cx: &mut Context<Self>,
     ) -> Div {
         let pal = self.palette;
+        let ob = pal.openbot_palette();
+        let hover_back = ob.bg_control_hover();
+        let text_pri = ob.text_primary();
         let lang = self.language_id.as_str();
         div()
             .w_full()
+            .h(px(38.0))
             .flex_shrink_0()
-            .px(px(14.0))
-            .py(px(10.0))
-            .bg(rgb(pal.dialogs_bg))
+            .px(px(16.0))
+            .bg(ob.bg_canvas())
             .border_b_1()
-            .border_color(pal.separator_rgba())
+            .border_color(ob.border_hairline())
             .flex()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(8.0))
             .child(
                 div()
                     .id("community-secondary-back-btn")
                     .cursor_pointer()
-                    .px(px(8.0))
-                    .py(px(5.0))
-                    .rounded_full()
-                    .bg(pal.service_pill_rgba())
-                    .hover(move |s| s.bg(pal.row_hover_rgba()))
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .hover(move |s| s.bg(hover_back).text_color(text_pri))
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .text_size(px(12.0))
-                    .text_color(rgb(pal.text_primary))
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ob.text_muted())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -3909,29 +3912,36 @@ impl CommunityWorkspace {
                             this.go_back(cx);
                         }),
                     )
-                    .child(tg_icon(IconName::BackArrow, 13.0, pal.text_primary))
-                    .child(tr_str(lang, "返回", "Back")),
+                    .child(tg_icon_rgba(IconName::BackArrow, 12.0, ob.text_muted()))
+                    .child(tr_str(lang, "社区", "Community")),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_dim())
+                    .child("›"),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(14.5))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(pal.text_primary))
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_primary())
                             .child(title),
                     )
-                    .when_some(subtitle, |col, sub| {
-                        col.child(
+                    .when_some(subtitle, |row, sub| {
+                        row.child(
                             div()
                                 .truncate()
-                                .text_size(px(11.0))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_size(px(11.5))
+                                .text_color(ob.text_muted())
                                 .child(sub),
                         )
                     }),

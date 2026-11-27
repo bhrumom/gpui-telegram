@@ -79,7 +79,7 @@ fn notif_kind_meta(kind: CommunityNotificationKind, pal: &TdesktopThemePalette, 
         ),
         CommunityNotificationKind::PollEnded => (
             IconName::Poll,
-            0x3B82F6,
+            pal.accent,
             tr_str(lang, "投票已结束", "poll has ended"),
         ),
         CommunityNotificationKind::System => (
@@ -452,7 +452,8 @@ pub fn render_notifications_view(
                                                         .rounded_full()
                                                         .bg(if active {
                                                             TdesktopThemePalette::rgba_with_alpha(
-                                                                0xFFFFFF, 0.24,
+                                                                pal.active_button_fg,
+                                                                0.16,
                                                             )
                                                         } else {
                                                             rgb(pal.unread_badge_bg).into()

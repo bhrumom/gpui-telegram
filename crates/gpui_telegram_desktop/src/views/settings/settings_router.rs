@@ -180,13 +180,244 @@ pub enum SettingsActiveInputKey {
         editor_gen: u64,
     },
     SearchQuery,
+    NavSearchQuery,
 }
+
+/// Maximum number of instant cross-tab search results shown in Settings left nav
+/// (matches OpenBot `SettingsPage.tsx` `SEARCH_LIMIT = 12`).
+pub const SETTINGS_NAV_SEARCH_LIMIT: usize = 12;
+
+/// Ranked instant search hit for OpenBot's 2-column `SettingsPage` left-nav search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsNavSearchHit {
+    pub section: SettingsSectionType,
+    pub title_en: &'static str,
+    pub title_zh: &'static str,
+    pub desc_en: &'static str,
+    pub desc_zh: &'static str,
+    pub rank: u8,
+}
+
+struct SettingsNavSearchRow {
+    section: SettingsSectionType,
+    title_en: &'static str,
+    title_zh: &'static str,
+    desc_en: &'static str,
+    desc_zh: &'static str,
+    keywords: &'static [&'static str],
+}
+
+const SETTINGS_NAV_SEARCH_CATALOG: &[SettingsNavSearchRow] = &[
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Main,
+        title_en: "General Overview",
+        title_zh: "常规概览",
+        desc_en: "Account summary, workspace preferences and quick links",
+        desc_zh: "账号概览、工作区偏好与快捷入口",
+        keywords: &["general", "overview", "main", "home", "常规", "概览", "主页"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Information,
+        title_en: "Edit Profile",
+        title_zh: "个人资料",
+        desc_en: "Name, username, bio, phone number and birthday",
+        desc_zh: "姓名、用户名、简介、手机号与生日",
+        keywords: &["profile", "account", "name", "username", "bio", "phone", "姓名", "昵称", "简介", "手机号"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Chat,
+        title_en: "Appearance & Chat",
+        title_zh: "外观与聊天",
+        desc_en: "Theme, dark mode, wallpaper, bubble radius, font size and Enter send",
+        desc_zh: "主题、深色模式、壁纸、气泡圆角、字号与回车发送",
+        keywords: &["theme", "dark", "light", "night", "wallpaper", "font", "bubble", "enter", "主题", "深色", "浅色", "夜间", "壁纸", "字体", "聊天"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Folders,
+        title_en: "Chat Folders",
+        title_zh: "聊天文件夹",
+        desc_en: "Organize chats into custom tabs and filter groups",
+        desc_zh: "自定义对话分组、标签页与过滤规则",
+        keywords: &["folder", "filter", "tab", "group", "文件夹", "分组", "标签"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Notifications,
+        title_en: "Notifications & Sounds",
+        title_zh: "通知与声音",
+        desc_en: "Desktop alerts, sound volume, badges and mute schedules",
+        desc_zh: "桌面提醒、提示音、角标计数与免打扰设置",
+        keywords: &["notification", "sound", "alert", "badge", "mute", "quiet", "通知", "声音", "提醒", "角标", "免打扰"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::NotificationsType,
+        title_en: "Notification Scope",
+        title_zh: "分类通知规则",
+        desc_en: "Per-type alerts for private chats, groups and channels",
+        desc_zh: "私聊、群组与频道的独立通知规则",
+        keywords: &["private", "groups", "channels", "scope", "私聊", "群组", "频道", "通知"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::NotificationsReactions,
+        title_en: "Reaction Alerts",
+        title_zh: "回应通知",
+        desc_en: "Notifications for emoji reactions on messages and stories",
+        desc_zh: "消息与动态表情回应通知提醒",
+        keywords: &["reaction", "emoji", "like", "回应", "表情", "通知"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Calls,
+        title_en: "Calls & Audio",
+        title_zh: "音视频通话",
+        desc_en: "Microphone, speakers, camera, mic test and peer-to-peer mode",
+        desc_zh: "麦克风、扬声器、摄像头、试麦与点对点连接",
+        keywords: &["call", "mic", "microphone", "speaker", "camera", "audio", "video", "p2p", "通话", "麦克风", "扬声器", "摄像头"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Language,
+        title_en: "Language",
+        title_zh: "界面语言",
+        desc_en: "Switch interface display language between Chinese and English",
+        desc_zh: "切换简体中文与英文界面显示语言",
+        keywords: &["language", "locale", "chinese", "english", "zh", "en", "translate", "语言", "中文", "英文", "多语言"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::PrivacySecurity,
+        title_en: "Privacy & Security",
+        title_zh: "隐私与安全",
+        desc_en: "Two-step verification, cloud password, recovery key and visibility",
+        desc_zh: "两步验证、云密码、恢复密钥与隐私可见范围",
+        keywords: &["privacy", "security", "2fa", "password", "cloud", "recovery", "隐私", "安全", "两步验证", "密码"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::ActiveSessions,
+        title_en: "Devices & Sessions",
+        title_zh: "活跃会话与设备",
+        desc_en: "Inspect logged-in devices and terminate remote sessions",
+        desc_zh: "查看已登录设备并远程下线异常会话",
+        keywords: &["session", "device", "login", "terminate", "设备", "会话", "登录"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::LocalPasscode,
+        title_en: "Local Passcode",
+        title_zh: "本地密码锁",
+        desc_en: "Lock desktop client with passcode and idle auto-lock timeout",
+        desc_zh: "为桌面端设置锁屏密码与空闲自动锁定",
+        keywords: &["passcode", "lock", "pin", "autolock", "密码锁", "锁屏", "自动锁定"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Passkeys,
+        title_en: "Passkeys",
+        title_zh: "通行密钥",
+        desc_en: "FIDO2, WebAuthn and biometric passwordless sign-in keys",
+        desc_zh: "FIDO2、WebAuthn 与生物识别免密登录",
+        keywords: &["passkey", "fido", "webauthn", "biometric", "通行密钥", "生物识别", "指纹"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::BlockedPeers,
+        title_en: "Blocked Users",
+        title_zh: "黑名单",
+        desc_en: "Manage blocked contacts, bots and restricted peers",
+        desc_zh: "管理已屏蔽的联系人、机器人与黑名单",
+        keywords: &["block", "blocked", "blacklist", "ban", "黑名单", "屏蔽", "拉黑"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::GlobalTtl,
+        title_en: "Auto-Delete Messages",
+        title_zh: "自动删除消息",
+        desc_en: "Default global message self-destruct timer (TTL)",
+        desc_zh: "新对话的默认全局消息定时销毁周期",
+        keywords: &["ttl", "autodelete", "auto-delete", "timer", "自动删除", "定时销毁", "阅后即焚"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Websites,
+        title_en: "Connected Websites",
+        title_zh: "已授权网站",
+        desc_en: "Review and revoke OAuth and bot website login sessions",
+        desc_zh: "查看并撤销网站登录授权与机器人连接",
+        keywords: &["website", "oauth", "connected", "bot", "网站", "授权"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::AiProviders,
+        title_en: "AI Providers & Models",
+        title_zh: "AI 模型与供应商",
+        desc_en: "Configure OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Ollama & routing",
+        desc_zh: "配置模型订阅、API 密钥、脱敏保护与智能路由",
+        keywords: &["ai", "provider", "model", "api", "key", "openai", "claude", "anthropic", "gemini", "deepseek", "kimi", "ollama", "magpie", "供应商", "模型", "密钥", "订阅"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Computers,
+        title_en: "Remote Computers",
+        title_zh: "远程电脑",
+        desc_en: "Cloud desktops, remote terminal nodes and remote assist codes",
+        desc_zh: "云端主机、远程终端节点与远程协助连接码",
+        keywords: &["computer", "remote", "terminal", "ssh", "cloud", "desktop", "assist", "远程电脑", "云电脑", "终端", "协助"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Shortcuts,
+        title_en: "Keyboard Shortcuts",
+        title_zh: "键盘快捷键",
+        desc_en: "Customize global hotkeys, navigation and composer bindings",
+        desc_zh: "查看与自定义全局热键、导航与输入快捷键",
+        keywords: &["shortcut", "hotkey", "keyboard", "keybind", "快捷键", "热键", "键盘"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Business,
+        title_en: "Business Tools",
+        title_zh: "商业版工具",
+        desc_en: "Opening hours, away messages, greetings and quick replies",
+        desc_zh: "营业时间、离开回复、欢迎语与快捷回复模板",
+        keywords: &["business", "hours", "greeting", "quick reply", "商业", "企业", "快捷回复"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Advanced,
+        title_en: "Advanced & Updates",
+        title_zh: "高级与更新",
+        desc_en: "Connection proxy, downloads, data export, hardware acceleration & updates",
+        desc_zh: "网络代理、下载目录、数据导出、硬件加速与版本更新",
+        keywords: &["advanced", "proxy", "socks5", "download", "export", "update", "opengl", "高级", "代理", "下载", "导出", "更新"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::LocalStorage,
+        title_en: "Local Storage & Cache",
+        title_zh: "本地存储与缓存",
+        desc_en: "Inspect disk usage, media cache limits and clear temporary files",
+        desc_zh: "查看磁盘占用、媒体缓存上限并一键清理缓存",
+        keywords: &["storage", "cache", "disk", "clear", "cleanup", "存储", "缓存", "磁盘", "清理"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::PowerSaving,
+        title_en: "Power Saving",
+        title_zh: "省电模式",
+        desc_en: "Reduce animations, autoplay videos and sticker motion on battery",
+        desc_zh: "低电量时降低动画、视频自动播放与动态贴纸能耗",
+        keywords: &["power", "battery", "animation", "autoplay", "reduced motion", "省电", "电池", "动画"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Premium,
+        title_en: "Premium",
+        title_zh: "高级会员",
+        desc_en: "Higher upload limits, faster downloads and exclusive perks",
+        desc_zh: "更大文件上传、加速下载与专属会员权益",
+        keywords: &["premium", "subscription", "perks", "4gb", "会员", "订阅", "特权"],
+    },
+    SettingsNavSearchRow {
+        section: SettingsSectionType::Credits,
+        title_en: "Stars & Credits",
+        title_zh: "星币与额度",
+        desc_en: "Check Stars balance, top-ups, usage history and gifts",
+        desc_zh: "查看星币余额、充值记录与消费明细",
+        keywords: &["stars", "credits", "balance", "wallet", "topup", "星币", "额度", "余额", "充值", "钱包"],
+    },
+];
 
 /// Manages settings navigation stack, modal rendering, and lazy instantiation of all settings sections.
 pub struct SettingsRouter {
     pub settings_section: SettingsSectionType,
     pub settings_stack: Vec<SettingsSectionType>,
     pub standalone_computers_mode: bool,
+    pub nav_search_query: String,
+    pub nav_search_focused: bool,
+    pub nav_search_selected_index: usize,
     pub palette: TdesktopThemePalette,
     pub lang_id: &'static str,
     pub is_chinese_locale: bool,
@@ -287,6 +518,9 @@ impl SettingsRouter {
             settings_section: SettingsSectionType::Main,
             settings_stack: Vec::new(),
             standalone_computers_mode: false,
+            nav_search_query: String::new(),
+            nav_search_focused: false,
+            nav_search_selected_index: 0,
             palette,
             lang_id,
             is_chinese_locale,
@@ -733,6 +967,62 @@ impl SettingsRouter {
         lazy_section!(self, cx, settings_search, |pal, lang| SettingsSearch::new_live(pal, lang), Self::observe_search)
     }
 
+    /// Ranks all 25 settings destinations using OpenBot's 4-tier `rankRows` scoring
+    /// (`0` = title startsWith, `1` = title contains, `2` = description/keywords contains, `3` = excluded),
+    /// capped at `SETTINGS_NAV_SEARCH_LIMIT` (`12`).
+    pub fn rank_nav_search_entries(query: &str) -> Vec<SettingsNavSearchHit> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(u8, usize, SettingsNavSearchHit)> = SETTINGS_NAV_SEARCH_CATALOG
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                let t_en = row.title_en.to_lowercase();
+                let t_zh = row.title_zh.to_lowercase();
+                let rank = if t_en.starts_with(&needle) || t_zh.starts_with(&needle) {
+                    0
+                } else if t_en.contains(&needle) || t_zh.contains(&needle) {
+                    1
+                } else if row.desc_en.to_lowercase().contains(&needle)
+                    || row.desc_zh.to_lowercase().contains(&needle)
+                    || row
+                        .keywords
+                        .iter()
+                        .any(|kw| kw.to_lowercase().contains(&needle))
+                {
+                    2
+                } else {
+                    3
+                };
+                (rank < 3).then_some((
+                    rank,
+                    idx,
+                    SettingsNavSearchHit {
+                        section: row.section,
+                        title_en: row.title_en,
+                        title_zh: row.title_zh,
+                        desc_en: row.desc_en,
+                        desc_zh: row.desc_zh,
+                        rank,
+                    },
+                ))
+            })
+            .collect();
+        scored.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+        scored
+            .into_iter()
+            .take(SETTINGS_NAV_SEARCH_LIMIT)
+            .map(|(_, _, hit)| hit)
+            .collect()
+    }
+
+    /// Returns ranked instant search hits for `self.nav_search_query` (`SETTINGS_NAV_SEARCH_LIMIT = 12`).
+    pub fn ranked_nav_search_results(&self) -> Vec<SettingsNavSearchHit> {
+        Self::rank_nav_search_entries(&self.nav_search_query)
+    }
+
     /// Navigates to `target`, clearing history when entering the settings modal or pushing onto the history stack.
     pub fn navigate_to(
         &mut self,
@@ -740,6 +1030,7 @@ impl SettingsRouter {
         entering_settings_modal: bool,
         cx: &mut Context<Self>,
     ) {
+        self.nav_search_focused = false;
         if self.settings_section == SettingsSectionType::Calls && target != SettingsSectionType::Calls {
             self.stop_mic_test_if_active(cx);
         }
@@ -827,6 +1118,9 @@ impl SettingsRouter {
         self.stop_mic_test_if_active(cx);
         self.clear_all_preedits(cx);
         self.standalone_computers_mode = false;
+        self.nav_search_query.clear();
+        self.nav_search_focused = false;
+        self.nav_search_selected_index = 0;
         self.settings_section = SettingsSectionType::Main;
         self.settings_stack.clear();
         self.last_active_input_key = None;
@@ -839,8 +1133,13 @@ impl SettingsRouter {
     pub fn close_silent(&mut self, cx: &mut Context<Self>) {
         self.stop_mic_test_if_active(cx);
         self.clear_all_preedits(cx);
-        let changed =
-            self.settings_section != SettingsSectionType::Main || !self.settings_stack.is_empty();
+        let changed = self.settings_section != SettingsSectionType::Main
+            || !self.settings_stack.is_empty()
+            || !self.nav_search_query.is_empty()
+            || self.nav_search_focused;
+        self.nav_search_query.clear();
+        self.nav_search_focused = false;
+        self.nav_search_selected_index = 0;
         self.settings_section = SettingsSectionType::Main;
         self.settings_stack.clear();
         self.last_active_input_key = None;
@@ -930,6 +1229,9 @@ impl SettingsRouter {
         self.settings_premium = None;
         self.settings_shortcuts = None;
         self.settings_business = None;
+        self.nav_search_query.clear();
+        self.nav_search_focused = false;
+        self.nav_search_selected_index = 0;
         self.settings_section = SettingsSectionType::Main;
         self.settings_stack.clear();
         self.last_active_input_key = None;
@@ -958,6 +1260,9 @@ impl SettingsRouter {
 
     /// Returns the canonical active input identity for the currently focused settings field, if any.
     pub fn current_active_input_key(&self, cx: &App) -> Option<SettingsActiveInputKey> {
+        if self.nav_search_focused {
+            return Some(SettingsActiveInputKey::NavSearchQuery);
+        }
         match self.settings_section {
             SettingsSectionType::Information => self
                 .settings_information
@@ -1037,6 +1342,9 @@ impl SettingsRouter {
         ime: &TextInputController,
         cx: &App,
     ) -> Option<(String, Option<String>)> {
+        if self.nav_search_focused {
+            return Some(ime.text_and_preedit(self.nav_search_query.clone()));
+        }
         if !self.is_input_active(cx) {
             return None;
         }
@@ -1167,6 +1475,12 @@ impl SettingsRouter {
 
     /// Clears the active settings input field and returns `true` if a settings input was active.
     pub fn clear_active_input(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.nav_search_focused {
+            self.nav_search_query.clear();
+            self.nav_search_selected_index = 0;
+            cx.notify();
+            return true;
+        }
         if !self.is_input_active(cx) {
             return false;
         }
@@ -1224,6 +1538,12 @@ impl SettingsRouter {
 
     /// Appends committed text into the active settings input field and returns `true` if handled.
     pub fn push_input_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.nav_search_focused {
+            self.nav_search_query.push_str(text);
+            self.nav_search_selected_index = 0;
+            cx.notify();
+            return true;
+        }
         if !self.is_input_active(cx) {
             return false;
         }
@@ -1288,6 +1608,64 @@ impl SettingsRouter {
         _is_shift: bool,
         cx: &mut Context<Self>,
     ) -> Option<bool> {
+        if self.nav_search_focused {
+            match key {
+                "backspace" => {
+                    self.nav_search_query.pop();
+                    self.nav_search_selected_index = 0;
+                    cx.notify();
+                    return Some(true);
+                }
+                "down" => {
+                    let len = self.ranked_nav_search_results().len();
+                    if len > 0 {
+                        self.nav_search_selected_index = (self.nav_search_selected_index + 1) % len;
+                    }
+                    cx.notify();
+                    return Some(true);
+                }
+                "up" => {
+                    let len = self.ranked_nav_search_results().len();
+                    if len > 0 {
+                        self.nav_search_selected_index = if self.nav_search_selected_index == 0 {
+                            len - 1
+                        } else {
+                            self.nav_search_selected_index - 1
+                        };
+                    }
+                    cx.notify();
+                    return Some(true);
+                }
+                "enter" => {
+                    let hits = self.ranked_nav_search_results();
+                    if let Some(hit) = hits
+                        .get(self.nav_search_selected_index)
+                        .or_else(|| hits.first())
+                    {
+                        let target = hit.section;
+                        self.nav_search_query.clear();
+                        self.nav_search_selected_index = 0;
+                        self.nav_search_focused = false;
+                        self.navigate_to(target, false, cx);
+                        return Some(true);
+                    }
+                    return Some(false);
+                }
+                "escape" => {
+                    if !self.nav_search_query.is_empty() {
+                        self.nav_search_query.clear();
+                        self.nav_search_selected_index = 0;
+                        cx.notify();
+                        return Some(true);
+                    }
+                    self.nav_search_focused = false;
+                    self.sync_active_input_key(cx);
+                    cx.notify();
+                    return Some(false);
+                }
+                _ => return Some(false),
+            }
+        }
         if !self.is_input_active(cx) {
             return None;
         }
@@ -1417,5 +1795,45 @@ impl SettingsRouter {
         self.sync_active_input_key(cx);
         cx.notify();
         Some(handled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn ranked_nav_search_follows_openbot_4_tier_ranking_and_limit_12() {
+        assert!(SettingsRouter::rank_nav_search_entries("   ").is_empty());
+
+        // Rank 0: title prefix match beats rank 1/2
+        let lang_hits = SettingsRouter::rank_nav_search_entries("lang");
+        assert!(!lang_hits.is_empty());
+        assert_eq!(lang_hits[0].section, SettingsSectionType::Language);
+        assert_eq!(lang_hits[0].rank, 0);
+
+        // Rank 1: title substring match (not prefix)
+        let sessions_hits = SettingsRouter::rank_nav_search_entries("Sessions");
+        assert_eq!(sessions_hits[0].section, SettingsSectionType::ActiveSessions);
+        assert_eq!(sessions_hits[0].rank, 1);
+
+        // Rank 2: description / keyword match
+        let deepseek_hits = SettingsRouter::rank_nav_search_entries("deepseek");
+        assert_eq!(deepseek_hits[0].section, SettingsSectionType::AiProviders);
+        assert_eq!(deepseek_hits[0].rank, 2);
+
+        // Chinese prefix & keyword matching
+        let zh_hits = SettingsRouter::rank_nav_search_entries("远程电脑");
+        assert_eq!(zh_hits[0].section, SettingsSectionType::Computers);
+        assert_eq!(zh_hits[0].rank, 0);
+
+        // Rank 3 excluded
+        assert!(SettingsRouter::rank_nav_search_entries("zzzz_no_match_999").is_empty());
+
+        // Limit cap = 12 even for broad single-letter queries
+        let broad_hits = SettingsRouter::rank_nav_search_entries("a");
+        assert!(broad_hits.len() <= SETTINGS_NAV_SEARCH_LIMIT);
+        assert_eq!(broad_hits.len(), SETTINGS_NAV_SEARCH_LIMIT);
+        assert!(broad_hits.windows(2).all(|w| w[0].rank <= w[1].rank));
     }
 }

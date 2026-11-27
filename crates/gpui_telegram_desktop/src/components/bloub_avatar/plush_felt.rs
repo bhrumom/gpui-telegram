@@ -12,8 +12,9 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{ObjectFit, ParentElement, Styled, StyledImage, div, img, px};
 use openbot_contracts::avatar::{
-    AvatarHue, AvatarMood, BloubColorId, BloubExpression, BloubParametricState, BloubShape,
-    EngineShapeId, PlushState, PlushTransition, bloub_avatar_profile, plush_mood_presentation,
+    AgentStepActivity, AvatarHue, AvatarMood, BloubColorId, BloubExpression, BloubParametricState,
+    BloubShape, EngineShapeId, PlushState, PlushTransition, activity_mood_presentation,
+    bloub_avatar_profile, plush_mood_presentation,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -57,7 +58,7 @@ const SHAKE_YAW_DEG: f64 = 12.0;
 const DISSOLVE_EDGE: f64 = 0.12;
 const PIXEL_STEP: u32 = 32;
 const MAX_TINT_CACHE_ENTRIES: usize = 64;
-const MAX_FRAME_CACHE_ENTRIES: usize = 48;
+const MAX_FRAME_CACHE_ENTRIES: usize = 192;
 
 /// Canonical 73 bundled `.webp` plush/felt relative paths under `assets/openbot_plush/`.
 pub const BUNDLED_RELATIVE_WEBP_PATHS: [&str; EXPECTED_BUNDLED_WEBP_COUNT] = [
@@ -1737,11 +1738,28 @@ impl PlushFeltRenderer {
         color: Option<&str>,
         mood: AvatarMood,
     ) -> Self {
+        Self::for_seed_with_activity(seed, None, hue, color, mood, None)
+    }
+
+    /// Resolves a deterministic 3D `PlushFeltRenderer` from `seed` with optional explicit
+    /// `shape_override`, `hue`/`color`, `mood`, and tool `activity` (`activity_mood_presentation`).
+    pub fn for_seed_with_activity(
+        seed: &str,
+        shape_override: Option<BloubShape>,
+        hue: Option<AvatarHue>,
+        color: Option<&str>,
+        mood: AvatarMood,
+        activity: Option<AgentStepActivity>,
+    ) -> Self {
         let profile = bloub_avatar_profile(seed, hue, color);
-        let mood_pres = plush_mood_presentation(mood);
+        let resolved_shape = shape_override.unwrap_or(profile.shape);
+        let mood_pres = match activity {
+            Some(act) => activity_mood_presentation(act),
+            None => plush_mood_presentation(mood),
+        };
         let expr = mood_pres.expression.unwrap_or(profile.expression);
         let mut renderer = Self::new(
-            bloub_shape_to_engine(profile.shape),
+            bloub_shape_to_engine(resolved_shape),
             &profile.color,
             expr,
             mood_pres.state,

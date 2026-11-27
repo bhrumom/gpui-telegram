@@ -39,6 +39,8 @@ pub struct InlineStyleFlags {
     pub mention: Option<String>,
     pub hashtag: Option<String>,
     pub bot_command: Option<String>,
+    /// OpenBot inline ReferenceChip `(kind, id, display_label)` for `@[Name](kind:id)` / `$skill:*` / `@everyone`.
+    pub reference_chip: Option<(String, String, String)>,
 }
 
 impl Default for InlineStyleFlags {
@@ -54,6 +56,7 @@ impl Default for InlineStyleFlags {
             mention: None,
             hashtag: None,
             bot_command: None,
+            reference_chip: None,
         }
     }
 }
@@ -86,6 +89,10 @@ pub enum RichBlock {
         lines: Vec<Vec<StyledSegment>>,
         collapsed_default: bool,
         block_id: usize,
+    },
+    Table {
+        headers: Vec<Vec<StyledSegment>>,
+        rows: Vec<Vec<Vec<StyledSegment>>>,
     },
 }
 
@@ -416,6 +423,36 @@ fn parse_markdown_list_item(line: &str) -> Option<(String, u8, &str)> {
     None
 }
 
+fn split_gfm_table_cells(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed);
+    let inner = inner
+        .strip_suffix('|')
+        .unwrap_or(inner);
+    let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
+    if cells.len() >= 2 {
+        Some(cells)
+    } else {
+        None
+    }
+}
+
+fn is_gfm_table_separator(line: &str) -> bool {
+    let Some(cells) = split_gfm_table_cells(line) else {
+        return false;
+    };
+    cells.iter().all(|cell| {
+        let c = cell.trim();
+        let dashes = c.bytes().filter(|&b| b == b'-').count();
+        dashes >= 3 && c.bytes().all(|b| matches!(b, b'-' | b':' | b' '))
+    })
+}
+
 fn parse_markdown_and_tokens(text: &str) -> Vec<RichBlock> {
     let mut blocks = Vec::new();
     let lines: Vec<&str> = text.split('\n').collect();
@@ -490,6 +527,41 @@ fn parse_markdown_and_tokens(text: &str) -> Vec<RichBlock> {
             });
             i += 1;
             continue;
+        }
+        if i + 1 < lines.len() {
+            let next_line = lines[i + 1].trim_end_matches('\r');
+            if is_gfm_table_separator(next_line) {
+                if let Some(header_cells) = split_gfm_table_cells(line) {
+                    let headers: Vec<Vec<StyledSegment>> = header_cells
+                        .into_iter()
+                        .map(|c| parse_inline_markdown(c, &mut spoiler_id))
+                        .collect();
+                    let col_count = headers.len();
+                    i += 2;
+                    let mut rows: Vec<Vec<Vec<StyledSegment>>> = Vec::new();
+                    while i < lines.len() {
+                        let body_line = lines[i].trim_end_matches('\r');
+                        if body_line.trim().is_empty() {
+                            break;
+                        }
+                        let Some(body_cells) = split_gfm_table_cells(body_line) else {
+                            break;
+                        };
+                        let mut parsed_row: Vec<Vec<StyledSegment>> = body_cells
+                            .into_iter()
+                            .take(col_count)
+                            .map(|c| parse_inline_markdown(c, &mut spoiler_id))
+                            .collect();
+                        while parsed_row.len() < col_count {
+                            parsed_row.push(Vec::new());
+                        }
+                        rows.push(parsed_row);
+                        i += 1;
+                    }
+                    blocks.push(RichBlock::Table { headers, rows });
+                    continue;
+                }
+            }
         }
         if let Some((bullet, indent, body)) = parse_markdown_list_item(line) {
             blocks.push(RichBlock::ListItem {
@@ -735,6 +807,63 @@ fn parse_inline_markdown(text: &str, spoiler_id: &mut usize) -> Vec<StyledSegmen
             pos += clean_len;
             continue;
         }
+        // OpenBot structured @[Name](kind:id) reference token
+        if rem.starts_with("@[") {
+            if let Some(close_br) = rem[2..].find("](") {
+                let label = &rem[2..2 + close_br];
+                let after_lp = &rem[2 + close_br + 2..];
+                if let Some(close_p) = after_lp.find(')') {
+                    let target = &after_lp[..close_p];
+                    if !label.is_empty() && !target.is_empty() {
+                        let (kind, id) = target
+                            .split_once(':')
+                            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                            .unwrap_or_else(|| ("agent".to_string(), target.trim().to_string()));
+                        let consumed = 2 + close_br + 2 + close_p + 1;
+                        let mut flags = InlineStyleFlags::default();
+                        flags.mention = Some(format!("@{}", label));
+                        flags.reference_chip = Some((kind, id, label.to_string()));
+                        segs.push(StyledSegment {
+                            text: label.to_string(),
+                            flags,
+                            spoiler_id: None,
+                        });
+                        pos += consumed;
+                        continue;
+                    }
+                }
+            }
+        }
+        // OpenBot $skill:slug / $workflow:slug / $routine:slug / $mcp:slug reference token
+        if rem.starts_with('$')
+            && (pos == 0
+                || text[..pos].ends_with(|c: char| c.is_whitespace() || c == '(' || c == '（'))
+            && rem.len() > 2
+        {
+            let token_len = 1 + rem[1..]
+                .find(|c: char| !c.is_alphanumeric() && !matches!(c, '_' | '-' | ':' | '.'))
+                .unwrap_or(rem.len() - 1);
+            if token_len > 2 {
+                let tok = &rem[..token_len];
+                if let Some((kind_raw, slug)) = tok[1..].split_once(':') {
+                    let kind_lc = kind_raw.to_ascii_lowercase();
+                    if matches!(kind_lc.as_str(), "skill" | "workflow" | "routine" | "mcp")
+                        && !slug.is_empty()
+                    {
+                        let mut flags = InlineStyleFlags::default();
+                        flags.bot_command = Some(tok.to_string());
+                        flags.reference_chip = Some((kind_lc, slug.to_string(), tok.to_string()));
+                        segs.push(StyledSegment {
+                            text: tok.to_string(),
+                            flags,
+                            spoiler_id: None,
+                        });
+                        pos += token_len;
+                        continue;
+                    }
+                }
+            }
+        }
         if (rem.starts_with('@')
             || rem.starts_with('#')
             || (rem.starts_with('/')
@@ -750,7 +879,17 @@ fn parse_inline_markdown(text: &str, spoiler_id: &mut usize) -> Vec<StyledSegmen
                 let tok = rem[..token_len].to_string();
                 let mut flags = InlineStyleFlags::default();
                 match prefix {
-                    '@' => flags.mention = Some(tok.clone()),
+                    '@' => {
+                        flags.mention = Some(tok.clone());
+                        let handle = tok.trim_start_matches('@');
+                        if handle.eq_ignore_ascii_case("everyone") {
+                            flags.reference_chip = Some((
+                                "everyone".to_string(),
+                                "everyone".to_string(),
+                                "@everyone".to_string(),
+                            ));
+                        }
+                    }
                     '#' => flags.hashtag = Some(tok.clone()),
                     _ => flags.bot_command = Some(tok.clone()),
                 }

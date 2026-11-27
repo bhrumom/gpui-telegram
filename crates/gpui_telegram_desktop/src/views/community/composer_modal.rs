@@ -1648,7 +1648,7 @@ fn render_drafts_drawer(
                                 .flex()
                                 .items_center()
                                 .gap(px(5.0))
-                                .child(render_flair_chip(badge, Some("#3B82F6"), &pal))
+                                .child(render_flair_chip(badge, None, &pal))
                                 .child(
                                     div()
                                         .truncate()

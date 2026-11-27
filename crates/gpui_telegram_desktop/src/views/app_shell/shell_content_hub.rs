@@ -21,13 +21,19 @@ use gpui_telegram_proto::miniapp_contracts::MiniAppLaunchMode;
 use crate::i18n::tr_str;
 use crate::views::app_shell::modal_container::{macos_modal_backdrop_rgba, macos_modal_card};
 use crate::views::app_shell::shell_truth::SessionRequestFence;
-use crate::views::apple_sidebar::{AppleSidebarEvent, AppleSidebarSection};
+use crate::views::modal_boxes_suite::ModalDialogKind;
+use crate::views::apple_sidebar::{
+    AppleSidebarEvent, AppleSidebarSection, RailHelpAction, save_page_rail_pins,
+};
 use crate::views::content_hub::{
     build_music_track_entries_from_creation, render_publish_review_modal_body,
     render_quick_creations_drawer, ContentHubEvent, ContentHubInputTarget, ContentHubSection,
     GameStatus, PublishModalField, ReviewerAccessState,
 };
+use crate::views::main_menu_drawer::MainMenuCommand;
 use crate::views::nav_rail::NavDestination;
+use crate::views::openbot::shell_state::OpenBotPage;
+use crate::views::settings::settings_type::SettingsSectionType;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
 
 /// Per-domain monotonic request generation fences for Content Hub async RPCs.
@@ -425,14 +431,62 @@ impl AppShell {
             ActiveWorkspacePanel::Community => (AppleSidebarSection::Community, true),
             _ => (AppleSidebarSection::Chats, false),
         };
-        let settings_active = self.active_panel == ActiveWorkspacePanel::Settings;
+        let is_standalone_computers = self.active_panel == ActiveWorkspacePanel::Settings && {
+            let sr = self.settings_router.read(cx);
+            sr.standalone_computers_mode && sr.settings_section == SettingsSectionType::Computers
+        };
+        let openbot_page = if self.active_panel == ActiveWorkspacePanel::OpenBot {
+            self.openbot_workspace
+                .as_ref()
+                .map(|ws| ws.read(cx).active_page)
+        } else {
+            None
+        };
+        let contacts_modal_active = self.sidebar.read(cx).is_contacts_modal_open
+            || matches!(
+                self.modal_container.read(cx).dialog.kind,
+                Some(ModalDialogKind::Contacts)
+            );
+        let highlighted_dest = if contacts_modal_active {
+            Some(AppleSidebarSection::Contacts)
+        } else {
+            match self.active_panel {
+                ActiveWorkspacePanel::Chats => Some(AppleSidebarSection::Chats),
+                ActiveWorkspacePanel::ContentHub(sec) => {
+                    Some(AppleSidebarSection::from_content_hub_section(sec))
+                }
+                ActiveWorkspacePanel::Community => Some(AppleSidebarSection::Community),
+                ActiveWorkspacePanel::Calls => Some(AppleSidebarSection::Calls),
+                ActiveWorkspacePanel::TaskCenter => Some(AppleSidebarSection::Tasks),
+                ActiveWorkspacePanel::McpTools => Some(AppleSidebarSection::McpTools),
+                ActiveWorkspacePanel::Browser => Some(AppleSidebarSection::Browser),
+                ActiveWorkspacePanel::Settings => {
+                    is_standalone_computers.then_some(AppleSidebarSection::RemoteComputer)
+                }
+                ActiveWorkspacePanel::OpenBot => match openbot_page {
+                    Some(OpenBotPage::Workflows) => Some(AppleSidebarSection::Workflows),
+                    Some(OpenBotPage::Tasks) => Some(AppleSidebarSection::Tasks),
+                    Some(OpenBotPage::Schedule) => Some(AppleSidebarSection::Schedule),
+                    Some(OpenBotPage::Library) => Some(AppleSidebarSection::Library),
+                    Some(OpenBotPage::Usage) => Some(AppleSidebarSection::Usage),
+                    Some(OpenBotPage::Settings) => None,
+                    _ => Some(AppleSidebarSection::Chats),
+                },
+                ActiveWorkspacePanel::OrcaBots | ActiveWorkspacePanel::OrcaIde => None,
+            }
+        };
+        let settings_active = (self.active_panel == ActiveWorkspacePanel::Settings
+            && !is_standalone_computers)
+            || matches!(openbot_page, Some(OpenBotPage::Settings));
         self.apple_sidebar.update(cx, |sb, scx| {
             if sb.active_section != target
                 || sb.highlight_active_section != highlight
+                || sb.highlighted_destination != highlighted_dest
                 || sb.settings_active != settings_active
             {
                 sb.set_active_section(target);
                 sb.set_highlight_active_section(highlight);
+                sb.set_highlighted_destination(highlighted_dest);
                 sb.set_settings_active(settings_active);
                 scx.notify();
             }
@@ -473,7 +527,8 @@ impl AppShell {
         });
     }
 
-    /// Switches between `Chats`, `Community`, and any Apple Content Hub vertical without clearing chat state.
+    /// Switches between `Chats`, `Community`, Apple Content Hub verticals, and all OpenBot `PageRail`
+    /// destinations without clearing chat state.
     pub fn select_apple_sidebar_section(
         &mut self,
         section: AppleSidebarSection,
@@ -494,10 +549,16 @@ impl AppShell {
             self.open_community_workspace(cx);
             return;
         }
-        self.leave_workspace_modal_panel_for_hub(cx);
-        self.dismiss_transient_popovers_for_hub(cx);
-        match section.to_content_hub_section() {
-            None => {
+        if let Some(hub_section) = section.to_content_hub_section() {
+            self.leave_workspace_modal_panel_for_hub(cx);
+            self.dismiss_transient_popovers_for_hub(cx);
+            self.switch_to_content_hub(hub_section, cx);
+            return;
+        }
+        match section {
+            AppleSidebarSection::Chats => {
+                self.leave_workspace_modal_panel_for_hub(cx);
+                self.dismiss_transient_popovers_for_hub(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
                 self.last_handled_nav_dest = Some(NavDestination::Chats);
                 self.nav_rail.update(cx, |r, rcx| {
@@ -521,9 +582,58 @@ impl AppShell {
                 }
                 cx.notify();
             }
-            Some(hub_section) => {
-                self.switch_to_content_hub(hub_section, cx);
+            AppleSidebarSection::Contacts => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.handle_main_menu_command(MainMenuCommand::Contacts, cx);
+                self.sync_apple_sidebar_to_active_panel(cx);
             }
+            AppleSidebarSection::Calls => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.handle_main_menu_command(MainMenuCommand::Calls, cx);
+            }
+            AppleSidebarSection::Tasks => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.handle_main_menu_command(MainMenuCommand::TaskCenter, cx);
+            }
+            AppleSidebarSection::McpTools => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.handle_main_menu_command(MainMenuCommand::McpTools, cx);
+            }
+            AppleSidebarSection::RemoteComputer => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.open_remote_computers_hub(cx);
+            }
+            AppleSidebarSection::Browser => {
+                self.dismiss_transient_popovers_for_hub(cx);
+                self.open_browser_workspace(cx);
+            }
+            AppleSidebarSection::Workflows
+            | AppleSidebarSection::Schedule
+            | AppleSidebarSection::Library
+            | AppleSidebarSection::Usage => {
+                let page = match section {
+                    AppleSidebarSection::Workflows => OpenBotPage::Workflows,
+                    AppleSidebarSection::Schedule => OpenBotPage::Schedule,
+                    AppleSidebarSection::Library => OpenBotPage::Library,
+                    AppleSidebarSection::Usage => OpenBotPage::Usage,
+                    _ => OpenBotPage::Agents,
+                };
+                self.leave_workspace_modal_panel_for_hub(cx);
+                self.dismiss_transient_popovers_for_hub(cx);
+                let ws = self.open_openbot_workspace(cx);
+                ws.update(cx, |w, wcx| {
+                    w.select_page(page);
+                    wcx.notify();
+                });
+                self.sync_apple_sidebar_to_active_panel(cx);
+                cx.notify();
+            }
+            AppleSidebarSection::Community
+            | AppleSidebarSection::Books
+            | AppleSidebarSection::Music
+            | AppleSidebarSection::Games
+            | AppleSidebarSection::AppStore
+            | AppleSidebarSection::MyCreations => {}
         }
     }
 
@@ -594,6 +704,11 @@ impl AppShell {
         self.occlude_browser_for_overlay(cx);
         self.blur_community_if_focused(cx);
         self.clear_all_ime_preedits(cx);
+        self.apple_sidebar.update(cx, |sb, scx| {
+            if sb.close_popovers() {
+                scx.notify();
+            }
+        });
         self.main_menu_drawer.update(cx, |m, mcx| {
             if m.is_open {
                 m.close();
@@ -828,6 +943,11 @@ impl AppShell {
                 self.open_creator_studio_bot_chat(cmd, cx);
             }
             AppleSidebarEvent::OpenAccountMenu => {
+                self.apple_sidebar.update(cx, |sb, scx| {
+                    if sb.close_popovers() {
+                        scx.notify();
+                    }
+                });
                 self.clear_ime_and_blur_content_hub_for_transition(true, cx);
                 self.toggle_account_popover(cx);
                 if self.sidebar.read(cx).is_account_popover_open {
@@ -837,11 +957,41 @@ impl AppShell {
                 cx.notify();
             }
             AppleSidebarEvent::OpenSettings => {
+                self.apple_sidebar.update(cx, |sb, scx| {
+                    if sb.close_popovers() {
+                        scx.notify();
+                    }
+                });
                 self.clear_ime_and_blur_content_hub_for_transition(true, cx);
-                self.handle_main_menu_command(
-                    crate::views::main_menu_drawer::MainMenuCommand::Settings,
-                    cx,
-                );
+                self.handle_main_menu_command(MainMenuCommand::Settings, cx);
+            }
+            AppleSidebarEvent::TogglePin(_) => {
+                let pins = self.apple_sidebar.read(cx).pinned_sections.clone();
+                let _ = save_page_rail_pins(&self.preferences_dir, &pins);
+                cx.notify();
+            }
+            AppleSidebarEvent::OpenHelp => {
+                self.apple_sidebar.update(cx, |sb, scx| {
+                    if sb.close_popovers() {
+                        scx.notify();
+                    }
+                });
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                self.handle_main_menu_command(MainMenuCommand::ShortcutsLegend, cx);
+            }
+            AppleSidebarEvent::OpenHelpAction(action) => {
+                self.apple_sidebar.update(cx, |sb, scx| {
+                    if sb.close_popovers() {
+                        scx.notify();
+                    }
+                });
+                self.clear_ime_and_blur_content_hub_for_transition(true, cx);
+                let cmd = match action {
+                    RailHelpAction::Shortcuts => MainMenuCommand::ShortcutsLegend,
+                    RailHelpAction::ExportData => MainMenuCommand::ExportData,
+                    RailHelpAction::About => MainMenuCommand::AboutTelegram,
+                };
+                self.handle_main_menu_command(cmd, cx);
             }
         }
     }

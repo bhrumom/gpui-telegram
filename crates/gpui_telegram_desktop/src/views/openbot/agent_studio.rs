@@ -92,6 +92,21 @@ impl GlobalSearchTab {
         }
     }
 
+    pub fn localized_label(self, lang_id: &str) -> &'static str {
+        if lang_id.starts_with("zh") {
+            match self {
+                Self::All => "全部",
+                Self::Agents => "助手",
+                Self::Channels => "群聊",
+                Self::Messages => "消息",
+                Self::Files => "文件",
+                Self::Routines => "定时任务",
+            }
+        } else {
+            self.label()
+        }
+    }
+
     pub fn parse(raw: &str) -> Option<Self> {
         let lower = raw.trim().to_ascii_lowercase();
         Self::ALL.into_iter().find(|t| t.as_str() == lower)
@@ -131,6 +146,22 @@ impl GlobalSearchSectionKind {
             Self::Routines => "Routines",
             Self::Actions => "Actions",
             Self::Settings => "Settings",
+        }
+    }
+
+    pub fn localized_label(self, lang_id: &str) -> &'static str {
+        if lang_id.starts_with("zh") {
+            match self {
+                Self::Agents => "助手",
+                Self::Channels => "群聊",
+                Self::Messages => "消息",
+                Self::Files => "文件",
+                Self::Routines => "定时任务",
+                Self::Actions => "快捷操作",
+                Self::Settings => "设置",
+            }
+        } else {
+            self.label()
         }
     }
 
@@ -286,60 +317,153 @@ impl GlobalSearchState {
         }
         out
     }
+
+    /// Opens the floating command palette and resets filter/query/selection cleanly.
+    pub fn open_palette(&mut self) {
+        self.open = true;
+        self.active_tab = GlobalSearchTab::All;
+        self.query.clear();
+        self.debounced_query.clear();
+        self.caret_x = 0.0;
+        self.selected_index = 0;
+        self.searching = false;
+    }
+
+    /// Closes the floating command palette.
+    pub fn close_palette(&mut self) {
+        self.open = false;
+        self.searching = false;
+    }
+
+    /// Returns flattened visible results across sections respecting `ALL_SECTION_LIMIT = 5`.
+    pub fn flat_filtered_results(&self) -> Vec<&GlobalSearchResultItem> {
+        self.filtered_sections()
+            .into_iter()
+            .flat_map(|(_, items)| items)
+            .collect()
+    }
+
+    /// Wraps keyboard selection (`ArrowUp`/`ArrowDown`) across visible results (`shouldFocusWrap = true`).
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.flat_filtered_results().len();
+        if len == 0 {
+            self.selected_index = 0;
+            return;
+        }
+        let cur = (self.selected_index.min(len - 1)) as isize;
+        let next = (cur + delta).rem_euclid(len as isize) as usize;
+        self.selected_index = next;
+    }
+
+    /// Cycles the active filter tab forward (`Tab`) or backward (`Shift+Tab`).
+    pub fn cycle_tab(&mut self, forward: bool) {
+        let all = GlobalSearchTab::ALL;
+        let cur = all
+            .iter()
+            .position(|&t| t == self.active_tab)
+            .unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % all.len()
+        } else {
+            (cur + all.len() - 1) % all.len()
+        };
+        self.active_tab = all[next];
+        self.selected_index = 0;
+    }
+
+    /// Returns the currently highlighted result hit, if any.
+    pub fn selected_result(&self) -> Option<&GlobalSearchResultItem> {
+        let flat = self.flat_filtered_results();
+        if flat.is_empty() {
+            return None;
+        }
+        let idx = self.selected_index.min(flat.len() - 1);
+        flat.get(idx).copied()
+    }
+
+    /// Returns the 1-indexed result for `Cmd/Ctrl+1..9` direct jump (`GlobalSearch.tsx`).
+    pub fn result_at_shortcut_digit(&self, digit_1_to_9: usize) -> Option<&GlobalSearchResultItem> {
+        if !(1..=9).contains(&digit_1_to_9) {
+            return None;
+        }
+        let flat = self.flat_filtered_results();
+        flat.get(digit_1_to_9 - 1).copied()
+    }
+
+    /// Appends typed text to `query` and updates `GlobalSearchPlush` caret tracking.
+    pub fn push_query_text(&mut self, text: &str, now_ms: u64) {
+        if text.is_empty() {
+            return;
+        }
+        let mut next = self.query.clone();
+        next.push_str(text);
+        let caret = (next.chars().count() as f64) * 8.0;
+        self.set_query(next, caret, now_ms);
+    }
+
+    /// Removes the last Unicode scalar from `query` and updates `GlobalSearchPlush` caret tracking.
+    pub fn backspace_query(&mut self, now_ms: u64) {
+        let mut next = self.query.clone();
+        if next.pop().is_some() {
+            let caret = (next.chars().count() as f64) * 8.0;
+            self.set_query(next, caret, now_ms);
+        }
+    }
+
+    /// Clears `query` and resets selection + caret gaze.
+    pub fn clear_query(&mut self, now_ms: u64) {
+        self.set_query(String::new(), 0.0, now_ms);
+    }
 }
 
 fn pal(palette: &OpenBotPalette, token: &str, fallback: u32) -> Rgba {
     palette.rgba(token).unwrap_or_else(|| rgb(fallback))
 }
 
-/// Renders the `Cmd/Ctrl+K` `GlobalSearch` modal with animated `GlobalSearchPlush`,
-/// 6 search tabs, and categorized `36px` result rows.
+/// Renders the `Cmd/Ctrl+K` `GlobalSearch` modal (`640px`, `16px` radius, `48px` top input bar +
+/// inline sliding-pill tabs, `36px` categorized rows with `Enter` `<Kbd>`, `56px` `GlobalSearchPlush`
+/// empty state, and `36px` keyboard footer).
 pub fn render_global_search_modal(
     state: &mut GlobalSearchState,
     palette: &OpenBotPalette,
     now_ms: f64,
 ) -> Div {
-    let overlay = pal(palette, "--openbot-bg-overlay", 0x1A1A1A);
-    let surface = pal(palette, "--openbot-bg-surface", 0x212121);
-    let hover = pal(palette, "--openbot-bg-control-hover", 0x242424);
-    let active_bg = pal(palette, "--openbot-bg-control-active", 0x2A2A2A);
-    let border = pal(palette, "--openbot-border-grouped", 0x333335);
-    let text_pri = pal(palette, "--openbot-text-primary", 0xFFFFFF);
-    let text_muted = pal(palette, "--openbot-text-muted", 0x979797);
-    let accent = pal(palette, "--openbot-accent", 0x007CF7);
-    let accent_soft = pal(palette, "--openbot-accent-soft", 0x163150);
+    let dark = palette.scheme.is_dark();
+    let card_bg = if dark { rgb(0x1E1E1E) } else { rgb(0xFFFFFF) };
+    let ring = palette
+        .rgba("--openbot-dialog-ring")
+        .unwrap_or_else(|| palette.border_strong_hairline());
+    let divider = palette.border();
+    let hover = palette.hover();
+    let active_bg = palette.bg_control_active();
+    let kbd_bg = palette.bg_control_hover();
+    let text_pri = palette.text_primary();
+    let text_sec = palette.text_secondary();
+    let text_muted = palette.text_muted();
 
-    let plush_el = state.plush.render_element(now_ms, 40.0);
     let sections = state.filtered_sections();
 
-    let mut tab_bar = div()
-        .px(px(14.0))
-        .py(px(8.0))
-        .border_b_1()
-        .border_color(border)
+    let mut tab_strip = div()
         .flex()
         .items_center()
-        .gap(px(4.0));
+        .gap(px(2.0))
+        .flex_shrink_0();
     for tab in GlobalSearchTab::ALL {
         let active = state.active_tab == tab;
-        tab_bar = tab_bar.child(
+        tab_strip = tab_strip.child(
             div()
                 .id(SharedString::from(format!("openbot-gs-tab-{}", tab.as_str())))
-                .h(px(26.0))
-                .px(px(10.0))
-                .rounded(px(999.0))
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
                 .cursor_pointer()
-                .bg(if active { accent_soft } else { surface })
+                .when(active, |el| el.bg(active_bg))
                 .flex()
                 .items_center()
-                .text_size(px(12.0))
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(if active { accent } else { text_muted })
-                .hover(move |s| s.bg(hover))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if active { text_pri } else { text_muted })
+                .hover(move |s| if active { s } else { s.text_color(text_sec) })
                 .child(tab.label()),
         );
     }
@@ -348,10 +472,9 @@ pub fn render_global_search_modal(
         .id("openbot-global-search-results")
         .flex_1()
         .min_h(px(0.0))
-        .max_h(px(360.0))
+        .max_h(px(400.0))
         .overflow_y_scroll()
-        .px(px(10.0))
-        .py(px(6.0))
+        .p(px(6.0))
         .flex()
         .flex_col();
 
@@ -366,41 +489,114 @@ pub fn render_global_search_modal(
             div()
                 .h(px(header_h))
                 .px(px(8.0))
+                .pb(px(4.0))
                 .flex()
                 .items_end()
-                .pb(px(4.0))
-                .text_size(px(11.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .justify_between()
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(text_muted)
-                .child(sec_kind.label().to_uppercase()),
+                .child(sec_kind.label())
+                .child(items.len().to_string()),
         );
         for item in items {
             let selected = flat_idx == state.selected_index;
             flat_idx += 1;
+            let leading: AnyElement = match item.section {
+                GlobalSearchSectionKind::Agents | GlobalSearchSectionKind::Messages => {
+                    let seed = item.avatar_seed.as_deref().unwrap_or(item.id.as_str());
+                    crate::components::avatar::render_plush_bot_avatar(
+                        seed,
+                        None,
+                        None,
+                        None,
+                        20.0,
+                        AvatarMood::Idle,
+                        None,
+                    )
+                    .into_any_element()
+                }
+                GlobalSearchSectionKind::Channels => div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(text_muted)
+                    .child("#")
+                    .into_any_element(),
+                GlobalSearchSectionKind::Files => div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon_rgba(IconName::FileDoc, 15.0, text_muted))
+                    .into_any_element(),
+                GlobalSearchSectionKind::Routines => div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon_rgba(IconName::ClockSending, 15.0, text_muted))
+                    .into_any_element(),
+                GlobalSearchSectionKind::Actions => div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon_rgba(IconName::ComposePen, 14.0, text_muted))
+                    .into_any_element(),
+                GlobalSearchSectionKind::Settings => div()
+                    .w(px(20.0))
+                    .h(px(20.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tg_icon_rgba(IconName::SettingsGear, 15.0, text_muted))
+                    .into_any_element(),
+            };
             list_body = list_body.child(
                 div()
                     .id(SharedString::from(format!("openbot-gs-row-{}", item.id)))
                     .h(px(GLOBAL_SEARCH_RESULT_HEIGHT_PX))
+                    .flex_shrink_0()
+                    .w_full()
                     .px(px(8.0))
-                    .rounded(px(9.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.0))
                     .when(selected, |el| el.bg(active_bg))
-                    .hover(move |s| s.bg(hover))
+                    .hover(move |s| if selected { s } else { s.bg(hover) })
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
+                            .overflow_hidden()
                             .flex()
                             .items_center()
                             .gap(px(8.0))
+                            .child(leading)
                             .child(
                                 div()
-                                    .truncate()
-                                    .text_size(px(13.0))
+                                    .max_w(px(220.0))
+                                    .flex_shrink_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(14.0))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(text_pri)
                                     .child(item.title.clone()),
@@ -408,23 +604,30 @@ pub fn render_global_search_modal(
                             .when(!item.subtitle.is_empty(), |el| {
                                 el.child(
                                     div()
-                                        .truncate()
-                                        .text_size(px(12.0))
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(13.5))
                                         .text_color(text_muted)
                                         .child(item.subtitle.clone()),
                                 )
                             }),
                     )
-                    .when_some(item.shortcut_hint.clone(), |el, hint| {
+                    .when(selected, |el| {
                         el.child(
                             div()
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded(px(6.0))
-                                .bg(surface)
+                                .h(px(20.0))
+                                .px(px(5.0))
+                                .rounded(px(4.0))
+                                .bg(kbd_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .text_size(px(11.0))
                                 .text_color(text_muted)
-                                .child(hint),
+                                .child("↵"),
                         )
                     }),
             );
@@ -432,47 +635,76 @@ pub fn render_global_search_modal(
     }
 
     if flat_idx == 0 {
+        let empty_plush = state.plush.render_element(now_ms, 56.0);
         list_body = list_body.child(
             div()
-                .h(px(110.0))
+                .min_h(px(148.0))
+                .py(px(12.0))
+                .w_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .text_size(px(13.0))
-                .text_color(text_muted)
-                .child(if state.searching {
-                    "Searching…"
-                } else {
-                    "No matching results"
-                }),
+                .gap(px(8.0))
+                .child(empty_plush)
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(text_muted)
+                        .child(if state.searching {
+                            "Searching…"
+                        } else {
+                            "No results found"
+                        }),
+                ),
         );
     }
 
+    let kbd_chip = |label: &'static str| {
+        div()
+            .h(px(20.0))
+            .px(px(5.0))
+            .rounded(px(4.0))
+            .bg(active_bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(text_sec)
+            .child(label)
+    };
+
     div()
-        .w(px(580.0))
-        .rounded(px(20.0))
-        .bg(overlay)
+        .w(px(640.0))
+        .rounded(px(16.0))
+        .bg(card_bg)
         .border_1()
-        .border_color(border)
+        .border_color(ring)
+        .shadow_lg()
         .flex()
         .flex_col()
         .overflow_hidden()
         .child(
             div()
-                .h(px(56.0))
-                .px(px(16.0))
+                .h(px(48.0))
+                .flex_shrink_0()
+                .w_full()
+                .pl(px(16.0))
+                .pr(px(8.0))
                 .border_b_1()
-                .border_color(border)
+                .border_color(divider)
                 .flex()
                 .items_center()
-                .gap(px(10.0))
-                .child(plush_el)
+                .gap(px(8.0))
                 .child(tg_icon_rgba(IconName::Search, 16.0, text_muted))
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .truncate()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_size(px(15.0))
                         .text_color(if state.query.is_empty() {
                             text_muted
@@ -480,27 +712,60 @@ pub fn render_global_search_modal(
                             text_pri
                         })
                         .child(if state.query.is_empty() {
-                            "Search agents, channels, messages, files, routines…".to_string()
+                            "Search".to_string()
                         } else {
                             state.query.clone()
                         }),
-                ),
+                )
+                .child(tab_strip),
         )
-        .child(tab_bar)
         .child(list_body)
         .child(
             div()
-                .h(px(32.0))
-                .px(px(14.0))
+                .h(px(36.0))
+                .flex_shrink_0()
+                .w_full()
+                .px(px(16.0))
                 .border_t_1()
-                .border_color(border)
+                .border_color(divider)
                 .flex()
                 .items_center()
-                .justify_between()
-                .text_size(px(11.0))
+                .gap(px(16.0))
+                .text_size(px(13.0))
                 .text_color(text_muted)
-                .child("↑↓ Navigate · ↵ Open · Tab Switch tab")
-                .child("Esc Close"),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(kbd_chip("↑"))
+                        .child(kbd_chip("↓"))
+                        .child("Navigate"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(kbd_chip("↵"))
+                        .child("Open"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(kbd_chip("Tab"))
+                        .child("Filter"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(kbd_chip("Esc"))
+                        .child("Close"),
+                ),
         )
 }
 
@@ -778,27 +1043,29 @@ impl FirstAgentSetupState {
     }
 }
 
-/// Renders the 1:1 OpenBot `FirstAgentSetup` onboarding / new-agent studio (`OB-F14`).
+/// Renders the 1:1 OpenBot `FirstAgentSetup` onboarding / new-agent studio (`OB-F14` / `UI-F08`).
 pub fn render_first_agent_setup(
     state: &FirstAgentSetupState,
     palette: &OpenBotPalette,
     now_sec: f64,
 ) -> Div {
     let dark = palette.scheme.is_dark();
-    let bg = pal(palette, "--openbot-bg-canvas", 0x1A1A1A);
-    let surface = pal(palette, "--openbot-bg-surface", 0x212121);
-    let hover = pal(palette, "--openbot-bg-control-hover", 0x242424);
-    let border = pal(palette, "--openbot-border-grouped", 0x333335);
-    let text_pri = pal(palette, "--openbot-text-primary", 0xFFFFFF);
-    let text_sec = pal(palette, "--openbot-text-secondary", 0xDCDCDC);
-    let text_muted = pal(palette, "--openbot-text-muted", 0x979797);
-    let accent = pal(palette, "--openbot-accent", 0x007CF7);
-    let accent_soft = pal(palette, "--openbot-accent-soft", 0x163150);
-    let danger = pal(palette, "--openbot-danger-text", 0xFF6069);
+    let bg = palette.bg_canvas();
+    let control = palette.bg_control();
+    let hover = palette.hover();
+    let border = palette.border_strong_hairline();
+    let text_pri = palette.text_primary();
+    let text_sec = palette.text_secondary();
+    let text_muted = palette.text_muted();
+    let accent_ring = palette.accent_text();
+    let accent_soft = palette.accent_soft();
+    let danger = palette.danger();
+    let cta_bg = palette.surface_light();
+    let cta_fg = palette.text_on_light();
 
     let selected_face = FIRST_AGENT_FACES[state.selected_face_index.min(FIRST_AGENT_FACE_COUNT - 1)];
     let mut hero_props = AgentAvatarProps::new(&state.avatar_seed)
-        .with_size(84.0)
+        .with_size(72.0)
         .with_mood(AvatarMood::Idle)
         .with_hue_and_color(state.avatar_hue, state.avatar_color.clone());
     hero_props.shape_override = Some(selected_face.shape);
@@ -806,57 +1073,95 @@ pub fn render_first_agent_setup(
     hero_props.eye_scale = FACE_CHOICE_EYE_SCALE;
     hero_props.dark_scheme = dark;
 
-    // 17-swatch color bar: `"A"` auto + 16 palette choices
-    let mut color_bar = div().flex().items_center().justify_center().gap(px(5.0)).flex_wrap();
-    color_bar = color_bar.child(
+    // Exact 9x2 = 18 circular color swatches: index 0 Auto (#8b5cf6) + all 17 AVATAR_COLOR_CHOICES
+    let mut swatch_cells: Vec<AnyElement> = Vec::with_capacity(18);
+    swatch_cells.push(
         div()
             .id("openbot-setup-color-auto")
-            .w(px(22.0))
-            .h(px(22.0))
+            .w(px(28.0))
+            .h(px(28.0))
             .rounded_full()
-            .bg(surface)
-            .border_1()
-            .border_color(if state.auto_color { accent } else { border })
             .cursor_pointer()
+            .when(state.auto_color, |el| el.border_1().border_color(accent_ring))
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(10.5))
-            .font_weight(FontWeight::BOLD)
-            .text_color(if state.auto_color { accent } else { text_sec })
-            .hover(move |s| s.bg(hover))
-            .child("A"),
+            .child(
+                div()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded_full()
+                    .bg(rgb(0x8B5CF6))
+                    .border_1()
+                    .border_color(palette.border_strong()),
+            )
+            .into_any_element(),
     );
-    for (idx, choice) in AVATAR_COLOR_CHOICES
-        .iter()
-        .take(FIRST_AGENT_COLOR_CHOICES_COUNT - 1)
-        .enumerate()
-    {
+    for (idx, choice) in AVATAR_COLOR_CHOICES.iter().enumerate() {
         let swatch_hex = match *choice {
             AvatarColorChoice::Hue { swatch, .. } | AvatarColorChoice::Preset { swatch, .. } => {
                 swatch
             }
         };
+        let is_selected = !state.auto_color
+            && match *choice {
+                AvatarColorChoice::Hue { hue, .. } => {
+                    state.avatar_color.is_none() && state.avatar_hue == Some(hue)
+                }
+                AvatarColorChoice::Preset { color, .. } => {
+                    state.avatar_color.as_deref() == Some(color)
+                }
+            };
         let swatch_rgba = parse_css_color_to_rgba(swatch_hex).unwrap_or_else(|| rgb(0x3B93F0));
-        color_bar = color_bar.child(
+        swatch_cells.push(
             div()
                 .id(SharedString::from(format!("openbot-setup-color-{idx}")))
-                .w(px(20.0))
-                .h(px(20.0))
+                .w(px(28.0))
+                .h(px(28.0))
                 .rounded_full()
-                .bg(swatch_rgba)
-                .border_1()
-                .border_color(border)
-                .cursor_pointer(),
+                .cursor_pointer()
+                .when(is_selected, |el| el.border_1().border_color(accent_ring))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded_full()
+                        .bg(swatch_rgba)
+                        .border_1()
+                        .border_color(palette.border_strong()),
+                )
+                .into_any_element(),
         );
     }
+    let row_1: Vec<AnyElement> = swatch_cells.drain(..9.min(swatch_cells.len())).collect();
+    let row_2: Vec<AnyElement> = swatch_cells;
+    let color_grid = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(4.0))
+        .child(div().flex().items_center().justify_center().gap(px(4.0)).children(row_1))
+        .child(div().flex().items_center().justify_center().gap(px(4.0)).children(row_2));
 
-    // 12 curated faces (`FACE_CHOICE_EYE_SCALE = 1.25`)
-    let mut face_grid = div().flex().flex_wrap().justify_center().gap(px(8.0));
+    // Exact 12 curated faces (`33x33px`, `24x24px` preview, `FACE_CHOICE_EYE_SCALE = 1.25`)
+    let mut face_row = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap(px(2.0));
     for (idx, face) in FIRST_AGENT_FACES.iter().enumerate() {
         let selected = idx == state.selected_face_index;
-        let mut fp = AgentAvatarProps::new(&state.avatar_seed)
-            .with_size(40.0)
+        let face_seed = if state.auto_color {
+            format!("openbot-face-seed-{idx}")
+        } else {
+            state.avatar_seed.clone()
+        };
+        let mut fp = AgentAvatarProps::new(&face_seed)
+            .with_size(24.0)
             .with_hue_and_color(state.avatar_hue, state.avatar_color.clone());
         fp.shape_override = Some(face.shape);
         fp.expression_override = Some(face.expression);
@@ -864,235 +1169,292 @@ pub fn render_first_agent_setup(
         fp.transition = PlushTransition::Cut;
         fp.dark_scheme = dark;
 
-        face_grid = face_grid.child(
+        face_row = face_row.child(
             div()
                 .id(SharedString::from(format!("openbot-setup-face-{idx}")))
-                .w(px(52.0))
-                .h(px(52.0))
-                .rounded(px(12.0))
-                .bg(if selected { accent_soft } else { surface })
-                .border_1()
-                .border_color(if selected { accent } else { border })
+                .w(px(33.0))
+                .h(px(33.0))
+                .rounded(px(8.0))
+                .when(selected, |el| {
+                    el.bg(accent_soft).border_1().border_color(accent_ring)
+                })
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover(move |s| s.bg(hover))
+                .hover(move |s| if selected { s } else { s.bg(hover) })
                 .child(render_agent_avatar(&fp, None, now_sec)),
         );
     }
 
-    // Provider & ReasoningEffort picker (all 18 providers, 8 reasoning efforts, ZERO temperature)
-    let mut provider_row = div()
-        .id("openbot-setup-providers")
-        .min_w(px(0.0))
-        .overflow_x_scroll()
-        .flex()
-        .items_center()
-        .gap(px(5.0));
-    for provider in AgentProviderId::ALL {
-        let active = provider == state.provider;
-        provider_row = provider_row.child(
-            div()
-                .id(SharedString::from(format!(
-                    "openbot-setup-prov-{}",
-                    provider.as_str()
-                )))
-                .h(px(26.0))
-                .px(px(9.0))
-                .rounded(px(8.0))
-                .flex_shrink_0()
-                .bg(if active { accent_soft } else { surface })
-                .border_1()
-                .border_color(if active { accent } else { border })
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .text_size(px(11.5))
-                .text_color(if active { accent } else { text_sec })
-                .hover(move |s| s.bg(hover))
-                .child(provider.descriptor().display_name),
-        );
-    }
-
-    let mut effort_row = div().flex().items_center().gap(px(4.0)).flex_wrap();
-    for effort in AgentReasoningEffort::ALL {
-        let active = effort == state.reasoning_effort;
-        effort_row = effort_row.child(
-            div()
-                .id(SharedString::from(format!(
-                    "openbot-setup-effort-{}",
-                    effort.as_str()
-                )))
-                .h(px(24.0))
-                .px(px(8.0))
-                .rounded(px(999.0))
-                .bg(if active { accent_soft } else { surface })
-                .border_1()
-                .border_color(if active { accent } else { border })
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .text_size(px(11.0))
-                .text_color(if active { accent } else { text_muted })
-                .hover(move |s| s.bg(hover))
-                .child(effort.as_str()),
-        );
-    }
-
-    // 6 momentum-draggable starter suggestions
+    // 6 momentum-draggable starter suggestions (`256x112px` cards with `42px` 3D plush)
     let mut suggestions_row = div()
         .id("openbot-setup-suggestions")
+        .w_full()
         .min_w(px(0.0))
         .overflow_x_scroll()
         .flex()
         .items_center()
-        .gap(px(8.0));
-    for suggestion in FIRST_AGENT_SUGGESTIONS {
+        .gap(px(10.0));
+    for (idx, suggestion) in FIRST_AGENT_SUGGESTIONS.iter().enumerate() {
         let matched = state.matched_suggestion_id.as_deref() == Some(suggestion.id);
+        let sug_plush = crate::components::avatar::render_plush_bot_avatar(
+            suggestion.id,
+            Some(FIRST_AGENT_FACES[idx % FIRST_AGENT_FACE_COUNT].shape),
+            None,
+            None,
+            42.0,
+            AvatarMood::Idle,
+            None,
+        );
         suggestions_row = suggestions_row.child(
             div()
                 .id(SharedString::from(format!("openbot-setup-sug-{}", suggestion.id)))
-                .w(px(172.0))
-                .p(px(10.0))
+                .w(px(256.0))
+                .h(px(112.0))
+                .p(px(16.0))
                 .rounded(px(12.0))
                 .flex_shrink_0()
-                .bg(if matched { accent_soft } else { surface })
-                .border_1()
-                .border_color(if matched { accent } else { border })
+                .when(matched, |el| {
+                    el.bg(accent_soft).border_1().border_color(accent_ring)
+                })
+                .when(!matched, |el| el.border_1().border_color(border))
                 .cursor_pointer()
                 .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .hover(move |s| s.bg(hover))
+                .items_center()
+                .gap(px(14.0))
+                .hover(move |s| if matched { s } else { s.bg(hover) })
+                .child(sug_plush)
                 .child(
                     div()
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(text_pri)
-                        .child(suggestion.title),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(text_muted)
-                        .child(suggestion.description),
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text_pri)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(suggestion.title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .line_height(px(18.0))
+                                .text_color(text_muted)
+                                .child(suggestion.description),
+                        ),
                 ),
         );
     }
 
+    let can_submit = !state.name.trim().is_empty() && !state.generating_profile;
     let scroll_body = div()
         .id("openbot-first-agent-setup")
         .flex_1()
         .w_full()
         .min_h(px(0.0))
         .overflow_y_scroll()
-        .p(px(24.0))
+        .px(px(24.0))
+        .py(px(20.0))
         .flex()
         .flex_col()
-        .items_center()
-        .gap(px(16.0))
+        .justify_between()
+        .gap(px(24.0))
         .child(
             div()
-                .text_size(px(22.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(text_pri)
-                .child(match state.mode {
-                    FirstAgentSetupMode::First => "Create your first agent",
-                    FirstAgentSetupMode::Additional => "Create a new agent",
-                }),
-        )
-        .child(render_agent_avatar(&hero_props, None, now_sec))
-        .child(color_bar)
-        .child(face_grid)
-        .child(
-            div()
-                .w(px(520.0))
+                .w(px(420.0))
+                .max_w_full()
+                .mx_auto()
                 .flex()
                 .flex_col()
-                .gap(px(10.0))
+                .items_center()
+                .gap(px(12.0))
+                .child(render_agent_avatar(&hero_props, None, now_sec))
+                .child(color_grid)
+                .child(face_row)
                 .child(
                     div()
-                        .p(px(10.0))
-                        .rounded(px(10.0))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
-                        .text_size(px(13.5))
-                        .text_color(if state.name.is_empty() { text_muted } else { text_pri })
-                        .child(if state.name.is_empty() {
-                            "Agent name (1..80 chars)".to_string()
-                        } else {
-                            state.name.clone()
-                        }),
-                )
-                .child(
-                    div()
-                        .p(px(10.0))
-                        .min_h(px(72.0))
-                        .rounded(px(10.0))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
-                        .text_size(px(13.0))
-                        .text_color(if state.purpose.is_empty() { text_muted } else { text_pri })
-                        .child(if state.purpose.is_empty() {
-                            "Describe what this agent should help you with…".to_string()
-                        } else {
-                            state.purpose.clone()
-                        }),
-                )
-                .child(provider_row)
-                .child(effort_row)
-                .child(suggestions_row)
-                .when_some(state.error_message.clone(), |el, err| {
-                    el.child(div().text_size(px(12.0)).text_color(danger).child(err))
-                })
-                .child(
-                    div()
+                        .w_full()
+                        .mt(px(4.0))
                         .flex()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .when(state.can_cancel_with_escape(), |el| {
-                            el.child(
-                                div()
-                                    .id("openbot-setup-cancel")
-                                    .h(px(34.0))
-                                    .px(px(14.0))
-                                    .rounded(px(10.0))
-                                    .bg(surface)
-                                    .border_1()
-                                    .border_color(border)
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(13.0))
-                                    .text_color(text_sec)
-                                    .hover(move |s| s.bg(hover))
-                                    .child("Cancel"),
-                            )
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text_sec)
+                                        .child("Name")
+                                        .child(div().text_color(danger).child("*")),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(38.0))
+                                        .px(px(12.0))
+                                        .rounded(px(8.0))
+                                        .bg(control)
+                                        .border_1()
+                                        .border_color(border)
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(14.0))
+                                        .text_color(if state.name.is_empty() {
+                                            text_muted
+                                        } else {
+                                            text_pri
+                                        })
+                                        .child(if state.name.is_empty() {
+                                            "New agent".to_string()
+                                        } else {
+                                            state.name.clone()
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text_sec)
+                                        .child("What should this agent help you with?"),
+                                )
+                                .child(
+                                    div()
+                                        .min_h(px(64.0))
+                                        .p(px(10.0))
+                                        .rounded(px(8.0))
+                                        .bg(control)
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_size(px(13.5))
+                                        .text_color(if state.purpose.is_empty() {
+                                            text_muted
+                                        } else {
+                                            text_pri
+                                        })
+                                        .child(if state.purpose.is_empty() {
+                                            "Plan trips, compare options, or handle daily work."
+                                                .to_string()
+                                        } else {
+                                            state.purpose.clone()
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(44.0))
+                                .px(px(12.0))
+                                .rounded(px(8.0))
+                                .bg(control)
+                                .border_1()
+                                .border_color(border)
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text_pri)
+                                        .child("Model"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(text_sec)
+                                        .child(format!(
+                                            "{} · {}",
+                                            state.model,
+                                            state.reasoning_effort.as_str()
+                                        )),
+                                ),
+                        )
+                        .when_some(state.error_message.clone(), |el, err| {
+                            el.child(div().text_size(px(12.0)).text_color(danger).child(err))
                         })
                         .child(
                             div()
-                                .id("openbot-setup-create")
-                                .h(px(34.0))
-                                .px(px(16.0))
-                                .rounded(px(10.0))
-                                .bg(accent)
-                                .cursor_pointer()
+                                .mt(px(4.0))
                                 .flex()
                                 .items_center()
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xFFFFFF))
-                                .child(if state.generating_profile {
-                                    "Generating…"
-                                } else {
-                                    "Create Agent"
-                                }),
+                                .justify_center()
+                                .gap(px(8.0))
+                                .when(state.can_cancel_with_escape(), |el| {
+                                    el.child(
+                                        div()
+                                            .id("openbot-setup-cancel")
+                                            .h(px(36.0))
+                                            .px(px(14.0))
+                                            .rounded(px(8.0))
+                                            .bg(control)
+                                            .border_1()
+                                            .border_color(border)
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(13.5))
+                                            .text_color(text_sec)
+                                            .hover(move |s| s.bg(hover))
+                                            .child("Cancel"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("openbot-setup-create")
+                                        .min_w(px(132.0))
+                                        .h(px(36.0))
+                                        .px(px(16.0))
+                                        .rounded(px(8.0))
+                                        .bg(cta_bg)
+                                        .when(!can_submit, |el| el.opacity(0.42))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(13.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(cta_fg)
+                                        .child(if state.generating_profile {
+                                            "Creating…"
+                                        } else {
+                                            "Create agent"
+                                        }),
+                                ),
                         ),
                 ),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text_muted)
+                        .child("Suggestions"),
+                )
+                .child(suggestions_row),
         );
 
     div()
@@ -1460,33 +1822,84 @@ fn render_settings_nav_row(
     palette: &OpenBotPalette,
     danger_row: bool,
 ) -> Stateful<Div> {
-    let hover = pal(palette, "--openbot-bg-control-hover", 0x242424);
+    let hover = palette.hover();
     let text_pri = if danger_row {
-        pal(palette, "--openbot-danger-text", 0xFF6069)
+        palette.danger()
     } else {
-        pal(palette, "--openbot-text-primary", 0xFFFFFF)
+        palette.text_primary()
     };
-    let text_muted = pal(palette, "--openbot-text-muted", 0x979797);
+    let text_muted = palette.text_muted();
 
     div()
         .id(id.into())
-        .h(px(36.0))
-        .px(px(10.0))
-        .rounded(px(10.0))
+        .min_h(px(40.0))
+        .px(px(12.0))
         .cursor_pointer()
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(8.0))
         .hover(move |s| s.bg(hover))
-        .child(div().text_size(px(13.0)).text_color(text_pri).child(label.to_string()))
+        .child(
+            div()
+                .text_size(px(13.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(text_pri)
+                .child(label.to_string()),
+        )
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(5.0))
-                .child(div().text_size(px(12.0)).text_color(text_muted).child(value.into()))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(text_muted)
+                        .child(value.into()),
+                )
                 .child(tg_icon_rgba(IconName::ChevronRight, 12.0, text_muted)),
         )
+}
+
+fn render_settings_inset_group(
+    title: &str,
+    palette: &OpenBotPalette,
+    rows: Vec<Stateful<Div>>,
+) -> Div {
+    let surface = palette.bg_surface();
+    let border = palette.border_hairline();
+    let text_muted = palette.text_muted();
+    let last_idx = rows.len().saturating_sub(1);
+    let mut card = div()
+        .w_full()
+        .rounded(px(8.0))
+        .bg(surface)
+        .border_1()
+        .border_color(border)
+        .overflow_hidden()
+        .flex()
+        .flex_col();
+    for (idx, row) in rows.into_iter().enumerate() {
+        card = card.child(row);
+        if idx < last_idx {
+            card = card.child(div().w_full().h(px(1.0)).bg(border));
+        }
+    }
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .ml(px(4.0))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(text_muted)
+                .child(title.to_string()),
+        )
+        .child(card)
 }
 
 fn render_settings_toggle_row(
@@ -1543,14 +1956,18 @@ fn render_agent_settings_main(
     now_sec: f64,
 ) -> Div {
     let dark = palette.scheme.is_dark();
-    let surface = pal(palette, "--openbot-bg-surface", 0x212121);
-    let border = pal(palette, "--openbot-border-grouped", 0x333335);
-    let text_pri = pal(palette, "--openbot-text-primary", 0xFFFFFF);
-    let text_muted = pal(palette, "--openbot-text-muted", 0x979797);
-    let accent = pal(palette, "--openbot-accent", 0x007CF7);
+    let canvas = palette.bg_canvas();
+    let surface = palette.bg_surface();
+    let control = palette.bg_control();
+    let border = palette.border_hairline();
+    let border_strong = palette.border_strong_hairline();
+    let text_pri = palette.text_primary();
+    let text_sec = palette.text_secondary();
+    let text_muted = palette.text_muted();
+    let accent = palette.accent();
 
     let mut av_props = AgentAvatarProps::new(&state.avatar_editor.seed)
-        .with_size(64.0)
+        .with_size(62.0)
         .with_hue_and_color(state.avatar_editor.hue, state.avatar_editor.color.clone())
         .with_url(state.avatar_editor.avatar_url.clone());
     av_props.dark_scheme = dark;
@@ -1561,13 +1978,16 @@ fn render_agent_settings_main(
         let sw = parse_css_color_to_rgba(preset.hex).unwrap_or_else(|| rgb(0x4699FE));
         chat_colors = chat_colors.child(
             div()
-                .id(SharedString::from(format!("openbot-as-chat-color-{}", preset.id)))
+                .id(SharedString::from(format!(
+                    "openbot-as-chat-color-{}",
+                    preset.id
+                )))
                 .w(px(18.0))
                 .h(px(18.0))
                 .rounded_full()
                 .bg(sw)
                 .border_1()
-                .border_color(if active { accent } else { border })
+                .border_color(if active { accent } else { border_strong })
                 .cursor_pointer(),
         );
     }
@@ -1580,45 +2000,72 @@ fn render_agent_settings_main(
         "Standard"
     };
 
+    let field_box = |label: &str, value: String, min_h_px: f32| {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .ml(px(8.0))
+                    .text_size(px(13.5))
+                    .text_color(text_sec)
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(min_h_px))
+                    .px(px(11.0))
+                    .py(px(9.0))
+                    .rounded(px(8.0))
+                    .bg(surface)
+                    .border_1()
+                    .border_color(border_strong)
+                    .text_size(px(14.5))
+                    .text_color(text_pri)
+                    .child(value),
+            )
+    };
+
     div()
         .flex()
         .flex_col()
-        .gap(px(12.0))
+        .gap(px(16.0))
         .child(
             div()
                 .relative()
+                .w_full()
+                .pt(px(8.0))
+                .pb(px(4.0))
                 .flex()
+                .flex_col()
                 .items_center()
-                .gap(px(12.0))
                 .child(
                     div()
                         .id("openbot-as-avatar-trigger")
+                        .relative()
+                        .w(px(62.0))
+                        .h(px(62.0))
                         .cursor_pointer()
-                        .child(render_agent_avatar(&av_props, None, now_sec)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
+                        .child(render_agent_avatar(&av_props, None, now_sec))
                         .child(
                             div()
-                                .text_size(px(15.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(text_pri)
-                                .child(state.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(text_muted)
-                                .child(if state.title.is_empty() {
-                                    "Add role title (<= 120 chars)".to_string()
-                                } else {
-                                    state.title.clone()
-                                }),
+                                .id("openbot-as-avatar-pencil")
+                                .absolute()
+                                .right(px(-4.0))
+                                .bottom(px(-4.0))
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded_full()
+                                .bg(control)
+                                .border_2()
+                                .border_color(canvas)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(tg_icon_rgba(IconName::Edit, 11.0, text_pri)),
                         ),
                 )
                 .when(state.avatar_editor.picker_open, |el| {
@@ -1626,7 +2073,7 @@ fn render_agent_settings_main(
                         deferred(
                             div()
                                 .absolute()
-                                .top(px(70.0))
+                                .top(px(78.0))
                                 .left(px(0.0))
                                 .occlude()
                                 .child(render_avatar_editor_popover(
@@ -1640,171 +2087,201 @@ fn render_agent_settings_main(
                     )
                 }),
         )
-        .child(
-            div()
-                .p(px(10.0))
-                .rounded(px(12.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(text_muted)
-                        .child(if state.description.is_empty() {
-                            "No description yet (<= 2,000 chars)".to_string()
-                        } else {
-                            state.description.clone()
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(text_pri)
-                        .child(format!(
-                            "{} · {} · {} · {}",
-                            state.provider.descriptor().display_name,
-                            state.model,
-                            state.reasoning_effort.as_str(),
-                            speed_tag
-                        )),
-                )
-                .child(chat_colors),
-        )
-        .child(
-            div()
-                .rounded(px(12.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .p(px(4.0))
-                .flex()
-                .flex_col()
-                .child(render_settings_nav_row(
-                    "openbot-as-nav-permissions",
-                    "Permissions",
-                    match state.access {
-                        AgentAccess::Full => "Full access",
-                        AgentAccess::Workspace => "Workspace only",
-                    },
+        .child(field_box("名称 / Name", state.name.clone(), 38.0))
+        .child(field_box(
+            "称号 / Title",
+            if state.title.is_empty() {
+                "添加角色称号 (<= 120 字符)".to_string()
+            } else {
+                state.title.clone()
+            },
+            38.0,
+        ))
+        .child(field_box(
+            "描述 / Description",
+            if state.description.is_empty() {
+                "暂无描述 (<= 2,000 字符)".to_string()
+            } else {
+                state.description.clone()
+            },
+            72.0,
+        ))
+        .child(render_settings_inset_group(
+            "核心 / Brain",
+            palette,
+            vec![
+                render_settings_nav_row(
+                    "openbot-as-nav-model",
+                    "模型与推理",
+                    format!(
+                        "{} · {} · {}",
+                        state.model,
+                        state.reasoning_effort.as_str(),
+                        speed_tag
+                    ),
                     palette,
                     false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-nav-folders",
-                    "Folders",
-                    format!("+{} / -{}", state.additional_folders.len(), state.excluded_folders.len()),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
+                ),
+                render_settings_nav_row(
                     "openbot-as-nav-backups",
-                    "Backup Models",
+                    "备用模型",
                     format!("{}/{}", state.backup_models.len(), AGENT_BACKUP_MODEL_LIMIT),
                     palette,
                     false,
-                ))
-                .child(render_settings_nav_row(
+                ),
+            ],
+        ))
+        .child(
+            div()
+                .w_full()
+                .px(px(12.0))
+                .py(px(10.0))
+                .rounded(px(8.0))
+                .bg(surface)
+                .border_1()
+                .border_color(border)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(text_muted)
+                        .child("气泡颜色"),
+                )
+                .child(chat_colors),
+        )
+        .child(render_settings_inset_group(
+            "已知 / Knows",
+            palette,
+            vec![
+                render_settings_nav_row(
+                    "openbot-as-link-instructions",
+                    "指令 (AGENTS.md)",
+                    format!(
+                        "{}/{}",
+                        state.instructions_chars, INPUT_LIMITS.agent_instructions_file
+                    ),
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-memories",
+                    "记忆",
+                    format!("已保存 {} 条", state.memories_count),
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-skills",
+                    "技能",
+                    format!("已分配 {} 个", state.skills_count),
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-tables",
+                    "数据表",
+                    format!("{} 个表", state.shared_tables_count),
+                    palette,
+                    false,
+                ),
+            ],
+        ))
+        .child(render_settings_inset_group(
+            "行为 / Does",
+            palette,
+            vec![
+                render_settings_nav_row(
+                    "openbot-as-link-routines",
+                    "自动化任务",
+                    format!("已配置 {} 个", state.routines_count),
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-usage",
+                    "用量",
+                    "查看",
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-duplicate",
+                    "复制助手",
+                    "",
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-link-export",
+                    "导出 .openbot",
+                    "",
+                    palette,
+                    false,
+                ),
+            ],
+        ))
+        .child(render_settings_inset_group(
+            "规则 / Rules",
+            palette,
+            vec![
+                render_settings_nav_row(
+                    "openbot-as-nav-permissions",
+                    "权限",
+                    match state.access {
+                        AgentAccess::Full => "完全访问",
+                        AgentAccess::Workspace => "工作区仅限",
+                    },
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
+                    "openbot-as-nav-folders",
+                    "文件夹",
+                    format!(
+                        "+{} / -{}",
+                        state.additional_folders.len(),
+                        state.excluded_folders.len()
+                    ),
+                    palette,
+                    false,
+                ),
+                render_settings_nav_row(
                     "openbot-as-nav-advanced",
-                    "Advanced",
+                    "高级",
                     match state.busy_message_mode {
                         BusyMessageMode::Steer => "Steer",
                         BusyMessageMode::Queue => "Queue",
                     },
                     palette,
                     false,
-                ))
-                .child(render_settings_nav_row(
+                ),
+                render_settings_nav_row(
                     "openbot-as-nav-notifications",
-                    "Notifications",
+                    "通知设置",
                     state.notification_level.label(),
                     palette,
                     false,
-                )),
-        )
-        .child(
-            div()
-                .rounded(px(12.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .p(px(4.0))
-                .flex()
-                .flex_col()
-                .child(render_settings_nav_row(
-                    "openbot-as-link-instructions",
-                    "Instructions (AGENTS.md)",
-                    format!("{}/{}", state.instructions_chars, INPUT_LIMITS.agent_instructions_file),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-memories",
-                    "Memories",
-                    format!("{}/{}", state.memories_count, INPUT_LIMITS.agent_memories),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-skills",
-                    "Skills",
-                    format!("{}/{}", state.skills_count, INPUT_LIMITS.agent_skills),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-routines",
-                    "Routines",
-                    format!("{}/{}", state.routines_count, INPUT_LIMITS.agent_routines),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-tables",
-                    "Shared Tables",
-                    format!("{}/{}", state.shared_tables_count, INPUT_LIMITS.shared_tables),
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-usage",
-                    "Usage",
-                    "View",
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-duplicate",
-                    "Duplicate Agent",
-                    "",
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
-                    "openbot-as-link-export",
-                    "Export .openbot",
-                    "",
-                    palette,
-                    false,
-                ))
-                .child(render_settings_nav_row(
+                ),
+                render_settings_nav_row(
                     "openbot-as-link-clear-history",
-                    "Delete History",
+                    "删除历史记录",
                     "",
                     palette,
                     true,
-                ))
-                .child(render_settings_nav_row(
+                ),
+                render_settings_nav_row(
                     "openbot-as-link-delete",
-                    "Delete Agent",
+                    "删除助手",
                     "",
                     palette,
                     true,
-                )),
-        )
+                ),
+            ],
+        ))
 }
 
 fn render_agent_settings_permissions(
@@ -2174,11 +2651,11 @@ pub fn render_agent_settings_panel(
     now_sec: f64,
 ) -> Div {
     let width = state.panel_width_px.max(AGENT_SETTINGS_MIN_PX);
-    let bg = pal(palette, "--openbot-bg-sheet", 0x141414);
-    let border = pal(palette, "--openbot-border", 0x222222);
-    let hover = pal(palette, "--openbot-bg-control-hover", 0x242424);
-    let text_pri = pal(palette, "--openbot-text-primary", 0xFFFFFF);
-    let text_muted = pal(palette, "--openbot-text-muted", 0x979797);
+    let bg = palette.bg_canvas();
+    let border = palette.border_hairline();
+    let hover = palette.bg_control_hover();
+    let text_pri = palette.text_primary();
+    let text_muted = palette.text_muted();
 
     let content = match state.subpage {
         AgentSettingsSubpage::Main => render_agent_settings_main(state, palette, now_sec),
@@ -2199,8 +2676,8 @@ pub fn render_agent_settings_panel(
         .flex_col()
         .child(
             div()
-                .h(px(46.0))
-                .px(px(14.0))
+                .h(px(39.0))
+                .px(px(10.0))
                 .border_b_1()
                 .border_color(border)
                 .flex()
@@ -2210,20 +2687,20 @@ pub fn render_agent_settings_panel(
                     el.child(
                         div()
                             .id("openbot-as-back")
-                            .w(px(26.0))
-                            .h(px(26.0))
+                            .w(px(28.0))
+                            .h(px(28.0))
                             .rounded(px(7.0))
                             .cursor_pointer()
                             .flex()
                             .items_center()
                             .justify_center()
                             .hover(move |s| s.bg(hover))
-                            .child(tg_icon_rgba(IconName::BackArrow, 14.0, text_muted)),
+                            .child(tg_icon_rgba(IconName::BackArrow, 15.0, text_muted)),
                     )
                 })
                 .child(
                     div()
-                        .text_size(px(14.5))
+                        .text_size(px(14.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(text_pri)
                         .child(state.subpage.label()),
@@ -2235,7 +2712,9 @@ pub fn render_agent_settings_panel(
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
-                .p(px(14.0))
+                .px(px(15.0))
+                .pt(px(20.0))
+                .pb(px(28.0))
                 .child(content),
         )
 }

@@ -12,7 +12,7 @@ use gpui::*;
 use openbot_contracts::avatar::{
     ACTIVITY_HOLD_MS, AVATAR_COLOR_CHOICES, AVATAR_EXPRESSIONS, AVATAR_HUE_CHOICES,
     AgentStepActivity, AvatarColorChoice, AvatarContractError, AvatarHue, AvatarMood, AvatarStyle,
-    BloubAvatarProfile, BloubExpression, BloubParametricState, BloubShape, EngineShapeId,
+    BloubAvatarProfile, BloubExpression, BloubShape, EngineShapeId,
     HOVER_FACES, HoverFace, PHOTO_BREATHE, PlushMoodPresentation, PlushState, PlushTransition,
     SUPPORTED_AVATAR_SILHOUETTES, ShapeSafeStateId, WORKING_FACE_MAX_MS, WORKING_FACE_MIN_MS,
     activity_mood_presentation, avatar_animation_phase, avatar_breathe_amount, avatar_default_seed,
@@ -27,7 +27,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::bot_engine::*;
-use super::eyefit::*;
 use super::image_normalizer::{
     AvatarImageNormalizer, AvatarNormalizeError, NormalizedAvatarOutput,
 };
@@ -641,38 +640,6 @@ fn plush_asset_file(rel: &str) -> Option<PathBuf> {
     None
 }
 
-fn load_tinted_bgra_webp(rel: &str, hex: &str) -> Option<Arc<RenderImage>> {
-    let raw = std::fs::read(plush_asset_file(rel)?).ok()?;
-    let mut rgba = image::load_from_memory(&raw).ok()?.into_rgba8();
-    let ramp = tint_ramp(hex);
-    for px in rgba.chunks_exact_mut(4) {
-        let grey = px[0] as usize;
-        let tinted = ramp[grey];
-        px[0] = tinted[2];
-        px[1] = tinted[1];
-        px[2] = tinted[0];
-    }
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
-}
-
-fn cached_tinted_forme(shape: BloubShape, hex: &str) -> Option<Arc<RenderImage>> {
-    static CACHE: OnceLock<Mutex<HashMap<(BloubShape, String), Option<Arc<RenderImage>>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (shape, hex.to_ascii_lowercase());
-    if let Some(found) = cache.lock().get(&key).cloned() {
-        return found;
-    }
-    let rel = format!("openbot_plush/bloub/forme-{}.webp", shape.as_str());
-    let rendered = load_tinted_bgra_webp(&rel, &key.1);
-    let mut guard = cache.lock();
-    if guard.len() >= 192 {
-        guard.clear();
-    }
-    guard.insert(key, rendered.clone());
-    rendered
-}
-
 fn parse_hex_u32(hex: &str, fallback: u32) -> u32 {
     let clean = hex.trim().trim_start_matches('#');
     if clean.len() >= 6 {
@@ -684,17 +651,6 @@ fn parse_hex_u32(hex: &str, fallback: u32) -> u32 {
 
 fn bloub_to_engine_shape(shape: BloubShape) -> EngineShapeId {
     parse_engine_shape(shape.as_str()).unwrap_or(EngineShapeId::Cercle)
-}
-
-fn plush_to_engine_state(state: PlushState) -> BloubParametricState {
-    match state {
-        PlushState::Wink => BloubParametricState::Wink,
-        PlushState::Wide => BloubParametricState::Wide,
-        PlushState::Notify => BloubParametricState::Notify,
-        PlushState::Idle | PlushState::Thinking | PlushState::Asleep | PlushState::Failed => {
-            BloubParametricState::Idle
-        }
-    }
 }
 
 pub fn render_agent_flat_svg(
@@ -820,27 +776,42 @@ pub fn render_agent_avatar(
             );
     }
 
-    let eng_state = plush_to_engine_state(resolved.plush_state);
-    let sample = BloubBotEngine::new(eng_shape, resolved.expression, eng_state)
-        .sample(sample_t, props.reduced_motion || !resolved.animated);
+    let mut renderer = PlushFeltRenderer::new(
+        eng_shape,
+        &resolved.color,
+        resolved.expression,
+        resolved.plush_state,
+    );
+    let eff_eye_scale = small_size_eye_scale(base_size).max(if props.eye_scale.is_finite() && props.eye_scale > 0.0 {
+        props.eye_scale
+    } else {
+        1.0
+    });
+    renderer.set_eye_scale(eff_eye_scale);
+    let plush_sample =
+        renderer.sample_plush_frame(sample_t, props.reduced_motion || !resolved.animated);
+
+    let plush_size = base_size * breathe_scale;
+    let plush_inset = (base_size - plush_size) * 0.5;
+    let extra_top = optical_offset_y;
     let plush_px = optical_box * resolved.plush_body_scale;
     let plush_left = (base_size - plush_px) * 0.5;
     let plush_top = (base_size - plush_px) * 0.5 + optical_offset_y;
-    let forme_img = cached_tinted_forme(resolved.shape, &resolved.color);
-    let ink_rgb = parse_hex_u32(&resolved.color, 0xE8483F);
-    let notif_rgb = parse_hex_u32(NOTIF_BLUE, 0x2496E8);
     let ring_spec = props.cutout_ring.map(SidebarPlushRingKind::spec);
     let dark_scheme = props.dark_scheme;
-    let plush_state = resolved.plush_state;
     let shape = resolved.shape;
-    let expr = resolved.expression;
+    let sil_rot = plush_sample.silhouette.rot;
+    let sil_cx = plush_sample.silhouette.cx;
+    let sil_cy = plush_sample.silhouette.cy;
+    let sil_sx = plush_sample.silhouette.sx;
+    let sil_sy = plush_sample.silhouette.sy;
 
     div()
         .relative()
         .w(px(base_size))
         .h(px(base_size))
         .flex_shrink_0()
-        .when_some(forme_img.clone(), |el, render_img| {
+        .when_some(ring_spec, |el, ring| {
             el.child(
                 div()
                     .absolute()
@@ -849,200 +820,49 @@ pub fn render_agent_avatar(
                     .w(px(plush_px))
                     .h(px(plush_px))
                     .child(
-                        img(render_img)
-                            .w(px(plush_px))
-                            .h(px(plush_px))
-                            .object_fit(ObjectFit::Contain),
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _cx| {
+                                let center = bounds.center();
+                                let min_dim =
+                                    f32::from(bounds.size.width.min(bounds.size.height));
+                                let px_per_vb = (min_dim / (VIEW_BOX as f32)).max(0.01);
+                                let ring_rgb = if dark_scheme {
+                                    ring.dark_fallback_rgb
+                                } else {
+                                    ring.light_fallback_rgb
+                                };
+                                let dilate_scale = 1.0
+                                    + f64::from(
+                                        ring.dilate_radius_px / (min_dim * 0.32).max(1.0),
+                                    );
+                                let ring_sil = Silhouette {
+                                    radii: bloub_shape_radii(shape),
+                                    rot: sil_rot,
+                                    cx: sil_cx,
+                                    cy: sil_cy,
+                                    sx: sil_sx * dilate_scale,
+                                    sy: sil_sy * dilate_scale,
+                                };
+                                if let Some(ring_path) =
+                                    silhouette_gpui_path(&ring_sil, center, px_per_vb)
+                                {
+                                    window.paint_path(ring_path, rgb(ring_rgb));
+                                }
+                            },
+                        )
+                        .w(px(plush_px))
+                        .h(px(plush_px)),
                     ),
             )
         })
-        .child(render_plush_overlay_canvas(
-            plush_left,
-            plush_top,
-            plush_px,
-            shape,
-            expr,
-            plush_state,
-            ink_rgb,
-            notif_rgb,
-            ring_spec,
-            dark_scheme,
-            forme_img.is_none(),
-            sample,
-            now_sec,
-        ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_plush_overlay_canvas(
-    left_px: f32,
-    top_px: f32,
-    box_px: f32,
-    shape: BloubShape,
-    expression: BloubExpression,
-    plush_state: PlushState,
-    ink_rgb: u32,
-    notif_rgb: u32,
-    ring_spec: Option<SidebarPlushRingSpec>,
-    dark_scheme: bool,
-    draw_body_fallback: bool,
-    sample: BloubFrameSample,
-    now_sec: f64,
-) -> Div {
-    div()
-        .absolute()
-        .left(px(left_px))
-        .top(px(top_px))
-        .w(px(box_px))
-        .h(px(box_px))
         .child(
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _cx| {
-                    let center = bounds.center();
-                    let min_dim = f32::from(bounds.size.width.min(bounds.size.height));
-                    let px_per_vb = (min_dim / (VIEW_BOX as f32)).max(0.01);
-
-                    if let Some(ring) = ring_spec {
-                        let ring_rgb = if dark_scheme {
-                            ring.dark_fallback_rgb
-                        } else {
-                            ring.light_fallback_rgb
-                        };
-                        let dilate_scale =
-                            1.0 + f64::from(ring.dilate_radius_px / (min_dim * 0.32).max(1.0));
-                        let ring_sil = Silhouette {
-                            radii: bloub_shape_radii(shape),
-                            rot: sample.silhouette.rot,
-                            cx: sample.silhouette.cx,
-                            cy: sample.silhouette.cy,
-                            sx: sample.silhouette.sx * dilate_scale,
-                            sy: sample.silhouette.sy * dilate_scale,
-                        };
-                        if let Some(ring_path) = silhouette_gpui_path(&ring_sil, center, px_per_vb)
-                        {
-                            window.paint_path(ring_path, rgb(ring_rgb));
-                        }
-                    }
-
-                    if draw_body_fallback {
-                        let sil = Silhouette {
-                            radii: bloub_shape_radii(shape),
-                            rot: sample.silhouette.rot,
-                            cx: sample.silhouette.cx,
-                            cy: sample.silhouette.cy,
-                            sx: sample.silhouette.sx,
-                            sy: sample.silhouette.sy,
-                        };
-                        if let Some(body_path) = silhouette_gpui_path(&sil, center, px_per_vb) {
-                            window.paint_path(body_path, rgb(ink_rgb));
-                        }
-                    }
-
-                    if plush_state == PlushState::Asleep {
-                        for side in [-1.0_f32, 1.0_f32] {
-                            let ex = f32::from(center.x) + side * 22.0 * px_per_vb;
-                            let ey = f32::from(center.y) + 6.0 * px_per_vb;
-                            let hw = 14.0 * px_per_vb;
-                            let mut arc = PathBuilder::stroke(px((5.5 * px_per_vb).max(1.2)));
-                            let p0 = point(px(ex - hw), px(ey));
-                            let ctrl = point(px(ex), px(ey + 0.84 * hw));
-                            let p1 = point(px(ex + hw), px(ey));
-                            arc.move_to(p0);
-                            arc.curve_to(p1, ctrl);
-                            if let Ok(path) = arc.build() {
-                                window.paint_path(path, rgb(0x1C1A1D));
-                            }
-                        }
-                        for z_idx in 0..3 {
-                            let life = ((now_sec / 3.0) - (z_idx as f64 / 3.0)).rem_euclid(1.0);
-                            let zx =
-                                f32::from(center.x) + ((55.0 + 70.0 * life) as f32) * px_per_vb;
-                            let zy =
-                                f32::from(center.y) + ((-74.0 - 64.0 * life) as f32) * px_per_vb;
-                            let zs = ((10.0 + 10.0 * life) as f32) * px_per_vb;
-                            let mut z_poly = PathBuilder::stroke(px((0.24 * zs).max(1.0)));
-                            z_poly.move_to(point(px(zx - zs * 0.5), px(zy - zs * 0.5)));
-                            z_poly.line_to(point(px(zx + zs * 0.5), px(zy - zs * 0.5)));
-                            z_poly.line_to(point(px(zx - zs * 0.5), px(zy + zs * 0.5)));
-                            z_poly.line_to(point(px(zx + zs * 0.5), px(zy + zs * 0.5)));
-                            if let Ok(path) = z_poly.build() {
-                                window.paint_path(path, rgb(ink_rgb));
-                            }
-                        }
-                    } else {
-                        let _ = expression_def(expression);
-                        for eye in &sample.eyes {
-                            if eye.culled || eye.alpha <= 0.01 {
-                                continue;
-                            }
-                            let [a, b, c, d, tx, ty] = eye.matrix;
-                            let hw = eye.w * 0.5;
-                            let hh = (eye.h * 0.5).max(0.03);
-                            let mut oval = PathBuilder::fill();
-                            for step in 0..=16 {
-                                let ang = (step as f64 / 16.0) * std::f64::consts::TAU;
-                                let lx = hw * ang.cos();
-                                let ly = hh * ang.sin();
-                                let vx = (a * lx + c * ly + tx) as f32;
-                                let vy = (b * lx + d * ly + ty) as f32;
-                                let pt = point(
-                                    px(f32::from(center.x) + vx * px_per_vb),
-                                    px(f32::from(center.y) + vy * px_per_vb),
-                                );
-                                if step == 0 {
-                                    oval.move_to(pt);
-                                } else {
-                                    oval.line_to(pt);
-                                }
-                            }
-                            oval.close();
-                            if let Ok(path) = oval.build() {
-                                window.paint_path(path, rgb(0x1C1A1D));
-                            }
-                        }
-                    }
-
-                    if plush_state == PlushState::Thinking {
-                        let offsets = [-0.557_f64, -0.013_f64, 0.532_f64];
-                        for (idx, off) in offsets.iter().enumerate() {
-                            let pulse = dot_pulse(now_sec * 1.4, idx);
-                            let r = (16.5 * 0.6 * (1.0 + 0.25 * pulse)) as f32 * px_per_vb;
-                            let bx = f32::from(center.x) + ((62.0 + off * 36.0) as f32) * px_per_vb;
-                            let by = f32::from(center.y) - 118.0 * px_per_vb;
-                            paint_filled_circle(window, point(px(bx), px(by)), r.max(1.2), ink_rgb);
-                        }
-                    } else if plush_state == PlushState::Notify {
-                        let bx = f32::from(center.x) + 86.0 * px_per_vb;
-                        let by = f32::from(center.y) - 86.0 * px_per_vb;
-                        let r = (24.0 * px_per_vb).max(2.0);
-                        paint_filled_circle(window, point(px(bx), px(by)), r, notif_rgb);
-                    }
-                },
-            )
-            .w(px(box_px))
-            .h(px(box_px)),
+            div()
+                .absolute()
+                .left(px(plush_inset))
+                .top(px(plush_inset + extra_top))
+                .child(render_plush_avatar_element(&plush_sample, plush_size)),
         )
-}
-
-fn paint_filled_circle(window: &mut Window, center: Point<Pixels>, radius: f32, color_rgb: u32) {
-    let mut b = PathBuilder::fill();
-    for step in 0..=16 {
-        let ang = (step as f32 / 16.0) * std::f32::consts::TAU;
-        let pt = point(
-            center.x + px(radius * ang.cos()),
-            center.y + px(radius * ang.sin()),
-        );
-        if step == 0 {
-            b.move_to(pt);
-        } else {
-            b.line_to(pt);
-        }
-    }
-    b.close();
-    if let Ok(path) = b.build() {
-        window.paint_path(path, rgb(color_rgb));
-    }
 }
 
 pub const SIDEBAR_WAIT_TOOLTIP_OPEN_DELAY_MS: u64 = 350;
@@ -1351,33 +1171,161 @@ fn cached_ui_felt_webp(rel: &'static str) -> Option<Arc<RenderImage>> {
     loaded
 }
 
-pub fn render_sidebar_felt_badge(
+/// High-level semantic OpenBot felt status badge state (`PROJECT.md` M1 contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeltStatusBadgeState {
+    Working3Balls,
+    UnreadPlum(u32),
+    WaitingAmber,
+    RespondedGreen,
+    ErrorRaspberry,
+}
+
+impl FeltStatusBadgeState {
+    pub const fn to_sidebar_badge(self) -> SidebarFeltBadge {
+        match self {
+            Self::Working3Balls => SidebarFeltBadge::Working,
+            Self::UnreadPlum(count) => SidebarFeltBadge::Unread {
+                count: count as u64,
+            },
+            Self::WaitingAmber => SidebarFeltBadge::Waiting {
+                reason: SidebarWaitReason::Approval,
+            },
+            Self::RespondedGreen => SidebarFeltBadge::Responded,
+            Self::ErrorRaspberry => SidebarFeltBadge::routine_failed(),
+        }
+    }
+}
+
+/// Computes `(dy_px, width_px, height_px)` for ball `ball_idx` (`0..3`) in the `30x16px`
+/// OpenBot working pill (`960ms` cycle, `0/130/260ms` stagger, peak `-1.75px`, static at `now_ms == 0`).
+pub fn working_ball_hop_sample(now_ms: u64, ball_idx: usize) -> (f32, f32, f32) {
+    const BASE_PX: f32 = 7.0;
+    if now_ms == 0 {
+        return (0.0, BASE_PX, BASE_PX);
+    }
+    const PERIOD_MS: u64 = 960;
+    const STAGGER_MS: u64 = 130;
+    let stagger = (ball_idx as u64) * STAGGER_MS;
+    let phase = ((now_ms + PERIOD_MS - (stagger % PERIOD_MS)) % PERIOD_MS) as f32 / (PERIOD_MS as f32);
+    let (dy, sx, sy) = if phase < 0.08 {
+        let u = phase / 0.08;
+        (0.0, 1.0 + 0.10 * u, 1.0 - 0.10 * u)
+    } else if phase < 0.26 {
+        let u = (phase - 0.08) / 0.18;
+        let ease = 1.0 - (1.0 - u) * (1.0 - u);
+        (-1.75 * ease, 1.0 - 0.06 * (1.0 - u), 1.0 + 0.08 * (1.0 - u))
+    } else if phase < 0.46 {
+        let u = (phase - 0.26) / 0.20;
+        (-1.75 * (1.0 - u * u), 1.0, 1.0)
+    } else if phase < 0.56 {
+        let u = (phase - 0.46) / 0.10;
+        let sq = (u * std::f32::consts::PI).sin();
+        (0.0, 1.0 + 0.08 * sq, 1.0 - 0.08 * sq)
+    } else {
+        (0.0, 1.0, 1.0)
+    };
+    (dy, BASE_PX * sx, BASE_PX * sy)
+}
+
+#[inline]
+fn rgb_is_dark(hex: u32) -> bool {
+    let r = ((hex >> 16) & 0xFF) as f32;
+    let g = ((hex >> 8) & 0xFF) as f32;
+    let b = (hex & 0xFF) as f32;
+    (0.299 * r + 0.587 * g + 0.114 * b) < 128.0
+}
+
+fn render_sidebar_felt_badge_inner(
     badge: SidebarFeltBadge,
     ring_rgb: u32,
+    dark_scheme: bool,
     animator: Option<&SidebarBadgeAnimator>,
     now_ms: u64,
 ) -> Div {
+    let tf = animator.map(|a| a.sample(now_ms));
+
+    if badge == SidebarFeltBadge::Working {
+        const BALL_SPECS: [(&str, u32); 3] = [
+            ("openbot_plush/ui/ball-lilac.webp", 0xC6A4E8),
+            ("openbot_plush/ui/ball-mint.webp", 0x7AD9B0),
+            ("openbot_plush/ui/ball-pink.webp", 0xF29BB8),
+        ];
+        let pill_bg = if dark_scheme { 0x212121 } else { 0xFFFFFF };
+        let mut pill = div()
+            .relative()
+            .w(px(30.0))
+            .h(px(16.0))
+            .px(px(3.5))
+            .pb(px(3.0))
+            .rounded_full()
+            .bg(rgb(pill_bg))
+            .opacity(tf.map_or(1.0, |t| t.opacity))
+            .flex()
+            .items_end()
+            .justify_center()
+            .gap(px(1.0));
+        for (idx, (asset_rel, fallback_rgb)) in BALL_SPECS.iter().enumerate() {
+            let (dy, bw, bh) = working_ball_hop_sample(now_ms, idx);
+            let ball_img = cached_ui_felt_webp(asset_rel);
+            let ball_el = div()
+                .relative()
+                .w(px(bw))
+                .h(px(bh))
+                .mb(px((-dy).max(0.0)))
+                .rounded_full()
+                .when(ball_img.is_none(), |el| el.bg(rgb(*fallback_rgb)))
+                .when_some(ball_img, |el, img_arc| {
+                    el.child(
+                        img(img_arc)
+                            .w(px(bw))
+                            .h(px(bh))
+                            .object_fit(ObjectFit::Contain),
+                    )
+                });
+            pill = pill.child(ball_el);
+        }
+        return pill;
+    }
+
     let box_px = badge.box_px();
     let outer_h = box_px + 2.0 * SIDEBAR_FELT_RING_BORDER_PX;
-    let tf = animator.map(|a| a.sample(now_ms));
     let outer_w = match badge {
         SidebarFeltBadge::Unread { count } => tf
             .map(|t| t.width_px)
             .unwrap_or_else(|| SidebarBadgeAnimator::estimate_pill_width(count)),
         _ => outer_h,
     };
-    let bg_rgb = match badge {
-        SidebarFeltBadge::Unread { .. } => 0x5D3C70,
-        SidebarFeltBadge::Waiting { .. } => 0xE67E0F,
+    let bg_fill: Background = match badge {
+        SidebarFeltBadge::Unread { .. } => linear_gradient(
+            180.0,
+            linear_color_stop(rgb(0x705083), 0.0),
+            linear_color_stop(rgb(0x4A285C), 1.0),
+        ),
+        SidebarFeltBadge::Waiting { .. } => linear_gradient(
+            180.0,
+            linear_color_stop(rgb(0xFF9511), 0.0),
+            linear_color_stop(rgb(0xCB680C), 1.0),
+        ),
         SidebarFeltBadge::Routine {
             phase: SidebarRoutinePhase::Failed,
-        } => 0xD41358,
-        SidebarFeltBadge::Responded => 0x31CF76,
-        SidebarFeltBadge::Working
-        | SidebarFeltBadge::Limited
-        | SidebarFeltBadge::Routine { .. } => 0x2A2A2A,
+        } => linear_gradient(
+            180.0,
+            linear_color_stop(rgb(0xF52070), 0.0),
+            linear_color_stop(rgb(0xB40641), 1.0),
+        ),
+        SidebarFeltBadge::Responded => rgb(0x31CF76).into(),
+        SidebarFeltBadge::Limited | SidebarFeltBadge::Routine { .. } | SidebarFeltBadge::Working => {
+            rgb(if dark_scheme { 0x2A2A2A } else { 0xE8E8EB }).into()
+        }
     };
     let felt_img = badge.felt_asset_path().and_then(cached_ui_felt_webp);
+    let suppress_label = matches!(
+        badge,
+        SidebarFeltBadge::Routine {
+            phase: SidebarRoutinePhase::Failed
+        }
+    ) && felt_img.is_some();
     let label = match badge {
         SidebarFeltBadge::Unread { count } => count.to_string(),
         SidebarFeltBadge::Waiting {
@@ -1403,7 +1351,7 @@ pub fn render_sidebar_felt_badge(
         .h(px(outer_h))
         .px(px(3.0))
         .rounded_full()
-        .bg(rgb(bg_rgb))
+        .bg(bg_fill)
         .border(px(SIDEBAR_FELT_RING_BORDER_PX))
         .border_color(rgb(ring_rgb))
         .opacity(tf.map_or(1.0, |t| t.opacity))
@@ -1421,14 +1369,42 @@ pub fn render_sidebar_felt_badge(
                     .object_fit(ObjectFit::Fill),
             )
         })
-        .child(
-            div()
-                .relative()
-                .text_color(rgb(0xF6EFE2))
-                .text_size(px(12.0))
-                .font_weight(FontWeight::EXTRA_BOLD)
-                .child(label),
-        )
+        .when(!suppress_label, |el| {
+            el.child(
+                div()
+                    .relative()
+                    .text_color(rgb(0xF6EFE2))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .child(label),
+            )
+        })
+}
+
+pub fn render_sidebar_felt_badge(
+    badge: SidebarFeltBadge,
+    ring_rgb: u32,
+    animator: Option<&SidebarBadgeAnimator>,
+    now_ms: u64,
+) -> Div {
+    render_sidebar_felt_badge_inner(badge, ring_rgb, rgb_is_dark(ring_rgb), animator, now_ms)
+}
+
+/// Renders an OpenBot felt status badge (`Working3Balls`, `UnreadPlum`, `WaitingAmber`,
+/// `RespondedGreen`, `ErrorRaspberry`) with exact `30x16px` working pill & felt gradients.
+pub fn render_felt_status_badge(
+    state: FeltStatusBadgeState,
+    ring_rgb: u32,
+    dark_scheme: bool,
+    now_ms: u64,
+) -> Div {
+    render_sidebar_felt_badge_inner(
+        state.to_sidebar_badge(),
+        ring_rgb,
+        dark_scheme,
+        None,
+        now_ms,
+    )
 }
 
 pub const CHANNEL_ROW_LIMIT: usize = 3;
@@ -1983,18 +1959,24 @@ pub fn render_channel_avatar(
         return div()
             .w(px(eval.size_px))
             .h(px(eval.size_px))
+            .rounded(px(tile_radius))
+            .bg(rgb(if dark_scheme { 0x212121 } else { 0xFFFFFF }))
+            .border_1()
+            .border_color(rgb(if dark_scheme { 0x262626 } else { 0xE8E8EB }))
             .flex()
             .items_center()
             .justify_center()
             .text_color(rgb(if dark_scheme { 0x979797 } else { 0x6B6B70 }))
-            .text_size(px((eval.size_px * 0.45).clamp(12.0, 24.0)))
-            .child("👥");
+            .text_size(px((eval.size_px * 0.48).clamp(11.0, 24.0)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child("#");
     }
 
     let find_agent = |agent_id: &str| agents.iter().find(|a| a.id == agent_id);
 
     match layout {
         ChannelAvatarLayout::Row => {
+            let visual_overlap = -(eval.size_px * 0.44).clamp(6.0, 16.0);
             let mut row = div().flex().items_center().h(px(eval.size_px));
             for (idx, agent_id) in eval.shown_member_ids.iter().enumerate() {
                 let brief = find_agent(agent_id);
@@ -2014,7 +1996,7 @@ pub fn render_channel_avatar(
                 let face_el = render_agent_avatar(&p, None, now_sec);
                 row = row.child(
                     div()
-                        .when(idx > 0, |el| el.ml(px(CHANNEL_ROW_OVERLAP_PX)))
+                        .when(idx > 0, |el| el.ml(px(visual_overlap)))
                         .child(face_el),
                 );
             }
@@ -2028,7 +2010,8 @@ pub fn render_channel_avatar(
                 .h(px(eval.size_px))
                 .flex_shrink_0();
 
-            for cell in &eval.cells {
+            let two_member_diagonal = eval.cells.len() == 2 && eval.plus_pill.is_none();
+            for (cell_idx, cell) in eval.cells.iter().enumerate() {
                 let brief = find_agent(&cell.agent_id);
                 let has_custom_url = brief
                     .and_then(|b| b.avatar_url.as_deref())
@@ -2043,7 +2026,19 @@ pub fn render_channel_avatar(
                 let cell_w = (cell.grid_col_span as f32) * eval.pitch_px;
                 let cell_h = (cell.grid_row_span as f32) * eval.pitch_px;
                 let cx = origin + ((cell.grid_col_start - 1) as f32) * eval.pitch_px + cell_w * 0.5;
-                let cy = origin + ((cell.grid_row_start - 1) as f32) * eval.pitch_px + cell_h * 0.5;
+                let diag_dy = if two_member_diagonal {
+                    if cell_idx == 0 {
+                        -0.08 * eval.size_px
+                    } else {
+                        0.08 * eval.size_px
+                    }
+                } else {
+                    0.0
+                };
+                let cy = origin
+                    + ((cell.grid_row_start - 1) as f32) * eval.pitch_px
+                    + cell_h * 0.5
+                    + diag_dy;
 
                 let mut p = AgentAvatarProps::new(
                     brief
@@ -2077,10 +2072,37 @@ pub fn render_channel_avatar(
                 };
                 let cx = origin + col_start * eval.pitch_px + (col_span * eval.pitch_px) * 0.5;
                 let cy = origin + 1.5 * eval.pitch_px + 1.5;
-                let pill_h = eval.pill_box_px;
-                let pill_w =
-                    (pill_h + (pill_text.len().saturating_sub(2) as f32) * 5.5).max(pill_h);
-                let felt_lilac = cached_ui_felt_webp("openbot_plush/ui/felt-pill-lilac.webp");
+                let ring_px = if eval.size_px <= 40.0 { 2.0 } else { 3.0 };
+                let ring_spec = ring_kind.unwrap_or(SidebarPlushRingKind::Default).spec();
+                let ring_rgb = if dark_scheme {
+                    ring_spec.dark_fallback_rgb
+                } else {
+                    ring_spec.light_fallback_rgb
+                };
+                let pill_h = eval.pill_box_px + 2.0 * ring_px;
+                let pill_w = (eval.pill_box_px
+                    + (pill_text.len().saturating_sub(2) as f32) * 5.5
+                    + 2.0 * ring_px)
+                    .max(pill_h);
+                let use_amber = eval.hidden_count >= 10;
+                let pill_bg = if use_amber {
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(rgb(0xFF9511), 0.0),
+                        linear_color_stop(rgb(0xCB680C), 1.0),
+                    )
+                } else {
+                    linear_gradient(
+                        180.0,
+                        linear_color_stop(rgb(0x705083), 0.0),
+                        linear_color_stop(rgb(0x4A285C), 1.0),
+                    )
+                };
+                let felt_tex = cached_ui_felt_webp(if use_amber {
+                    "openbot_plush/ui/felt-pill-amber.webp"
+                } else {
+                    "openbot_plush/ui/felt-pill-lilac.webp"
+                });
 
                 container = container.child(
                     div()
@@ -2091,12 +2113,14 @@ pub fn render_channel_avatar(
                         .h(px(pill_h))
                         .px(px(4.0))
                         .rounded_full()
-                        .bg(rgb(0x5D3C70))
+                        .bg(pill_bg)
+                        .border(px(ring_px))
+                        .border_color(rgb(ring_rgb))
                         .overflow_hidden()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when_some(felt_lilac, |el, img_arc| {
+                        .when_some(felt_tex, |el, img_arc| {
                             el.child(
                                 img(img_arc)
                                     .absolute()
@@ -2110,7 +2134,7 @@ pub fn render_channel_avatar(
                             div()
                                 .relative()
                                 .text_color(rgb(0xF6EFE2))
-                                .text_size(px((pill_h * 0.62).clamp(9.0, 14.0)))
+                                .text_size(px((eval.pill_box_px * 0.62).clamp(9.0, 14.0)))
                                 .font_weight(FontWeight::EXTRA_BOLD)
                                 .child(pill_text.clone()),
                         ),

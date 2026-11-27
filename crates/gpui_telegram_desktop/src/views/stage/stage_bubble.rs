@@ -7,8 +7,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::components::avatar::render_plush_bot_avatar;
 use crate::components::grok_bot_avatar::{render_grok_persona_avatar, GrokPersonaState};
+use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::views::openbot::conversation::compute_message_preview;
+use crate::views::openbot::steps_and_trace::{AgentStepEntry, AgentStepKind, STEPS_MAX_HEIGHT};
 use super::cards::bot_assist_card::{
     render_bot_assist_card, BotAssistClickDraft, BotAssistLoginDraft, BotAssistLoginField,
 };
@@ -28,6 +32,9 @@ use super::document_contact_cards::{
 use super::entities::{parse_rich_blocks, push_sanitized_no_breaks, RichBlock, StyledSegment};
 use super::entities_render::{render_rich_message_body, RichTextAction};
 use super::history_element::{MSG_MAX_WIDTH, MSG_MIN_WIDTH, MSG_PHOTO_SIZE, MSG_PHOTO_SKIP};
+use super::openbot_stage_chrome::{
+    normalize_fabushi_plush_spec, openbot_stage_icon, OpenBotStageIcon,
+};
 use super::reactions::button::{sort_reaction_pills, ReactionKey, ReactionPill};
 use super::rich_meta::{format_view_count, resolve_image_source, MessageRichMeta};
 use super::stage_context_menu::{
@@ -37,8 +44,8 @@ use super::stage_context_menu::{
 /// Compact minimum bubble width in Apple Messages style so short messages like "好" / "OK"
 /// hug tightly as sleek pills without altering `history_element::MSG_MIN_WIDTH` (`160.0`).
 pub const APPLE_MSG_MIN_WIDTH: f32 = 38.0;
-const APPLE_AVATAR_SIZE: f32 = 28.0;
-const APPLE_AVATAR_SKIP: f32 = 34.0;
+const APPLE_AVATAR_SIZE: f32 = 32.0;
+const APPLE_AVATAR_SKIP: f32 = 44.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BubbleGroupLayout {
@@ -70,6 +77,38 @@ pub enum BubbleUiAction {
     OpenContact(u64),
     OpenWebUrl(String),
     OpenInstantView(String, String),
+    // Additive M3 OpenBot actions (UI-F10 / UI-F11)
+    ToggleErrorDetails(u64),
+    ToggleAgentSteps(u64),
+    ToggleLongMessage(u64),
+    CopyMessageText(u64),
+    CopyRawText(String),
+    OpenSenderDm {
+        user_id: u64,
+        sender_name: String,
+    },
+}
+
+/// Optional OpenBot-specific per-row context passed into `render_message_row_openbot`.
+#[derive(Clone, Copy, Default)]
+pub struct OpenBotBubbleExtra<'a> {
+    pub is_group_chat: bool,
+    pub is_direct_human: bool,
+    pub sender_hue_name: Option<&'a str>,
+    pub sender_is_bot: bool,
+    pub error_expanded: bool,
+    pub steps_expanded: bool,
+    pub long_expanded: bool,
+    pub turn_steps: &'a [AgentStepEntry],
+}
+
+/// Parsed provider / tool / raw JSON error payload rendered as a collapsible OpenBot failed step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredErrorCard {
+    pub summary_title: String,
+    pub concise_reason: String,
+    pub raw_payload: String,
+    pub is_json: bool,
 }
 
 fn make_row_height_probe_canvas(
@@ -297,7 +336,9 @@ fn compute_definite_bubble_width(
 
         for block in blocks {
             match block {
-                RichBlock::PreCode { .. } | RichBlock::Divider => return Some(eff_max_w),
+                RichBlock::PreCode { .. } | RichBlock::Divider | RichBlock::Table { .. } => {
+                    return Some(eff_max_w)
+                }
                 RichBlock::Paragraph(segs) => {
                     let line_w = measure_rich_line_width_px(
                         &segs,
@@ -468,28 +509,174 @@ pub fn render_message_row_apple<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, BubbleUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    render_message_row_openbot(
+        msg,
+        meta,
+        active_fabushi_bot,
+        group,
+        stage_w,
+        is_selected,
+        has_any_selection,
+        is_last_outgoing,
+        is_row_hovered,
+        reaction_overlay_mode,
+        reaction_overlay_layout,
+        bubble_widths_probe,
+        bubble_bounds_probe,
+        row_heights_probe,
+        highlight_alpha,
+        is_unread_anchor,
+        date_divider_label,
+        revealed_spoilers,
+        expanded_quotes,
+        copied_code_msg,
+        bot_assist,
+        OpenBotBubbleExtra::default(),
+        palette,
+        lang_id,
+        window,
+        cx,
+        on_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_message_row_openbot<V: 'static>(
+    msg: &MessageItemModel,
+    meta: Option<&MessageRichMeta>,
+    active_fabushi_bot: Option<&FabushiBotSummaryDto>,
+    group: BubbleGroupLayout,
+    stage_w: f32,
+    is_selected: bool,
+    has_any_selection: bool,
+    is_last_outgoing: bool,
+    is_row_hovered: bool,
+    reaction_overlay_mode: Option<ReactionOverlayMode>,
+    reaction_overlay_layout: ReactionOverlayLayout,
+    bubble_widths_probe: Option<Rc<RefCell<HashMap<u64, f32>>>>,
+    bubble_bounds_probe: Option<Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>>,
+    row_heights_probe: Option<Rc<RefCell<HashMap<u64, f32>>>>,
+    highlight_alpha: f32,
+    is_unread_anchor: bool,
+    date_divider_label: Option<&str>,
+    revealed_spoilers: &HashSet<(u64, usize)>,
+    expanded_quotes: &HashSet<(u64, usize)>,
+    copied_code_msg: Option<u64>,
+    bot_assist: Option<BotAssistRenderContext<'_>>,
+    extra: OpenBotBubbleExtra<'_>,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    window: &Window,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, BubbleUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
     let msg_id = msg.id;
     let is_outgoing = msg.direction == MessageDirection::Outgoing;
     let is_apple = palette.is_apple_style();
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
 
     if let MessageContent::Service { text, .. } = &msg.content {
+        if is_apple {
+            let act_dm = on_action.clone();
+            let sender_uid = msg.sender_id;
+            let sender_name = msg.sender_name.clone();
+            let has_agent_pill = sender_uid > 0
+                && !sender_name.trim().is_empty()
+                && (text.contains("Assigned")
+                    || text.contains("分配")
+                    || text.contains("转交")
+                    || text.contains("joined")
+                    || text.contains("加入"));
+            let pill_hover = ob.hover();
+            return div()
+                .id(SharedString::from(format!("svc-row-{}", msg_id)))
+                .relative()
+                .w_full()
+                .py(px(10.0))
+                .px(px(16.0))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(680.0))
+                        .min_h(px(22.0))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
+                                .child(text.clone()),
+                        )
+                        .when(has_agent_pill, |el| {
+                            let click_name = sender_name.clone();
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!("svc-agent-pill-{}", msg_id)))
+                                    .h(px(22.0))
+                                    .px(px(7.0))
+                                    .rounded_full()
+                                    .bg(ob.bg_surface())
+                                    .border_1()
+                                    .border_color(ob.border_hairline())
+                                    .hover(move |s| s.bg(pill_hover))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            act_dm(
+                                                this,
+                                                BubbleUiAction::OpenSenderDm {
+                                                    user_id: sender_uid,
+                                                    sender_name: click_name.clone(),
+                                                },
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child(render_plush_bot_avatar(
+                                        &sender_name,
+                                        None,
+                                        None,
+                                        None,
+                                        15.0,
+                                        openbot_contracts::avatar::AvatarMood::Idle,
+                                        None,
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(ob.text_primary())
+                                            .child(sender_name),
+                                    ),
+                            )
+                        }),
+                )
+                .when_some(row_heights_probe, |el, probe| {
+                    el.child(make_row_height_probe_canvas(msg_id, probe))
+                })
+                .into_any_element();
+        }
         return div()
             .id(SharedString::from(format!("svc-row-{}", msg_id)))
             .relative()
             .w_full()
-            .py(px(if is_apple { 10.0 } else { 8.0 }))
+            .py(px(8.0))
             .flex_shrink_0()
             .flex()
             .justify_center()
-            .child(if is_apple {
-                div()
-                    .px(px(10.0))
-                    .py(px(2.0))
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(palette.text_secondary))
-                    .child(text.clone())
-            } else {
+            .child(
                 div()
                     .px(px(14.0))
                     .py(px(4.0))
@@ -498,8 +685,8 @@ pub fn render_message_row_apple<V: 'static>(
                     .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(palette.service_pill_fg))
-                    .child(text.clone())
-            })
+                    .child(text.clone()),
+            )
             .when_some(row_heights_probe, |el, probe| {
                 el.child(make_row_height_probe_canvas(msg_id, probe))
             })
@@ -507,13 +694,13 @@ pub fn render_message_row_apple<V: 'static>(
     }
 
     let is_apple_out = is_apple && is_outgoing;
-    let eff_r = if is_apple && matches!(palette.bubble_radius_px, 12 | 17 | 18) {
-        18.0
+    let eff_r = if is_apple {
+        22.0
     } else {
         palette.bubble_radius_px as f32
     };
-    let r_lg = palette.scaled_px(eff_r);
-    let r_sm = palette.scaled_px(if is_apple { 6.0 } else { 4.0 });
+    let r_lg = if is_apple { eff_r } else { palette.scaled_px(eff_r) };
+    let r_sm = if is_apple { 6.0 } else { palette.scaled_px(4.0) };
     let (tl, tr, br, bl) = if is_outgoing {
         (
             r_lg,
@@ -543,8 +730,17 @@ pub fn render_message_row_apple<V: 'static>(
     };
 
     let is_local_bot_card = matches!(msg.content, MessageContent::LocalBotAssistCard(_));
+    let structured_error = if is_apple && !is_outgoing {
+        match &msg.content {
+            MessageContent::Text { text, .. } => extract_structured_error_payload(text),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let is_apple_fullbleed_media = is_apple
         && !is_local_bot_card
+        && structured_error.is_none()
         && meta.map_or(true, |m| {
             m.document.is_none() && m.contact.is_none() && m.forward_from.is_none()
         })
@@ -575,20 +771,33 @@ pub fn render_message_row_apple<V: 'static>(
             (false, false) => palette.msg_in_bg,
         }
     };
-    let tail_hex = if is_apple && !is_local_bot_card {
-        match (is_outgoing, is_selected) {
-            (true, true) => palette.msg_out_selected_bg,
-            (true, false) => palette.msg_out_bg_bottom,
-            (false, true) => palette.msg_in_selected_bg,
-            (false, false) => palette.msg_in_bg,
-        }
-    } else {
-        bubble_hex
-    };
 
-    let body_el = render_bubble_inner_content(
-        msg, meta, is_outgoing, revealed_spoilers, expanded_quotes, copied_code_msg, bot_assist, palette, lang_id, cx, on_action.clone(),
-    );
+    let body_el = if let Some(ref err_card) = structured_error {
+        render_structured_error_step_card(
+            msg_id,
+            err_card,
+            extra.error_expanded,
+            palette,
+            lang_id,
+            cx,
+            on_action.clone(),
+        )
+    } else {
+        render_bubble_inner_content_ext(
+            msg,
+            meta,
+            is_outgoing,
+            extra.long_expanded,
+            revealed_spoilers,
+            expanded_quotes,
+            copied_code_msg,
+            bot_assist,
+            palette,
+            lang_id,
+            cx,
+            on_action.clone(),
+        )
+    };
 
     let eff_min_w = palette.scaled_px(if is_apple {
         APPLE_MSG_MIN_WIDTH
@@ -605,20 +814,48 @@ pub fn render_message_row_apple<V: 'static>(
         0.0
     };
     let sel_skip = if has_any_selection { 32.0 } else { 0.0 };
-    let avail_w = (stage_w - 24.0 - 32.0 - 56.0 - avatar_skip - sel_skip).max(eff_min_w);
-    let eff_max_w = palette.scaled_px(MSG_MAX_WIDTH).min(avail_w).max(eff_min_w);
-    let definite_w = compute_definite_bubble_width(
-        msg,
-        meta,
-        group,
-        is_outgoing,
-        revealed_spoilers,
-        palette,
-        lang_id,
-        eff_min_w,
-        eff_max_w,
-        window,
-    );
+    let stream_container_w = if is_apple && extra.is_direct_human {
+        stage_w.min(760.0)
+    } else if is_apple {
+        stage_w.clamp(360.0, 1440.0)
+    } else {
+        stage_w
+    };
+    let avail_w = (stream_container_w - 32.0 - avatar_skip - sel_skip).max(eff_min_w);
+    let eff_max_w = if is_apple {
+        if extra.is_direct_human {
+            (avail_w * 0.78).min(560.0).max(eff_min_w)
+        } else if is_outgoing {
+            (avail_w * 0.92)
+                .min((avail_w * 0.50).max(420.0))
+                .min(800.0)
+                .max(eff_min_w)
+        } else {
+            avail_w
+                .min((avail_w * 0.70).max(720.0))
+                .min(1200.0)
+                .max(eff_min_w)
+        }
+    } else {
+        let classic_avail = (stage_w - 24.0 - 32.0 - 56.0 - avatar_skip - sel_skip).max(eff_min_w);
+        palette.scaled_px(MSG_MAX_WIDTH).min(classic_avail).max(eff_min_w)
+    };
+    let definite_w = if structured_error.is_some() {
+        Some(eff_max_w.min(640.0).max(320.0))
+    } else {
+        compute_definite_bubble_width(
+            msg,
+            meta,
+            group,
+            is_outgoing,
+            revealed_spoilers,
+            palette,
+            lang_id,
+            eff_min_w,
+            eff_max_w,
+            window,
+        )
+    };
 
     let act_rclick = on_action.clone();
     let act_dbl = on_action.clone();
@@ -636,23 +873,29 @@ pub fn render_message_row_apple<V: 'static>(
         .when(definite_w.is_none(), |el| {
             el.min_w(px(eff_min_w)).max_w(px(eff_max_w))
         })
-        .when(is_apple_media_no_caption, |el| el.px(px(0.0)).py(px(0.0)))
+        .when(is_apple_media_no_caption || structured_error.is_some(), |el| {
+            el.px(px(0.0)).py(px(0.0))
+        })
         .when(is_apple_fullbleed_media && !is_apple_media_no_caption, |el| {
             el.px(px(0.0)).pt(px(0.0)).pb(px(palette.scaled_px(8.0)))
         })
-        .when(!is_apple_fullbleed_media, |el| {
-            el.px(px(palette.scaled_px(if is_apple { 13.0 } else { 11.0 })))
-                .py(px(palette.scaled_px(if is_apple { 7.5 } else { 7.0 })))
+        .when(!is_apple_fullbleed_media && structured_error.is_none(), |el| {
+            el.px(px(if is_apple { 12.0 } else { palette.scaled_px(11.0) }))
+                .py(px(if is_apple { 8.0 } else { palette.scaled_px(7.0) }))
         })
         .rounded_tl(px(tl))
         .rounded_tr(px(tr))
         .rounded_br(px(br))
         .rounded_bl(px(bl));
 
-    bubble = if is_apple_media_no_caption && !is_selected {
+    bubble = if (is_apple_media_no_caption || structured_error.is_some()) && !is_selected {
         bubble
-    } else if is_apple && is_outgoing && !is_selected && !is_local_bot_card {
-        bubble.bg(palette.msg_out_gradient())
+    } else if is_apple && !is_local_bot_card {
+        bubble
+            .bg(rgb(bubble_hex))
+            .when(!is_dark && !is_selected, |el| {
+                el.border_1().border_color(ob.border_hairline())
+            })
     } else {
         bubble.bg(rgb(bubble_hex))
     };
@@ -727,32 +970,23 @@ pub fn render_message_row_apple<V: 'static>(
     if let Some(reply) = &msg.reply_to {
         let target_id = reply.message_id;
         let act_reply = on_action.clone();
-        let reply_bg = if is_apple_out {
-            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.16)
-        } else if is_apple {
-            TdesktopThemePalette::rgba_with_alpha(
-                palette.text_primary,
-                if palette.mode.is_dark() { 0.08 } else { 0.05 },
-            )
+        let reply_bg = if is_apple {
+            ob.hover()
         } else {
             TdesktopThemePalette::rgba_with_alpha(palette.reply_bar_bg, 0.30)
         };
-        let reply_bar = if is_apple_out {
-            palette.msg_out_fg
-        } else if is_apple {
-            palette.accent
+        let reply_bar = if is_apple {
+            if is_dark { 0x6A6A6A } else { 0x8E8E93 }
         } else {
             palette.reply_bar_fg
         };
-        let reply_sender_fg = if is_apple_out {
-            palette.msg_out_fg
-        } else if is_apple {
+        let reply_sender_fg = if is_apple {
             palette.text_primary
         } else {
             palette.reply_bar_fg
         };
-        let reply_snippet_fg = if is_apple_out {
-            palette.msg_out_secondary_fg
+        let reply_snippet_fg = if is_apple {
+            palette.text_secondary
         } else {
             palette.text_secondary
         };
@@ -854,11 +1088,11 @@ pub fn render_message_row_apple<V: 'static>(
                 let bg_hex = if is_paid {
                     0xFF9F0A
                 } else if is_chosen {
-                    palette.accent
-                } else if palette.mode.is_dark() {
-                    0x3A3A3C
+                    if is_dark { 0x333336 } else { 0x1C1C1E }
+                } else if is_dark {
+                    0x242424
                 } else {
-                    0xE5E5EA
+                    0xEFEFF2
                 };
                 let count_fg = if is_chosen || is_paid {
                     0xFFFFFF
@@ -958,10 +1192,6 @@ pub fn render_message_row_apple<V: 'static>(
         }
     }
 
-    let show_apple_tail = is_apple
-        && group.show_tail
-        && !is_local_bot_card
-        && !is_apple_media_no_caption;
     if group.show_tail && !is_apple {
         let tail_el = if is_outgoing {
             div().absolute().bottom(px(0.0)).right(px(-6.0)).child(tg_icon(IconName::BubbleTailOut, 12.0, bubble_hex))
@@ -969,24 +1199,6 @@ pub fn render_message_row_apple<V: 'static>(
             div().absolute().bottom(px(0.0)).left(px(-6.0)).child(tg_icon(IconName::BubbleTailIn, 12.0, bubble_hex))
         };
         bubble = bubble.child(tail_el);
-    }
-
-    // Subtle non-shifting hover timestamp outside the bubble edge in Apple style
-    if is_apple && is_row_hovered && !has_any_selection && !msg.timestamp.is_empty() {
-        bubble = bubble.child(
-            div()
-                .id(SharedString::from(format!("hover-ts-{}", msg_id)))
-                .absolute()
-                .bottom(px(7.0))
-                .w(px(42.0))
-                .when(is_outgoing, |el| el.left(px(-82.0)).flex().justify_end())
-                .when(!is_outgoing, |el| el.right(px(-82.0)).flex().justify_start())
-                .text_size(px(10.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(palette.text_secondary))
-                .whitespace_nowrap()
-                .child(msg.timestamp.clone()),
-        );
     }
 
     if bubble_widths_probe.is_some() || bubble_bounds_probe.is_some() {
@@ -1032,7 +1244,13 @@ pub fn render_message_row_apple<V: 'static>(
         );
     }
 
-    if let Some(overlay_mode) = reaction_overlay_mode.filter(|_| !has_any_selection && !msg.is_local_only()) {
+    let show_hover_rx_overlay = reaction_overlay_mode
+        .filter(|m| {
+            !has_any_selection
+                && !msg.is_local_only()
+                && (!is_apple || !matches!(m, ReactionOverlayMode::CornerButton))
+        });
+    if let Some(overlay_mode) = show_hover_rx_overlay {
         let chosen_emojis: Vec<String> = msg
             .reactions
             .iter()
@@ -1067,30 +1285,7 @@ pub fn render_message_row_apple<V: 'static>(
         ));
     }
 
-    let bubble_element: AnyElement = if show_apple_tail {
-        let apple_tail = if is_outgoing {
-            div()
-                .absolute()
-                .bottom(px(0.0))
-                .right(px(-6.0))
-                .child(tg_icon(IconName::BubbleTailOut, 16.0, tail_hex))
-        } else {
-            div()
-                .absolute()
-                .bottom(px(0.0))
-                .left(px(-6.0))
-                .child(tg_icon(IconName::BubbleTailIn, 16.0, tail_hex))
-        };
-        div()
-            .relative()
-            .flex()
-            .flex_shrink_0()
-            .child(apple_tail)
-            .child(bubble)
-            .into_any_element()
-    } else {
-        bubble.into_any_element()
-    };
+    let bubble_element: AnyElement = bubble.into_any_element();
 
     let mut stack = div()
         .flex()
@@ -1103,18 +1298,59 @@ pub fn render_message_row_apple<V: 'static>(
         .when(is_apple, |el| {
             el.min_w(px(0.0)).max_w(px(eff_max_w))
         })
-        .when(is_outgoing, |el| el.items_end().ml(px(56.0)))
-        .when(!is_outgoing, |el| el.items_start().mr(px(56.0)));
+        .when(is_outgoing, |el| el.items_end().ml(px(if is_apple { 28.0 } else { 56.0 })))
+        .when(!is_outgoing, |el| el.items_start().mr(px(if is_apple { 28.0 } else { 56.0 })));
 
-    if is_apple && group.show_sender_name && !is_outgoing {
+    if is_apple && !is_outgoing && !group.attached_to_prev && (extra.is_group_chat || group.show_sender_name) && !msg.sender_name.trim().is_empty() {
+        let sender_uid = msg.sender_id;
+        let sender_name = msg.sender_name.clone();
+        let hue_name = extra
+            .sender_hue_name
+            .filter(|h| TdesktopThemePalette::is_tinted_bot_hue(h))
+            .unwrap_or_else(|| TdesktopThemePalette::bot_hue_name_for_id(sender_uid));
+        let (_, _, author_fg_hex) = TdesktopThemePalette::bot_hue_colors(hue_name, is_dark);
+        let act_dm = on_action.clone();
+        let click_name = sender_name.clone();
         stack = stack.child(
             div()
-                .pl(px(12.0))
-                .mb(px(if !msg.reactions.is_empty() { 12.0 } else { 3.0 }))
-                .text_size(px(11.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(palette.text_secondary))
-                .child(msg.sender_name.clone()),
+                .id(SharedString::from(format!("openbot-group-author-{}", msg_id)))
+                .pl(px(4.0))
+                .mb(px(if !msg.reactions.is_empty() { 10.0 } else { 3.0 }))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("openbot-author-link-{}", msg_id)))
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(author_fg_hex))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                act_dm(
+                                    this,
+                                    BubbleUiAction::OpenSenderDm {
+                                        user_id: sender_uid,
+                                        sender_name: click_name.clone(),
+                                    },
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(sender_name),
+                )
+                .when(is_row_hovered && !msg.timestamp.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(ob.text_dim())
+                            .child(msg.timestamp.clone()),
+                    )
+                }),
         );
     }
 
@@ -1127,59 +1363,173 @@ pub fn render_message_row_apple<V: 'static>(
         }));
     }
 
-    if is_apple {
-        let is_edited = matches!(msg.content, MessageContent::Text { is_edited: true, .. })
-            || meta.and_then(|m| m.edit_date.as_ref()).is_some();
-        let show_receipt = is_outgoing && is_last_outgoing;
-        if is_edited || show_receipt {
-            let is_zh = lang_id.starts_with("zh");
-            let mut cap_row = div()
+    if is_apple && !has_any_selection {
+        let has_steps = !is_outgoing && !extra.turn_steps.is_empty();
+        let show_action_row = is_row_hovered
+            || show_hover_rx_overlay.is_some()
+            || extra.steps_expanded
+            || has_steps;
+        if show_action_row {
+            let show_icons = is_row_hovered || show_hover_rx_overlay.is_some();
+            let a_copy = on_action.clone();
+            let a_reply = on_action.clone();
+            let a_react = on_action.clone();
+            let a_pin = on_action.clone();
+            let a_more = on_action.clone();
+            let a_steps = on_action.clone();
+            let hover_bg = ob.hover();
+            let icon_c = ob.text_muted();
+
+            let mut action_row = div()
+                .id(SharedString::from(format!("message-action-row-{}", msg_id)))
                 .mt(px(3.0))
-                .px(px(4.0))
+                .min_h(px(24.0))
+                .px(px(2.0))
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(4.0))
                 .when(is_outgoing, |el| el.justify_end())
                 .when(!is_outgoing, |el| el.justify_start());
-            if is_edited {
-                cap_row = cap_row.child(
+
+            if show_icons {
+                let make_btn = |id_suffix: &str, icon: OpenBotStageIcon, act: BubbleUiAction| {
+                    let cb = on_action.clone();
                     div()
-                        .text_size(px(10.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.text_secondary))
-                        .child(if is_zh { "已编辑" } else { "Edited" }),
-                );
-            }
-            if show_receipt {
-                let receipt_label = match msg.delivery_status {
-                    DeliveryStatus::Sending => {
-                        if is_zh { "正在发送…".to_string() } else { "Sending…".to_string() }
-                    }
-                    DeliveryStatus::Sent => {
-                        if is_zh { "已送达".to_string() } else { "Delivered".to_string() }
-                    }
-                    DeliveryStatus::Read => {
-                        if msg.timestamp.trim().is_empty() {
-                            if is_zh { "已读".to_string() } else { "Read".to_string() }
-                        } else if is_zh {
-                            format!("已读 {}", msg.timestamp)
-                        } else {
-                            format!("Read {}", msg.timestamp)
-                        }
-                    }
+                        .id(SharedString::from(format!("msg-act-{}-{}", id_suffix, msg_id)))
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .rounded(px(6.0))
+                        .hover(move |s| s.bg(hover_bg))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cb(this, act.clone(), cx);
+                            }),
+                        )
+                        .child(openbot_stage_icon(icon, 13.0, icon_c))
                 };
-                cap_row = cap_row.child(
+                let _ = (a_copy, a_reply, a_react, a_pin);
+                action_row = action_row
+                    .child(make_btn("copy", OpenBotStageIcon::Copy, BubbleUiAction::CopyMessageText(msg_id)))
+                    .child(make_btn("reply", OpenBotStageIcon::Reply, BubbleUiAction::Context(ContextMenuAction::Reply(msg_id))))
+                    .when(!msg.is_local_only(), |el| {
+                        el.child(make_btn("react", OpenBotStageIcon::Smile, BubbleUiAction::ToggleReactionPicker(msg_id)))
+                            .child(make_btn("pin", OpenBotStageIcon::Pin, BubbleUiAction::Context(ContextMenuAction::TogglePin(msg_id))))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("msg-act-more-{}", msg_id)))
+                                    .w(px(24.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            a_more(this, BubbleUiAction::OpenContextMenu(msg_id, ev.position), cx);
+                                        }),
+                                    )
+                                    .child(openbot_stage_icon(OpenBotStageIcon::MoreHorizontal, 13.0, icon_c)),
+                            )
+                    });
+                if !msg.timestamp.is_empty() {
+                    let is_edited = matches!(msg.content, MessageContent::Text { is_edited: true, .. })
+                        || meta.and_then(|m| m.edit_date.as_ref()).is_some();
+                    let time_str = if is_edited {
+                        format!(
+                            "{} · {}",
+                            msg.timestamp,
+                            tr_str(lang_id, "已编辑", "Edited")
+                        )
+                    } else {
+                        msg.timestamp.clone()
+                    };
+                    action_row = action_row.child(
+                        div()
+                            .px(px(4.0))
+                            .text_size(px(12.5))
+                            .text_color(ob.text_dim())
+                            .whitespace_nowrap()
+                            .child(time_str),
+                    );
+                }
+            }
+
+            if has_steps {
+                let total_ms: u64 = extra
+                    .turn_steps
+                    .iter()
+                    .filter_map(|s| s.duration_ms)
+                    .sum();
+                let count = extra.turn_steps.len();
+                let steps_lbl = if total_ms >= 1000 {
+                    format!(
+                        "{} {} · {}s",
+                        count,
+                        tr_str(lang_id, "步", "steps"),
+                        total_ms / 1000
+                    )
+                } else {
+                    format!("{} {}", count, tr_str(lang_id, "步", "steps"))
+                };
+                action_row = action_row.child(
                     div()
-                        .id(SharedString::from(format!("delivery-receipt-{}", msg_id)))
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.text_secondary))
-                        .child(receipt_label),
+                        .id(SharedString::from(format!("msg-steps-toggle-{}", msg_id)))
+                        .h(px(24.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .hover(move |s| s.bg(hover_bg))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_steps(this, BubbleUiAction::ToggleAgentSteps(msg_id), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(ob.text_muted())
+                                .child(steps_lbl),
+                        )
+                        .child(openbot_stage_icon(
+                            if extra.steps_expanded {
+                                OpenBotStageIcon::ChevronDown
+                            } else {
+                                OpenBotStageIcon::ChevronRight
+                            },
+                            12.0,
+                            ob.text_muted(),
+                        )),
                 );
             }
-            stack = stack.child(cap_row);
+
+            stack = stack.child(action_row);
+
+            if has_steps && extra.steps_expanded {
+                stack = stack.child(render_openbot_agent_step_list(
+                    msg_id,
+                    extra.turn_steps,
+                    palette,
+                    lang_id,
+                ));
+            }
         }
     }
+    let _ = is_last_outgoing;
 
     let base_pt: f32 = if group.attached_to_prev {
         2.0
@@ -1240,10 +1590,18 @@ pub fn render_message_row_apple<V: 'static>(
         let av_src = meta.and_then(|m| m.avatar_url.as_deref()).and_then(|u| resolve_image_source(u, None));
         let av_size = if is_apple { APPLE_AVATAR_SIZE } else { MSG_PHOTO_SIZE };
         let av_skip = if is_apple { APPLE_AVATAR_SKIP } else { MSG_PHOTO_SKIP };
+        let sender_uid = msg.sender_id;
+        let sender_name = msg.sender_name.clone();
+        let act_av_dm = on_action.clone();
         row = row.child(
-            div().w(px(av_skip)).flex().justify_start().when(group.show_bottom_avatar, |el| {
-                if let Some(src) = av_src {
-                    el.child(
+            div()
+                .w(px(av_skip))
+                .pr(px(if is_apple { 8.0 } else { 6.0 }))
+                .flex_shrink_0()
+                .flex()
+                .justify_start()
+                .when(group.show_bottom_avatar, |el| {
+                    let av_inner: AnyElement = if let Some(src) = av_src {
                         div()
                             .w(px(av_size))
                             .h(px(av_size))
@@ -1253,23 +1611,54 @@ pub fn render_message_row_apple<V: 'static>(
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(img(src).size_full().object_fit(ObjectFit::Cover)),
-                    )
-                } else if let Some(fab) = active_fabushi_bot
-                    .filter(|f| !f.avatar_shape.eq_ignore_ascii_case("classic"))
-                {
-                    el.child(render_grok_persona_avatar(
-                        &fab.agent_id,
-                        &fab.avatar_shape,
-                        &fab.avatar_color,
-                        &msg.avatar_initials,
-                        av_size,
-                        GrokPersonaState::from_activity_str(&fab.execution_state, false),
-                        palette.stage_bg,
-                        false,
-                    ))
-                } else {
-                    el.child(
+                            .child(img(src).size_full().object_fit(ObjectFit::Cover))
+                            .into_any_element()
+                    } else if is_apple && (extra.sender_is_bot || extra.sender_hue_name.is_some()) {
+                        let (_, hue, color_hex) = normalize_fabushi_plush_spec(
+                            "",
+                            extra.sender_hue_name.unwrap_or(""),
+                        );
+                        let seed = format!("sender_{}_{}", msg.sender_id, msg.sender_name);
+                        render_plush_bot_avatar(
+                            &seed,
+                            None,
+                            hue,
+                            color_hex.as_deref(),
+                            av_size,
+                            openbot_contracts::avatar::AvatarMood::Idle,
+                            None,
+                        )
+                        .into_any_element()
+                    } else if let Some(fab) = active_fabushi_bot
+                        .filter(|f| !extra.is_group_chat && !f.avatar_shape.eq_ignore_ascii_case("classic"))
+                    {
+                        if is_apple {
+                            let (shape, hue, color) =
+                                normalize_fabushi_plush_spec(&fab.avatar_shape, &fab.avatar_color);
+                            render_plush_bot_avatar(
+                                &fab.agent_id,
+                                shape,
+                                hue,
+                                color.as_deref(),
+                                av_size,
+                                openbot_contracts::avatar::AvatarMood::Idle,
+                                None,
+                            )
+                            .into_any_element()
+                        } else {
+                            render_grok_persona_avatar(
+                                &fab.agent_id,
+                                &fab.avatar_shape,
+                                &fab.avatar_color,
+                                &msg.avatar_initials,
+                                av_size,
+                                GrokPersonaState::from_activity_str(&fab.execution_state, false),
+                                palette.stage_bg,
+                                false,
+                            )
+                            .into_any_element()
+                        }
+                    } else {
                         div()
                             .w(px(av_size))
                             .h(px(av_size))
@@ -1279,15 +1668,38 @@ pub fn render_message_row_apple<V: 'static>(
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(if is_apple { 10.5 } else { 12.0 }))
+                            .text_size(px(if is_apple { 11.5 } else { 12.0 }))
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(0xFFFFFF))
                             .when(meta.and_then(|m| m.avatar_url.as_ref()).is_none(), |a| {
                                 a.child(msg.avatar_initials.clone())
-                            }),
+                            })
+                            .into_any_element()
+                    };
+
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("group-sender-avatar-{}", msg_id)))
+                            .when(is_apple && extra.is_group_chat && sender_uid > 0, |btn| {
+                                let click_name = sender_name.clone();
+                                btn.cursor_pointer().on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        act_av_dm(
+                                            this,
+                                            BubbleUiAction::OpenSenderDm {
+                                                user_id: sender_uid,
+                                                sender_name: click_name.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    }),
+                                )
+                            })
+                            .child(av_inner),
                     )
-                }
-            }),
+                }),
         );
     }
 
@@ -1296,9 +1708,23 @@ pub fn render_message_row_apple<V: 'static>(
     } else {
         row.justify_start().child(stack)
     };
+    let wrapped_row = if is_apple && extra.is_direct_human {
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(div().w_full().max_w(px(760.0)).child(aligned_row))
+            .into_any_element()
+    } else {
+        aligned_row.into_any_element()
+    };
 
     if date_divider_label.is_none() && !is_unread_anchor {
-        return aligned_row
+        return div()
+            .relative()
+            .w_full()
+            .flex_shrink_0()
+            .child(wrapped_row)
             .when_some(row_heights_probe, |el, probe| {
                 el.child(make_row_height_probe_canvas(msg_id, probe))
             })
@@ -1362,7 +1788,7 @@ pub fn render_message_row_apple<V: 'static>(
                 ),
             )
         })
-        .child(aligned_row)
+        .child(wrapped_row)
         .when_some(row_heights_probe, |el, probe| {
             el.child(make_row_height_probe_canvas(msg_id, probe))
         })
@@ -1370,10 +1796,11 @@ pub fn render_message_row_apple<V: 'static>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_bubble_inner_content<V: 'static>(
+fn render_bubble_inner_content_ext<V: 'static>(
     msg: &MessageItemModel,
     meta: Option<&MessageRichMeta>,
     is_outgoing: bool,
+    long_expanded: bool,
     revealed_spoilers: &HashSet<(u64, usize)>,
     expanded_quotes: &HashSet<(u64, usize)>,
     copied_code_msg: Option<u64>,
@@ -1416,11 +1843,58 @@ fn render_bubble_inner_content<V: 'static>(
     match &msg.content {
         MessageContent::Text { text, .. } => {
             let a_rt = on_action.clone();
+            let preview = if palette.is_apple_style() {
+                Some(compute_message_preview(text, false, long_expanded))
+            } else {
+                None
+            };
+            let display_text = preview
+                .as_ref()
+                .map(|p| p.preview_text.as_str())
+                .unwrap_or(text.as_str());
+            let show_more_avail = preview.as_ref().is_some_and(|p| p.show_more_available);
+            let is_collapsed = preview.as_ref().is_some_and(|p| p.collapsed);
             let mut col = div().flex().flex_col().w_full().min_w(px(0.0)).gap(px(4.0)).child(render_rich_message_body(
-                msg_id, text, explicit_entities, revealed_spoilers, expanded_quotes,
+                msg_id, display_text, explicit_entities, revealed_spoilers, expanded_quotes,
                 copied_code_msg, palette, lang_id, is_outgoing, cx,
                 move |this, r, cx| a_rt(this, BubbleUiAction::RichText(r), cx),
             ));
+            if show_more_avail {
+                let ob = palette.openbot_palette();
+                let a_long = on_action.clone();
+                let hover_bg = ob.hover();
+                col = col.child(
+                    div()
+                        .id(SharedString::from(format!("msg-long-toggle-{}", msg_id)))
+                        .mt(px(4.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .bg(ob.bg_control())
+                        .border_1()
+                        .border_color(ob.border_hairline())
+                        .hover(move |s| s.bg(hover_bg))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_muted())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_long(this, BubbleUiAction::ToggleLongMessage(msg_id), cx);
+                            }),
+                        )
+                        .child(if is_collapsed {
+                            tr_str(lang_id, "显示全部", "Show full")
+                        } else {
+                            tr_str(lang_id, "收起长消息", "Show less")
+                        }),
+                );
+            }
             if let Some(m) = meta {
                 if m.show_translation {
                     if let Some(ref tr_txt) = m.translated_text {
@@ -1609,4 +2083,496 @@ fn render_bottom_meta_strip(
             el.child(tg_icon(icon, palette.scaled_px(13.0), tint))
         })
         .into_any_element()
+}
+
+/// Detects raw JSON error walls (e.g. Gemini/OpenAI HTTP 400 tool-schema dumps) or prefixed
+/// provider/tool failure cards and extracts a concise human summary + raw payload for OpenBot's
+/// collapsible `AgentSteps` failed-step drawer (`UI-F10`).
+pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCard> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    const ERROR_PREFIXES: [&str; 9] = [
+        "⚠️ **执行失败",
+        "⚠️ **AI 服务请求失败",
+        "⚠️ **本地 AI 执行失败",
+        "⚠️ **无法启动 AI 回复",
+        "⚠️ **执行异常",
+        "⚠️ **AI Provider Request Failed",
+        "⚠️ **Local AI Turn Failed",
+        "PROVIDER_ERROR:",
+        "tool_error:",
+    ];
+
+    let matched_prefix = ERROR_PREFIXES
+        .iter()
+        .find(|p| trimmed.starts_with(**p))
+        .copied();
+
+    let extract_json_reason = |val: &serde_json::Value| -> Option<String> {
+        if let Some(msg) = val
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(msg.lines().next().unwrap_or(msg).trim().to_string());
+        }
+        if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
+            return Some(msg.lines().next().unwrap_or(msg).trim().to_string());
+        }
+        if let Some(arr) = val
+            .get("error")
+            .and_then(|e| e.get("details"))
+            .and_then(|d| d.as_array())
+        {
+            for item in arr {
+                if let Some(viols) = item.get("fieldViolations").and_then(|v| v.as_array()) {
+                    if let Some(desc) = viols
+                        .first()
+                        .and_then(|v| v.get("description"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(desc.trim().to_string());
+                    }
+                }
+            }
+        }
+        if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+            return Some(desc.trim().to_string());
+        }
+        None
+    };
+
+    // Case 1: Pure raw JSON error object or array
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let has_err_shape = val.get("error").is_some()
+                || val.get("fieldViolations").is_some()
+                || val.get("violations").is_some()
+                || val.get("status").and_then(|v| v.as_str()).is_some_and(|s| {
+                    s.eq_ignore_ascii_case("INVALID_ARGUMENT")
+                        || s.eq_ignore_ascii_case("ERROR")
+                        || s.eq_ignore_ascii_case("FAILED_PRECONDITION")
+                })
+                || trimmed.contains("function_declarations")
+                || trimmed.contains("invalid_request_error");
+            if has_err_shape {
+                let reason = extract_json_reason(&val)
+                    .unwrap_or_else(|| "Model provider returned a structured error payload".to_string());
+                let short_reason: String = reason.chars().take(120).collect();
+                return Some(StructuredErrorCard {
+                    summary_title: "执行失败".to_string(),
+                    concise_reason: short_reason,
+                    raw_payload: trimmed.to_string(),
+                    is_json: true,
+                });
+            }
+        } else {
+            let line_count = trimmed.lines().count();
+            let key_hits = [
+                "\"error\"",
+                "\"violations\"",
+                "\"fieldViolations\"",
+                "\"function_declarations\"",
+                "\"invalid_request_error\"",
+                "\"description\"",
+                "\"status\"",
+            ]
+            .iter()
+            .filter(|k| trimmed.contains(**k))
+            .count();
+            if line_count >= 4 && key_hits >= 2 {
+                return Some(StructuredErrorCard {
+                    summary_title: "执行失败".to_string(),
+                    concise_reason: "Model provider returned an invalid request payload".to_string(),
+                    raw_payload: trimmed.to_string(),
+                    is_json: true,
+                });
+            }
+        }
+    }
+
+    // Case 2: Prefixed provider/tool failure card containing JSON / HTTP error traces / long wall
+    if let Some(prefix) = matched_prefix {
+        let has_embedded_json = trimmed.contains('{') && trimmed.contains('}');
+        let has_http_trace = trimmed.contains("HTTP 4")
+            || trimmed.contains("HTTP 5")
+            || trimmed.contains("status=")
+            || trimmed.contains("fieldViolations")
+            || trimmed.contains("function_declarations");
+        if has_embedded_json || has_http_trace || trimmed.chars().count() > 180 {
+            let title_line = trimmed
+                .lines()
+                .next()
+                .unwrap_or(prefix)
+                .replace("⚠️", "")
+                .replace("**", "")
+                .trim()
+                .to_string();
+            let summary_title = title_line
+                .split(&['：', ':'][..])
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("执行失败")
+                .to_string();
+
+            let mut concise = String::new();
+            if let (Some(j_start), Some(j_end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+                if j_start < j_end {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&trimmed[j_start..=j_end]) {
+                        if let Some(r) = extract_json_reason(&val) {
+                            concise = r;
+                        }
+                    }
+                }
+            }
+            if concise.is_empty() {
+                let after_colon = title_line
+                    .split_once('：')
+                    .or_else(|| title_line.split_once(':'))
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                if !after_colon.is_empty() && !after_colon.starts_with('{') {
+                    concise = after_colon.to_string();
+                } else {
+                    concise = "Provider or tool call returned an error response".to_string();
+                }
+            }
+            let concise_reason: String = concise.chars().take(120).collect();
+            return Some(StructuredErrorCard {
+                summary_title,
+                concise_reason,
+                raw_payload: trimmed.to_string(),
+                is_json: has_embedded_json,
+            });
+        }
+    }
+
+    None
+}
+
+fn render_structured_error_step_card<V: 'static>(
+    msg_id: u64,
+    err: &StructuredErrorCard,
+    expanded: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, BubbleUiAction, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let a_toggle = on_action.clone();
+    let a_copy = on_action;
+    let raw_copy = err.raw_payload.clone();
+    let hover_bg = ob.hover();
+    let danger_bg = ob
+        .rgba("--openbot-danger-soft")
+        .unwrap_or_else(|| TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.14));
+    let danger_border = ob
+        .rgba("--openbot-danger-border")
+        .unwrap_or_else(|| ob.danger());
+
+    div()
+        .id(SharedString::from(format!("agent-step-error-card-{}", msg_id)))
+        .w_full()
+        .min_w(px(0.0))
+        .rounded(px(14.0))
+        .bg(ob.bg_surface())
+        .border_1()
+        .border_color(danger_border)
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(7.0))
+                        .py(px(2.0))
+                        .rounded_full()
+                        .bg(danger_bg)
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(openbot_stage_icon(OpenBotStageIcon::AlertCircle, 12.0, ob.danger()))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.danger())
+                                .child(tr_str(lang_id, "失败", "Failed")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
+                        .child(err.summary_title.clone()),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(12.5))
+                .text_color(ob.text_muted())
+                .child(err.concise_reason.clone()),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id(("agent-step-error-toggle", msg_id))
+                        .h(px(24.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .hover(move |s| s.bg(hover_bg))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_toggle(this, BubbleUiAction::ToggleErrorDetails(msg_id), cx);
+                            }),
+                        )
+                        .child(openbot_stage_icon(
+                            if expanded {
+                                OpenBotStageIcon::ChevronDown
+                            } else {
+                                OpenBotStageIcon::ChevronRight
+                            },
+                            12.0,
+                            ob.text_muted(),
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_muted())
+                                .child(if expanded {
+                                    tr_str(lang_id, "隐藏错误详情", "Hide error")
+                                } else {
+                                    tr_str(lang_id, "显示错误详情", "Show error")
+                                }),
+                        ),
+                )
+                .when(expanded, |row| {
+                    row.child(
+                        div()
+                            .id(("agent-step-error-copy", msg_id))
+                            .h(px(24.0))
+                            .px(px(7.0))
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    a_copy(this, BubbleUiAction::CopyRawText(raw_copy.clone()), cx);
+                                }),
+                            )
+                            .child(openbot_stage_icon(OpenBotStageIcon::Copy, 12.0, ob.text_muted()))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_muted())
+                                    .child(tr_str(lang_id, "复制", "Copy")),
+                            ),
+                    )
+                }),
+        )
+        .when(expanded, |col| {
+            col.child(
+                div()
+                    .id(SharedString::from(format!("agent-step-error-pre-{}", msg_id)))
+                    .w_full()
+                    .max_h(px(160.0))
+                    .overflow_y_scroll()
+                    .rounded(px(4.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(12.0))
+                    .line_height(px(16.5))
+                    .text_color(ob.text_secondary())
+                    .child(err.raw_payload.clone()),
+            )
+        })
+        .into_any_element()
+}
+
+/// Renders an OpenBot collapsible `AgentStepList` (`max_h: 220px`, Sparkles/Puzzle/Brain/Alert icons).
+pub fn render_openbot_agent_step_list(
+    scope_id: u64,
+    steps: &[AgentStepEntry],
+    palette: &TdesktopThemePalette,
+    _lang_id: &str,
+) -> AnyElement {
+    let ob = palette.openbot_palette();
+    let mut list = div()
+        .id(SharedString::from(format!("openbot-agent-steps-{}", scope_id)))
+        .mt(px(4.0))
+        .w_full()
+        .max_w(px(640.0))
+        .max_h(px(STEPS_MAX_HEIGHT))
+        .overflow_y_scroll()
+        .rounded(px(10.0))
+        .bg(ob.bg_surface())
+        .border_1()
+        .border_color(ob.border_hairline())
+        .p(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(5.0));
+
+    for (step_idx, step) in steps.iter().enumerate() {
+        let (icon_kind, icon_color) = if step.failed {
+            (OpenBotStageIcon::AlertCircle, ob.danger())
+        } else {
+            match step.kind {
+                AgentStepKind::Thinking => (OpenBotStageIcon::Sparkles, ob.text_muted()),
+                AgentStepKind::Progress => (OpenBotStageIcon::Puzzle, ob.text_muted()),
+                AgentStepKind::Memory | AgentStepKind::MemorySummary => {
+                    (OpenBotStageIcon::Brain, ob.text_muted())
+                }
+            }
+        };
+        let is_thinking = step.kind == AgentStepKind::Thinking;
+        let is_strike = step.is_strikethrough_memory();
+        list = list.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(openbot_stage_icon(icon_kind, 12.5, icon_color))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(12.0))
+                                .when(is_thinking, |el| el.italic())
+                                .when(is_strike, |el| el.line_through())
+                                .text_color(if step.failed { ob.danger() } else { ob.text_secondary() })
+                                .child(step.label.clone()),
+                        )
+                        .when_some(step.duration_ms.filter(|&ms| ms >= 100), |row, ms| {
+                            let d_lbl = if ms >= 1000 {
+                                format!("{:.1}s", ms as f32 / 1000.0)
+                            } else {
+                                format!("{ms}ms")
+                            };
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.0))
+                                    .text_color(ob.text_dim())
+                                    .child(d_lbl),
+                            )
+                        }),
+                )
+                .when_some(step.stderr.as_ref().filter(|s| !s.trim().is_empty()), |col, stderr| {
+                    col.child(
+                        div()
+                            .id(SharedString::from(format!("agent-step-stderr-{}-{}", scope_id, step_idx)))
+                            .ml(px(18.0))
+                            .max_h(px(120.0))
+                            .overflow_y_scroll()
+                            .rounded(px(4.0))
+                            .bg(ob.bg_control())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .px(px(6.0))
+                            .py(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(ob.danger())
+                            .child(stderr.clone()),
+                    )
+                }),
+        );
+    }
+
+    list.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn extracts_raw_gemini_json_error_wall_into_collapsible_card() {
+        let raw = r#"{
+  "error": {
+    "code": 400,
+    "message": "Invalid JSON payload received. Unknown name \"additionalProperties\" at 'tools[0].function_declarations[0].parameters'",
+    "status": "INVALID_ARGUMENT",
+    "details": [{
+      "fieldViolations": [{
+        "field": "tools[0].function_declarations[0].parameters",
+        "description": "Invalid JSON payload received."
+      }]
+    }]
+  }
+}"#;
+        let card = extract_structured_error_payload(raw).expect("must detect raw JSON error wall");
+        assert!(card.is_json);
+        assert!(card.concise_reason.contains("Invalid JSON payload"));
+        assert_eq!(card.raw_payload, raw);
+    }
+
+    #[std::prelude::v1::test]
+    fn extracts_prefixed_hermes_provider_error_card() {
+        let raw = "⚠️ **执行失败 (400)**：{\"error\":{\"message\":\"Bad request on tool schema\",\"status\":\"INVALID_ARGUMENT\"}}";
+        let card = extract_structured_error_payload(raw).expect("must detect prefixed provider error");
+        assert!(card.is_json);
+        assert_eq!(card.summary_title, "执行失败 (400)");
+        assert_eq!(card.concise_reason, "Bad request on tool schema");
+    }
+
+    #[std::prelude::v1::test]
+    fn ignores_normal_assistant_prose_and_short_json() {
+        assert!(extract_structured_error_payload("Hello! Here is your summary.").is_none());
+        assert!(extract_structured_error_payload("{\"hello\": \"world\"}").is_none());
+    }
 }

@@ -57,10 +57,10 @@ impl BookReaderTheme {
     /// `(paper_bg, chrome_bg, text_fg, secondary_fg, accent_fg, border_rgb)`
     pub fn colors(self) -> (u32, u32, u32, u32, u32, u32) {
         match self {
-            Self::Light => (0xFFFFFF, 0xF7F7F8, 0x1C1C1E, 0x636366, 0xFF9500, 0xE5E5EA),
-            Self::Sepia => (0xF8F1E3, 0xEFE4CE, 0x433422, 0x7A664D, 0xC97A10, 0xDFD2B7),
-            Self::Gray => (0x4A4A4D, 0x3F3F42, 0xF2F2F7, 0xC7C7CC, 0xFF9F0A, 0x5E5E62),
-            Self::Night => (0x141416, 0x1C1C1E, 0xECECF0, 0x98989F, 0xFF9F0A, 0x2C2C2E),
+            Self::Light => (0xFFFFFF, 0xF5F5F7, 0x1C1C1E, 0x6E6E73, 0x1C1C1E, 0xE5E5EA),
+            Self::Sepia => (0xF8F1E3, 0xEFE4CE, 0x433422, 0x7A664D, 0xA86A1A, 0xDFD2B7),
+            Self::Gray => (0x3A3A3D, 0x2F2F32, 0xF0F0F2, 0xB8B8BE, 0xF0F0F0, 0x4E4E52),
+            Self::Night => (0x1A1A1A, 0x212121, 0xF0F0F0, 0x999999, 0xF0F0F0, 0x2C2C2E),
         }
     }
 }
@@ -522,6 +522,10 @@ pub fn render_book_reader(
     let pal = ws.palette;
     let lang = ws.language_id.clone();
     let (paper_bg, chrome_bg, text_fg, secondary_fg, accent_fg, border_rgb) = reader.theme.colors();
+    let active_pill_fg = match reader.theme {
+        BookReaderTheme::Gray | BookReaderTheme::Night => 0x141414,
+        BookReaderTheme::Light | BookReaderTheme::Sepia => 0xFFFFFF,
+    };
 
     let chapter_opt = reader.payload.chapters.get(reader.current_chapter_index);
     let chapter_title = chapter_opt
@@ -784,7 +788,7 @@ pub fn render_book_reader(
                                     })
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(if active { 0xFFFFFF } else { text_fg }))
+                                    .text_color(rgb(if active { active_pill_fg } else { text_fg }))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -899,7 +903,7 @@ pub fn render_book_reader(
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(if !reader.show_bookmarks_tab {
-                                                0xFFFFFF
+                                                active_pill_fg
                                             } else {
                                                 text_fg
                                             }))
@@ -931,7 +935,7 @@ pub fn render_book_reader(
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(if reader.show_bookmarks_tab {
-                                                0xFFFFFF
+                                                active_pill_fg
                                             } else {
                                                 text_fg
                                             }))
