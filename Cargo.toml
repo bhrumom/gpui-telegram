@@ -22,6 +22,9 @@ members = [
     "crates/openbot_contracts",
     "crates/openbot_storage",
     "crates/openbot_runtime",
+    "crates/orca_core",
+    "crates/orca_bots",
+    "crates/orca_ide",
     "tests/e2e_magpie_gateway",
     "tests/e2e_suite",
 
@@ -45,7 +48,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.6.15"
+version = "1.7.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]
@@ -73,6 +76,9 @@ bot-browser = { path = "crates/bot-browser" }
 openbot_contracts = { path = "crates/openbot_contracts" }
 openbot_storage = { path = "crates/openbot_storage" }
 openbot_runtime = { path = "crates/openbot_runtime" }
+orca_core = { path = "crates/orca_core" }
+orca_bots = { path = "crates/orca_bots" }
+orca_ide = { path = "crates/orca_ide" }
 
 # --- Inherited Domain Crates ---
 fabushi-messaging-core = { path = "inherited/mahayana-messaging" }

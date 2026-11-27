@@ -69,6 +69,7 @@ impl ConversationStage {
         self.pending_call_request = false;
         self.pending_video_call = false;
         self.pending_media_url = None;
+        self.pending_open_url = None;
         self.pending_media_viewer = None;
         self.pending_iv_url = None;
         self.pending_bot_action = None;

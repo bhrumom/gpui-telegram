@@ -209,13 +209,11 @@ impl LocalCommunityRuntime {
     }
 
     fn init_from_store(store: CommunityStore, db_path: Option<PathBuf>) -> Result<Self> {
-        let now_ms = now_millis();
         store.with_conn(|conn| {
             conn.execute_batch(META_TABLE_SQL)
                 .map_err(|e| TelegramError::Database(format!("create community_client_meta: {e}")))
         })?;
-        store.seed_if_empty(now_ms)?;
-        store.with_transaction(|tx| ensure_guest_actor_conn(tx, now_ms))?;
+        store.purge_starter_seed_data()?;
 
         let (persisted_owner, persisted_active) = store.with_conn(|conn| {
             let owner = read_meta_conn(conn, META_KEY_OWNER_USER_ID)?
@@ -271,14 +269,14 @@ impl LocalCommunityRuntime {
             .filter(|s| !s.is_empty());
         *self.active_actor_id.write() = normalized.clone();
         // Never overwrite persisted active_actor_id on disk while unbound on an owned DB,
-        // nor persist values containing ASCII control bytes (let outbound validation reject them).
+        // nor persist invalid actor IDs (control chars, non-ASCII, embedded whitespace) —
+        // let outbound validation reject them explicitly.
         if self.bound_user_id.read().is_none() && self.persisted_owner_user_id.read().is_some() {
             return;
         }
-        if normalized
-            .as_deref()
-            .is_some_and(|id| id.bytes().any(|b| b < 0x20 || b == 0x7f))
-        {
+        if normalized.as_deref().is_some_and(|id| {
+            crate::net::api_community::validate_and_normalize_actor_id(id).is_err()
+        }) {
             return;
         }
         let _ = self.store.with_conn(|conn| match normalized.as_deref() {
@@ -295,8 +293,6 @@ impl LocalCommunityRuntime {
     ) -> Result<String> {
         tx.execute_batch(ACCOUNT_SWITCH_WIPE_SQL)
             .map_err(|e| TelegramError::Database(format!("wipe community account scope: {e}")))?;
-        ops::seed_if_empty_tx(tx, now_ms)?;
-        ensure_guest_actor_conn(tx, now_ms)?;
         ops::sync_telegram_identities_tx(tx, human_input, &[], now_ms)?;
         let human_id = human_actor_id(user_id as i64);
         write_meta_conn(tx, META_KEY_OWNER_USER_ID, &user_id.to_string())?;
@@ -344,7 +340,7 @@ impl LocalCommunityRuntime {
             let persisted_active = self
                 .store
                 .with_conn(|conn| read_meta_conn(conn, META_KEY_ACTIVE_ACTOR_ID))?
-                .filter(|s| !s.trim().is_empty());
+                .filter(|s| crate::net::api_community::validate_and_normalize_actor_id(s).is_ok());
             let resolved_active = match persisted_active {
                 Some(ref cand) => match self.store.get_actor(cand, None)? {
                     Some(actor) if can_user_act_as(user_id as i64, &actor) => actor.actor_id,
@@ -399,23 +395,34 @@ impl LocalCommunityRuntime {
     }
 
     pub(crate) fn resolve_caller_actor_id(&self, explicit_act_as: Option<&str>) -> Result<String> {
-        let candidate = explicit_act_as
-            .map(|s| s.trim_matches(' '))
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| self.active_actor_id.read().clone());
+        let explicit_candidate = match explicit_act_as {
+            Some(raw) if !raw.is_empty() => {
+                if raw.bytes().any(|b| b < 0x20 || b >= 0x7f) {
+                    return Err(TelegramError::Validation(
+                        "Invalid control or non-ASCII characters in active actor id".to_string(),
+                    ));
+                }
+                let trimmed = raw.trim_matches(' ');
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let clean = crate::net::api_community::validate_and_normalize_actor_id(trimmed)
+                        .map_err(|msg| TelegramError::Validation(msg.to_string()))?;
+                    Some(clean.to_string())
+                }
+            }
+            _ => None,
+        };
+        let candidate = explicit_candidate.or_else(|| self.active_actor_id.read().clone());
         let bound_uid = *self.bound_user_id.read();
 
         if let Some(cand) = candidate {
-            if cand.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                return Err(TelegramError::Validation(
-                    "Invalid control characters in active actor id".to_string(),
-                ));
-            }
+            let clean = crate::net::api_community::validate_and_normalize_actor_id(&cand)
+                .map_err(|msg| TelegramError::Validation(msg.to_string()))?;
             let actor = self
                 .store
-                .get_actor(&cand, None)?
-                .ok_or_else(|| TelegramError::NotFound(format!("actor '{cand}' not found")))?;
+                .get_actor(clean, None)?
+                .ok_or_else(|| TelegramError::NotFound(format!("actor '{clean}' not found")))?;
             let effective_uid = bound_uid.map(|u| u as i64).unwrap_or(LOCAL_GUEST_USER_ID);
             validate_act_as(effective_uid, &actor)?;
             return Ok(actor.actor_id);

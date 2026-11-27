@@ -24,8 +24,9 @@ use openbot_contracts::limits::{INPUT_LIMITS, is_bounded_string, is_uuid_v4, utf
 use openbot_contracts::providers::{AgentProviderId, is_agent_model};
 use openbot_contracts::queue::QueueSender;
 use openbot_storage::{
-    AgentStore, EnqueueInput, MailboxStore, OpenBotDatabase, OrchestrationEventInput,
-    now_rfc3339_millis, workspace_metadata_fingerprint, write_json_file_atomically,
+    AgentMemoryOrigin, AgentStore, EnqueueInput, MailboxStore, MemoryStore, OpenBotDatabase,
+    OrchestrationEventInput, SaveMemoryInput, now_rfc3339_millis, workspace_metadata_fingerprint,
+    write_json_file_atomically,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -699,6 +700,16 @@ struct ArchiveSourceMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ArchiveManifestMemory {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<AgentMemoryOrigin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ArchiveManifestAgent {
     key: String,
     name: String,
@@ -728,6 +739,8 @@ struct ArchiveManifestAgent {
     files: Option<String>,
     #[serde(default)]
     memories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    structured_memories: Vec<ArchiveManifestMemory>,
     #[serde(default)]
     skills: Vec<InstalledSkillRecord>,
 }
@@ -771,10 +784,18 @@ impl AgentLifecycleService {
 
         for (index, agent) in agents.iter().enumerate() {
             let key = unique_archive_key(&agent.name, index, &mut used_keys);
-            let memories: Vec<String> = memory_store
-                .list(&agent.id)?
+            let raw_memories = memory_store.list(&agent.id)?;
+            let memories: Vec<String> = raw_memories
+                .iter()
+                .map(|m| m.entry.text.clone())
+                .collect();
+            let structured_memories: Vec<ArchiveManifestMemory> = raw_memories
                 .into_iter()
-                .map(|m| m.entry.text)
+                .map(|m| ArchiveManifestMemory {
+                    text: m.entry.text,
+                    site: m.entry.site,
+                    origin: Some(m.entry.origin),
+                })
                 .collect();
             let skills = skills_manifest
                 .by_agent
@@ -810,6 +831,7 @@ impl AgentLifecycleService {
                 avatar_color: agent.avatar_color.clone(),
                 files: has_files.then_some(files_prefix),
                 memories,
+                structured_memories,
                 skills,
             });
         }
@@ -920,6 +942,7 @@ impl AgentLifecycleService {
         }
 
         let memory_store = self.database.agent_memory_store();
+        let base_memory_store = MemoryStore::new(self.database.clone());
         let mut imported_agents = Vec::with_capacity(chosen.len());
         let mut warnings = Vec::new();
         let mut imported_memories = 0usize;
@@ -961,10 +984,39 @@ impl AgentLifecycleService {
                 }
             }
 
-            for mem in &spec.memories {
-                match memory_store.create_manual(&created.id, mem) {
-                    Ok(_) => imported_memories += 1,
-                    Err(e) => warnings.push(format!("{}: skipped memory ({e})", created.name)),
+            if !spec.structured_memories.is_empty() {
+                for mem in &spec.structured_memories {
+                    let save_res = if let Some(ref site) = mem.site {
+                        base_memory_store
+                            .save_base(
+                                &created.id,
+                                SaveMemoryInput {
+                                    memory_id: None,
+                                    text: mem.text.clone(),
+                                    origin: mem.origin.unwrap_or(AgentMemoryOrigin::Manual),
+                                    source_turn_id: None,
+                                    command_id: None,
+                                    uncapped: false,
+                                    site: Some(Some(site.clone())),
+                                },
+                            )
+                            .map(|_| ())
+                    } else {
+                        memory_store
+                            .create_manual(&created.id, &mem.text)
+                            .map(|_| ())
+                    };
+                    match save_res {
+                        Ok(()) => imported_memories += 1,
+                        Err(e) => warnings.push(format!("{}: skipped memory ({e})", created.name)),
+                    }
+                }
+            } else {
+                for mem in &spec.memories {
+                    match memory_store.create_manual(&created.id, mem) {
+                        Ok(_) => imported_memories += 1,
+                        Err(e) => warnings.push(format!("{}: skipped memory ({e})", created.name)),
+                    }
                 }
             }
 

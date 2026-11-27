@@ -225,6 +225,7 @@ pub struct SettingsComputersSections {
     // Cloud Server Form state + TextInputControllers
     pub editing_node_id: Option<String>,
     pub form_focus: CloudFormField,
+    pub form_session_gen: u64,
     pub form_name: String,
     pub form_host: String,
     pub form_port: String,
@@ -289,6 +290,7 @@ impl SettingsComputersSections {
             cli_status: None,
             editing_node_id: None,
             form_focus: CloudFormField::None,
+            form_session_gen: 0,
             form_name: String::new(),
             form_host: String::new(),
             form_port: "22".to_string(),
@@ -577,6 +579,7 @@ impl SettingsComputersSections {
     ) {
         self.page = SettingsComputersPage::CloudForm;
         self.form_focus = CloudFormField::DisplayName;
+        self.form_session_gen = self.form_session_gen.wrapping_add(1);
         self.assist_focus = AssistInputField::None;
         self.policy_menu_open = false;
         self.device_picker_open = false;
@@ -874,6 +877,38 @@ impl SettingsComputersSections {
             });
             cx.notify();
         }
+    }
+
+    pub fn clear_all_preedits(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        let controllers = [
+            self.input_name.clone(),
+            self.input_host.clone(),
+            self.input_port.clone(),
+            self.input_username.clone(),
+            self.input_credential.clone(),
+            self.input_agent_url.clone(),
+            self.input_workdir.clone(),
+            self.input_assist_custom_code.clone(),
+            self.input_assist_target_id.clone(),
+            self.input_assist_target_code.clone(),
+        ];
+        for ctrl in controllers.into_iter().flatten() {
+            let needs_clear = {
+                let r = ctrl.read(cx);
+                r.ime_preedit.is_some() || r.just_committed_ime || r.last_ime_commit_at.is_some()
+            };
+            if needs_clear {
+                ctrl.update(cx, |c, _| {
+                    c.clear_ime_state();
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn submit_cloud_form(&mut self) -> bool {

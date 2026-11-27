@@ -11,6 +11,8 @@ pub struct ServerConfig {
     pub ws_inactivity_timeout_secs: u64,
     #[serde(default = "default_agent_model")]
     pub default_agent_model: String,
+    #[serde(default)]
+    pub allow_deterministic_bot_fallback: bool,
 }
 
 fn default_agent_model() -> String {
@@ -28,6 +30,7 @@ impl Default for ServerConfig {
             ws_heartbeat_interval_secs: 30,
             ws_inactivity_timeout_secs: 60,
             default_agent_model: default_agent_model(),
+            allow_deterministic_bot_fallback: false,
         }
     }
 }

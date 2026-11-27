@@ -5,19 +5,21 @@ use crate::db::schema::{ChatRecord, UserRecord};
 use crate::messaging::pipeline::MessagePipeline;
 use crate::routes::bots_miniapps::{bot_record_to_entry, miniapp_record_to_entry};
 use crate::routes::broadcast_chat_pts;
+use crate::search::PublicCatalogSearchService;
 use crate::server::{extract_message_content_text, AppState};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use gpui_telegram_core::types::{ChatId, MsgId, PeerId, UserId};
+use gpui_telegram_proto::creations::{CreationKind, CREATOR_STUDIO_BOT_USER_ID};
 use gpui_telegram_proto::message::{
     InlineKeyboardButton, MessageContent, MessageEntity, MessageEntityType, MessageItem,
     ReplyHeader,
 };
 use gpui_telegram_proto::miniapp_contracts::{validate_bot_command, BotCommandSpec};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // ============================================================================
@@ -308,7 +310,10 @@ pub fn record_incoming_user_message_for_bot(
     };
 
     for member_id in members {
-        if member_id == sender_id || member_id.0 == BOTFATHER_USER_ID {
+        if member_id == sender_id
+            || member_id.0 == BOTFATHER_USER_ID
+            || member_id.0 == CREATOR_STUDIO_BOT_USER_ID as u64
+        {
             continue;
         }
         let Ok(Some(bot)) = state.db.get_bot_by_user_id(member_id.0 as i64) else {
@@ -356,7 +361,7 @@ pub fn record_incoming_callback_query_for_bot(
     msg_id: MsgId,
     callback_data: &str,
 ) -> Option<String> {
-    if bot_user_id.0 == BOTFATHER_USER_ID {
+    if bot_user_id.0 == BOTFATHER_USER_ID || bot_user_id.0 == CREATOR_STUDIO_BOT_USER_ID as u64 {
         return None;
     }
     let bot = state.db.get_bot_by_user_id(bot_user_id.0 as i64).ok().flatten()?;
@@ -469,25 +474,85 @@ pub fn enqueue_web_app_data_update(
 // Request Parameter & Keyboard Parsers
 // ============================================================================
 
+struct ParsedBotApiParams {
+    params: Map<String, Value>,
+    /// Uncoerced raw string values for parameters originating from URL query-string
+    /// or `application/x-www-form-urlencoded` body. Keys parsed from a JSON body are
+    /// intentionally absent here so handlers can distinguish raw form/query strings
+    /// from typed JSON values.
+    raw_strings: HashMap<String, String>,
+    /// Populated when a non-empty JSON request body fails to parse as a JSON object.
+    json_parse_error: Option<String>,
+}
+
+impl ParsedBotApiParams {
+    fn strict_optional_str(&self, key: &str) -> Result<Option<&str>, String> {
+        if let Some(raw) = self.raw_strings.get(key) {
+            return Ok(Some(raw.as_str()));
+        }
+        match self.params.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(format!("Bad Request: {key} must be a string")),
+        }
+    }
+
+    fn strict_optional_bool(&self, key: &str) -> Result<Option<bool>, ()> {
+        if let Some(raw) = self.raw_strings.get(key) {
+            return match raw.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(Some(true)),
+                "false" | "0" => Ok(Some(false)),
+                _ => Err(()),
+            };
+        }
+        match self.params.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(1) => Ok(Some(true)),
+                Some(0) => Ok(Some(false)),
+                _ => Err(()),
+            },
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(Some(true)),
+                "false" | "0" => Ok(Some(false)),
+                _ => Err(()),
+            },
+            Some(_) => Err(()),
+        }
+    }
+}
+
 fn parse_bot_api_params(
     query: &HashMap<String, String>,
     headers: &HeaderMap,
     body: &[u8],
-) -> Map<String, Value> {
-    let mut map = Map::new();
+) -> ParsedBotApiParams {
+    let mut params = Map::new();
+    let mut raw_strings = HashMap::new();
+    let mut json_parse_error = None;
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if !body.is_empty() {
-        let trimmed = std::str::from_utf8(body).unwrap_or("").trim();
-        let looks_json = content_type.contains("application/json") || trimmed.starts_with('{');
+    if !body.is_empty() && !body.iter().all(u8::is_ascii_whitespace) {
+        let trimmed = std::str::from_utf8(body).map(str::trim).unwrap_or("");
+        let is_form = content_type.contains("application/x-www-form-urlencoded");
+        let looks_json = !is_form
+            && (content_type.contains("application/json")
+                || trimmed.starts_with('{')
+                || trimmed.starts_with('['));
         if looks_json {
-            if let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(body) {
-                for (k, v) in obj {
-                    map.insert(k, v);
+            match serde_json::from_slice::<Value>(body) {
+                Ok(Value::Object(obj)) => {
+                    for (k, v) in obj {
+                        params.insert(k, v);
+                    }
+                }
+                _ => {
+                    json_parse_error = Some("Bad Request: invalid JSON body".to_string());
                 }
             }
         } else if !trimmed.is_empty() {
@@ -499,18 +564,25 @@ fn parse_bot_api_params(
                 let k = percent_decode_component(&rk.replace('+', " "));
                 let v_str = percent_decode_component(&rv.replace('+', " "));
                 if !k.is_empty() {
-                    map.insert(k, parse_scalar_or_json(&v_str));
+                    params.insert(k.clone(), parse_scalar_or_json(&v_str));
+                    raw_strings.insert(k, v_str);
                 }
             }
         }
     }
 
     for (k, v) in query {
-        map.entry(k.clone())
-            .or_insert_with(|| parse_scalar_or_json(v));
+        if !params.contains_key(k) {
+            params.insert(k.clone(), parse_scalar_or_json(v));
+            raw_strings.insert(k.clone(), v.clone());
+        }
     }
 
-    map
+    ParsedBotApiParams {
+        params,
+        raw_strings,
+        json_parse_error,
+    }
 }
 
 fn parse_scalar_or_json(raw: &str) -> Value {
@@ -539,6 +611,21 @@ fn parse_scalar_or_json(raw: &str) -> Value {
 
 fn param_str<'a>(params: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     params.get(key).and_then(|v| v.as_str())
+}
+
+fn param_id_string(params: &Map<String, Value>, key: &str) -> Option<String> {
+    match params.get(key)? {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 fn param_i64(params: &Map<String, Value>, key: &str) -> Option<i64> {
@@ -830,35 +917,41 @@ async fn dispatch_bot_api_call(
         return bot_err(StatusCode::UNAUTHORIZED, 401, "Unauthorized");
     };
 
-    let params = parse_bot_api_params(query, headers, body);
+    let parsed = parse_bot_api_params(query, headers, body);
+    if let Some(err_msg) = parsed.json_parse_error {
+        return bot_err(StatusCode::BAD_REQUEST, 400, &err_msg);
+    }
+    let params = &parsed.params;
     let method_lc = method.trim().to_ascii_lowercase();
 
     match method_lc.as_str() {
         "getme" => handle_get_me(&bot),
-        "getupdates" => handle_get_updates(state, &bot, &params),
-        "setwebhook" => handle_set_webhook(state, &bot, &params),
-        "deletewebhook" => handle_delete_webhook(state, &bot, &params),
+        "getupdates" => handle_get_updates(state, &bot, params),
+        "setwebhook" => handle_set_webhook(state, &bot, params),
+        "deletewebhook" => handle_delete_webhook(state, &bot, params),
         "getwebhookinfo" => handle_get_webhook_info(state, &bot),
-        "sendmessage" => handle_send_message(state, &bot, &params),
-        "editmessagetext" => handle_edit_message_text(state, &bot, &params),
-        "deletemessage" => handle_delete_message(state, &bot, &params),
-        "pinchatmessage" => handle_pin_chat_message(state, &bot, &params),
-        "unpinchatmessage" => handle_unpin_chat_message(state, &bot, &params),
-        "unpinallchatmessages" => handle_unpin_all_chat_messages(state, &bot, &params),
-        "answercallbackquery" => handle_answer_callback_query(&params),
-        "answerwebappquery" => handle_answer_web_app_query(state, &bot, &params),
-        "setmycommands" => handle_set_my_commands(state, &bot, &params),
+        "sendmessage" => handle_send_message(state, &bot, params),
+        "editmessagetext" => handle_edit_message_text(state, &bot, params),
+        "deletemessage" => handle_delete_message(state, &bot, params),
+        "pinchatmessage" => handle_pin_chat_message(state, &bot, params),
+        "unpinchatmessage" => handle_unpin_chat_message(state, &bot, params),
+        "unpinallchatmessages" => handle_unpin_all_chat_messages(state, &bot, params),
+        "answercallbackquery" => handle_answer_callback_query(params),
+        "answerinlinequery" => handle_answer_inline_query(&parsed),
+        "answerwebappquery" => handle_answer_web_app_query(state, &bot, params),
+        "recommendcontent" => handle_recommend_content(state, &parsed),
+        "setmycommands" => handle_set_my_commands(state, &bot, params),
         "getmycommands" => handle_get_my_commands(&bot),
         "deletemycommands" => handle_delete_my_commands(state, &bot),
-        "setchatmenubutton" => handle_set_chat_menu_button(state, &bot, &params),
+        "setchatmenubutton" => handle_set_chat_menu_button(state, &bot, params),
         "getchatmenubutton" => handle_get_chat_menu_button(&bot),
-        "setmydescription" => handle_set_my_description(state, &bot, &params),
+        "setmydescription" => handle_set_my_description(state, &bot, params),
         "getmydescription" => handle_get_my_description(&bot),
-        "setmyshortdescription" => handle_set_my_short_description(state, &bot, &params),
+        "setmyshortdescription" => handle_set_my_short_description(state, &bot, params),
         "getmyshortdescription" => handle_get_my_short_description(&bot),
-        "setmyname" => handle_set_my_name(state, &bot, &params),
+        "setmyname" => handle_set_my_name(state, &bot, params),
         "getmyname" => handle_get_my_name(&bot),
-        "setmyprivacypolicy" => handle_set_my_privacy_policy(state, &bot, &params),
+        "setmyprivacypolicy" => handle_set_my_privacy_policy(state, &bot, params),
         "getmyprivacypolicy" => handle_get_my_privacy_policy(&bot),
         "publishminiapp" => handle_publish_mini_app(state, &bot, &params),
         m if m.starts_with("community.") => {
@@ -1489,6 +1582,295 @@ fn handle_answer_callback_query(params: &Map<String, Value>) -> Response {
         );
     }
     bot_ok(json!(true))
+}
+
+fn handle_answer_inline_query(parsed: &ParsedBotApiParams) -> Response {
+    let params = &parsed.params;
+    let has_qid = if let Some(raw) = parsed.raw_strings.get("inline_query_id") {
+        !raw.trim().is_empty()
+    } else {
+        param_id_string(params, "inline_query_id").is_some()
+    };
+    if !has_qid {
+        return bot_err(
+            StatusCode::BAD_REQUEST,
+            400,
+            "Bad Request: inline_query_id is empty",
+        );
+    }
+
+    let results_arr = match params.get("results") {
+        Some(Value::Array(arr)) => arr.clone(),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(arr)) => arr,
+            _ => {
+                return bot_err(
+                    StatusCode::BAD_REQUEST,
+                    400,
+                    "Bad Request: results must be a JSON array",
+                );
+            }
+        },
+        _ => {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: results must be a JSON array",
+            );
+        }
+    };
+
+    if results_arr.len() > 50 {
+        return bot_err(
+            StatusCode::BAD_REQUEST,
+            400,
+            "Bad Request: RESULTS_TOO_MUCH (max 50 results)",
+        );
+    }
+
+    let mut seen_ids = HashSet::with_capacity(results_arr.len());
+    for (idx, item) in results_arr.iter().enumerate() {
+        let Some(obj) = item.as_object() else {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                &format!("Bad Request: results[{idx}] must be an object"),
+            );
+        };
+        let (raw_id_len, id_str) = match obj.get("id") {
+            Some(Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    (s.len(), None)
+                } else {
+                    (s.len(), Some(t.to_string()))
+                }
+            }
+            Some(Value::Number(n)) => {
+                let s = n.to_string();
+                (s.len(), Some(s))
+            }
+            _ => (0, None),
+        };
+        let Some(rid) = id_str else {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                &format!("Bad Request: results[{idx}].id is required"),
+            );
+        };
+        if raw_id_len > 64 {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                &format!("Bad Request: results[{idx}].id exceeds 64 bytes"),
+            );
+        }
+        if !seen_ids.insert(rid) {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: RESULT_ID_DUPLICATE",
+            );
+        }
+        let has_type = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_type {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                &format!("Bad Request: results[{idx}].type is required"),
+            );
+        }
+    }
+
+    if let Some(raw) = parsed.raw_strings.get("cache_time") {
+        if !raw.trim().parse::<i64>().is_ok_and(|ct| ct >= 0) {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: cache_time must be a non-negative integer",
+            );
+        }
+    } else if let Some(v) = params.get("cache_time").filter(|v| !v.is_null()) {
+        let parsed_ct = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()));
+        if !parsed_ct.is_some_and(|ct| ct >= 0) {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: cache_time must be a non-negative integer",
+            );
+        }
+    }
+    if parsed.strict_optional_bool("is_personal").is_err() {
+        return bot_err(
+            StatusCode::BAD_REQUEST,
+            400,
+            "Bad Request: is_personal must be a boolean",
+        );
+    }
+    if let Some(raw) = parsed.raw_strings.get("next_offset") {
+        if raw.len() > 64 {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: next_offset must be a string up to 64 bytes",
+            );
+        }
+    } else if let Some(v) = params.get("next_offset").filter(|v| !v.is_null()) {
+        let valid_offset = match v {
+            Value::String(s) => s.len() <= 64,
+            Value::Number(n) => n.to_string().len() <= 64,
+            _ => false,
+        };
+        if !valid_offset {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: next_offset must be a string up to 64 bytes",
+            );
+        }
+    }
+    let btn_opt: Option<Value> = if let Some(raw) = parsed.raw_strings.get("button") {
+        if raw.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str::<Value>(raw)
+                    .unwrap_or_else(|_| Value::String(raw.clone())),
+            )
+        }
+    } else {
+        params.get("button").filter(|v| !v.is_null()).cloned()
+    };
+    if let Some(btn_raw) = btn_opt {
+        let btn_parsed = match &btn_raw {
+            Value::Object(_) => Some(btn_raw),
+            Value::String(s) => serde_json::from_str::<Value>(s)
+                .ok()
+                .filter(Value::is_object),
+            _ => None,
+        };
+        let valid_btn = btn_parsed
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if !valid_btn {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: button must be an object with non-empty text",
+            );
+        }
+    }
+
+    bot_ok(json!(true))
+}
+
+fn handle_recommend_content(state: &AppState, parsed: &ParsedBotApiParams) -> Response {
+    let raw_query = match parsed.strict_optional_str("query") {
+        Ok(v) => v,
+        Err(msg) => return bot_err(StatusCode::BAD_REQUEST, 400, &msg),
+    };
+    let raw_q = match parsed.strict_optional_str("q") {
+        Ok(v) => v,
+        Err(msg) => return bot_err(StatusCode::BAD_REQUEST, 400, &msg),
+    };
+    let query_opt = raw_query
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| raw_q.filter(|s| !s.trim().is_empty()))
+        .or(raw_query)
+        .or(raw_q);
+
+    let genre_opt = match parsed.strict_optional_str("genre") {
+        Ok(v) => v.map(str::trim).filter(|s| !s.is_empty()),
+        Err(msg) => return bot_err(StatusCode::BAD_REQUEST, 400, &msg),
+    };
+
+    let kind_raw = match parsed.strict_optional_str("kind") {
+        Ok(v) => v.map(str::trim),
+        Err(_) => {
+            return bot_err(
+                StatusCode::BAD_REQUEST,
+                400,
+                "Bad Request: invalid kind",
+            );
+        }
+    };
+    let kind_opt = match kind_raw {
+        None | Some("") => None,
+        Some(raw) if raw.eq_ignore_ascii_case("all") => None,
+        Some(raw) if raw.eq_ignore_ascii_case("apps") => Some(CreationKind::App),
+        Some(raw) => match CreationKind::parse(raw) {
+            Some(k) => Some(k),
+            None => {
+                return bot_err(
+                    StatusCode::BAD_REQUEST,
+                    400,
+                    &format!("Bad Request: invalid kind '{raw}'"),
+                );
+            }
+        },
+    };
+
+    let limit = if let Some(raw) = parsed.raw_strings.get("limit") {
+        let t = raw.trim();
+        if t.is_empty() {
+            10usize
+        } else {
+            match t.parse::<i64>() {
+                Ok(n) if n <= 0 => 0usize,
+                Ok(n) => (n as usize).min(50),
+                Err(_) => {
+                    return bot_err(
+                        StatusCode::BAD_REQUEST,
+                        400,
+                        "Bad Request: limit must be an integer",
+                    );
+                }
+            }
+        }
+    } else if let Some(raw_lim) = parsed.params.get("limit").filter(|v| !v.is_null()) {
+        let parsed_lim = raw_lim
+            .as_i64()
+            .or_else(|| raw_lim.as_str().and_then(|s| s.trim().parse::<i64>().ok()));
+        match parsed_lim {
+            Some(n) if n <= 0 => 0usize,
+            Some(n) => (n as usize).min(50),
+            None => {
+                return bot_err(
+                    StatusCode::BAD_REQUEST,
+                    400,
+                    "Bad Request: limit must be an integer",
+                );
+            }
+        }
+    } else {
+        10usize
+    };
+
+    if limit == 0 {
+        return bot_ok(json!([]));
+    }
+
+    // Layer 4 Zero-Leak Guarantee: query EXCLUSIVELY PublicCatalogSearchService.
+    let catalog = PublicCatalogSearchService::new(Arc::clone(&state.db));
+    match catalog.recommend(query_opt, kind_opt, genre_opt, limit) {
+        Ok(mut resp) => {
+            for item in &mut resp.items {
+                item.reason =
+                    crate::routes::creator_bot::sanitize_recommendation_reason(&item.reason);
+            }
+            bot_ok(serde_json::to_value(&resp.items).unwrap_or_else(|_| json!([])))
+        }
+        Err(_) => bot_err(StatusCode::INTERNAL_SERVER_ERROR, 500, "Internal server error"),
+    }
 }
 
 fn handle_answer_web_app_query(

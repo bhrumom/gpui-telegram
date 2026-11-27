@@ -17,8 +17,9 @@ use crate::views::sidebar::dialogs_renderer::{
 };
 use crate::views::sidebar::dialogs_row_view::{render_dialog_row_item, SidebarDialogMeta};
 use crate::views::sidebar::gemini_unified_sidebar::{
-    render_collapsed_gemini_sidebar, render_expanded_gemini_footer,
-    render_expanded_gemini_search_bar, render_expanded_gemini_top_bar, UnifiedNavSnapshot,
+    render_collapsed_gemini_sidebar, render_expanded_community_entry_pill,
+    render_expanded_gemini_footer, render_expanded_gemini_search_bar,
+    render_expanded_gemini_top_bar, UnifiedNavSnapshot,
 };
 use crate::views::sidebar::sidebar_search_view::{
     render_apps_catalog_section_with_recent, render_search_panel, render_search_results_list,
@@ -109,6 +110,7 @@ impl Render for ChatSidebar {
                 row_active_id,
                 self.hovered_rail_item,
                 self.hovered_rail_dialog_id,
+                self.has_leading_app_sidebar,
                 &palette,
                 &lang_id,
                 cx,
@@ -126,6 +128,7 @@ impl Render for ChatSidebar {
             &nav_snapshot,
             is_plus_open || creation_modal.is_some(),
             self.hovered_rail_item,
+            self.has_leading_app_sidebar,
             &palette,
             &lang_id,
             cx,
@@ -139,8 +142,18 @@ impl Render for ChatSidebar {
             cx,
             |this, action, cx| this.handle_unified_action(action, cx),
         );
+        let community_pill = (!is_search_focused && !self.has_leading_app_sidebar).then(|| {
+            render_expanded_community_entry_pill(
+                &nav_snapshot,
+                &palette,
+                &lang_id,
+                cx,
+                |this, action, cx| this.handle_unified_action(action, cx),
+            )
+        });
         let footer = render_expanded_gemini_footer(
             &nav_snapshot,
+            self.has_leading_app_sidebar,
             &palette,
             &lang_id,
             cx,
@@ -836,6 +849,7 @@ impl Render for ChatSidebar {
             )
             .child(top_bar)
             .child(search_bar)
+            .when_some(community_pill, |el, pill| el.child(pill))
             .when_some(search_panel, |el, panel| el.child(panel))
             .when_some(suggestion_bar, |el, bar| el.child(bar))
             .when_some(stories_strip, |el, strip| el.child(strip))

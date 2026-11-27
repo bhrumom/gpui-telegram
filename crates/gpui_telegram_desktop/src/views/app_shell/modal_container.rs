@@ -10,6 +10,7 @@ use crate::theme::palette::TdesktopThemePalette;
 use crate::views::boxes::modal_render::render_dialog_overlay;
 use crate::views::modal_boxes_suite::{ActiveModalDialog, ModalActionOutcome, ModalDialogKind};
 use gpui::*;
+use zeroize::Zeroize as _;
 
 pub struct ModalContainer {
     pub stack: StandaloneLayerStackLayers,
@@ -74,6 +75,25 @@ impl ModalContainer {
         self.stack.hide_layers();
         self.dialog.close();
         self.backdrop.invalidate();
+    }
+
+    /// Dismisses all active modals and wipes account-scoped dialog data & secret input drafts
+    /// across logout / account-switch boundaries while preserving `palette` and `language_id`.
+    pub fn reset_for_logout_or_account_switch(&mut self) {
+        self.hide_all();
+        self.dialog.primary_input.zeroize();
+        self.dialog.secondary_input.zeroize();
+        self.dialog.tertiary_input.zeroize();
+        self.dialog.poll_options = vec![String::new(), String::new()];
+        self.dialog.selected_members.clear();
+        self.dialog.contacts_list.clear();
+        self.dialog.call_logs.clear();
+        self.dialog.proxies.clear();
+        self.dialog.translated_text = None;
+        self.dialog.stories.clear();
+        self.dialog.story_slide_idx = 0;
+        self.dialog.forward_targets.clear();
+        self.dialog.pending_outcome = None;
     }
 
     pub fn is_modal_active(&self) -> bool {
@@ -141,7 +161,7 @@ pub(crate) fn macos_popover_surface(id: &'static str, pal: TdesktopThemePalette)
 
 /// Crisp Apple-style primary accent pill CTA button (`#007AFF` / `#0A84FF`).
 pub(crate) fn macos_primary_pill_btn(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
@@ -164,7 +184,7 @@ pub(crate) fn macos_primary_pill_btn(
 
 /// Subtle Apple-style secondary pill button with hairline border.
 pub(crate) fn macos_secondary_pill_btn(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: &'static str,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {

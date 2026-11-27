@@ -405,7 +405,7 @@ impl ManagedChild {
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             let _ = Command::new("kill")
-                .args(["-INT", &format!("-{pid}")])
+                .args(["-INT", "--", &format!("-{pid}")])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -421,7 +421,7 @@ impl ManagedChild {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 let _ = Command::new("kill")
-                    .args(["-KILL", &format!("-{pid}")])
+                    .args(["-KILL", "--", &format!("-{pid}")])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -441,7 +441,7 @@ impl ManagedChild {
         #[cfg(unix)]
         if let Some(pid) = self.child.as_ref().and_then(|c| c.id()) {
             let _ = Command::new("kill")
-                .args(["-INT", &format!("-{pid}")])
+                .args(["-INT", "--", &format!("-{pid}")])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -457,7 +457,7 @@ impl Drop for ManagedChild {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
                 let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &format!("-{pid}")])
+                    .args(["-KILL", "--", &format!("-{pid}")])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

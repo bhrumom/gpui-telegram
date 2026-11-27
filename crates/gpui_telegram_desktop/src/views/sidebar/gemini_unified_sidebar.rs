@@ -21,6 +21,7 @@ pub struct UnifiedNavSnapshot {
     pub tasks_unread: u32,
     pub mcp_unread: u32,
     pub saved_unread: u32,
+    pub community_unread: u32,
     pub account_initials: String,
     pub account_name: String,
     pub is_connected: bool,
@@ -49,6 +50,7 @@ impl UnifiedNavSnapshot {
                 tasks_unread: badge_for(NavDestination::TaskCenter),
                 mcp_unread: badge_for(NavDestination::McpTools),
                 saved_unread: badge_for(NavDestination::SavedMessages),
+                community_unread: badge_for(NavDestination::Community),
                 account_initials: r.account_initials.clone(),
                 account_name: r.account_name.clone(),
                 is_connected: r.is_connected,
@@ -62,6 +64,7 @@ impl UnifiedNavSnapshot {
                 tasks_unread: 0,
                 mcp_unread: 0,
                 saved_unread: 0,
+                community_unread: 0,
                 account_initials: "TG".to_string(),
                 account_name: String::new(),
                 is_connected: false,
@@ -229,6 +232,7 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
     active_chat_id: Option<u64>,
     hovered_item: Option<&'static str>,
     hovered_dialog_id: Option<u64>,
+    has_leading_app_sidebar: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -283,7 +287,7 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
         .flex_col()
         .items_center()
         .justify_between()
-        .when(!cfg!(target_os = "macos"), |el| el.pt(px(10.0)))
+        .when(!cfg!(target_os = "macos") || has_leading_app_sidebar, |el| el.pt(px(10.0)))
         .pb(px(10.0))
         .child(
             div()
@@ -293,7 +297,7 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                 .items_center()
                 .flex_shrink_0()
                 .gap(px(6.0))
-                .when(cfg!(target_os = "macos"), |el| {
+                .when(cfg!(target_os = "macos") && !has_leading_app_sidebar, |el| {
                     el.child(
                         div()
                             .w_full()
@@ -419,6 +423,27 @@ pub fn render_collapsed_gemini_sidebar<V: 'static>(
                         },
                     ),
                 ))
+                .when(!has_leading_app_sidebar, |col| {
+                    col.child(render_collapsed_icon_btn(
+                        "rail-community-btn",
+                        "community",
+                        IconName::CommunityGlobe,
+                        tr_str(lang_id, "社区", "Community"),
+                        nav.active_destination == NavDestination::Community,
+                        nav.community_unread,
+                        hovered_item,
+                        palette,
+                        cx,
+                        on_action.clone(),
+                        UnifiedSidebarAction::SelectDestination(
+                            if nav.active_destination == NavDestination::Community {
+                                NavDestination::Chats
+                            } else {
+                                NavDestination::Community
+                            },
+                        ),
+                    ))
+                })
                 .child(
                     div()
                         .w(px(24.0))

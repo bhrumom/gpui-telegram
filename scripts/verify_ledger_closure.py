@@ -264,7 +264,31 @@ def validate_claimed_entry_closure(
     return issues
 
 
-def is_target_referenced_in_runtime(repo_root: str, target_rel_path: str) -> bool:
+def _load_stripped_crate_sources(repo_root: str) -> list[tuple[str, str]]:
+    """Load and comment-strip all non-test Rust sources under crates/ once per verification run."""
+    sources: list[tuple[str, str]] = []
+    crates_root = os.path.join(repo_root, "crates")
+    if not os.path.isdir(crates_root):
+        return sources
+    for dp, _, fns in os.walk(crates_root):
+        for fn in fns:
+            if not fn.endswith(".rs"):
+                continue
+            fpath = os.path.join(dp, fn)
+            rel_f = os.path.relpath(fpath, repo_root).replace("\\", "/")
+            if "/tests/" in rel_f:
+                continue
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                txt = strip_rust_comments(f.read())
+            sources.append((rel_f, txt))
+    return sources
+
+
+def is_target_referenced_in_runtime(
+    repo_root: str,
+    target_rel_path: str,
+    stripped_src_cache: list[tuple[str, str]] | None = None,
+) -> bool:
     """Check whether a verified target Rust file is connected into crate root / runtime entrypoints."""
     norm = target_rel_path.replace("\\", "/")
     if not norm.startswith("crates/") or not norm.endswith(".rs"):
@@ -320,6 +344,14 @@ def is_target_referenced_in_runtime(repo_root: str, target_rel_path: str) -> boo
     ]
     mod_ref_token = parts[-2] if stem == "mod" else stem
     ref_re = re.compile(rf"\b{re.escape(mod_ref_token)}\b")
+    if stripped_src_cache is not None:
+        for rel_f, txt in stripped_src_cache:
+            if rel_f == norm:
+                continue
+            if ref_re.search(txt):
+                return True
+        return any(norm == rr for rr in runtime_roots)
+
     for dp, _, fns in os.walk(os.path.join(repo_root, "crates")):
         for fn in fns:
             if not fn.endswith(".rs"):
@@ -375,6 +407,7 @@ def validate_capability_coverage(
 
     shard_meta_map = {s["subsystem"]: s for s in master_index.get("shards", [])}
     summary_counts = defaultdict(lambda: defaultdict(int))
+    stripped_src_cache: list[tuple[str, str]] | None = None
 
     for cap in caps:
         cid = cap.get("capability_id", "<unknown>")
@@ -420,7 +453,9 @@ def validate_capability_coverage(
                 tags = detect_boilerplate_tags(code)
                 if tags:
                     violations.append(f"{cid}: verified_entrypoint '{ep_path}' has stub/shim tags: {tags}")
-                if not is_target_referenced_in_runtime(repo_root, ep_path):
+                if stripped_src_cache is None:
+                    stripped_src_cache = _load_stripped_crate_sources(repo_root)
+                if not is_target_referenced_in_runtime(repo_root, ep_path, stripped_src_cache):
                     violations.append(f"{cid}: verified_entrypoint '{ep_path}' is unreachable from runtime")
 
         if bt.get("status") == "verified":

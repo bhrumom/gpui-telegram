@@ -900,6 +900,47 @@ async fn test_live_server_errors_and_domain_404_never_fall_back() {
     server.stop().await;
 }
 
+/// Explicit test fixture helper: creates a real test moderator `u:8888` and `"rust"` community
+/// in a local test SQLite store (production local DBs start empty with zero hardcoded fake seed data).
+fn setup_local_test_rust_community(
+    rt: &gpui_telegram_client::community_runtime::LocalCommunityRuntime,
+) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = rt.store().sync_telegram_identities(
+        &TelegramHumanSyncInput {
+            user_id: 8888,
+            username: Some("rust_mod".into()),
+            display_name: "Rust Mod".into(),
+            bio: Some("Test moderator".into()),
+            avatar_media_id: None,
+        },
+        &[],
+        now_ms,
+    );
+    let _ = rt.store().create_community(
+        "u:8888",
+        &CreateCommunityRequest {
+            slug: "rust".into(),
+            name: "Rust".into(),
+            description: "Systems engineering test community".into(),
+            category: "tech".into(),
+            banner_media_id: None,
+            icon_media_id: None,
+            icon_emoji: None,
+            accent_color: None,
+            rules: vec![],
+            post_flairs: vec![],
+            user_flairs: vec![],
+            wiki_markdown: String::new(),
+            automod_rules: vec![],
+            allow_bots: true,
+            require_bot_disclosure: true,
+            is_nsfw: false,
+        },
+        now_ms,
+    );
+}
+
 #[tokio::test]
 async fn test_legacy_404_variants_transparently_fall_back_to_local() {
     let variants: Vec<(&str, Router)> = vec![
@@ -920,10 +961,15 @@ async fn test_legacy_404_variants_transparently_fall_back_to_local() {
             panic!("legacy 404 variant '{label}' must fall back to local: {e:?}")
         });
         assert_eq!(c.runtime_mode(), CommunityRuntimeMode::LocalFallback);
-        assert!(!feed.items.is_empty(), "seeded local feed must be populated for '{label}'");
+        assert!(feed.items.is_empty(), "fresh local feed must start empty with zero fake data for '{label}'");
 
-        let comms = c.list_communities(None, None).await.expect("seeded communities");
-        assert!(comms.communities.len() >= 8, "expected >= 8 seeded communities");
+        let comms_before = c.list_communities(None, None).await.expect("list empty communities");
+        assert!(comms_before.communities.is_empty(), "fresh local DB must have zero seeded fake communities");
+
+        client.set_auth_session(make_auth_session(1001, "alice_legacy", "tok_legacy"));
+        setup_local_test_rust_community(c.local_runtime());
+        let comms = c.list_communities(None, None).await.expect("created community");
+        assert_eq!(comms.communities.len(), 1);
 
         let created = c.create_post(&CreatePostRequest {
             community_slug: Some("rust".into()),
@@ -950,7 +996,7 @@ async fn test_closed_port_and_mid_session_shutdown_fallback() {
     );
     let feed = client_a.community().get_feed(&FeedRequestDto::default()).await.expect("closed-port fallback");
     assert_eq!(client_a.community().runtime_mode(), CommunityRuntimeMode::LocalFallback);
-    assert!(!feed.items.is_empty());
+    assert!(feed.items.is_empty(), "fresh local DB must start empty with zero fake posts");
     drop_client(client_a).await;
 
     // Part B: Live server succeeds (Online), then shuts down mid-session -> seamless LocalFallback
@@ -971,16 +1017,19 @@ async fn test_closed_port_and_mid_session_shutdown_fallback() {
 
     let fallback_trending = client_b.community().get_trending(Some(5)).await.expect("fallback trending");
     assert_eq!(client_b.community().runtime_mode(), CommunityRuntimeMode::LocalFallback);
-    assert!(!fallback_trending.topics.is_empty());
+    assert!(fallback_trending.topics.is_empty());
 
+    setup_local_test_rust_community(client_b.community().local_runtime());
     let offline_post = client_b.community().create_post(&CreatePostRequest {
         community_slug: Some("rust".into()),
         title: Some("Mid-session offline post".into()),
-        body: "Saved locally after live server stopped".into(),
+        body: "Saved locally after live server stopped #offline".into(),
         ..Default::default()
     }).await.expect("offline create_post after shutdown");
     let detail = client_b.community().get_post(&offline_post.post.post_id, None).await.expect("local get_post");
-    assert_eq!(detail.post.body, "Saved locally after live server stopped");
+    assert_eq!(detail.post.body, "Saved locally after live server stopped #offline");
+    let after_trending = client_b.community().get_trending(Some(5)).await.expect("trending after real post");
+    assert!(!after_trending.topics.is_empty());
 
     drop_client(client_b).await;
 }
@@ -994,6 +1043,7 @@ async fn test_offline_writes_local_bots_anti_loop_and_reopen_different_server_ur
     let client = open_client(&closed_url, dir.path());
     client.set_auth_session(alice.clone());
     let c = client.community();
+    setup_local_test_rust_community(c.local_runtime());
 
     // Sync identities locally with an owned Reactive bot + a Manual bot
     let synced = c
@@ -1301,6 +1351,7 @@ async fn test_account_switch_alice_to_bob_isolates_db_and_enforces_local_securit
     let client = open_client(&closed_url, dir.path());
     client.set_auth_session(alice);
     let c = client.community();
+    setup_local_test_rust_community(c.local_runtime());
 
     // Alice creates private draft, bookmark, custom algo prefs, private list, and owned bot
     let draft = c
@@ -1444,6 +1495,7 @@ async fn test_account_switch_alice_to_bob_isolates_db_and_enforces_local_securit
     );
 
     // Bob writes his own private draft, logs out, client closes, Charlie opens same TempDir
+    setup_local_test_rust_community(c.local_runtime());
     let bob_draft = c
         .create_post(&CreatePostRequest {
             community_slug: Some("rust".into()),
@@ -1611,6 +1663,40 @@ async fn test_concurrent_community_calls_block_on_and_clean_drop() {
     let client = open_client(&closed_url, dir.path());
     client.set_auth_session(make_auth_session(4004, "concurrent_alice", "tok_conc"));
     let facade = client.community().clone();
+    setup_local_test_rust_community(facade.local_runtime());
+    let conc_bot = facade
+        .register_bot_actor(&RegisterBotActorRequest {
+            bot_user_id: Some(5404),
+            actor_kind: Some(ActorKind::Bot),
+            handle: "conc_bot".into(),
+            display_name: "Conc Bot".into(),
+            bio: None,
+            avatar_media_id: None,
+            banner_media_id: None,
+            avatar_shape: None,
+            avatar_color: None,
+            bot_badge: None,
+            bot_model: None,
+            bot_capabilities: vec![],
+            bot_autonomy_mode: BotAutonomyMode::Manual,
+            bot_persona: None,
+            cooldown_secs: None,
+            max_posts_per_hour: None,
+        })
+        .await
+        .expect("register conc_bot");
+    let _ = facade
+        .create_post_as(
+            &conc_bot.actor.actor_id,
+            &CreatePostRequest {
+                community_slug: Some("rust".into()),
+                title: Some("Initial Bot Post".into()),
+                body: "Baseline bot post for concurrent feed/search #rust".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("baseline bot post");
 
     // 1. Spawn 18 concurrent async tasks mixing reads, writes, search (is:bot), trending, and votes
     let mut handles = Vec::new();
@@ -1647,7 +1733,7 @@ async fn test_concurrent_community_calls_block_on_and_clean_drop() {
                         })
                         .await
                         .expect("concurrent is:bot search");
-                    assert!(!res.posts.is_empty(), "is:bot alias must match seeded bot posts");
+                    assert!(!res.posts.is_empty(), "is:bot alias must match bot posts");
                 }
                 _ => {
                     let _ = f.get_trending(Some(5)).await.expect("concurrent trending");
@@ -1696,6 +1782,7 @@ async fn test_r2_unbound_post_logout_reopen_act_as_and_write_isolation() {
     let client = open_client(&closed_url, dir.path());
     client.set_auth_session(alice.clone());
     let c = client.community();
+    setup_local_test_rust_community(c.local_runtime());
 
     // Alice creates a private draft, private list, and owned bot, then sets active actor to her bot.
     let draft = c
@@ -1748,7 +1835,7 @@ async fn test_r2_unbound_post_logout_reopen_act_as_and_write_isolation() {
     assert_eq!(c.active_actor_id(), None);
 
     // 1) Post-logout Act-As impersonation attacks MUST fail with PermissionDenied.
-    for spoofed in ["u:101", "b:5101", "u:900001", "b:910001", "u:900003"] {
+    for spoofed in ["u:101", "b:5101", "u:8888"] {
         c.set_active_actor_id(Some(spoofed.to_string()));
         let feed_err = c
             .get_feed(&FeedRequestDto::default())
@@ -1843,20 +1930,49 @@ async fn test_r2_unbound_post_logout_reopen_act_as_and_write_isolation() {
 
 #[tokio::test]
 async fn test_r2_register_bot_idor_dot_segments_and_crlf_headers() {
-    // Part A: Local register_bot_actor IDOR against seeded bot b:910001
+    // Part A: Local register_bot_actor IDOR against another user's registered bot b:920001
     let dir_idor = tempfile::tempdir().expect("tempdir");
     let closed_url = unused_closed_port_url();
     let client_idor = open_client(&closed_url, dir_idor.path());
     client_idor.set_auth_session(make_auth_session(101, "alice_idor", "tok_alice"));
     let ci = client_idor.community();
 
+    // Seed another user's (owner_user_id=102) bot directly into the local store
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    ci.local_runtime()
+        .store()
+        .create_bot_actor(
+            102,
+            920001,
+            &RegisterBotActorRequest {
+                bot_user_id: Some(920001),
+                actor_kind: Some(ActorKind::Bot),
+                handle: "ferris_bot".into(),
+                display_name: "Ferris Systems Bot".into(),
+                bio: Some("Rust & systems engineering assistant".into()),
+                avatar_media_id: None,
+                banner_media_id: None,
+                avatar_shape: None,
+                avatar_color: None,
+                bot_badge: None,
+                bot_model: None,
+                bot_capabilities: vec![],
+                bot_autonomy_mode: BotAutonomyMode::Manual,
+                bot_persona: None,
+                cooldown_secs: None,
+                max_posts_per_hour: None,
+            },
+            now_ms,
+        )
+        .expect("insert owner 102 bot 920001");
+
     let before_ferris = ci
-        .get_actor_profile("b:910001")
+        .get_actor_profile("b:920001")
         .await
-        .expect("seeded ferris_bot");
+        .expect("registered ferris_bot");
     let idor_err = ci
         .register_bot_actor(&RegisterBotActorRequest {
-            bot_user_id: Some(910001),
+            bot_user_id: Some(920001),
             actor_kind: Some(ActorKind::Bot),
             handle: "ferris_bot".into(),
             display_name: "PWNED FERRIS".into(),
@@ -1877,9 +1993,9 @@ async fn test_r2_register_bot_idor_dot_segments_and_crlf_headers() {
         .expect_err("overwriting unowned bot_user_id must fail");
     assert!(matches!(idor_err, TelegramError::PermissionDenied(_)), "got {idor_err:?}");
     let after_ferris = ci
-        .get_actor_profile("b:910001")
+        .get_actor_profile("b:920001")
         .await
-        .expect("seeded ferris_bot intact");
+        .expect("registered ferris_bot intact");
     assert_eq!(after_ferris.actor.display_name, before_ferris.actor.display_name);
     assert_eq!(after_ferris.actor.bio, before_ferris.actor.bio);
     drop_client(client_idor).await;
@@ -2106,7 +2222,23 @@ async fn test_r2_domain_404_verified_write_guard_503_poisoning_and_guest_timeout
             .await
             .expect("legacy 404 feed fallback");
         assert_eq!(client_c.community().runtime_mode(), CommunityRuntimeMode::LocalFallback);
-        let local_pid = feed.items[0].post.post_id.clone();
+        assert!(feed.items.is_empty(), "fresh local DB must start empty with zero fake posts");
+        setup_local_test_rust_community(client_c.community().local_runtime());
+        let local_created = client_c
+            .community()
+            .local_runtime()
+            .store()
+            .create_post(
+                "u:8888",
+                &CreatePostRequest {
+                    community_slug: Some("rust".into()),
+                    body: "Local fallback post after 503/401".into(),
+                    ..Default::default()
+                },
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .expect("create local fallback post");
+        let local_pid = local_created.post.post_id.clone();
         let post_detail = client_c
             .community()
             .get_post(&local_pid, None)
@@ -2151,7 +2283,7 @@ async fn test_r2_domain_404_verified_write_guard_503_poisoning_and_guest_timeout
         .await
         .expect("guest timeout fallback");
     assert_eq!(client_d.community().runtime_mode(), CommunityRuntimeMode::LocalFallback);
-    assert!(!guest_feed.items.is_empty());
+    assert!(guest_feed.items.is_empty(), "fresh local DB must start empty with zero fake posts");
 
     // Immediately sign in as Alice (within the 5s timeout backoff window!)
     client_d.set_auth_session(make_auth_session(101, "alice_fast", "tok_alice_fast"));
@@ -2177,6 +2309,7 @@ async fn test_r2_local_search_draft_deleted_guards_banned_mention_unread_and_top
     let client = open_client(&closed_url, dir.path());
     client.set_auth_session(alice.clone());
     let c = client.community();
+    setup_local_test_rust_community(c.local_runtime());
 
     // 1. Local search: c:<slug>, community_slug: Some("C/Rust"), multi-word flair: Some("Deep Dive")
     let deep_post = c
@@ -2294,12 +2427,12 @@ async fn test_r2_local_search_draft_deleted_guards_banned_mention_unread_and_top
         Err(TelegramError::NotFound(_))
     ));
 
-    // Insert a private Draft authored by another user (seeded u:900001) and verify quote/repost/get_comments all reject with NotFound
+    // Insert a private Draft authored by another user (seeded u:8888) and verify quote/repost/get_comments all reject with NotFound
     let other_draft = c
         .local_runtime()
         .store()
         .create_post(
-            "u:900001",
+            "u:8888",
             &CreatePostRequest {
                 community_slug: Some("rust".into()),
                 title: Some("Other User Secret Draft".into()),
@@ -2463,7 +2596,7 @@ async fn test_r2_local_search_draft_deleted_guards_banned_mention_unread_and_top
             conn.execute(
                 "INSERT INTO community_notifications
                  (notif_id, recipient_actor_id, actor_id, kind, target_post_id, target_comment_id, preview_text, is_read, created_at_ms)
-                 VALUES ('notif_unread_old', 'u:101', 'u:900001', 'mention', NULL, NULL, 'Old unread alert', 0, 1000)",
+                 VALUES ('notif_unread_old', 'u:101', 'u:8888', 'mention', NULL, NULL, 'Old unread alert', 0, 1000)",
                 [],
             )
             .unwrap();
@@ -2471,7 +2604,7 @@ async fn test_r2_local_search_draft_deleted_guards_banned_mention_unread_and_top
                 conn.execute(
                     "INSERT INTO community_notifications
                      (notif_id, recipient_actor_id, actor_id, kind, target_post_id, target_comment_id, preview_text, is_read, created_at_ms)
-                     VALUES (?1, 'u:101', 'u:900001', 'reply', NULL, NULL, 'Read item', 1, ?2)",
+                     VALUES (?1, 'u:101', 'u:8888', 'reply', NULL, NULL, 'Read item', 1, ?2)",
                     rusqlite::params![format!("notif_read_{i}"), 2000 + i],
                 )
                 .unwrap();
@@ -2611,8 +2744,9 @@ async fn test_r2_mid_session_server_stop_acting_as_online_registered_bot() {
             .await
             .expect("mid-session fallback get_feed while acting as online-registered b:42 must succeed");
         assert_eq!(c.runtime_mode(), CommunityRuntimeMode::LocalFallback);
-        assert!(!fallback_feed.items.is_empty());
+        assert!(fallback_feed.items.is_empty(), "fresh local DB must start empty with zero fake posts");
 
+        setup_local_test_rust_community(c.local_runtime());
         let fallback_post = c
             .create_post(&CreatePostRequest {
                 community_slug: Some("rust".into()),
@@ -2646,10 +2780,363 @@ async fn test_r2_mid_session_server_stop_acting_as_online_registered_bot() {
             .await
             .expect("mid-session fallback get_feed after get_identities mirror must succeed");
         assert_eq!(c.runtime_mode(), CommunityRuntimeMode::LocalFallback);
-        assert!(!fallback_feed.items.is_empty());
+        assert!(fallback_feed.items.is_empty(), "fresh local DB must start empty with zero fake posts");
 
         drop_client(client).await;
     }
 }
+
+#[tokio::test]
+async fn test_r9_create_post_as_actor_header_isolation_and_validation() {
+    // 1. Online mode: create_post_as sends X-Community-Actor-Id for the bot WITHOUT mutating
+    //    shared active_actor_id, while concurrent/subsequent calls continue using Human u:1001.
+    let state = MockState::default();
+    let server = spawn_router(build_full_mock_router(state.clone())).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = open_client(&server.base_url, dir.path());
+    client.set_auth_session(make_auth_session(1001, "alice_iso", "tok_alice"));
+    let c = client.community();
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    let req = CreatePostRequest {
+        community_slug: Some("rust".into()),
+        body: "Bot-authored test post via create_post_as".into(),
+        ..Default::default()
+    };
+    let created = c
+        .create_post_as("  b:42  ", &req)
+        .await
+        .expect("create_post_as succeeds");
+    assert!(!created.post.post_id.is_empty());
+    assert_eq!(
+        c.active_actor_id().as_deref(),
+        Some("u:1001"),
+        "create_post_as must NEVER mutate facade.active_actor_id"
+    );
+
+    let _ = c
+        .vote_post("p_1", &VoteRequest { direction: 1 })
+        .await
+        .expect("vote_post succeeds");
+
+    {
+        let captured = state.captured.lock();
+        let create_req = captured
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v1/community/posts")
+            .expect("captured POST /posts");
+        assert_eq!(create_req.actor_id.as_deref(), Some("b:42"));
+
+        let vote_req = captured
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v1/community/posts/p_1/vote")
+            .expect("captured POST /vote");
+        assert_eq!(vote_req.actor_id.as_deref(), Some("u:1001"));
+    }
+
+    // 2. Empty, space-only, and CRLF/control-character actor_ids must all be rejected cleanly
+    //    (never silently falling back to Human active_actor_id).
+    for bad in ["", "   ", "\r\n", "b:42\r\nX-Injected: 1", "b:42\x00"] {
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("bad actor_id {bad:?} must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "expected Validation for {bad:?}, got {err:?}"
+        );
+    }
+    assert_eq!(c.active_actor_id().as_deref(), Some("u:1001"));
+
+    // 3. Offline/local fallback mode: create_post_as authors under b:42 while active_actor_id stays u:1001.
+    let _ = c.get_identities().await.expect("mirror b:42 locally");
+    server.stop().await;
+
+    setup_local_test_rust_community(c.local_runtime());
+    let local_post = c
+        .create_post_as("b:42", &req)
+        .await
+        .expect("local create_post_as b:42 succeeds");
+    assert_eq!(local_post.post.author_actor_id, "b:42");
+    assert_eq!(c.active_actor_id().as_deref(), Some("u:1001"));
+
+    let crlf_local = c
+        .create_post_as("b:42\r\n", &req)
+        .await
+        .expect_err("local CRLF actor_id must fail");
+    assert!(matches!(crlf_local, TelegramError::Validation(_)));
+
+    drop_client(client).await;
+}
+
+#[tokio::test]
+async fn test_r10_actor_id_unicode_obs_text_rejection_and_offline_viewer_hydration() {
+    // Part A (R9-HUNT-1): Unicode whitespace (NBSP, U+3000, NEL, U+2028), zero-width/BOM,
+    // obs-text/emoji, embedded space, and ASCII controls MUST all fail client-side validation
+    // with ZERO HTTP requests captured (never silently falling back to Human Bearer identity).
+    let state = MockState::default();
+    let server = spawn_router(build_full_mock_router(state.clone())).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = open_client(&server.base_url, dir.path());
+    client.set_auth_session(make_auth_session(1001, "alice_r10", "tok_alice"));
+    let c = client.community();
+    let http = client.http_client.clone();
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    let req = CreatePostRequest {
+        community_slug: Some("rust".into()),
+        body: "R10 actor validation test".into(),
+        ..Default::default()
+    };
+
+    let bad_payloads = [
+        "",
+        "   ",
+        "\t",
+        "\r\n",
+        "\x00",
+        "\x7f",
+        "b:42\r\nX-Injected: 1",
+        "b:42 evil",
+        "\u{00A0}",
+        "\u{3000}",
+        " \u{00A0} ",
+        "\u{0085}",
+        "\u{2028}",
+        "\u{2029}",
+        "\u{200B}",
+        "\u{200C}",
+        "\u{200D}",
+        "\u{FEFF}",
+        "b:42\u{00A0}",
+        "b:42\u{200B}",
+        "b:42🦀",
+    ];
+
+    for bad in bad_payloads {
+        let before = state.captured.lock().len();
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("online create_post_as({bad:?}) must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "online create_post_as({bad:?}) expected Validation, got {err:?}"
+        );
+        assert_eq!(
+            state.captured.lock().len(),
+            before,
+            "online create_post_as({bad:?}) must send 0 HTTP requests"
+        );
+        assert_eq!(
+            c.active_actor_id().as_deref(),
+            Some("u:1001"),
+            "create_post_as({bad:?}) must not mutate active_actor_id"
+        );
+
+        // Direct HttpClient::community_create_post check for non-empty bad headers
+        if !bad.is_empty() && bad != "   " {
+            let http_err = http
+                .community_create_post(Some("tok_alice"), Some(bad), &req)
+                .await
+                .expect_err(&format!("direct HTTP act_as={bad:?} must fail"));
+            assert!(
+                matches!(http_err, gpui_telegram_client::CommunityApiError::InvalidInput(_)),
+                "direct HTTP act_as={bad:?} expected InvalidInput, got {http_err:?}"
+            );
+            assert_eq!(
+                state.captured.lock().len(),
+                before,
+                "direct HTTP act_as={bad:?} must send 0 HTTP requests"
+            );
+        }
+    }
+
+    // set_active_actor_id with Unicode whitespace / obs-text must fail outbound get_feed with
+    // 0 HTTP requests and must NOT poison persisted SQLite active_actor_id on disk!
+    for bad in ["\u{00A0}", "\u{3000}", "\u{200B}", "\u{FEFF}", "b:42🦀", "b:42 evil"] {
+        let before = state.captured.lock().len();
+        c.set_active_actor_id(Some(bad.to_string()));
+        let err = c
+            .get_feed(&FeedRequestDto::default())
+            .await
+            .expect_err(&format!("online get_feed with active_actor_id={bad:?} must fail"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "online get_feed({bad:?}) expected Validation, got {err:?}"
+        );
+        assert_eq!(
+            state.captured.lock().len(),
+            before,
+            "online get_feed({bad:?}) must send 0 HTTP requests"
+        );
+    }
+
+    // Re-bind same account scope: persisted active_actor_id must still be clean "u:1001"
+    c.local_runtime()
+        .bind_account_scope(1001, "alice_r10", Some("Alice R10"))
+        .expect("rebind account scope");
+    assert_eq!(
+        c.active_actor_id().as_deref(),
+        Some("u:1001"),
+        "invalid actor_ids must NEVER persist to SQLite community_client_meta"
+    );
+
+    // Positive check: valid padded ASCII actor_id succeeds and sends normalized X-Community-Actor-Id
+    let _ = c
+        .create_post_as("  b:42  ", &req)
+        .await
+        .expect("padded valid actor_id must succeed");
+    assert_eq!(
+        state
+            .captured
+            .lock()
+            .last()
+            .and_then(|r| r.actor_id.as_deref()),
+        Some("b:42")
+    );
+
+    // Switch to offline/local fallback mode and test BOTH R9-HUNT-1 offline & R9-HUNT-6!
+    let _ = c.get_identities().await.expect("mirror b:42 locally");
+    server.stop().await;
+
+    for bad in bad_payloads {
+        let err = c
+            .create_post_as(bad, &req)
+            .await
+            .expect_err(&format!("offline create_post_as({bad:?}) must fail validation"));
+        assert!(
+            matches!(err, TelegramError::Validation(_)),
+            "offline create_post_as({bad:?}) expected Validation, got {err:?}"
+        );
+    }
+    for bad in ["\u{00A0}", "\u{200B}", "b:42🦀", "b:42 evil"] {
+        c.set_active_actor_id(Some(bad.to_string()));
+        let err = c
+            .get_feed(&FeedRequestDto::default())
+            .await
+            .expect_err(&format!("offline get_feed({bad:?}) must fail"));
+        assert!(matches!(err, TelegramError::Validation(_)));
+    }
+    c.set_active_actor_id(Some("u:1001".to_string()));
+
+    // Part B (R9-HUNT-6): Offline LocalCommunityRuntime::get_community moderators AND
+    // LocalCommunityRuntime::search actors MUST hydrate is_following / is_muted / is_blocked!
+    let local_rt = c.local_runtime();
+    setup_local_test_rust_community(local_rt);
+    let comm_init = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community rust");
+    let other_mod = comm_init
+        .moderators
+        .iter()
+        .find(|m| m.actor_id != "u:1001")
+        .cloned()
+        .expect("rust community must have a non-viewer moderator");
+    assert!(!other_mod.is_following && !other_mod.is_muted && !other_mod.is_blocked);
+
+    // Follow + mute the moderator in local SQLite
+    local_rt
+        .follow_actor(Some("u:1001"), &other_mod.actor_id)
+        .expect("local follow moderator");
+    local_rt
+        .set_mute_block(
+            Some("u:1001"),
+            &MuteBlockRequest {
+                target_kind: MuteBlockTargetKind::Actor,
+                target_value: other_mod.actor_id.clone(),
+                action: MuteBlockActionKind::Mute,
+                reason: None,
+            },
+        )
+        .expect("local mute moderator");
+
+    let comm_after_fm = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community after follow+mute");
+    let mod_fm = comm_after_fm
+        .moderators
+        .iter()
+        .find(|m| m.actor_id == other_mod.actor_id)
+        .expect("moderator present");
+    assert!(
+        mod_fm.is_following && mod_fm.is_muted && !mod_fm.is_blocked,
+        "R9-HUNT-6: offline get_community moderators must hydrate is_following+is_muted, got {mod_fm:?}"
+    );
+
+    // Bonus sibling check: offline search People/Bots must also hydrate viewer flags!
+    let search_tab = if other_mod.actor_kind.is_bot_like() {
+        CommunitySearchTab::Bots
+    } else {
+        CommunitySearchTab::People
+    };
+    let search_fm = local_rt
+        .search(
+            Some("u:1001"),
+            &CommunitySearchRequestDto {
+                tab: search_tab,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .expect("local search");
+    let found_actor = search_fm
+        .actors
+        .iter()
+        .find(|a| a.actor_id == other_mod.actor_id)
+        .expect("moderator present in local search");
+    assert!(
+        found_actor.is_following && found_actor.is_muted && !found_actor.is_blocked,
+        "R9-HUNT-6 sibling: offline search actors must hydrate is_following+is_muted, got {found_actor:?}"
+    );
+
+    // Block the moderator -> is_blocked=true, is_following=false in BOTH get_community & search!
+    local_rt
+        .set_mute_block(
+            Some("u:1001"),
+            &MuteBlockRequest {
+                target_kind: MuteBlockTargetKind::Actor,
+                target_value: other_mod.actor_id.clone(),
+                action: MuteBlockActionKind::Block,
+                reason: None,
+            },
+        )
+        .expect("local block moderator");
+
+    let comm_after_blk = local_rt
+        .get_community(Some("u:1001"), "rust")
+        .expect("local get_community after block");
+    let mod_blk = comm_after_blk
+        .moderators
+        .iter()
+        .find(|m| m.actor_id == other_mod.actor_id)
+        .expect("moderator present after block");
+    assert!(
+        !mod_blk.is_following && mod_blk.is_blocked,
+        "R9-HUNT-6: offline get_community moderator must reflect block+unfollow, got {mod_blk:?}"
+    );
+    let search_blk = local_rt
+        .search(
+            Some("u:1001"),
+            &CommunitySearchRequestDto {
+                tab: search_tab,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .expect("local search after block");
+    let found_blk = search_blk
+        .actors
+        .iter()
+        .find(|a| a.actor_id == other_mod.actor_id)
+        .expect("actor present in search after block");
+    assert!(
+        !found_blk.is_following && found_blk.is_blocked,
+        "R9-HUNT-6 sibling: offline search actor must reflect block+unfollow, got {found_blk:?}"
+    );
+
+    drop_client(client).await;
+}
+
 
 

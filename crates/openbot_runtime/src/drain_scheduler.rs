@@ -1610,6 +1610,41 @@ impl DrainScheduler {
         })
     }
 
+    /// Marks deliveries bound to `turn_id` as completed, clears the active lane entry,
+    /// and clears `active_turn_id` on the thread while leaving remaining `Queued`
+    /// deliveries untouched.
+    pub fn complete_active_turn(&self, agent_id: &str, turn_id: &str) -> RuntimeResult<()> {
+        let agent = self.require_agent(agent_id)?;
+        let deliveries = self.mailbox.find_deliveries_by_turn(&agent.id, turn_id);
+        let mut lane_task_id: Option<String> = None;
+        for ctx in deliveries {
+            if lane_task_id.is_none() {
+                lane_task_id = self.mailbox.lane_id_for_delivery(&ctx.delivery.id);
+            }
+            self.mailbox
+                .mark_terminal(&ctx.delivery.id, QueueDeliveryStatus::Completed, None)?;
+        }
+        self.state
+            .lock()
+            .active_lanes
+            .retain(|_, turn| !(turn.agent_id == agent.id && turn.turn_id == turn_id));
+
+        let thread_id = self.ensure_thread_id(&agent, lane_task_id.as_deref())?;
+        self.thread_store
+            .persist_conversation_changes(&PersistConversationChangesInput {
+                agent_id: agent.id,
+                thread_id,
+                active_turn_id: None,
+                changed_messages: Vec::new(),
+                removed_message_ids: Vec::new(),
+                deleted_message_ids: Vec::new(),
+                event_type: "turn.completed".to_string(),
+                detail: serde_json::json!({ "turnId": turn_id }),
+                command_id: None,
+            })?;
+        Ok(())
+    }
+
     /// Creates an idempotent branched side-task thread (`openbot-thread-<uuid>`) cloned up
     /// to `message_id`, enforcing `branchSourceBusy` and the `50` open side-thread limit.
     pub fn branch_thread(&self, input: BranchThreadInput) -> RuntimeResult<BranchThreadOutcome> {

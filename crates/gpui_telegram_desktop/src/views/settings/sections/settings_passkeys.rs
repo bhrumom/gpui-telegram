@@ -65,7 +65,7 @@ impl SettingsPasskeysSections {
                 id: self.next_id,
                 name: name.clone(),
                 software_emoji_id: Some(0x1F511),
-                created_at: 1709000000,
+                created_at: 0,
                 last_used_at: None,
             };
             self.next_id += 1;
@@ -89,11 +89,15 @@ impl SettingsPasskeysSections {
         } else {
             name.trim().to_string()
         };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let entry = PasskeyEntry {
             id: self.next_id,
             name: resolved_name.clone(),
             software_emoji_id: emoji_id,
-            created_at: 1709000000,
+            created_at: now_secs,
             last_used_at: None,
         };
         self.next_id += 1;

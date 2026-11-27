@@ -196,6 +196,28 @@ impl ActiveModalDialog {
         self.open(kind, forward_targets);
     }
 
+    /// Returns `true` when the active dialog renders an editable text input field.
+    pub fn has_text_input(&self) -> bool {
+        match self.kind.as_ref() {
+            Some(
+                ModalDialogKind::CreatePoll
+                | ModalDialogKind::ForwardMessages { .. }
+                | ModalDialogKind::NewGroup
+                | ModalDialogKind::NewChannel
+                | ModalDialogKind::Contacts
+                | ModalDialogKind::AddContact
+                | ModalDialogKind::ConnectionProxy
+                | ModalDialogKind::MediaEditor { .. }
+                | ModalDialogKind::ReportMessage { .. }
+                | ModalDialogKind::PasscodeSetup
+                | ModalDialogKind::LanguagePicker
+                | ModalDialogKind::EditPeer { .. },
+            ) => true,
+            Some(ModalDialogKind::StoriesViewer { .. }) => !self.stories.is_empty(),
+            _ => false,
+        }
+    }
+
     pub fn active_field_text(&self) -> String {
         match self.active_field {
             ActiveTextField::Primary => self.primary_input.clone(),
@@ -232,6 +254,9 @@ impl ActiveModalDialog {
         if key == "escape" {
             self.close();
             return true;
+        }
+        if !self.has_text_input() {
+            return false;
         }
         let target: &mut String = match self.active_field {
             ActiveTextField::Primary => &mut self.primary_input,

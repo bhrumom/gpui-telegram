@@ -270,6 +270,13 @@ pub struct AppState {
     pub community_search_indexer: Arc<gpui_telegram_community::CommunitySearchIndexer>,
     pub community_bot_guard: Arc<gpui_telegram_community::BotLoopGuard>,
     pub community_ticker_started: Arc<std::sync::atomic::AtomicBool>,
+    pub orca_bots: Arc<orca_bots::OrcaBotsFacade>,
+    pub orca_ide: Arc<orca_ide::OrcaIdeFacade>,
+    pub orca_wake_hub: Arc<crate::routes::orca_share_wake::OrcaWakeHub>,
+    pub orca_handover_lineage: Arc<orca_bots::InMemoryWorkspaceLineage>,
+    pub orca_webhook_calls: Arc<RwLock<HashMap<String, Vec<orca_bots::WebhookCallRecord>>>>,
+    pub orca_telegram_links: Arc<RwLock<HashMap<String, i64>>>,
+    _orca_temp_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl Default for AppState {
@@ -493,17 +500,22 @@ impl AppState {
                 }
             }
         }
-        let _ = db.seed_default_catalog_if_empty();
+        let _ = db.purge_legacy_builtin_sticker_gif_catalog();
         let _ = db.seed_botfather_and_flagship_apps();
         let _ = ensure_default_ai_bot(&db);
+        let _ = ensure_creator_studio_bot(&db);
 
-        // Idempotent starter Community seeding (8 communities, Humans+Bots, posts, comments, lists)
-        let seed_now_ms = Utc::now().timestamp_millis();
-        if let Err(err) = db.pool().with_transaction(|tx| {
-            gpui_telegram_community::store::ops::seed_if_empty_tx(tx, seed_now_ms)
-        }) {
-            tracing::warn!("Community seed_if_empty_tx failed: {}", err);
-        }
+        // Idempotently purge any legacy starter fake/seed Community rows while preserving all real user data
+        let purged_community_seed_rows = match db
+            .pool()
+            .with_transaction(gpui_telegram_community::store::ops::purge_starter_seed_data_tx)
+        {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!("Community purge_starter_seed_data_tx failed: {}", err);
+                0
+            }
+        };
 
         // Dedicated Tantivy BM25 Community search index (`<db_path>.community.idx` on disk; in_ram otherwise)
         let community_search_indexer = if config.is_in_memory() || db.pool().path().is_none() {
@@ -526,6 +538,12 @@ impl AppState {
                     }),
             )
         };
+        if purged_community_seed_rows > 0 && community_search_indexer.doc_count() > 0 {
+            for idx in 1..=30 {
+                let _ = community_search_indexer.delete_post(&format!("seed_post_{idx:02}"));
+            }
+            let _ = community_search_indexer.commit();
+        }
         if community_search_indexer.doc_count() == 0 {
             let posts_res = db.pool().with_reader(|conn| {
                 let mut stmt = conn
@@ -594,7 +612,8 @@ impl AppState {
             Arc::downgrade(&community_search_indexer),
             Arc::downgrade(&community_bot_guard),
             self_weak.clone(),
-        ));
+        )
+        .with_cas(Arc::downgrade(&cas)));
         fabushi_bots.set_platform_im_bridge(im_bridge);
         fabushi_bots.set_agentic_backend(db.clone());
         gateway_hub.set_pipeline(message_pipeline.clone(), db.clone());
@@ -786,7 +805,9 @@ impl AppState {
         gateway_hub.set_event_bus(event_bus.clone());
 
         let push_hub = Arc::new(crate::push::PushGatewayHub::new(db.clone()));
-        push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::MockPushDispatcher::new()));
+        if config.is_in_memory() {
+            push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::MockPushDispatcher::new()));
+        }
         push_hub.register_dispatcher(Arc::new(crate::push::dispatchers::ApnsDispatcher::new(
             "org.telegram.GPUI",
         )));
@@ -809,6 +830,69 @@ impl AppState {
         let kdf_fake_salt_secret = init_kdf_fake_salt_secret(&db);
 
         let agent_capability_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&action_approval_secret));
+
+        let (orca_root, _orca_temp_dir) = if let Ok(dir) = std::env::var("ORCA_DATA_DIR")
+            && !dir.trim().is_empty()
+        {
+            (std::path::PathBuf::from(dir.trim()), None)
+        } else if !config.is_in_memory() {
+            let db_path = std::path::PathBuf::from(config.resolve_db_path());
+            let parent = db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            (parent.join("orca"), None)
+        } else {
+            let td = tempfile::Builder::new()
+                .prefix("gpui_orca_inmem_")
+                .tempdir()
+                .expect("Failed to create ephemeral Orca tempdir");
+            let root = td.path().to_path_buf();
+            (root, Some(Arc::new(td)))
+        };
+
+        let orca_host_id = std::env::var("ORCA_HOST_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| orca_core::LOCAL_EXECUTION_HOST_ID.to_string());
+        let allow_loopback_oauth = std::env::var("GPUI_OFFLINE_TEST").ok().as_deref() == Some("1")
+            || std::env::var("ORCA_ALLOW_LOOPBACK_OAUTH").ok().as_deref() == Some("1");
+        let oauth_policy = if allow_loopback_oauth {
+            orca_bots::OAuthSecurityPolicy::allow_loopback_for_tests()
+        } else {
+            orca_bots::OAuthSecurityPolicy::strict()
+        };
+
+        let mut bots_cfg = orca_bots::OrcaBotsConfig::new(
+            orca_root.join("bots_data"),
+            orca_root.join("bots_home"),
+        );
+        bots_cfg.host_id = orca_host_id.clone();
+        bots_cfg.oauth_policy = oauth_policy;
+        bots_cfg.webhook_base_url = format!("http://{}:{}", config.host, config.port);
+        if config.is_in_memory() {
+            bots_cfg.import_roots = Some(orca_bots::BotImportDiscoveryRoots::default_for_home(
+                &orca_root.join("fake_home"),
+            ));
+        }
+        let orca_bots = Arc::new(
+            orca_bots::OrcaBotsFacade::open(bots_cfg).expect("Failed to initialize OrcaBotsFacade"),
+        );
+
+        let mut ide_cfg = orca_ide::OrcaIdeConfig::new(
+            orca_root.join("ide_data"),
+            orca_root.join("workspaces"),
+        );
+        ide_cfg.host_id = orca_host_id;
+        let orca_ide = Arc::new(
+            orca_ide::OrcaIdeFacade::open_with_bots(ide_cfg, orca_bots.clone())
+                .expect("Failed to initialize OrcaIdeFacade"),
+        );
+        let orca_wake_hub = Arc::new(crate::routes::orca_share_wake::OrcaWakeHub::new());
+        let orca_handover_lineage = Arc::new(orca_bots::InMemoryWorkspaceLineage::new());
+        let orca_webhook_calls = Arc::new(RwLock::new(HashMap::new()));
+        let orca_telegram_links = Arc::new(RwLock::new(HashMap::new()));
 
         let _shutdown_guard = Arc::new(AppShutdownGuard {
             gateway_hub: Arc::downgrade(&gateway_hub),
@@ -859,6 +943,13 @@ impl AppState {
             community_search_indexer,
             community_bot_guard,
             community_ticker_started,
+            orca_bots,
+            orca_ide,
+            orca_wake_hub,
+            orca_handover_lineage,
+            orca_webhook_calls,
+            orca_telegram_links,
+            _orca_temp_dir,
         }
     }
 
@@ -1148,6 +1239,7 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(routes::community::router())
+        .merge(routes::orca_router())
         // --- Public Routes ---
         .route("/health", get(health_check))
         .route("/api/v1/status", get(server_status))
@@ -1593,11 +1685,18 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             "/api/v1/automation-apps/{app_id}/runs",
             post(routes::automation_apps::automation_app_record_run),
         )
-        .route("/api/v1/bots", post(routes::bots_miniapps::bots_create))
+        .route(
+            "/api/v1/bots",
+            get(routes::bots_miniapps::bots_list).post(routes::bots_miniapps::bots_create),
+        )
         .route("/api/v1/bots/my", get(routes::bots_miniapps::bots_my))
         .route(
             "/api/v1/bots/attach-menu",
             get(routes::bots_miniapps::bots_attach_menu),
+        )
+        .route(
+            "/api/v1/bots/inline-query",
+            get(routes::creator_bot::bots_inline_query),
         )
         .route(
             "/api/v1/bots/profile/{target}",
@@ -1740,6 +1839,79 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             "/api/v1/remote/webrtc/signal",
             post(routes::remote_assist::remote_webrtc_signal),
         )
+        // --- Cloud Creations & Moderation Review Workflow ---
+        .route(
+            "/api/v1/creations",
+            post(routes::creations::creations_create)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/v1/creations/my", get(routes::creations::creations_list_my))
+        .route("/api/v1/creations/sync", get(routes::creations::creations_sync))
+        .route(
+            "/api/v1/creations/review-queue",
+            get(routes::creations::creations_review_queue),
+        )
+        .route(
+            "/api/v1/creations/{id}",
+            get(routes::creations::creations_get)
+                .put(routes::creations::creations_update)
+                .delete(routes::creations::creations_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/creations/{id}/submit-review",
+            post(routes::creations::creations_submit_review),
+        )
+        .route(
+            "/api/v1/creations/{id}/withdraw-review",
+            post(routes::creations::creations_withdraw_review),
+        )
+        .route(
+            "/api/v1/creations/{id}/unpublish",
+            post(routes::creations::creations_unpublish),
+        )
+        .route(
+            "/api/v1/creations/{id}/audit",
+            get(routes::creations::creations_audit_list),
+        )
+        .route(
+            "/api/v1/creations/{id}/review",
+            post(routes::creations::creations_review_decide),
+        )
+        // --- Public Catalog, Verticals, Recommendations, User States, Reviews & Leaderboards ---
+        .route("/api/v1/catalog", get(routes::creations::catalog_search))
+        .route("/api/v1/catalog/books", get(routes::creations::catalog_books))
+        .route("/api/v1/catalog/music", get(routes::creations::catalog_music))
+        .route("/api/v1/catalog/games", get(routes::creations::catalog_games))
+        .route(
+            "/api/v1/catalog/appstore",
+            get(routes::creations::catalog_appstore),
+        )
+        .route(
+            "/api/v1/catalog/recommend",
+            get(routes::creations::catalog_recommend),
+        )
+        .route(
+            "/api/v1/catalog/my-states",
+            get(routes::creations::catalog_my_states),
+        )
+        .route(
+            "/api/v1/catalog/{id}/state",
+            put(routes::creations::catalog_upsert_state),
+        )
+        .route(
+            "/api/v1/catalog/{id}/reviews",
+            get(routes::creations::catalog_list_reviews)
+                .post(routes::creations::catalog_upsert_review),
+        )
+        .route(
+            "/api/v1/catalog/{id}/scores",
+            post(routes::creations::catalog_submit_score),
+        )
+        .route(
+            "/api/v1/catalog/{id}/leaderboard",
+            get(routes::creations::catalog_leaderboard),
+        )
         // --- WebSocket Upgrade Route ---
         .route("/api/v1/ws", get(ws_upgrade_handler))
         // --- Tower Middleware Stack ---
@@ -1786,7 +1958,7 @@ async fn server_status() -> Json<Value> {
             "statistics", "export", "wallet_stars", "acp_durable",
             "hermes_agent", "hermes_gateway", "openai_compat", "acp_json_rpc",
             "auto_update_relay", "official_mcp_oauth21", "remote_control",
-            "remote_assist", "community"
+            "remote_assist", "community", "orca"
         ]
     }))
 }
@@ -3205,6 +3377,13 @@ async fn auth_alipay_simulate_scan(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AlipaySimulateScanRequest>,
 ) -> Response {
+    if !state.config.is_in_memory() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "mock_disabled", "message": "Simulated Alipay OAuth is disabled in production" })),
+        )
+            .into_response();
+    }
     let attempt = match state.db.get_oauth_attempt(&req.attempt_id) {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -3641,6 +3820,84 @@ pub(crate) fn ensure_default_ai_bot(db: &crate::db::ServerDatabase) -> UserId {
         };
         let _ = db.create_user(&bot_user);
     }
+    bot_id
+}
+
+/// Ensures the official `@CreatorStudioBot` (UID `777_020`) exists in `users` and `bots_registry`
+/// with `is_official = 1`, `is_inline = 1`, `is_standard_bot = 0`, `owner_user_id = 0`, and all 9
+/// creator/recommendation commands BEFORE `hydrate_all_fabushi_bots` runs.
+pub(crate) fn ensure_creator_studio_bot(db: &crate::db::ServerDatabase) -> UserId {
+    let bot_uid_i64 = gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID;
+    let bot_id = UserId(bot_uid_i64 as u64);
+    let now_ms = Utc::now().timestamp_millis();
+    let username = gpui_telegram_proto::CREATOR_STUDIO_BOT_USERNAME;
+    let display_name = "Creator Studio";
+    let bio = "Official Creator Studio Bot — create & publish cloud Books, Music, Games & Apps directly in chat.";
+    let description = "在消息聊天中创作图书、音乐、游戏与应用并保存到云端，支持提交审核上架、撤回、下架与公开作品推荐。";
+    let about = "Official Creative Hub & Public Recommendation Bot (@CreatorStudioBot).";
+    let persona = "You are Creator Studio, an official assistant helping users author and publish cloud Books, Music, Games, and Apps directly via chat.";
+    let commands_json = serde_json::to_string(&crate::routes::creator_bot::creator_studio_commands())
+        .unwrap_or_else(|_| "[]".to_string());
+    let bot_token = crate::routes::creator_bot::CREATOR_STUDIO_BOT_TOKEN;
+
+    let _ = db.pool().with_transaction(|tx| {
+        tx.execute(
+            r#"INSERT INTO users
+               (user_id, username, phone, first_name, last_name, bio, password_hash,
+                is_bot, is_verified, is_support, is_scam, is_fake,
+                profile_photo_file_id, account_generation, created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, NULL, ?3, NULL, ?4, NULL, 1, 1, 0, 0, 0, NULL, 1, ?5, ?5)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username = excluded.username,
+                 first_name = excluded.first_name,
+                 bio = excluded.bio,
+                 is_bot = 1,
+                 is_verified = 1,
+                 updated_at_ms = excluded.updated_at_ms"#,
+            rusqlite::params![bot_uid_i64, username, display_name, bio, now_ms],
+        )
+        .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+
+        tx.execute(
+            r#"INSERT INTO bots_registry
+               (bot_user_id, owner_user_id, username, display_name, bot_token,
+                description, about, ai_persona, menu_button_text, menu_button_url,
+                is_official, is_inline, allow_attach_menu, attach_peer_types_json,
+                commands_json, created_at, updated_at,
+                agent_id, avatar_shape, avatar_color, preferred_model, thinking_level,
+                approval_mode, toolset_preset, menu_button_type, is_standard_bot)
+               VALUES (?1, 0, ?2, ?3, ?4,
+                       ?5, ?6, ?7, '', '',
+                       1, 1, 0, '["users","bots","groups","channels"]',
+                       ?8, ?9, ?9,
+                       'creator_studio_bot', 'orb', 'violet', '', 'medium',
+                       'prompt', 'full', 'default', 0)
+               ON CONFLICT(bot_user_id) DO UPDATE SET
+                 username = excluded.username,
+                 display_name = excluded.display_name,
+                 description = excluded.description,
+                 about = excluded.about,
+                 is_official = 1,
+                 is_inline = 1,
+                 is_standard_bot = 0,
+                 commands_json = excluded.commands_json,
+                 updated_at = excluded.updated_at"#,
+            rusqlite::params![
+                bot_uid_i64,
+                username,
+                display_name,
+                bot_token,
+                description,
+                about,
+                persona,
+                commands_json,
+                now_ms,
+            ],
+        )
+        .map_err(|e| gpui_telegram_core::error::TelegramError::Database(e.to_string()))?;
+        Ok(())
+    });
+
     bot_id
 }
 
@@ -5188,7 +5445,29 @@ pub(crate) fn extract_message_content_text(content: &MessageContent) -> String {
         MessageContent::Poll(p) => format!("[Poll: {}]", p.question),
         MessageContent::Todo(t) => format!("[Todo: {}]", t.title),
         MessageContent::Invoice(i) => format!("[Invoice: {}]", i.title),
-        MessageContent::GenerativeCard(g) => format!("[Card: {}]", g.title),
+        MessageContent::GenerativeCard(g) => {
+            let mut parts: Vec<String> = Vec::new();
+            let title_t = g.title.trim();
+            if !title_t.is_empty() {
+                parts.push(title_t.to_string());
+            }
+            if let Some(sub) = g.subtitle.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                parts.push(sub.to_string());
+            }
+            for comp in &g.components {
+                if let gpui_telegram_proto::cards::GenerativeComponent::Text { text, .. } = comp {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            if parts.len() <= 1 {
+                format!("[Card: {}]", g.title)
+            } else {
+                parts.join("\n")
+            }
+        }
         MessageContent::Encrypted(_) => "[Encrypted message]".to_string(),
     }
 }

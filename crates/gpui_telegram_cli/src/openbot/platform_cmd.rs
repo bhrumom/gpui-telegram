@@ -221,6 +221,17 @@ pub fn flag_spec(action: &str) -> Result<FlagSpec, CliError> {
     }
 }
 
+fn wrap_platform_payload(wrapper_key: &str, inner: Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = inner.as_object() {
+        for (k, v) in obj {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out.insert(wrapper_key.to_string(), inner);
+    Value::Object(out)
+}
+
 pub fn run_platform(action: &str, flags: &ParsedFlags, data_dir: &Path) -> Result<Value, CliError> {
     let runtime = open_host_runtime(data_dir)?;
     match action {
@@ -305,8 +316,9 @@ fn run_workflow_save(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Resul
         .workflows()
         .save_workflow(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({
-        "workflow": {
+    Ok(wrap_platform_payload(
+        "workflow",
+        json!({
             "id": out.workflow_id,
             "workflow_id": out.workflow_id,
             "title": out.title,
@@ -315,8 +327,8 @@ fn run_workflow_save(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Resul
             "step_count": out.step_count,
             "edge_count": out.edge_count,
             "loop_edges": out.loop_edges,
-        }
-    }))
+        }),
+    ))
 }
 
 fn run_workflow_run(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -361,7 +373,7 @@ fn run_workflow_run(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result
         .workflows()
         .run_workflow(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "workflow": out }))
+    Ok(wrap_platform_payload("workflow", json!(out)))
 }
 
 fn parse_routine_schedule(raw: &str) -> Result<Option<RoutineSchedule>, CliError> {
@@ -506,8 +518,9 @@ fn run_routine_save(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result
         .routines()
         .save_routine(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({
-        "routine": {
+    Ok(wrap_platform_payload(
+        "routine",
+        json!({
             "id": out.routine_id,
             "routine_id": out.routine_id,
             "owner_id": out.owner_id,
@@ -516,8 +529,8 @@ fn run_routine_save(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result
             "interval_seconds": out.interval_seconds,
             "next_run_at": out.next_run_at,
             "webhook_route_id": out.webhook_route_id,
-        }
-    }))
+        }),
+    ))
 }
 
 fn lookup_routine_owner(
@@ -532,7 +545,7 @@ fn lookup_routine_owner(
     let agent_store = runtime.database().agent_routine_store();
     for ag in agents {
         if agent_store
-            .get(&ag.id, routine_id)
+            .get_record(&ag.id, routine_id)
             .map_err(map_storage_error)?
             .is_some()
         {
@@ -547,7 +560,7 @@ fn lookup_routine_owner(
     let ch_store = runtime.database().channel_routine_store();
     for ch in channels {
         if ch_store
-            .get(&ch.channel.id, routine_id)
+            .get_record(&ch.channel.id, routine_id)
             .map_err(map_storage_error)?
             .is_some()
         {
@@ -617,7 +630,7 @@ fn run_routine_run(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
         .routines()
         .run_routine(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "routine": out }))
+    Ok(wrap_platform_payload("routine", json!(out)))
 }
 
 fn run_webhook_post(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -684,7 +697,7 @@ fn run_webhook_post(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result
         .routines()
         .post_webhook(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "routine": out }))
+    Ok(wrap_platform_payload("routine", json!(out)))
 }
 
 fn run_crm_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -704,7 +717,7 @@ fn run_crm_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Val
         .crm()
         .sync_stripe(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "crm": out }))
+    Ok(wrap_platform_payload("crm", json!(out)))
 }
 
 fn run_crm_propose(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -731,7 +744,7 @@ fn run_crm_propose(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
         .crm()
         .propose_or_apply(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "crm": out }))
+    Ok(wrap_platform_payload("crm", json!(out)))
 }
 
 struct ScopedStageDir {
@@ -814,7 +827,7 @@ fn run_site_publish(
         .static_sites()
         .publish_site(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "site": record }))
+    Ok(wrap_platform_payload("site", json!(record)))
 }
 
 fn run_site_delete(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -830,7 +843,7 @@ fn run_site_delete(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
         .static_sites()
         .delete_site(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "site": out }))
+    Ok(wrap_platform_payload("site", json!(out)))
 }
 
 fn run_marketplace_search(
@@ -849,7 +862,7 @@ fn run_marketplace_search(
         .marketplace()
         .search(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "marketplace": out }))
+    Ok(wrap_platform_payload("marketplace", json!(out)))
 }
 
 fn run_html_render(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -921,7 +934,7 @@ fn run_html_render(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
         .html_media()
         .render_or_generate(req)
         .map_err(map_runtime_error)?;
-    Ok(json!({ "html_media": out }))
+    Ok(wrap_platform_payload("html_media", json!(out)))
 }
 
 fn run_voice_eval(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -997,27 +1010,29 @@ fn run_voice_eval(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<V
                 .voice()
                 .save_voice_server_settings(address.clone(), None, routes.clone())
                 .map_err(map_runtime_error)?;
-            return Ok(json!({
-                "voice": {
+            return Ok(wrap_platform_payload(
+                "voice",
+                json!({
                     "mode": "server-config",
                     "voice_server": {
                         "address": saved.address,
                         "hasApiKey": has_api_key || saved.has_api_key,
                         "routes": saved.routes,
                     }
-                }
-            }));
+                }),
+            ));
         }
         let existing = runtime
             .voice()
             .get_voice_server_settings()
             .map_err(map_runtime_error)?;
-        return Ok(json!({
-            "voice": {
+        return Ok(wrap_platform_payload(
+            "voice",
+            json!({
                 "mode": "server-config",
                 "voice_server": existing,
-            }
-        }));
+            }),
+        ));
     }
 
     let audio_seconds = match flags.get("--audio-seconds") {
@@ -1095,6 +1110,7 @@ fn run_voice_eval(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<V
                 "mode": "live",
                 "live_voices": CODEX_LIVE_VOICES.len(),
                 "selected_live_voice": out.live_voice,
+                "voice_agent_id": out.voice_agent_id,
                 "session_id": sid,
                 "answer_sdp": answer_sdp,
                 "webrtc_ready": true,
@@ -1107,7 +1123,7 @@ fn run_voice_eval(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<V
             )));
         }
     };
-    Ok(json!({ "voice": body }))
+    Ok(wrap_platform_payload("voice", body))
 }
 
 fn run_bridge_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<Value, CliError> {
@@ -1187,8 +1203,9 @@ fn run_bridge_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
                 &entry,
             )
             .map_err(map_runtime_error)?;
-        return Ok(json!({
-            "bridge": {
+        return Ok(wrap_platform_payload(
+            "bridge",
+            json!({
                 "platform": platform_raw,
                 "direction": "outbound",
                 "decision": "allow",
@@ -1197,8 +1214,8 @@ fn run_bridge_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
                 "replied": true,
                 "saved_history_only": false,
                 "pairing_code": Value::Null,
-            }
-        }));
+            }),
+        ));
     }
 
     let sender = obj
@@ -1326,8 +1343,9 @@ fn run_bridge_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
     let delivered = eval_out.decision == "allow" || eval_out.decision == "save";
     let replied = eval_out.decision == "allow";
     let saved_history_only = eval_out.decision == "save";
-    Ok(json!({
-        "bridge": {
+    Ok(wrap_platform_payload(
+        "bridge",
+        json!({
             "platform": platform_raw,
             "direction": "inbound",
             "decision": eval_out.decision,
@@ -1338,6 +1356,6 @@ fn run_bridge_sync(flags: &ParsedFlags, runtime: &OpenBotHostRuntime) -> Result<
             "pairing_code": eval_out.pairing_code,
             "normalized_forms": eval_out.normalized_forms,
             "dedup_key": eval_out.dedup_key,
-        }
-    }))
+        }),
+    ))
 }

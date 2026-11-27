@@ -79,37 +79,60 @@ impl ServerDatabase {
     pub fn user_can_access_media(&self, user_id: UserId, media_id: &str) -> Result<bool> {
         let Some((_, uploader, chat_opt)) = self.get_media_file(media_id)? else { return Ok(true); };
         if uploader == user_id { return Ok(true); }
-        if let Some(cid) = chat_opt { return self.is_user_in_chat(cid, user_id); }
+        let is_chat_media = chat_opt.is_some();
+        if let Some(cid) = chat_opt {
+            if self.is_user_in_chat(cid, user_id)? {
+                return Ok(true);
+            }
+        }
         self.pool.with_reader(|conn| {
-            gpui_telegram_community::store::ops::is_media_referenced_publicly_conn(conn, media_id)
+            // Upstream community rule: only non-chat uploads can be exposed via public posts.
+            if !is_chat_media
+                && gpui_telegram_community::store::ops::is_media_referenced_publicly_conn(conn, media_id)?
+            {
+                return Ok(true);
+            }
+            // Creations rule: any media (incl. chat uploads) referenced by a published public creation.
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM creation_public_assets WHERE media_id = ?1)",
+                params![media_id],
+                |r| r.get(0),
+            )
+            .map_db()
+        })
+    }
+
+    /// Purges legacy hardcoded demo sticker pack (`pack_durov`) and fake `builtin_gif_*` GIF
+    /// catalog rows while preserving any real uploaded stickers/GIFs.
+    pub fn purge_legacy_builtin_sticker_gif_catalog(&self) -> Result<()> {
+        self.pool.with_transaction(|tx| {
+            tx.execute(
+                "DELETE FROM user_sticker_sets WHERE set_id = 'pack_durov'",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM stickers WHERE set_id = 'pack_durov' OR file_id LIKE 'builtin_stk_%'",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM sticker_sets WHERE set_id = 'pack_durov'",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM gifs_catalog WHERE gif_id IN ('gif_celebrate', 'gif_rocket', 'gif_thumbsup', 'gif_coding') OR url LIKE '/api/v1/media/builtin_%'",
+                [],
+            )
+            .map_err(|e| TelegramError::Database(e.to_string()))?;
+            Ok(())
         })
     }
 
     pub fn seed_default_catalog_if_empty(&self) -> Result<()> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.pool.with_transaction(|tx| {
-            let cnt: i64 = tx.query_row("SELECT COUNT(*) FROM sticker_sets", [], |r| r.get(0)).map_err(|e| TelegramError::Database(e.to_string()))?;
-            if cnt == 0 {
-                tx.execute("INSERT INTO sticker_sets (set_id, short_name, title, is_animated, is_video, is_official, created_at_ms) VALUES ('pack_durov', 'DurovAnimals', 'Durov Originals', 0, 0, 1, ?1)", params![now_ms]).map_err(|e| TelegramError::Database(e.to_string()))?;
-                for (idx, (sid, emoji)) in [("stk_thumbs", "👍"), ("stk_rocket", "🚀"), ("stk_heart", "❤️"), ("stk_fire", "🔥")].iter().enumerate() {
-                    tx.execute("INSERT INTO stickers (sticker_id, set_id, emoji, mime_type, width, height, file_id, lottie_json, sort_order) VALUES (?1, 'pack_durov', ?2, 'image/webp', 512, 512, ?3, NULL, ?4)",
-                        params![sid, emoji, format!("builtin_{}", sid), idx as i64]).map_err(|e| TelegramError::Database(e.to_string()))?;
-                }
-            }
-            let gif_cnt: i64 = tx.query_row("SELECT COUNT(*) FROM gifs_catalog", [], |r| r.get(0)).map_err(|e| TelegramError::Database(e.to_string()))?;
-            if gif_cnt == 0 {
-                for (id, title, tags) in [
-                    ("gif_celebrate", "Party Celebration", "party happy celebration confetti dance"),
-                    ("gif_rocket", "Rocket Launch", "rocket moon fast ship launch"),
-                    ("gif_thumbsup", "Approval Thumbs Up", "ok yes approve thumbs good"),
-                    ("gif_coding", "Fast Coding Cat", "code cat typing rust dev"),
-                ] {
-                    tx.execute("INSERT INTO gifs_catalog (gif_id, title, tags, width, height, duration_secs, mime_type, url, preview_url, created_at_ms) VALUES (?1, ?2, ?3, 320, 240, 3, 'image/gif', ?4, ?5, ?6)",
-                        params![id, title, tags, format!("/api/v1/media/builtin_{}", id), format!("/api/v1/media/builtin_{}_thumb", id), now_ms]).map_err(|e| TelegramError::Database(e.to_string()))?;
-                }
-            }
-            Ok(())
-        })
+        // Production runtime must never inject hardcoded fake stickers or non-existent builtin GIFs.
+        self.purge_legacy_builtin_sticker_gif_catalog()
     }
 
     pub fn list_sticker_sets(&self, user_id: UserId) -> Result<Vec<StickerSetDto>> {

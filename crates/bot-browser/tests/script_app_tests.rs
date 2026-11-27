@@ -4510,3 +4510,46 @@ impl<E: std::fmt::Debug> UnwrapErrOrPanic<E> for Result<(), E> {
         }
     }
 }
+
+#[test]
+fn b1_regression_digit_overflow_to_lowercase_sensitive_key_never_bypasses_scanner() {
+    use bot_browser::scan_text_for_secret_leaks;
+    let params: Vec<ScriptParameter> = Vec::new();
+    let cases = [
+        (
+            "digits130_token",
+            format!("{}token=super_secret_live_value_9999", "0".repeat(130)),
+        ),
+        (
+            "digits130_api_key",
+            format!("{}api_key=super_secret_live_value_9999", "0".repeat(130)),
+        ),
+        (
+            "digits25_token",
+            format!("{}token=super_secret_live_value_9999", "0".repeat(25)),
+        ),
+        (
+            "digits130_secret",
+            format!("{}secret=super_secret_live_value_9999", "9".repeat(130)),
+        ),
+    ];
+    for (label, payload) in cases {
+        assert!(
+            matches!(
+                scan_text_for_secret_leaks(&payload, label, &params),
+                Err(BotBrowserError::SecretLeakDetected(_))
+            ),
+            "B1 regression `{label}` must reject in scan_text_for_secret_leaks"
+        );
+        let mut app = base_valid_app();
+        app.description = payload;
+        assert!(
+            matches!(
+                validate_script_app_safe_for_publish(&app),
+                Err(BotBrowserError::SecretLeakDetected(_))
+            ),
+            "B1 regression `{label}` must reject in validate_script_app_safe_for_publish"
+        );
+    }
+}
+

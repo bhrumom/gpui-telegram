@@ -92,8 +92,12 @@ impl CallOverlay {
         s.state = TalkModeState::Connecting;
         s.is_connected = false;
         s.signal_bars = 0;
+        s.available_outputs.clear();
         s.avatar_path = avatar_path.clone();
-        if let Some(emojis) = e2ee_emojis.filter(|e| !e.trim().is_empty()) { s.e2ee_emojis = emojis; }
+        s.e2ee_emojis = e2ee_emojis
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_default();
         s.palette = palette.clone();
         s.video_viewport = VideoViewport::new(peer_name.clone(), palette);
         s.video_viewport.avatar_path = avatar_path;

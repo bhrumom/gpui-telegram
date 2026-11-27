@@ -1100,26 +1100,190 @@ impl CommunityStore {
         self.with_conn(|conn| list_mod_logs_conn(conn, slug_or_id, limit))
     }
     pub fn list_moderators(&self, slug_or_id: &str) -> Result<Vec<CommunityActorDto>> {
-        self.with_conn(|conn| {
-            let comm = get_community_conn(conn, slug_or_id, None)?
-                .ok_or_else(|| TelegramError::NotFound(format!("community '{slug_or_id}' not found")))?;
-            let sql = format!(
-                "SELECT {} FROM community_actors a
-                 JOIN community_memberships m ON m.actor_id = a.actor_id
-                 WHERE m.community_id = ?1 AND m.role IN ('owner', 'mod', 'bot_mod')
-                 ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'mod' THEN 1 ELSE 2 END, a.handle ASC",
-                super::actors::ACTOR_SELECT_COLS.replace("actor_id,", "a.actor_id,")
-                    .replace("created_at_ms", "a.created_at_ms")
-            );
-            let mut stmt = conn.prepare(&sql).map_err(|e| db_err("prepare moderators", e))?;
-            let rows = stmt
-                .query_map(params![comm.community_id], super::actors::row_to_actor)
-                .map_err(|e| db_err("query moderators", e))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(|e| db_err("read moderator", e))?);
-            }
-            Ok(out)
-        })
+        self.list_moderators_for_viewer(slug_or_id, None)
+    }
+    pub fn list_moderators_for_viewer(
+        &self,
+        slug_or_id: &str,
+        viewer_actor_id: Option<&str>,
+    ) -> Result<Vec<CommunityActorDto>> {
+        self.with_conn(|conn| list_moderators_conn(conn, slug_or_id, viewer_actor_id))
+    }
+}
+
+pub fn list_moderators_conn(
+    conn: &Connection,
+    slug_or_id: &str,
+    viewer_actor_id: Option<&str>,
+) -> Result<Vec<CommunityActorDto>> {
+    let comm = get_community_conn(conn, slug_or_id, None)?
+        .ok_or_else(|| TelegramError::NotFound(format!("community '{slug_or_id}' not found")))?;
+    let sql = format!(
+        "SELECT {} FROM community_actors a
+         JOIN community_memberships m ON m.actor_id = a.actor_id
+         WHERE m.community_id = ?1 AND m.role IN ('owner', 'mod', 'bot_mod')
+         ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'mod' THEN 1 ELSE 2 END, a.handle ASC",
+        super::actors::ACTOR_SELECT_COLS
+            .replace("actor_id,", "a.actor_id,")
+            .replace("created_at_ms", "a.created_at_ms")
+    );
+    let mut out = Vec::new();
+    {
+        let mut stmt = conn.prepare(&sql).map_err(|e| db_err("prepare moderators", e))?;
+        let rows = stmt
+            .query_map(params![comm.community_id], super::actors::row_to_actor)
+            .map_err(|e| db_err("query moderators", e))?;
+        for r in rows {
+            out.push(r.map_err(|e| db_err("read moderator", e))?);
+        }
+    }
+    for actor in &mut out {
+        super::actors::hydrate_actor_viewer_flags(conn, actor, viewer_actor_id)?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_telegram_proto::community_contracts::{
+        MuteBlockActionKind, MuteBlockRequest, MuteBlockTargetKind, RegisterHumanActorRequest,
+    };
+
+    #[test]
+    fn list_moderators_for_viewer_hydrates_follow_mute_block_and_preserves_legacy() {
+        let store = CommunityStore::open_in_memory().expect("in-memory store");
+        let now = 1_750_000_000_000_i64;
+        let owner = store
+            .create_human_actor(
+                2001,
+                &RegisterHumanActorRequest {
+                    handle: "mod_owner".into(),
+                    display_name: "Owner".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("owner");
+        let mod_b = store
+            .create_human_actor(
+                2002,
+                &RegisterHumanActorRequest {
+                    handle: "mod_beta".into(),
+                    display_name: "Mod Beta".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("mod_b");
+        let mod_c = store
+            .create_human_actor(
+                2003,
+                &RegisterHumanActorRequest {
+                    handle: "mod_gamma".into(),
+                    display_name: "Mod Gamma".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("mod_c");
+
+        let comm = store
+            .create_community(
+                &owner.actor_id,
+                &CreateCommunityRequest {
+                    slug: "mod_hydrate_test".into(),
+                    name: "Mod Hydrate".into(),
+                    description: "test".into(),
+                    category: "tech".into(),
+                    banner_media_id: None,
+                    icon_media_id: None,
+                    icon_emoji: None,
+                    accent_color: None,
+                    rules: Vec::new(),
+                    post_flairs: Vec::new(),
+                    user_flairs: Vec::new(),
+                    wiki_markdown: String::new(),
+                    automod_rules: Vec::new(),
+                    allow_bots: true,
+                    require_bot_disclosure: true,
+                    is_nsfw: false,
+                },
+                now + 10,
+            )
+            .expect("create community");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO community_memberships (community_id, actor_id, role, joined_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'mod', ?3, ?3), (?1, ?4, 'mod', ?3, ?3)",
+                    params![comm.community_id, mod_b.actor_id, now + 20, mod_c.actor_id],
+                )
+                .map_err(|e| db_err("seed mods", e))?;
+                Ok(())
+            })
+            .expect("seed mods");
+
+        // Owner follows + mutes mod_b, and blocks mod_c.
+        store
+            .follow_actor(&owner.actor_id, &mod_b.actor_id, now + 30)
+            .expect("follow mod_b");
+        store
+            .set_mute_block(
+                &owner.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: mod_b.actor_id.clone(),
+                    action: MuteBlockActionKind::Mute,
+                    reason: None,
+                },
+                now + 31,
+            )
+            .expect("mute mod_b");
+        store
+            .set_mute_block(
+                &owner.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: mod_c.actor_id.clone(),
+                    action: MuteBlockActionKind::Block,
+                    reason: None,
+                },
+                now + 32,
+            )
+            .expect("block mod_c");
+
+        let hydrated = store
+            .list_moderators_for_viewer(&comm.slug, Some(&owner.actor_id))
+            .expect("list_moderators_for_viewer");
+        let self_dto = hydrated.iter().find(|a| a.actor_id == owner.actor_id).expect("owner");
+        assert!(!self_dto.is_following && !self_dto.is_muted && !self_dto.is_blocked);
+        let b_dto = hydrated.iter().find(|a| a.actor_id == mod_b.actor_id).expect("mod_b");
+        assert!(b_dto.is_following && b_dto.is_muted && !b_dto.is_blocked);
+        let c_dto = hydrated.iter().find(|a| a.actor_id == mod_c.actor_id).expect("mod_c");
+        assert!(!c_dto.is_following && !c_dto.is_muted && c_dto.is_blocked);
+
+        // Legacy list_moderators (None viewer) stays unhydrated and backward-compatible.
+        let legacy = store.list_moderators(&comm.slug).expect("legacy list_moderators");
+        assert_eq!(legacy.len(), 3);
+        assert!(legacy.iter().all(|a| !a.is_following && !a.is_muted && !a.is_blocked));
     }
 }

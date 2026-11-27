@@ -376,6 +376,19 @@ pub fn list_actors_conn(
     Ok(out)
 }
 
+pub fn list_actors_for_viewer_conn(
+    conn: &Connection,
+    kind_filter: Option<ActorKind>,
+    viewer_actor_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommunityActorDto>> {
+    let mut out = list_actors_conn(conn, kind_filter, limit)?;
+    for actor in &mut out {
+        hydrate_actor_viewer_flags(conn, actor, viewer_actor_id)?;
+    }
+    Ok(out)
+}
+
 pub fn sync_telegram_identities_tx(
     tx: &Transaction<'_>,
     human: &TelegramHumanSyncInput,
@@ -540,8 +553,27 @@ pub fn follow_actor_tx(
     }
     let follower = get_actor_conn(tx, follower_id, None)?
         .ok_or_else(|| TelegramError::NotFound(format!("follower '{follower_id}' not found")))?;
-    if get_actor_conn(tx, target_id, None)?.is_none() {
-        return Err(TelegramError::NotFound(format!("target actor '{target_id}' not found")));
+    let target = get_actor_conn(tx, target_id, None)?
+        .ok_or_else(|| TelegramError::NotFound(format!("target actor '{target_id}' not found")))?;
+    if follower.actor_id == target.actor_id {
+        return Err(TelegramError::Validation("cannot follow yourself".to_string()));
+    }
+    let blocked: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM community_mutes_blocks
+                WHERE target_kind = 'actor' AND action = 'block'
+                  AND ((owner_actor_id = ?1 AND target_value = ?2)
+                    OR (owner_actor_id = ?2 AND target_value = ?1))
+            )",
+            params![follower.actor_id, target.actor_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| db_err("check block before follow", e))?;
+    if blocked != 0 {
+        return Err(TelegramError::PermissionDenied(
+            "cannot follow an actor while a block exists between you".to_string(),
+        ));
     }
     let changed = tx
         .execute(
@@ -775,6 +807,15 @@ impl CommunityStore {
         self.with_conn(|conn| list_actors_conn(conn, kind_filter, limit))
     }
 
+    pub fn list_actors_for_viewer(
+        &self,
+        kind_filter: Option<ActorKind>,
+        viewer_actor_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommunityActorDto>> {
+        self.with_conn(|conn| list_actors_for_viewer_conn(conn, kind_filter, viewer_actor_id, limit))
+    }
+
     pub fn update_actor(
         &self,
         actor_id: &str,
@@ -815,5 +856,205 @@ impl CommunityStore {
 
     pub fn list_mutes_blocks(&self, owner_actor_id: &str) -> Result<Vec<CommunityMuteBlockDto>> {
         self.with_conn(|conn| list_mutes_blocks_conn(conn, owner_actor_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follow_actor_rejected_when_bidirectional_block_exists() {
+        let store = CommunityStore::open_in_memory().expect("in-memory store");
+        let now = 1_700_000_000_000i64;
+        let alice = store
+            .create_human_actor(
+                101,
+                &RegisterHumanActorRequest {
+                    handle: "alice_blk".into(),
+                    display_name: "Alice".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("alice");
+        let bob = store
+            .create_human_actor(
+                102,
+                &RegisterHumanActorRequest {
+                    handle: "bob_blk".into(),
+                    display_name: "Bob".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("bob");
+
+        // Alice blocks Bob -> neither Alice->Bob nor Bob->Alice follow may succeed.
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Block,
+                    reason: None,
+                },
+                now + 10,
+            )
+            .expect("block bob");
+
+        let err_ab = store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 20)
+            .expect_err("blocker following blocked target must fail");
+        assert!(matches!(err_ab, TelegramError::PermissionDenied(_)), "got {err_ab:?}");
+
+        let err_ba = store
+            .follow_actor(&bob.actor_id, &alice.actor_id, now + 30)
+            .expect_err("blocked actor following blocker must fail");
+        assert!(matches!(err_ba, TelegramError::PermissionDenied(_)), "got {err_ba:?}");
+
+        // Mute (not block) must NOT reject follow, and after removing block follow succeeds.
+        store
+            .remove_mute_block(
+                &alice.actor_id,
+                MuteBlockTargetKind::Actor,
+                &bob.actor_id,
+                MuteBlockActionKind::Block,
+            )
+            .expect("unblock bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Mute,
+                    reason: None,
+                },
+                now + 40,
+            )
+            .expect("mute bob");
+        let followed = store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 50)
+            .expect("follow after unblock must succeed");
+        assert!(followed);
+        let bob_view = store
+            .get_actor(&bob.actor_id, Some(&alice.actor_id))
+            .expect("get bob")
+            .expect("bob exists");
+        assert!(bob_view.is_following);
+        assert_eq!(bob_view.followers_count, 1);
+    }
+
+    #[test]
+    fn list_actors_for_viewer_hydrates_social_flags_and_preserves_legacy_list_actors() {
+        let store = CommunityStore::open_in_memory().expect("in-memory store");
+        let now = 1_750_000_000_000_i64;
+        let alice = store
+            .create_human_actor(
+                3001,
+                &RegisterHumanActorRequest {
+                    handle: "alice_list".into(),
+                    display_name: "Alice".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("alice");
+        let bob = store
+            .create_human_actor(
+                3002,
+                &RegisterHumanActorRequest {
+                    handle: "bob_list".into(),
+                    display_name: "Bob".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("bob");
+        let carol = store
+            .create_human_actor(
+                3003,
+                &RegisterHumanActorRequest {
+                    handle: "carol_list".into(),
+                    display_name: "Carol".into(),
+                    bio: None,
+                    location: None,
+                    website: None,
+                    avatar_media_id: None,
+                    banner_media_id: None,
+                    avatar_shape: None,
+                    avatar_color: None,
+                },
+                now,
+            )
+            .expect("carol");
+
+        store
+            .follow_actor(&alice.actor_id, &bob.actor_id, now + 10)
+            .expect("follow bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: bob.actor_id.clone(),
+                    action: MuteBlockActionKind::Mute,
+                    reason: None,
+                },
+                now + 11,
+            )
+            .expect("mute bob");
+        store
+            .set_mute_block(
+                &alice.actor_id,
+                &MuteBlockRequest {
+                    target_kind: MuteBlockTargetKind::Actor,
+                    target_value: carol.actor_id.clone(),
+                    action: MuteBlockActionKind::Block,
+                    reason: None,
+                },
+                now + 12,
+            )
+            .expect("block carol");
+
+        let hydrated = store
+            .list_actors_for_viewer(None, Some(&alice.actor_id), 50)
+            .expect("list_actors_for_viewer");
+        let alice_dto = hydrated.iter().find(|a| a.actor_id == alice.actor_id).expect("alice");
+        assert!(!alice_dto.is_following && !alice_dto.is_muted && !alice_dto.is_blocked);
+        let bob_dto = hydrated.iter().find(|a| a.actor_id == bob.actor_id).expect("bob");
+        assert!(bob_dto.is_following && bob_dto.is_muted && !bob_dto.is_blocked);
+        let carol_dto = hydrated.iter().find(|a| a.actor_id == carol.actor_id).expect("carol");
+        assert!(!carol_dto.is_following && !carol_dto.is_muted && carol_dto.is_blocked);
+
+        // Legacy list_actors signature and behavior remain untouched.
+        let legacy = store.list_actors(None, 50).expect("legacy list_actors");
+        assert!(legacy.iter().all(|a| !a.is_following && !a.is_muted && !a.is_blocked));
     }
 }

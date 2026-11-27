@@ -825,7 +825,7 @@ fn test_ob_f20_live_runtime_bridge_all_15_ui_probes_and_baseline_invariants() {
 
     // Explicit baseline Telegram preservation assertions (TRAPS #1, #2, #3)
     let rail = NavRail::new();
-    assert_eq!(rail.items.len(), 10, "TRAP #1: NavRail::items must remain exactly 10");
+    assert_eq!(rail.items.len(), 13, "TRAP #1: NavRail::items must remain unchanged by OpenBot");
     assert!(rail.items.iter().all(|it| it.unread_badge == 0));
     assert_eq!(nav_destination_for_shortcut_digit("0"), None, "TRAP #2: digit '0' must stay None");
     for (digit, expected) in [
@@ -1023,7 +1023,7 @@ fn body_headless_appshell_and_openbot_fusion(cx: &mut App) {
     });
 
     shell.update(cx, |s, cx| {
-        assert_eq!(s.nav_rail.read(cx).items.len(), 10);
+        assert_eq!(s.nav_rail.read(cx).items.len(), 13);
         assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
 
         // Cmd+0 activates OpenBotWorkspaceShell without touching nav_destination_for_shortcut_digit("0")
@@ -1086,11 +1086,11 @@ fn body_headless_appshell_and_openbot_fusion(cx: &mut App) {
                 .any(|m| m.user_id == agent_did)
         );
 
-        // Cmd+Shift+O toggles back to Telegram Chats with 10-item NavRail intact
+        // Cmd+Shift+O toggles back to Telegram Chats with 13-item NavRail intact
         assert!(s.handle_shortcut_key("o", true, cx));
         assert_eq!(s.active_panel, ActiveWorkspacePanel::Chats);
         assert_eq!(s.nav_rail.read(cx).active_destination, NavDestination::Chats);
-        assert_eq!(s.nav_rail.read(cx).items.len(), 10);
+        assert_eq!(s.nav_rail.read(cx).items.len(), 13);
     });
 }
 

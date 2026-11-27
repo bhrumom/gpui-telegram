@@ -4,6 +4,7 @@ pub mod api_automation_apps;
 pub mod api_chats;
 pub mod api_community;
 pub mod api_computers;
+pub mod api_creations;
 pub mod api_e2ee;
 pub mod api_features;
 pub mod api_miniapps;
@@ -11,12 +12,24 @@ pub mod api_user_vault;
 pub mod hermes_client;
 pub mod http_client;
 pub mod http_helpers;
+pub mod orca_client;
 pub mod proxy;
 pub mod tailnet;
 pub mod ws_channel;
 pub mod ws_transport;
 
 pub use api_chats::SendAsPeerDto;
+pub use api_creations::{BotInlineQueryResponse, BotInlineQueryResultDto};
+pub use gpui_telegram_proto::creations::{
+    AppStoreCatalogResponse, AppStoreMiniAppEntry, BotRecommendationItem, CatalogQueryResponse,
+    CatalogRecommendResponse, CatalogSortMode, CoverArtwork, CreateCreationRequest,
+    CreateCreationReviewRequest, CreationAuditListResponse, CreationKind, CreationListResponse,
+    CreationPayload, CreationReviewAuditDto, CreationReviewEntryDto, CreationReviewStatus,
+    CreationReviewsResponse, CreationSyncResponse, CreationVisibility, GameLeaderboardEntryDto,
+    GameLeaderboardResponse, PublicCatalogItemDto, ReviewDecision, ReviewDecisionRequest,
+    SubmitGameScoreRequest, SubmitReviewRequest, SubmitReviewResponse, UpdateCreationRequest,
+    UpsertCreationStateRequest, UserCreationDto, UserCreationStateDto, UserCreationStatesResponse,
+};
 pub use api_community::{
     CommunityApiError, CommunityAuth, RegisterBotActorResult, COMMUNITY_ACTOR_HEADER,
     HEADER_COMMUNITY_ACTOR_ID,
@@ -128,5 +141,6 @@ pub use gpui_telegram_proto::automation_apps::{
     RecordAutomationRunRequest, RecordAutomationRunResponse, UninstallAutomationAppResponse,
     AUTOMATION_APP_SCHEMA_VERSION_V1,
 };
+pub use orca_client::{OrcaClient, OrcaClientError};
 pub use ws_channel::WsChannel;
 pub use ws_transport::{connect_ws_with_proxy, ConnectionStatus, WsConnectError, WsTransport};

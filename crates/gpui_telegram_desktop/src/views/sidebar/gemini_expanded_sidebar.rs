@@ -18,6 +18,7 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
     _nav: &UnifiedNavSnapshot,
     is_plus_active: bool,
     hovered_item: Option<&'static str>,
+    has_leading_app_sidebar: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -41,7 +42,7 @@ pub fn render_expanded_gemini_top_bar<V: 'static>(
     let on_compose_hover = on_action.clone();
     let on_plus_click = on_action;
 
-    let left_clearance = if cfg!(target_os = "macos") {
+    let left_clearance = if cfg!(target_os = "macos") && !has_leading_app_sidebar {
         76.0
     } else {
         12.0
@@ -401,6 +402,119 @@ fn render_expanded_nav_row<V: 'static>(
         .into_any_element()
 }
 
+/// Renders the prominent Community (Reddit × X) entry pill below the search bar in the expanded sidebar.
+pub fn render_expanded_community_entry_pill<V: 'static>(
+    nav: &UnifiedNavSnapshot,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + 'static,
+) -> AnyElement {
+    let is_active = nav.active_destination == NavDestination::Community;
+    let target = if is_active {
+        NavDestination::Chats
+    } else {
+        NavDestination::Community
+    };
+    let hover_bg = if palette.is_apple_style() {
+        if palette.mode.is_dark() {
+            TdesktopThemePalette::rgba_with_alpha(0xFFFFFF, 0.08)
+        } else {
+            TdesktopThemePalette::rgba_with_alpha(0x000000, 0.05)
+        }
+    } else {
+        rgb(palette.dialogs_hover_bg).into()
+    };
+    let active_bg = TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.16);
+    let fg = if is_active {
+        palette.accent
+    } else {
+        palette.text_primary
+    };
+
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .px(px(10.0))
+        .pb(px(6.0))
+        .child(
+            div()
+                .id("sidebar-nav-community")
+                .cursor_pointer()
+                .w_full()
+                .h(px(36.0))
+                .px(px(11.0))
+                .rounded(px(10.0))
+                .bg(if is_active {
+                    active_bg
+                } else {
+                    palette.card_surface_rgba()
+                })
+                .border_1()
+                .border_color(if is_active {
+                    TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.42)
+                } else {
+                    palette.hairline_border_rgba()
+                })
+                .hover(move |s| if is_active { s } else { s.bg(hover_bg) })
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        on_action(this, UnifiedSidebarAction::SelectDestination(target), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .min_w(px(0.0))
+                        .child(tg_icon(IconName::CommunityGlobe, 16.0, if is_active { palette.accent } else { palette.icon_fg }))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(fg))
+                                .child(tr_str(lang_id, "社区", "Community")),
+                        )
+                        .child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded_full()
+                                .bg(TdesktopThemePalette::rgba_with_alpha(palette.accent, 0.14))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(palette.accent))
+                                .child("Reddit × X"),
+                        ),
+                )
+                .when(nav.community_unread > 0, |el| {
+                    el.child(
+                        div()
+                            .min_w(px(18.0))
+                            .h(px(18.0))
+                            .px(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(palette.unread_badge_bg))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(palette.unread_badge_fg))
+                            .child(format_compact_badge(nav.community_unread)),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
 /// Renders the Gemini-style primary action button, primary navigation pills, and expandable More rows.
 pub fn render_expanded_gemini_nav_section<V: 'static>(
     nav: &UnifiedNavSnapshot,
@@ -421,6 +535,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
             NavDestination::TalkMode
                 | NavDestination::RemoteComputer
                 | NavDestination::Browser
+                | NavDestination::Community
                 | NavDestination::SavedMessages
         );
 
@@ -635,6 +750,17 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
                 UnifiedSidebarAction::SelectDestination(NavDestination::Browser),
             ))
             .child(render_expanded_nav_row(
+                "sidebar-nav-community-more",
+                IconName::CommunityGlobe,
+                tr_str(lang_id, "社区", "Community"),
+                nav.active_destination == NavDestination::Community,
+                nav.community_unread,
+                palette,
+                cx,
+                on_action.clone(),
+                UnifiedSidebarAction::SelectDestination(NavDestination::Community),
+            ))
+            .child(render_expanded_nav_row(
                 "sidebar-nav-saved",
                 IconName::SavedMessages,
                 tr_str(lang_id, "收藏夹", "Saved Messages"),
@@ -664,6 +790,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
 /// left and minimal workspace action icons (Tasks, Remote, Contacts, Calls, Settings) on the right.
 pub fn render_expanded_gemini_footer<V: 'static>(
     nav: &UnifiedNavSnapshot,
+    has_leading_app_sidebar: bool,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -746,6 +873,11 @@ pub fn render_expanded_gemini_footer<V: 'static>(
         NavDestination::Chats
     } else {
         NavDestination::Browser
+    };
+    let community_target = if nav.active_destination == NavDestination::Community {
+        NavDestination::Chats
+    } else {
+        NavDestination::Community
     };
     let settings_target = if nav.active_destination == NavDestination::Settings {
         NavDestination::Chats
@@ -859,6 +991,15 @@ pub fn render_expanded_gemini_footer<V: 'static>(
                     0,
                     UnifiedSidebarAction::SelectDestination(browser_target),
                 ))
+                .when(!has_leading_app_sidebar, |dock| {
+                    dock.child(render_dock_icon_btn(
+                        "top-action-community",
+                        IconName::CommunityGlobe,
+                        nav.active_destination == NavDestination::Community,
+                        nav.community_unread,
+                        UnifiedSidebarAction::SelectDestination(community_target),
+                    ))
+                })
                 .child(render_dock_icon_btn(
                     "top-action-contacts",
                     IconName::ContactsUsers,

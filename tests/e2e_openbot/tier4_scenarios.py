@@ -249,6 +249,19 @@ def test_t4_scenario_01_engineering_sprint_channel_delegation_and_loop_recovery(
     )
     assert require_field(rep, "reply_message_id", expected_type=str).startswith("channel-reply-")
     assert require_field(rep, "is_reply_task", expected_type=bool) is True
+    reply_tid = require_field(rep, "reply_task_id", "task.id", expected_type=str)
+    env.run_cli_json(
+        "channel",
+        "result",
+        "--channel-id",
+        cid,
+        "--task-id",
+        reply_tid,
+        "--agent-id",
+        backend,
+        "--text",
+        "Confirmed: PRAGMA synchronous=NORMAL was active.",
+    )
 
     env.run_cli_json(
         "channel",

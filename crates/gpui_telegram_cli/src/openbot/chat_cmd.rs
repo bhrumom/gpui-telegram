@@ -332,13 +332,19 @@ pub fn run_chat(action: &str, flags: &ParsedFlags, data_dir: &Path) -> Result<Va
             to_json_val(out, "queue-resume")
         }
         "queue-steer" => {
+            let agent_id = flags.require("--agent-id")?.to_string();
             let input = QueueSteerInput {
-                agent_id: flags.require("--agent-id")?.to_string(),
+                agent_id: agent_id.clone(),
                 delivery_id: flags.require("--delivery-id")?.to_string(),
                 expected_turn_id: flags.require("--expected-turn-id")?.to_string(),
                 routine_turn: flags.has("--routine-turn"),
             };
             let out = sched.queue_steer(input).map_err(map_runtime_error)?;
+            if out.steered {
+                sched
+                    .complete_active_turn(&agent_id, &out.turn_id)
+                    .map_err(map_runtime_error)?;
+            }
             to_json_val(out, "queue-steer")
         }
         "branch" => {

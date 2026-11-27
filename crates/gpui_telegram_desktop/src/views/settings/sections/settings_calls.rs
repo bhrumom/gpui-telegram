@@ -53,6 +53,12 @@ impl SettingsCallsSections {
 
     pub fn new_live(palette: TdesktopThemePalette, language_id: &str) -> Self {
         let mut s = Self::new();
+        s.input_device = String::new();
+        s.output_device = String::new();
+        s.camera_device = String::new();
+        s.available_inputs.clear();
+        s.available_outputs.clear();
+        s.available_cameras.clear();
         s.palette = palette;
         s.language_id = language_id.into();
         s.is_visible = true;

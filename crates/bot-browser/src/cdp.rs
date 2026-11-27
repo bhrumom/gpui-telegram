@@ -1501,7 +1501,7 @@ fn extract_eval_value(res: &Value) -> Option<&Value> {
         .or_else(|| res.get("value"))
 }
 
-fn parse_eval_json<T: for<'de> Deserialize<'de>>(
+pub(crate) fn parse_eval_json<T: for<'de> Deserialize<'de>>(
     res: &Value,
     op_name: &str,
 ) -> Result<T, BotBrowserError> {
@@ -1517,7 +1517,7 @@ fn parse_eval_json<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn decode_screenshot_png(res: &Value) -> Result<Vec<u8>, BotBrowserError> {
+pub(crate) fn decode_screenshot_png(res: &Value) -> Result<Vec<u8>, BotBrowserError> {
     let b64 = res
         .get("data")
         .and_then(|v| v.as_str())
@@ -1530,7 +1530,7 @@ fn decode_screenshot_png(res: &Value) -> Result<Vec<u8>, BotBrowserError> {
         .map_err(|e| BotBrowserError::Cdp(format!("invalid screenshot base64: {e}")))
 }
 
-fn crop_element_png_if_needed(
+pub(crate) fn crop_element_png_if_needed(
     raw_png: Vec<u8>,
     rect: &ElementRect,
     viewport_width: f64,

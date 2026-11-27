@@ -87,20 +87,32 @@ jobs:
           cargo nextest run --profile ci \
             -p gpui_telegram_core \
             -p gpui_telegram_proto \
+            -p openbot_contracts \
+            -p openbot_storage \
+            -p openbot_runtime \
+            -p orca_core \
+            -p orca_bots \
+            -p orca_ide \
             -p fabushi_remote_engine \
             -p gpui_telegram_server \
             -p gpui_telegram_client \
             -p gpui_telegram_cli \
             --lib
           cargo nextest run --profile ci \
+            -p gpui_telegram_community --features storage \
+            --lib
+          cargo nextest run --profile ci \
             -p fabushi_remote_daemon --bins \
             -p fabushi_remote_engine --test engine_tests \
+            -p openbot_contracts --test avatar_and_providers --test conversation_queue_and_ui_blocks --test cross_language_golden_vectors --test tags_mentions_and_channels --test voice_island_ipc_and_team_protocol --test workflows_routines_and_crm \
+            -p openbot_storage --test storage_integration_smoke \
+            -p openbot_runtime --test m3_runtime_integration_tests --test m4_platform_tests \
             -p gpui_telegram_proto --test proto_tests --test api_rpc_endpoints_tests \
-            -p gpui_telegram_agent --test hermes_engine_tests \
-            -p gpui_telegram_server --test db_pts_messaging_tests --test server_routes_auth_tests --test hermes_gateway_and_bot_bugfix_tests --test mcp_oauth_official_mcp_remote_assist_tests \
-            -p gpui_telegram_client --test auth_client_tests \
-            -p gpui_telegram_cli --test cli_integration_tests \
-            -p gpui_telegram_desktop --test tdesktop_full_parity_integration_tests --test desktop_views_tests --test hermes_desktop_bugfix_tests --test remote_control_ui_tests
+            -p gpui_telegram_agent --test hermes_engine_tests --test community_tools_tests \
+            -p gpui_telegram_server --test db_pts_messaging_tests --test server_routes_auth_tests --test hermes_gateway_and_bot_bugfix_tests --test mcp_oauth_official_mcp_remote_assist_tests --test community_rest_auth_media_tests --test community_bot_api_hermes_ws_tests \
+            -p gpui_telegram_client --test auth_client_tests --test community_client_tests \
+            -p gpui_telegram_cli --test cli_integration_tests --test openbot_cli_tests \
+            -p gpui_telegram_desktop --test tdesktop_full_parity_integration_tests --test desktop_views_tests --test hermes_desktop_bugfix_tests --test remote_control_ui_tests --test community_shell_feed_tests --test community_views_full_tests --test openbot_avatar_theme_tests --test openbot_ui_fusion_tests --test orca_desktop_m5_tests
           cargo check --workspace --lib --bins
       - name: Report sccache Hit Statistics & Clean Temp Garbage
         run: |
@@ -131,6 +143,12 @@ jobs:
           cargo nextest run --profile ci \
             -p gpui_telegram_core \
             -p gpui_telegram_proto \
+            -p openbot_contracts \
+            -p openbot_storage \
+            -p openbot_runtime \
+            -p orca_core \
+            -p orca_bots \
+            -p orca_ide \
             -p fabushi_remote_engine \
             -p gpui_telegram_media \
             -p gpui_telegram_webrtc \
@@ -140,14 +158,20 @@ jobs:
             -p gpui_telegram_cli \
             --lib
           cargo nextest run --profile ci \
+            -p gpui_telegram_community --features storage \
+            --lib
+          cargo nextest run --profile ci \
             -p fabushi_remote_daemon --bins \
             -p fabushi_remote_engine --test engine_tests \
+            -p openbot_contracts --test avatar_and_providers --test conversation_queue_and_ui_blocks --test cross_language_golden_vectors --test tags_mentions_and_channels --test voice_island_ipc_and_team_protocol --test workflows_routines_and_crm \
+            -p openbot_storage --test storage_integration_smoke \
+            -p openbot_runtime --test m3_runtime_integration_tests --test m4_platform_tests \
             -p gpui_telegram_proto --test proto_tests --test api_rpc_endpoints_tests \
             -p gpui_telegram_media --test waveform_5bit_codec_roundtrip \
-            -p gpui_telegram_agent --test agent_runtime_tests --test mcp_cua_talk_tests --test hermes_engine_tests \
-            -p gpui_telegram_server --test db_pts_messaging_tests --test server_routes_auth_tests --test hermes_gateway_and_bot_bugfix_tests --test mcp_oauth_official_mcp_remote_assist_tests \
-            -p gpui_telegram_client --test auth_client_tests \
-            -p gpui_telegram_cli --test cli_integration_tests \
+            -p gpui_telegram_agent --test agent_runtime_tests --test mcp_cua_talk_tests --test hermes_engine_tests --test community_tools_tests \
+            -p gpui_telegram_server --test db_pts_messaging_tests --test server_routes_auth_tests --test hermes_gateway_and_bot_bugfix_tests --test mcp_oauth_official_mcp_remote_assist_tests --test community_rest_auth_media_tests --test community_bot_api_hermes_ws_tests \
+            -p gpui_telegram_client --test auth_client_tests --test community_client_tests \
+            -p gpui_telegram_cli --test cli_integration_tests --test openbot_cli_tests \
             -p gpui_telegram_desktop \
               --test tdesktop_full_parity_integration_tests \
               --test desktop_views_tests \
@@ -157,7 +181,12 @@ jobs:
               --test dialogs_widget_subsystem_tests \
               --test window_themes_subsystem_tests \
               --test milestone_1_nav_calls_regression_tests \
-              --test milestone_3_settings_regression_tests
+              --test milestone_3_settings_regression_tests \
+              --test community_shell_feed_tests \
+              --test community_views_full_tests \
+              --test openbot_avatar_theme_tests \
+              --test openbot_ui_fusion_tests \
+              --test orca_desktop_m5_tests
           cargo check --workspace --lib --bins
           cargo build --profile ci --bin gpui_telegram_desktop --bin fabushi --bin fabushi-remote-daemon
       - uses: actions/upload-artifact@v4
@@ -195,6 +224,9 @@ jobs:
           cargo check --workspace --lib --bins
           cargo test --profile ci -p fabushi_remote_engine --test engine_tests
           cargo test --profile ci -p gpui_telegram_client --lib config::tests
+          cargo test --profile ci -p gpui_telegram_community --features sqlite --lib
+          cargo test --profile ci -p openbot_contracts --lib
+          cargo test --profile ci -p orca_core --lib
           cargo build --profile ci --bin gpui_telegram_desktop --bin fabushi --bin fabushi-remote-daemon
       - name: Clean Temp Garbage
         shell: bash

@@ -109,10 +109,31 @@ pub fn trigram_jaccard_similarity(a: &str, b: &str) -> f32 {
     }
 }
 
+fn compile_automod_regex(pat: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    RegexBuilder::new(pat)
+        .case_insensitive(true)
+        .size_limit(MAX_REGEX_SIZE_BYTES)
+        .dfa_size_limit(MAX_REGEX_SIZE_BYTES)
+        .build()
+}
+
 /// Declarative per-community AutoMod evaluator.
 pub struct AutoModEngine;
 
 impl AutoModEngine {
+    /// Validates an AutoMod regex pattern with the exact [`RegexBuilder`] configuration
+    /// (`case_insensitive(true)`, `size_limit = 64 KiB`, `dfa_size_limit = 64 KiB`) used by
+    /// [`Self::evaluate_with_context`]. Empty or whitespace-only patterns return `Ok(())`.
+    pub fn validate_regex(pattern: &str) -> std::result::Result<(), String> {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        compile_automod_regex(trimmed)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     /// Evaluates AutoMod rules against an actor's submission using current UTC timestamp.
     pub fn evaluate(
         rules: &[AutoModRuleDto],
@@ -178,12 +199,7 @@ impl AutoModEngine {
 
             // 2. Bounded ReDoS-safe regex match
             if let Some(pat) = rule.regex_pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-                match RegexBuilder::new(pat)
-                    .case_insensitive(true)
-                    .size_limit(MAX_REGEX_SIZE_BYTES)
-                    .dfa_size_limit(MAX_REGEX_SIZE_BYTES)
-                    .build()
-                {
+                match compile_automod_regex(pat) {
                     Ok(re) => {
                         if re.is_match(&combined) {
                             rule_reasons.push(format!("matched regex '{}'", rule.name));
@@ -617,5 +633,93 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    #[test]
+    fn automod_validate_regex_matches_engine_builder_parity() {
+        // Empty / whitespace-only patterns are always accepted (no regex condition).
+        for empty in ["", "   ", "\t\n"] {
+            assert!(
+                AutoModEngine::validate_regex(empty).is_ok(),
+                "empty/whitespace pattern {empty:?} must be accepted"
+            );
+        }
+
+        // Valid syntax, Unicode/dot/bracket capture group names, and within-64-KiB patterns.
+        let valid_cases = [
+            "(spam|airdrop)\\s+free",
+            "(?i)(?:scam|phish){1,3}?",
+            "(?<标签>测试)",
+            "(?<α>x)",
+            "(?P<α>x)",
+            "(?<a.b>x)",
+            "(?P<a.b>x)",
+            "(?<a[0]>x)",
+            "(?P<a[0]>x)",
+            "(?:a|b){400}",
+            "(?:a|b){600}",
+            "(?:a|b){800}",
+            "(a{10000}){0}",
+            "(\\d{100}){0}",
+            "\\p{Latin}{20}",
+            "\\[SPAM]",
+            "\\b{start}foo\\b{end}",
+            "a{1,2}??",
+        ];
+        for pat in valid_cases {
+            assert!(
+                AutoModEngine::validate_regex(pat).is_ok(),
+                "expected valid AutoMod regex `{pat}` to be accepted, got: {:?}",
+                AutoModEngine::validate_regex(pat)
+            );
+            assert!(
+                compile_automod_regex(pat.trim()).is_ok(),
+                "differential check: compile_automod_regex(`{pat}`) must agree"
+            );
+        }
+
+        // Invalid syntax and 64 KiB NFA/DFA overflow patterns (must be rejected).
+        let invalid_cases = [
+            "[a-z]{250}",
+            "[a-z]{300}",
+            "[a-z]{400}",
+            "[a-z0-9_-]{350}",
+            "[a-z0-9._%+-]{350}",
+            "((a{10}){10}){10}",
+            "(?-u:\\xff)",
+            "\\p{NotARealProperty}",
+            "\\字",
+            "(unclosed",
+            "[unclosed",
+            "[z-a]",
+            "(?P<1bad>foo)",
+        ];
+        for pat in invalid_cases {
+            assert!(
+                AutoModEngine::validate_regex(pat).is_err(),
+                "expected invalid/oversized AutoMod regex `{pat}` to be rejected"
+            );
+            assert!(
+                compile_automod_regex(pat.trim()).is_err(),
+                "differential check: compile_automod_regex(`{pat}`) must agree"
+            );
+        }
+
+        // End-to-end evaluation proof for bilingual Unicode named capture group rule.
+        let now = 1_760_000_000_000_i64;
+        let user = actor(ActorKind::Human, 100, now - 86_400_000);
+        let mut r = base_rule("r_unicode_cap", AutoModActionKind::FlagForReview);
+        r.regex_pattern = Some("(?<标签>测试)".into());
+        let decision = AutoModEngine::evaluate_with_context(
+            &[r],
+            &user,
+            None,
+            "这是一段测试文本",
+            now,
+            &[],
+            Some("rust"),
+        );
+        assert_eq!(decision.action, AutoModActionKind::FlagForReview);
+        assert_eq!(decision.matched_rule_ids, vec!["r_unicode_cap".to_string()]);
     }
 }

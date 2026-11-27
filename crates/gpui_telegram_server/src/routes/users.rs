@@ -485,6 +485,15 @@ pub async fn contacts_add_or_upsert(
                     &text,
                     kb,
                 );
+            } else if target_uid.0 == gpui_telegram_proto::CREATOR_STUDIO_BOT_USER_ID as u64 {
+                let reply = crate::routes::creator_bot::build_creator_studio_welcome_reply();
+                let _ = crate::routes::creator_bot::send_creator_bot_reply_in_topic(
+                    &state,
+                    bot_cid,
+                    target_uid,
+                    reply,
+                    None,
+                );
             } else {
                 let bot_apps: Vec<_> = state
                     .db

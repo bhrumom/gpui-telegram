@@ -27,6 +27,7 @@ fn test_state(dir: &TempDir, db_name: &str) -> (Arc<AppState>, Router) {
     let mut cfg = ServerConfig::default();
     cfg.database_url = dir.path().join(db_name).display().to_string();
     cfg.media_storage_path = dir.path().join("media").display().to_string();
+    cfg.allow_deterministic_bot_fallback = true;
     let state = Arc::new(AppState::try_new(cfg).expect("AppState::try_new"));
     let router = build_router_with_state(state.clone());
     (state, router)

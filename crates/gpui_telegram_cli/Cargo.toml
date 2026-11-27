@@ -19,6 +19,7 @@ path = "src/bin/gpui-telegram-cli.rs"
 [dependencies]
 gpui_telegram_core = { workspace = true }
 gpui_telegram_proto = { workspace = true }
+orca_core = { workspace = true }
 fabushi_remote_engine = { workspace = true }
 openbot_contracts = { workspace = true }
 openbot_storage = { workspace = true }

@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "bot-browser"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "aes",
  "argon2",
@@ -986,6 +986,7 @@ dependencies = [
  "hmac",
  "image",
  "keyring",
+ "orca_core",
  "parking_lot",
  "pbkdf2",
  "reqwest",
@@ -2118,7 +2119,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_magpie_gateway"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2142,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "e2e_suite"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2156,6 +2157,7 @@ dependencies = [
  "gpui",
  "gpui_telegram_agent",
  "gpui_telegram_client",
+ "gpui_telegram_community",
  "gpui_telegram_core",
  "gpui_telegram_desktop",
  "gpui_telegram_media",
@@ -2491,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_daemon"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2508,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_engine"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3350,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_agent"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3387,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_cli"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3401,6 +3403,7 @@ dependencies = [
  "openbot_contracts",
  "openbot_runtime",
  "openbot_storage",
+ "orca_core",
  "reqwest",
  "serde",
  "serde_json",
@@ -3415,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_client"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "aes",
  "argon2",
@@ -3439,6 +3442,7 @@ dependencies = [
  "mahayana-host-runtime",
  "mahayana-node-agent-coordinator",
  "md-5",
+ "orca_core",
  "parking_lot",
  "pbkdf2",
  "reqwest",
@@ -3460,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_coding"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3479,7 +3483,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_community"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "chrono",
  "gpui_telegram_core",
@@ -3499,7 +3503,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_core"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "aes",
  "cbc",
@@ -3521,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_desktop"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "base64 0.22.1",
  "bot-browser",
@@ -3534,6 +3538,7 @@ dependencies = [
  "gpui_telegram_agent",
  "gpui_telegram_client",
  "gpui_telegram_coding",
+ "gpui_telegram_community",
  "gpui_telegram_core",
  "gpui_telegram_media",
  "gpui_telegram_proto",
@@ -3546,6 +3551,9 @@ dependencies = [
  "openbot_contracts",
  "openbot_runtime",
  "openbot_storage",
+ "orca_bots",
+ "orca_core",
+ "orca_ide",
  "parking_lot",
  "qrcode",
  "raw-window-handle",
@@ -3562,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_media"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "chrono",
  "fabushi-messaging-core",
@@ -3578,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_proto"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3586,6 +3594,7 @@ dependencies = [
  "gpui_telegram_core",
  "mahayana-host-runtime",
  "mahayana-node-agent-coordinator",
+ "orca_core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3594,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_server"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3620,6 +3629,9 @@ dependencies = [
  "magpie_gateway",
  "mahayana-host-runtime",
  "mahayana-node-agent-coordinator",
+ "orca_bots",
+ "orca_core",
+ "orca_ide",
  "parking_lot",
  "reqwest",
  "rusqlite",
@@ -3645,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_test_harness"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3675,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_webrtc"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4747,7 +4759,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magpie_gateway"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5754,7 +5766,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_contracts"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5775,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_runtime"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5820,7 +5832,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_storage"
-version = "1.6.15"
+version = "1.7.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5846,6 +5858,87 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orca_bots"
+version = "1.7.1"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "http",
+ "orca_core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "orca_core"
+version = "1.7.1"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "url",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "orca_ide"
+version = "1.7.1"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "getrandom 0.2.17",
+ "hex",
+ "http",
+ "orca_bots",
+ "orca_core",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "zeroize",
+]
 
 [[package]]
 name = "ordered-stream"

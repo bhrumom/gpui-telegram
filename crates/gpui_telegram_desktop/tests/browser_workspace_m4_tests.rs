@@ -5691,17 +5691,20 @@ async fn body_regression_shell_blockers_overlay_ime_and_hostile_invariants(mut a
             window.dispatch_keystroke(Keystroke::parse(shortcut).unwrap(), cx);
             {
                 let s = shell_ent.read(cx);
-                assert!(s.modal_container.read(cx).is_modal_active());
+                let overlay_open =
+                    s.modal_container.read(cx).is_modal_active() || s.orca_jump_palette.is_some();
+                assert!(overlay_open, "{shortcut} must open overlay/modal");
                 assert_eq!(
                     s.active_text_and_preedit(cx).1,
                     None,
-                    "{shortcut} modal must not inherit browser IME preedit"
+                    "{shortcut} overlay must not inherit browser IME preedit"
                 );
             }
             window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+            let s = shell_ent.read(cx);
             assert!(
-                !shell_ent.read(cx).modal_container.read(cx).is_modal_active(),
-                "Single Esc must close {shortcut} modal"
+                !s.modal_container.read(cx).is_modal_active() && s.orca_jump_palette.is_none(),
+                "Single Esc must close {shortcut} overlay"
             );
         })
         .unwrap();

@@ -51,7 +51,9 @@ pub mod ops {
         get_feed_conn, get_trending_conn, list_lists_conn, list_notifications_conn,
         mark_notifications_read_tx, put_algo_prefs_tx, record_signal_tx, update_list_tx,
     };
-    pub use super::{apply_migrations_conn, apply_pragmas_conn, seed_if_empty_tx};
+    pub use super::{
+        apply_migrations_conn, apply_pragmas_conn, purge_starter_seed_data_tx, seed_if_empty_tx,
+    };
 }
 
 /// Applies production WAL + foreign_keys + busy_timeout pragmas on a SQLite connection.
@@ -170,10 +172,211 @@ impl CommunityStore {
         }
     }
 
-    /// Idempotently populates the starter dataset if `communities` is empty.
+    /// Idempotently populates the starter dataset if `communities` is empty (test fixture helper).
     pub fn seed_if_empty(&self, now_ms: i64) -> Result<bool> {
         self.with_transaction(|tx| seed_if_empty_tx(tx, now_ms))
     }
+
+    /// Idempotently purges all legacy starter seed rows (`seed_*` IDs and synthetic seed actors
+    /// `u:900001..=u:900007`, `b:910001..=b:910007`) while preserving 100% of real user data.
+    pub fn purge_starter_seed_data(&self) -> Result<usize> {
+        self.with_transaction(purge_starter_seed_data_tx)
+    }
+}
+
+/// Starter seed actor IDs previously created by `seed_if_empty_tx`.
+const STARTER_SEED_ACTORS_SQL: &str = "('u:900001','u:900002','u:900003','u:900004','u:900005','u:900006','u:900007','b:910001','b:910002','b:910003','b:910004','b:910005','b:910006','b:910007')";
+
+/// Idempotently removes all legacy starter seed data in strict reverse-FK order while keeping
+/// all real user-created actors, communities, posts, comments, lists, and notifications intact.
+pub fn purge_starter_seed_data_tx(tx: &Transaction<'_>) -> Result<usize> {
+    let mut removed = 0usize;
+
+    let run = |sql: &str, label: &str| -> Result<usize> {
+        tx.execute(sql, []).map_err(|e| db_err(label, e))
+    };
+
+    // Child tables referencing seed actors, seed communities, seed posts, or seed comments
+    removed += run(
+        &format!("DELETE FROM community_bot_cooldowns WHERE bot_actor_id IN {STARTER_SEED_ACTORS_SQL}"),
+        "purge seed bot cooldowns",
+    )?;
+    removed += run(
+        &format!("DELETE FROM community_algo_prefs WHERE actor_id IN {STARTER_SEED_ACTORS_SQL}"),
+        "purge seed algo prefs",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_actor_affinities WHERE viewer_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR (target_kind = 'author' AND target_key IN {STARTER_SEED_ACTORS_SQL})
+             OR (target_kind = 'community' AND target_key LIKE 'seed_comm_%')"
+        ),
+        "purge seed affinities",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_user_signals WHERE actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR post_id LIKE 'seed_post_%' OR community_id LIKE 'seed_comm_%'
+             OR target_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed signals",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_mod_logs WHERE log_id LIKE 'seed_modlog_%'
+             OR community_id LIKE 'seed_comm_%' OR mod_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR target_id LIKE 'seed_post_%' OR target_id LIKE 'seed_comment_%'"
+        ),
+        "purge seed mod logs",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_mod_queue WHERE item_id LIKE 'seed_modq_%'
+             OR community_id LIKE 'seed_comm_%' OR target_id LIKE 'seed_post_%'
+             OR target_id LIKE 'seed_comment_%'"
+        ),
+        "purge seed mod queue",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_notifications WHERE notif_id LIKE 'seed_notif_%'
+             OR recipient_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR target_post_id LIKE 'seed_post_%'
+             OR target_comment_id LIKE 'seed_comment_%'"
+        ),
+        "purge seed notifications",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_lists WHERE list_id LIKE 'seed_list_%'
+             OR owner_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed lists",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_awards WHERE award_id LIKE 'seed_award_%'
+             OR giver_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR recipient_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR target_id LIKE 'seed_post_%'
+             OR target_id LIKE 'seed_comment_%'"
+        ),
+        "purge seed awards",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_poll_votes WHERE post_id LIKE 'seed_post_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed poll votes",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_bookmarks WHERE post_id LIKE 'seed_post_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed bookmarks",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_reposts WHERE original_post_id LIKE 'seed_post_%'
+             OR repost_post_id LIKE 'seed_post_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed reposts",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_likes WHERE target_id LIKE 'seed_post_%'
+             OR target_id LIKE 'seed_comment_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed likes",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_votes WHERE target_id LIKE 'seed_post_%'
+             OR target_id LIKE 'seed_comment_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed votes",
+    )?;
+    // Break self-FK links on comments being removed before deleting them
+    let _ = run(
+        &format!(
+            "UPDATE community_comments SET parent_comment_id = NULL
+             WHERE comment_id LIKE 'seed_comment_%'
+             OR post_id LIKE 'seed_post_%'
+             OR author_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR parent_comment_id LIKE 'seed_comment_%'"
+        ),
+        "unlink seed comment parents",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_comments WHERE comment_id LIKE 'seed_comment_%'
+             OR post_id LIKE 'seed_post_%'
+             OR author_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed comments",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_post_edits WHERE post_id LIKE 'seed_post_%'
+             OR editor_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed post edits",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_posts WHERE post_id LIKE 'seed_post_%'
+             OR author_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed posts",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_wiki_revisions WHERE community_id LIKE 'seed_comm_%'
+             OR editor_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed wiki revisions",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_memberships WHERE community_id LIKE 'seed_comm_%'
+             OR actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed memberships",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM communities WHERE community_id LIKE 'seed_comm_%'
+             OR creator_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed communities",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_mutes_blocks WHERE owner_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR (target_kind = 'actor' AND target_value IN {STARTER_SEED_ACTORS_SQL})
+             OR (target_kind = 'community' AND target_value LIKE 'seed_comm_%')"
+        ),
+        "purge seed mutes blocks",
+    )?;
+    removed += run(
+        &format!(
+            "DELETE FROM community_follows WHERE follower_actor_id IN {STARTER_SEED_ACTORS_SQL}
+             OR target_actor_id IN {STARTER_SEED_ACTORS_SQL}"
+        ),
+        "purge seed follows",
+    )?;
+    removed += run(
+        &format!("DELETE FROM community_actors WHERE actor_id IN {STARTER_SEED_ACTORS_SQL}"),
+        "purge seed actors",
+    )?;
+
+    Ok(removed)
 }
 
 /// Seeds the starter dataset atomically inside `tx` if no communities exist yet.

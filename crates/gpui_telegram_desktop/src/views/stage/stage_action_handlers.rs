@@ -104,10 +104,15 @@ impl ConversationStage {
         }
     }
 
+    pub fn focus_search(&mut self) {
+        self.search_open = true;
+        self.search_focus_seq = self.search_focus_seq.wrapping_add(1);
+    }
+
     pub(crate) fn handle_stage_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         if ks.modifiers.platform && ks.key == "f" && self.active_chat_id.is_some() {
-            self.search_open = true;
+            self.focus_search();
             cx.notify();
             return;
         }
@@ -168,11 +173,14 @@ impl ConversationStage {
                 self.more_menu_open = false;
                 self.ttl_submenu_open = false;
                 self.search_open = !self.search_open;
-                if !self.search_open {
+                if self.search_open {
+                    self.search_focus_seq = self.search_focus_seq.wrapping_add(1);
+                } else {
                     self.search_query.clear();
                     self.search_match_ids.clear();
                 }
             }
+            TopBarUiAction::FocusSearch => self.focus_search(),
             TopBarUiAction::SearchStep(delta) => self.step_search_match(delta),
             TopBarUiAction::SearchClear => {
                 self.search_open = false;
@@ -764,13 +772,13 @@ impl ConversationStage {
                 self.pending_download_url = Some((url, file_name));
             }
             BubbleUiAction::OpenContact(uid) => self.pending_open_profile_peer_id = Some(uid),
-            BubbleUiAction::OpenWebUrl(url) => self.pending_media_url = Some((url, false)),
+            BubbleUiAction::OpenWebUrl(url) => self.pending_open_url = Some(url),
             BubbleUiAction::OpenInstantView(url, title) => self.pending_iv_url = Some((url, title)),
         }
         cx.notify();
     }
 
-    fn handle_rich_text_action(&mut self, action: RichTextAction, cx: &mut Context<Self>) {
+    pub fn handle_rich_text_action(&mut self, action: RichTextAction, cx: &mut Context<Self>) {
         match action {
             RichTextAction::ToggleSpoiler(msg_id, idx) => {
                 if !self.revealed_spoilers.insert((msg_id, idx)) {
@@ -787,7 +795,10 @@ impl ConversationStage {
                 let msg = tr_key_or(&self.lang_id, "lng_copied_to_clipboard", "Code copied").to_string();
                 self.show_toast_banner(msg, cx);
             }
-            RichTextAction::OpenUrl(url) => self.pending_media_url = Some((url, false)),
+            RichTextAction::OpenUrl(url) => {
+                self.pending_open_url = Some(url);
+                cx.notify();
+            }
             RichTextAction::ClickMention(m) | RichTextAction::ClickHashtag(m) | RichTextAction::ClickBotCommand(m) => {
                 self.pending_bot_action = Some(m);
             }
