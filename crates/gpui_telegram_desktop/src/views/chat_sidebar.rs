@@ -359,6 +359,7 @@ pub struct ChatSidebar {
     pub bot_ids: std::collections::HashSet<u64>,
     pub bot_fabushi_visuals: std::collections::HashMap<u64, (String, u32)>,
     pub bot_grok_avatars: std::collections::HashMap<u64, BotGrokAvatarVisual>,
+    pub bot_execution_states: std::collections::HashMap<u64, String>,
     pub contact_chat_ids: std::collections::HashSet<u64>,
     pub group_chat_ids: std::collections::HashSet<u64>,
     pub channel_chat_ids: std::collections::HashSet<u64>,
@@ -488,6 +489,7 @@ impl ChatSidebar {
             bot_ids: std::collections::HashSet::new(),
             bot_fabushi_visuals: std::collections::HashMap::new(),
             bot_grok_avatars: std::collections::HashMap::new(),
+            bot_execution_states: std::collections::HashMap::new(),
             contact_chat_ids: std::collections::HashSet::new(),
             group_chat_ids: std::collections::HashSet::new(),
             channel_chat_ids: std::collections::HashSet::new(),
@@ -919,6 +921,7 @@ impl ChatSidebar {
         self.has_synced_dialogs = false;
         self.bot_fabushi_visuals.clear();
         self.bot_grok_avatars.clear();
+        self.bot_execution_states.clear();
         self.saved_messages_id = None;
         self.media_badges.clear();
         self.forum_topics.clear();
@@ -1089,9 +1092,42 @@ impl ChatSidebar {
 
     pub fn select_dialog_from_user(&mut self, id: u64) {
         self.select_dialog(id);
+        if self
+            .bot_execution_states
+            .get(&id)
+            .is_some_and(|st| matches!(st.as_str(), "responded" | "done" | "completed"))
+        {
+            self.bot_execution_states.remove(&id);
+        }
+        if let Some(g) = self.bot_grok_avatars.get_mut(&id) {
+            if matches!(
+                g.execution_state.trim().to_ascii_lowercase().as_str(),
+                "responded" | "done" | "completed"
+            ) {
+                g.execution_state = "idle".to_string();
+            }
+        }
         if self.active_chat_id == Some(id) {
             self.cancel_compose_mode();
             self.selection_revision = self.selection_revision.wrapping_add(1);
+        }
+    }
+
+    /// Synchronizes live bot execution state (`"working"`, `"searching"`, `"failed"`,
+    /// `"responded"`, `"waiting"`, `"idle"`, etc.) onto the sidebar so avatars animate
+    /// working faces, failed shakes, responded smiles, and the 3-ball felt badge 1:1 with OpenBot.
+    pub fn set_bot_execution_state(&mut self, chat_id: u64, state: &str) {
+        let norm = state.trim().to_ascii_lowercase();
+        if norm.is_empty() || norm == "idle" {
+            self.bot_execution_states.remove(&chat_id);
+            if let Some(g) = self.bot_grok_avatars.get_mut(&chat_id) {
+                g.execution_state = "idle".to_string();
+            }
+        } else {
+            self.bot_execution_states.insert(chat_id, norm.clone());
+            if let Some(g) = self.bot_grok_avatars.get_mut(&chat_id) {
+                g.execution_state = norm;
+            }
         }
     }
 

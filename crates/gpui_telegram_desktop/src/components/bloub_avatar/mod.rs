@@ -15,6 +15,7 @@ pub mod clusters_and_editor;
 pub mod crew_pile;
 pub mod eyefit;
 pub mod image_normalizer;
+pub mod live_avatar;
 pub mod mascots_and_logo;
 pub mod plush_felt;
 pub mod silhouettes;
@@ -49,13 +50,14 @@ pub use clusters_and_editor::{
     WorkingBadgeLayoutSnapshot, channel_activity_sentence, channel_icon_glyph,
     channel_icon_tile_colors, compute_working_badge_layout, known_channel_icon,
     render_agent_avatar, render_agent_flat_svg, render_avatar_editor_popover,
-    render_channel_avatar, render_channel_icon_tile, render_felt_status_badge,
-    render_sidebar_felt_badge, resolve_channel_cluster, resolve_channel_cluster_sized,
-    sidebar_plush_ring_svg_defs, working_ball_hop_sample,
+    render_channel_avatar, render_channel_avatar_with_hover, render_channel_icon_tile,
+    render_felt_status_badge, render_sidebar_felt_badge, resolve_channel_cluster,
+    resolve_channel_cluster_sized, sidebar_plush_ring_svg_defs, working_ball_hop_sample,
 };
 pub use crew_pile::*;
 pub use eyefit::*;
 pub use image_normalizer::*;
+pub use live_avatar::*;
 pub use mascots_and_logo::*;
 pub use plush_felt::*;
 pub use silhouettes::*;

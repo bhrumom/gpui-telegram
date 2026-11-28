@@ -975,6 +975,7 @@ impl AppShell {
                         TypingAction::Cancel => {
                             self.sidebar.update(cx, |sb, sb_cx| {
                                 sb.set_typing(target_chat_u64, None);
+                                sb.set_bot_execution_state(target_chat_u64, "idle");
                                 sb_cx.notify();
                             });
                             self.stage.update(cx, |st, st_cx| {
@@ -1002,6 +1003,9 @@ impl AppShell {
                                 );
                                 self.sidebar.update(cx, |sb, sb_cx| {
                                     sb.set_typing(target_chat_u64, indicator.clone());
+                                    if sb.bot_ids.contains(&target_chat_u64) {
+                                        sb.set_bot_execution_state(target_chat_u64, "working");
+                                    }
                                     sb_cx.notify();
                                 });
                                 self.stage.update(cx, |st, st_cx| {
@@ -1488,6 +1492,7 @@ impl AppShell {
                     self.sidebar.update(cx, |sb, sb_cx| {
                         if !is_group_or_channel {
                             sb.bot_ids.insert(target_chat_u64);
+                            sb.set_bot_execution_state(target_chat_u64, &state);
                         }
                         sb.set_typing(target_chat_u64, sidebar_indicator);
                         sb_cx.notify();
@@ -1784,6 +1789,12 @@ impl AppShell {
         self.sidebar.update(cx, |sb, sb_cx| {
             if !is_outgoing {
                 sb.set_typing(chat_u64, None);
+                if is_bot_chat {
+                    sb.set_bot_execution_state(
+                        chat_u64,
+                        if is_current_chat { "idle" } else { "responded" },
+                    );
+                }
             }
             if let Some(dialog) = sb.dialogs.iter_mut().find(|d| d.id == chat_u64) {
                 dialog.last_message = sb_preview_for_dialog;

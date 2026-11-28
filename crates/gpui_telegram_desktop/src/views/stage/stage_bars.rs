@@ -6,9 +6,7 @@ use gpui_telegram_proto::miniapp_contracts::{
     resolve_grok_persona_color, resolve_grok_persona_shape, FabushiBotSummaryDto,
 };
 
-use crate::components::avatar::{
-    render_channel_avatar, ChannelAgentBrief, ChannelAvatarLayout,
-};
+use crate::components::avatar::{ChannelAgentBrief, ChannelAvatarLayout};
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
 };
@@ -21,7 +19,7 @@ use crate::i18n::{tr_fmt, tr_key_or, tr_str};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use super::openbot_stage_chrome::{
     activity_str_to_openbot_mood, build_channel_avatar_inputs, openbot_stage_icon,
-    render_fabushi_plush_avatar, render_tab_concave_fillet, OpenBotStageIcon,
+    render_tab_concave_fillet, OpenBotStageIcon,
 };
 use super::rich_meta::resolve_image_source;
 
@@ -1903,15 +1901,17 @@ pub fn render_openbot_conversation_header<V: 'static>(
     let show_subtitle = layout.title_subtitle_visible;
     let main_tab_active = props.active_thread_id.is_none();
 
+    let chat_id_val = props.chat_id.unwrap_or(0);
+    let header_hover_key = format!("stage-header:{chat_id_val}");
     let avatar_el: AnyElement = if is_group {
         let (members, agents) = build_channel_avatar_inputs(
-            props.chat_id.unwrap_or(0),
+            chat_id_val,
             props.group_member_tiles,
             props.group_member_briefs,
         );
         let img_url = props.avatar_url.filter(|u| !u.trim().is_empty());
         let size = if img_url.is_some() { 20.0 } else { 18.0 };
-        render_channel_avatar(
+        crate::components::avatar::render_channel_avatar_with_hover(
             &members,
             &agents,
             ChannelAvatarLayout::Row,
@@ -1922,20 +1922,27 @@ pub fn render_openbot_conversation_header<V: 'static>(
             None,
             is_dark,
             0.0,
+            Some(&header_hover_key),
         )
         .into_any_element()
     } else if is_bot {
-        let fallback_seed = format!("bot_{}_{}", props.chat_id.unwrap_or(0), props.title);
-        render_fabushi_plush_avatar(
+        let fallback_seed = format!("bot_{}_{}", chat_id_val, props.title);
+        super::openbot_stage_chrome::render_fabushi_plush_avatar_interactive(
+            format!("stage-header-bot:{chat_id_val}"),
+            Some(&header_hover_key),
             props.active_fabushi_bot,
             &fallback_seed,
             18.0,
             mood,
             activity,
+            false,
+            crate::components::bloub_avatar::AvatarMotionMode::Hover,
+            false,
+            is_dark,
         )
         .into_any_element()
     } else {
-        let pid = props.chat_id.unwrap_or(0) as i64;
+        let pid = chat_id_val as i64;
         let (grad_top, grad_bot) = palette.peer_avatar_gradient(pid);
         let img_src = props.avatar_url.and_then(|u| resolve_image_source(u, None));
         div()
@@ -2026,6 +2033,14 @@ pub fn render_openbot_conversation_header<V: 'static>(
                 .rounded(px(6.0))
                 .when(!layout.title_disabled, |s| s.hover(move |h| h.bg(hover_bg)))
         })
+        .on_hover(cx.listener(move |_this, hovered: &bool, _w, cx| {
+            if crate::components::bloub_avatar::set_live_avatar_group_hover(
+                &header_hover_key,
+                *hovered,
+            ) {
+                cx.notify();
+            }
+        }))
         .when(!layout.title_disabled, |el| {
             el.on_mouse_down(
                 MouseButton::Left,

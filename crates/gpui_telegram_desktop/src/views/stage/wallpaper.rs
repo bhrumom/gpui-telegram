@@ -491,12 +491,18 @@ pub fn render_openbot_agent_empty_state(
     let ob = palette.openbot_palette();
     let is_zh = lang_id.starts_with("zh");
     let seed = format!("bot_{}_{}", chat_id, agent_name);
-    let plush = super::openbot_stage_chrome::render_fabushi_plush_avatar(
+    let plush = super::openbot_stage_chrome::render_fabushi_plush_avatar_interactive(
+        format!("stage-empty:{chat_id}"),
+        None,
         active_fabushi_bot,
         &seed,
         layout.avatar_px,
         openbot_contracts::avatar::AvatarMood::Idle,
         None,
+        false,
+        crate::components::bloub_avatar::AvatarMotionMode::Always,
+        false,
+        palette.mode.is_dark(),
     );
     let heading = if is_zh {
         format!("{} 已准备就绪", agent_name)

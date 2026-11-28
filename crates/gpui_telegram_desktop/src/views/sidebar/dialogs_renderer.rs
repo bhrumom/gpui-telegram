@@ -3,13 +3,16 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+use crate::components::bloub_avatar::{
+    is_live_avatar_group_hovered, set_live_avatar_group_hover,
+};
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{
     AddContactKind, DialogItemModel, SEARCH_HEADER_HEIGHT, SEARCH_HEIGHT, SEARCH_RADIUS,
 };
 use crate::views::sidebar::dialogs_row_view::{
-    render_openbot_dialog_avatar_with_badge, resolve_dialog_felt_badge_state,
+    render_openbot_dialog_avatar_with_badge_interactive, resolve_dialog_felt_badge_state,
     resolve_dialog_preview_priority, SidebarDialogMeta,
 };
 use crate::views::sidebar::ui::dialogs_stories_list::DialogsStoriesListUi;
@@ -499,7 +502,9 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
                 meta,
                 &resolve_dialog_preview_priority(item, meta, lang_id),
             );
-            let avatar = render_openbot_dialog_avatar_with_badge(
+            let hover_key = format!("sidebar-pinned:{did}");
+            let is_tile_hovered = is_live_avatar_group_hovered(&hover_key);
+            let avatar = render_openbot_dialog_avatar_with_badge_interactive(
                 item,
                 meta,
                 palette,
@@ -507,6 +512,10 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
                 tile_surface_hex,
                 is_selected,
                 badge_state,
+                "sidebar-pinned",
+                Some(&hover_key),
+                is_tile_hovered,
+                true,
             );
 
             div()
@@ -520,6 +529,11 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
                 .rounded(px(8.0))
                 .when(is_selected, |el| el.bg(active_bg))
                 .hover(move |s| if is_selected { s } else { s.bg(hover_bg) })
+                .on_hover(cx.listener(move |_this, hovered: &bool, _w, cx| {
+                    if set_live_avatar_group_hover(&hover_key, *hovered) {
+                        cx.notify();
+                    }
+                }))
                 .flex()
                 .flex_col()
                 .items_center()

@@ -218,6 +218,11 @@ pub struct AgentAvatarProps {
     pub on_screen: bool,
     pub cutout_ring: Option<SidebarPlushRingKind>,
     pub dark_scheme: bool,
+    /// Overrides OpenBot's `shape_override.is_none()` hover-face gate:
+    /// - `None`: OpenBot default (`shape_override.is_none() && expression_override.is_none()`).
+    /// - `Some(true)`: allow hover face reactions even when `shape_override` is explicitly saved.
+    /// - `Some(false)`: suppress hover face reactions (e.g. avatar editor picker grid cells).
+    pub allow_hover_face: Option<bool>,
 }
 
 impl Default for AgentAvatarProps {
@@ -252,6 +257,7 @@ impl AgentAvatarProps {
             on_screen: true,
             cutout_ring: None,
             dark_scheme: true,
+            allow_hover_face: None,
         }
     }
 
@@ -293,6 +299,36 @@ impl AgentAvatarProps {
     pub fn with_hue_and_color(mut self, hue: Option<AvatarHue>, color: Option<String>) -> Self {
         self.hue = hue;
         self.color = color;
+        self
+    }
+
+    pub fn with_working_faces(mut self, working_faces: bool) -> Self {
+        self.working_faces = working_faces;
+        self
+    }
+
+    pub fn with_motion(mut self, motion: AvatarMotionMode) -> Self {
+        self.motion = motion;
+        self
+    }
+
+    pub fn with_follow_pointer(mut self, follow_pointer: bool) -> Self {
+        self.follow_pointer = follow_pointer;
+        self
+    }
+
+    pub fn with_activity(mut self, activity: Option<AgentStepActivity>) -> Self {
+        self.activity = activity;
+        self
+    }
+
+    pub fn with_shape_override(mut self, shape: Option<BloubShape>) -> Self {
+        self.shape_override = shape;
+        self
+    }
+
+    pub fn with_allow_hover_face(mut self, allow: bool) -> Self {
+        self.allow_hover_face = Some(allow);
         self
     }
 
@@ -520,10 +556,13 @@ impl AgentAvatarController {
             step_mood.unwrap_or_else(|| plush_mood_presentation(props.mood))
         };
 
+        let allow_hover = props
+            .allow_hover_face
+            .unwrap_or(props.shape_override.is_none() && props.expression_override.is_none());
         let hovered = self.interacting
             && !props.reduced_motion
             && props.mood == AvatarMood::Idle
-            && props.shape_override.is_none()
+            && allow_hover
             && props.expression_override.is_none();
         let hover = if hovered { self.hover_face } else { None };
 
@@ -571,11 +610,11 @@ impl AgentAvatarController {
         };
         let animated = !props.reduced_motion
             && props.on_screen
-            && props.document_focused
-            && (props.follow_pointer
-                || (plush_mood.busy && props.ambient_motion)
-                || !props.motion.is_static()
-                || self.interacting);
+            && (self.interacting
+                || (props.document_focused
+                    && (props.follow_pointer
+                        || (plush_mood.busy && props.ambient_motion)
+                        || !props.motion.is_static())));
         let fps = if !animated {
             0
         } else if self.interacting || props.follow_pointer || !props.motion.is_static() {
@@ -686,6 +725,25 @@ pub fn render_agent_flat_svg(
     render_flat_svg(&sample, &resolved.color, DEFAULT_PAPER)
 }
 
+pub(crate) fn cached_custom_url_render_image(url: &str) -> Option<Arc<RenderImage>> {
+    static URL_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<RenderImage>>>>> = OnceLock::new();
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cache = URL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().get(trimmed).cloned() {
+        return hit;
+    }
+    let decoded = decode_url_to_render_image(trimmed);
+    let mut guard = cache.lock();
+    if guard.len() >= 128 {
+        guard.clear();
+    }
+    guard.insert(trimmed.to_string(), decoded.clone());
+    decoded
+}
+
 fn decode_url_to_render_image(url: &str) -> Option<Arc<RenderImage>> {
     let trimmed = url.trim();
     let raw = if let Some(rest) = trimmed.strip_prefix("data:") {
@@ -709,6 +767,23 @@ pub fn render_agent_avatar(
     controller: Option<&AgentAvatarController>,
     now_sec: f64,
 ) -> Div {
+    if controller.is_none() && !props.reduced_motion {
+        let instance_key = format!(
+            "agent-avatar|{}|{:.1}|{:?}|{:?}|{:?}|{}|{}|{:?}",
+            props.seed,
+            props.size_px,
+            props.shape_override,
+            props.expression_override,
+            props.color,
+            props.working_faces,
+            props.follow_pointer,
+            props.motion
+        );
+        return super::live_avatar::render_live_agent_avatar(
+            super::live_avatar::LiveAvatarSpec::new(instance_key, props.clone()),
+        );
+    }
+
     let default_ctrl = AgentAvatarController::new(&props.seed);
     let resolved = controller.unwrap_or(&default_ctrl).resolve(props);
     let base_size = if props.size_px.is_finite() {
@@ -1172,6 +1247,10 @@ impl SidebarBadgeAnimator {
     }
 }
 
+pub(crate) fn cached_ui_felt_webp_shared(rel: &'static str) -> Option<Arc<RenderImage>> {
+    cached_ui_felt_webp(rel)
+}
+
 fn cached_ui_felt_webp(rel: &'static str) -> Option<Arc<RenderImage>> {
     static CACHE: OnceLock<Mutex<HashMap<&'static str, Option<Arc<RenderImage>>>>> =
         OnceLock::new();
@@ -1328,6 +1407,13 @@ fn render_sidebar_felt_badge_inner(
     let tf = animator.map(|a| a.sample(now_ms));
 
     if badge == SidebarFeltBadge::Working {
+        if now_ms > 0 {
+            return super::live_avatar::render_live_working_balls_badge(
+                dark_scheme,
+                false,
+                tf.map_or(1.0, |t| t.opacity),
+            );
+        }
         let layout = compute_working_badge_layout(dark_scheme, false, now_ms);
         let mut pill = div()
             .relative()
@@ -2029,6 +2115,35 @@ pub fn render_channel_avatar(
     dark_scheme: bool,
     now_sec: f64,
 ) -> Div {
+    render_channel_avatar_with_hover(
+        members,
+        agents,
+        layout,
+        icon,
+        image_url,
+        image_failed,
+        size_px,
+        ring_kind,
+        dark_scheme,
+        now_sec,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_channel_avatar_with_hover(
+    members: &[ChannelMember],
+    agents: &[ChannelAgentBrief],
+    layout: ChannelAvatarLayout,
+    icon: Option<&ChannelIcon>,
+    image_url: Option<&str>,
+    image_failed: bool,
+    size_px: f32,
+    ring_kind: Option<SidebarPlushRingKind>,
+    dark_scheme: bool,
+    now_sec: f64,
+    hover_group_key: Option<&str>,
+) -> Div {
     let eval =
         resolve_channel_cluster_sized(members, layout, icon, image_url, image_failed, size_px);
     let tile_radius = match layout {
@@ -2040,7 +2155,7 @@ pub fn render_channel_avatar(
     match eval.mode {
         ChannelClusterMode::CustomImage => {
             let url = eval.active_image_url.unwrap_or_default();
-            let decoded = decode_url_to_render_image(&url);
+            let decoded = cached_custom_url_render_image(&url);
             return div()
                 .w(px(eval.size_px))
                 .h(px(eval.size_px))
@@ -2086,6 +2201,11 @@ pub fn render_channel_avatar(
     }
 
     let find_agent = |agent_id: &str| agents.iter().find(|a| a.id == agent_id);
+    let hover_group_owned = hover_group_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let _ = now_sec;
 
     match layout {
         ChannelAvatarLayout::Row => {
@@ -2103,10 +2223,20 @@ pub fn render_channel_avatar(
                     brief.and_then(|b| b.avatar_hue),
                     brief.and_then(|b| b.avatar_color.clone()),
                 )
-                .with_url(brief.and_then(|b| b.avatar_url.clone()));
+                .with_url(brief.and_then(|b| b.avatar_url.clone()))
+                .with_allow_hover_face(true);
                 p.cutout_ring = ring_kind;
                 p.dark_scheme = dark_scheme;
-                let face_el = render_agent_avatar(&p, None, now_sec);
+                let cell_key = format!(
+                    "channel-row|{}|{}|{}",
+                    hover_group_owned.as_deref().unwrap_or("default"),
+                    idx,
+                    agent_id
+                );
+                let face_el = super::live_avatar::render_live_agent_avatar(
+                    super::live_avatar::LiveAvatarSpec::new(cell_key, p)
+                        .with_optional_hover_group(hover_group_owned.clone()),
+                );
                 row = row.child(
                     div()
                         .when(idx > 0, |el| el.ml(px(visual_overlap)))
@@ -2163,16 +2293,28 @@ pub fn render_channel_avatar(
                     brief.and_then(|b| b.avatar_hue),
                     brief.and_then(|b| b.avatar_color.clone()),
                 )
-                .with_url(brief.and_then(|b| b.avatar_url.clone()));
+                .with_url(brief.and_then(|b| b.avatar_url.clone()))
+                .with_allow_hover_face(true);
                 p.cutout_ring = ring_kind;
                 p.dark_scheme = dark_scheme;
+
+                let cell_key = format!(
+                    "channel-cluster|{}|{}|{}",
+                    hover_group_owned.as_deref().unwrap_or("default"),
+                    cell_idx,
+                    cell.agent_id
+                );
+                let face_el = super::live_avatar::render_live_agent_avatar(
+                    super::live_avatar::LiveAvatarSpec::new(cell_key, p)
+                        .with_optional_hover_group(hover_group_owned.clone()),
+                );
 
                 container = container.child(
                     div()
                         .absolute()
                         .left(px(cx - effective_face * 0.5))
                         .top(px(cy - effective_face * 0.5))
-                        .child(render_agent_avatar(&p, None, now_sec)),
+                        .child(face_el),
                 );
             }
 
@@ -3002,6 +3144,7 @@ pub fn render_avatar_editor_popover(
                 .with_size(EDITOR_SHAPE_AVATAR_PX)
                 .with_hue_and_color(state.hue, state.color.clone());
             p.shape_override = Some(shape_opt);
+            p.allow_hover_face = Some(false);
             p.transition = PlushTransition::Cut;
             p.dark_scheme = dark_scheme;
 
@@ -3034,6 +3177,7 @@ pub fn render_avatar_editor_popover(
                 .with_size(EDITOR_EYES_AVATAR_PX)
                 .with_hue_and_color(state.hue, state.color.clone());
             p.expression_override = Some(expr_opt);
+            p.allow_hover_face = Some(false);
             p.transition = PlushTransition::Cut;
             p.dark_scheme = dark_scheme;
 

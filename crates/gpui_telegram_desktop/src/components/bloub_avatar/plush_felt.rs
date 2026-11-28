@@ -19,15 +19,12 @@ use openbot_contracts::avatar::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use super::bot_engine::{BloubBotEngine, blink_lid_at, dot_pulse};
+use super::bot_engine::{BloubBotEngine, LookOverride, dot_pulse};
 use super::eyefit::{
-    ComposedEyeTransform, DecalageOffset, ExpressionDef, EyeSpec, GazeAngles, blink_scale,
-    decalage_for, expression_def, fit_eyes_zero_clipping, project_eyes_3d,
-    verify_eyes_zero_clipping,
+    ComposedEyeTransform, ExpressionDef, EyeSpec, GazeAngles, expression_def,
 };
 use super::silhouettes::{
     DEMI_VIEWBOX, NOTIF_BLUE, RAYON, Silhouette, VIEW_BOX, engine_shape_radii, radius_at_angle,
-    silhouette_svg_path,
 };
 
 pub const PLUSH_BODY_SCALE: f64 = 1.15;
@@ -365,6 +362,31 @@ impl BundledPlushAssets {
         let tinted = Arc::new(tint_rgba_image(&working, &resolved_hex));
         self.tinted_rgba_cache.lock().insert(cache_key, tinted.clone());
         Ok(tinted)
+    }
+
+    pub fn decode_rgba_resized(
+        &self,
+        rel_path: &str,
+        target_px: u32,
+    ) -> Result<Arc<image::RgbaImage>, String> {
+        let base = self.decode_rgba(rel_path)?;
+        if target_px == 0 || (base.width() == target_px && base.height() == target_px) {
+            return Ok(base);
+        }
+        let cache_key = format!("{rel_path}|__raw__|{target_px}");
+        if let Some(cached) = self.tinted_rgba_cache.lock().get(&cache_key) {
+            return Ok(cached);
+        }
+        let resized = Arc::new(image::imageops::resize(
+            &*base,
+            target_px,
+            target_px,
+            image::imageops::FilterType::Triangle,
+        ));
+        self.tinted_rgba_cache
+            .lock()
+            .insert(cache_key, resized.clone());
+        Ok(resized)
     }
 
     pub fn tinted_render_image(
@@ -1674,14 +1696,6 @@ pub const fn bloub_shape_to_engine(shape: BloubShape) -> EngineShapeId {
     }
 }
 
-#[inline]
-fn harmonic_wave(t: f64, period: f64, phase: f64) -> f64 {
-    let r = TAU * t / period;
-    0.55 * (r + phase).sin()
-        + 0.30 * (2.0 * r + 1.7 * phase + 1.1).sin()
-        + 0.15 * (3.0 * r + 2.3 * phase + 2.4).sin()
-}
-
 impl PlushFeltRenderer {
     pub fn new(
         shape: EngineShapeId,
@@ -1701,8 +1715,9 @@ impl PlushFeltRenderer {
         } else {
             DecorTrack::OFF
         };
-        let engine = BloubBotEngine::new(shape, expression, engine_state_of(state));
-        Self {
+        let mut engine = BloubBotEngine::new(shape, expression, engine_state_of(state));
+        engine.set_decalage_disabled(false);
+        let mut renderer = Self {
             character: None,
             shape,
             ink_hex: target.ink_hex.clone(),
@@ -1725,7 +1740,9 @@ impl PlushFeltRenderer {
             pad_fade: PadFadeState::NONE,
             engine,
             last_clock_sec: 0.0,
-        }
+        };
+        renderer.sync_engine_face(None);
+        renderer
     }
 
     pub fn for_character(character: PlushCharacterId, state: PlushState) -> Self {
@@ -1741,6 +1758,8 @@ impl PlushFeltRenderer {
         renderer.ink_hex = target.ink_hex.clone();
         renderer.avant = target.clone();
         renderer.apres = target;
+        renderer.engine.set_decalage_disabled(true);
+        renderer.sync_engine_face(None);
         renderer
     }
 
@@ -1780,6 +1799,38 @@ impl PlushFeltRenderer {
         renderer
     }
 
+    fn desired_engine_face(&self, target: &BodyTarget) -> (ExpressionDef, bool) {
+        let resting = self.resting_face_for(target);
+        match self.state {
+            PlushState::Asleep => (asleep_face(), true),
+            PlushState::Failed => (failed_face(&resting), true),
+            _ => {
+                let is_custom = target.character.is_some() && self.expression_override.is_none();
+                (resting, is_custom)
+            }
+        }
+    }
+
+    fn sync_engine_face(&mut self, morph_at_sec: Option<f64>) {
+        let (face, is_custom) = self.desired_engine_face(&self.apres);
+        match morph_at_sec.filter(|t| t.is_finite()) {
+            Some(now_sec) => {
+                if is_custom {
+                    self.engine.set_expression_def(face, now_sec);
+                } else {
+                    self.engine.set_expression(face.id, now_sec);
+                }
+            }
+            None => {
+                if is_custom {
+                    self.engine.set_expression_def_immediate(face);
+                } else {
+                    self.engine.set_expression(face.id, f64::NEG_INFINITY);
+                }
+            }
+        }
+    }
+
     fn push_body_target(&mut self, next: BodyTarget, now_sec: f64) {
         if self.apres.key == next.key {
             self.queued_target = None;
@@ -1808,6 +1859,9 @@ impl PlushFeltRenderer {
     }
 
     pub fn set_character(&mut self, character: Option<PlushCharacterId>, now_sec: f64) {
+        if self.character == character {
+            return;
+        }
         self.character = character;
         if let Some(ch) = character {
             let spec = ch.spec();
@@ -1815,35 +1869,67 @@ impl PlushFeltRenderer {
             self.ink_hex = spec.ink.to_owned();
         }
         let next = BodyTarget::from_config(self.character, self.shape, &self.ink_hex);
-        self.engine = BloubBotEngine::new(next.shape, self.expression, engine_state_of(self.state));
+        self.engine.set_decalage_disabled(self.character.is_some());
+        self.engine.set_shape(next.shape, now_sec);
         self.push_body_target(next, now_sec);
+        self.sync_engine_face(Some(now_sec));
     }
 
     pub fn set_shape(&mut self, shape: EngineShapeId, now_sec: f64) {
+        if self.character.is_none() && self.shape == shape {
+            return;
+        }
         self.character = None;
         self.shape = shape;
         let next = BodyTarget::from_config(None, self.shape, &self.ink_hex);
-        self.engine = BloubBotEngine::new(self.shape, self.expression, engine_state_of(self.state));
+        self.engine.set_decalage_disabled(false);
+        self.engine.set_shape(self.shape, now_sec);
         self.push_body_target(next, now_sec);
+        self.sync_engine_face(Some(now_sec));
     }
 
     pub fn set_color(&mut self, color_hex: &str, now_sec: f64) {
         if self.character.is_some() {
             return;
         }
-        self.ink_hex = resolve_ink_hex(color_hex);
+        let resolved = resolve_ink_hex(color_hex);
+        if self.ink_hex == resolved {
+            return;
+        }
+        self.ink_hex = resolved;
         let next = BodyTarget::from_config(None, self.shape, &self.ink_hex);
         self.push_body_target(next, now_sec);
     }
 
+    /// Sets the expression immediately (used for setup / deterministic snapshot rendering).
     pub fn set_expression(&mut self, expression: BloubExpression) {
         self.expression = expression;
         self.expression_override = Some(expression);
-        self.engine = BloubBotEngine::new(self.shape, self.expression, engine_state_of(self.state));
+        self.sync_engine_face(None);
+    }
+
+    /// Smoothly morphs the avatar's expression at `now_sec` (`0.45s` `easeOutQuint`).
+    pub fn set_expression_at(&mut self, expression: BloubExpression, now_sec: f64) {
+        if self.expression == expression && self.expression_override == Some(expression) {
+            return;
+        }
+        self.expression = expression;
+        self.expression_override = Some(expression);
+        self.sync_engine_face(Some(now_sec));
     }
 
     pub fn clear_expression_override(&mut self) {
         self.expression_override = None;
+        self.sync_engine_face(None);
+    }
+
+    /// Clears the expression override and smoothly morphs back to the resting face at `now_sec`.
+    pub fn clear_expression_override_at(&mut self, now_sec: f64) {
+        if self.expression_override.is_none() {
+            return;
+        }
+        self.expression_override = None;
+        self.sync_engine_face(Some(now_sec));
     }
 
     pub fn set_transition(&mut self, transition: PlushTransition) {
@@ -1878,6 +1964,10 @@ impl PlushFeltRenderer {
         self.state
     }
 
+    pub const fn expression(&self) -> BloubExpression {
+        self.expression
+    }
+
     pub const fn transition(&self) -> PlushTransition {
         self.transition
     }
@@ -1888,6 +1978,10 @@ impl PlushFeltRenderer {
 
     pub const fn last_clock_sec(&self) -> f64 {
         self.last_clock_sec
+    }
+
+    pub fn is_in_transition(&self) -> bool {
+        self.in_transition
     }
 
     fn current_pads(&self, state: PlushState) -> [PlushPadSpec; 2] {
@@ -1945,8 +2039,9 @@ impl PlushFeltRenderer {
             now_sec,
             next_state,
         );
-        self.engine =
-            BloubBotEngine::new(self.shape, self.expression, engine_state_of(self.state));
+        self.engine
+            .set_state(engine_state_of(self.state), now_sec, 0.0);
+        self.sync_engine_face(Some(now_sec));
     }
 
     pub fn sample_plush_frame(&mut self, now_sec: f64, reduced_motion: bool) -> PlushFrameSample {
@@ -2014,34 +2109,31 @@ impl PlushFeltRenderer {
             0.0
         };
 
-        let engine_sample = self.engine.sample(sample_t, reduced_motion);
-        let resting_face = self.resting_face_for(&shown);
-        let active_face = match self.state {
-            PlushState::Asleep => asleep_face(),
-            PlushState::Failed => failed_face(&resting_face),
-            PlushState::Wink => ExpressionDef {
-                id: self.expression,
-                gaze: GazeAngles { yaw: -5.37, pitch: 4.55, roll: 6.7 },
-                split: 16.25,
-                eyes: [
-                    EyeSpec { w: 0.236, h: 0.464, tilt: 0.0, open: 1.0 },
-                    EyeSpec { w: 0.447, h: 0.089, tilt: 0.0, open: 1.0 },
-                ],
-            },
-            PlushState::Wide => ExpressionDef {
-                id: self.expression,
-                gaze: GazeAngles { yaw: 6.92, pitch: -21.96, roll: 11.6 },
-                split: 18.43,
-                eyes: [EyeSpec { w: 0.356, h: 0.875, tilt: 0.0, open: 1.0 }; 2],
-            },
-            PlushState::Notify => ExpressionDef {
-                id: self.expression,
-                gaze: GazeAngles { yaw: -21.94, pitch: -5.82, roll: -12.2 },
-                split: 18.89,
-                eyes: [EyeSpec { w: 0.505, h: 0.498, tilt: 0.0, open: 1.0 }; 2],
-            },
-            PlushState::Idle | PlushState::Thinking => resting_face,
+        let mut engine_look = LookOverride {
+            yaw: look.yaw,
+            pitch: look.pitch,
+            mix: look.mix,
+            spin: look.spin,
+            wander: look.wander,
+            blink: look.blink,
         };
+        if !reduced_motion
+            && matches!(
+                self.state,
+                PlushState::Idle | PlushState::Wink | PlushState::Wide | PlushState::Notify
+            )
+        {
+            if let Some((nx, ny)) = self.pointer_gaze {
+                engine_look.yaw = -26.0 + nx * 16.0;
+                engine_look.pitch = 10.0 - ny * 13.0;
+                engine_look.mix = 1.0;
+                engine_look.wander = 0.0;
+            }
+        }
+        self.engine.set_look_immediate(engine_look);
+        let engine_sample = self.engine.sample(sample_t, reduced_motion);
+
+        let resting_face = self.resting_face_for(&shown);
         let active_pads = if self.state == PlushState::Failed {
             failed_symmetric_pads(shown.pads, &resting_face)
         } else {
@@ -2053,9 +2145,7 @@ impl PlushFeltRenderer {
             reduced_motion,
             state_elapsed,
             &shown,
-            &active_face,
             active_pads,
-            look,
             shake_deg,
             &engine_sample,
             trans_elapsed,
@@ -2070,112 +2160,17 @@ impl PlushFeltRenderer {
         reduced_motion: bool,
         state_elapsed: f64,
         shown: &BodyTarget,
-        active_face: &ExpressionDef,
         active_pads: [PlushPadSpec; 2],
-        look: PlushLook,
         shake_deg: f64,
         engine_sample: &super::bot_engine::BloubFrameSample,
         trans_elapsed: f64,
         trans_sample: PlushTransitionSample,
     ) -> PlushFrameSample {
-        let (d_yaw, d_pitch, d_roll, drift_x, drift_y, lid, breath_sy) = if reduced_motion {
-            (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0)
-        } else {
-            let w_amt = look.wander;
-            let dy = (harmonic_wave(sample_t, 11.3, 0.4) * 5.5
-                + harmonic_wave(sample_t, 3.7, 2.1) * 1.6)
-                * w_amt;
-            let dp = (harmonic_wave(sample_t, 9.1, 1.3) * 4.2
-                + harmonic_wave(sample_t, 4.3, 0.7) * 1.3)
-                * w_amt;
-            let dr = harmonic_wave(sample_t, 13.7, 3.2) * 2.2 * w_amt;
-            let dx = harmonic_wave(sample_t, 7.9, 1.9) * 0.006;
-            let dfy = harmonic_wave(sample_t, 5.3, 0.3) * 0.007;
-            let raw_lid = blink_lid_at(sample_t);
-            let blink_lid = match look.blink {
-                None => raw_lid,
-                Some(b) => 1.0 - (1.0 - raw_lid) * clamp01(b),
-            };
-            let breath = 1.0 + (sample_t / 3.4 * TAU).sin() * 0.005;
-            (dy, dp, dr, dx, dfy, blink_lid, breath)
-        };
-
-        let mut target_yaw = lerp(active_face.gaze.yaw, look.yaw, look.mix);
-        let mut target_pitch = lerp(active_face.gaze.pitch, look.pitch, look.mix);
-        if !reduced_motion
-            && matches!(
-                self.state,
-                PlushState::Idle | PlushState::Wink | PlushState::Wide | PlushState::Notify
-            )
-        {
-            if let Some((nx, ny)) = self.pointer_gaze {
-                target_yaw = -26.0 + nx * 16.0;
-                target_pitch = 10.0 - ny * 13.0;
-            }
-        }
-        let gaze = GazeAngles {
-            yaw: target_yaw + d_yaw - look.spin,
-            pitch: target_pitch + d_pitch,
-            roll: active_face.gaze.roll + d_roll,
-        };
-
-        let sil = Silhouette {
-            radii: shown.radii,
-            rot: 0.0,
-            cx: 0.0,
-            cy: 0.0,
-            sx: 1.0,
-            sy: breath_sy,
-        };
-        let decalage: DecalageOffset = if shown.character.is_some() {
-            DecalageOffset::default()
-        } else {
-            let expr_key = match self.state {
-                PlushState::Idle | PlushState::Thinking => Some(active_face.id),
-                _ => None,
-            };
-            decalage_for(shown.shape, engine_state_of(self.state), expr_key)
-        };
-
-        let basis = project_eyes_3d(gaze, RAYON, active_face.split);
-        let raw_eyes: [ComposedEyeTransform; 2] = std::array::from_fn(|idx| {
-            let r = basis[idx];
-            let spec = active_face.eyes[idx];
-            let culled = r.depth <= 0.02;
-            let alpha = if culled {
-                0.0
-            } else {
-                engine_sample.eye_alpha * clamp01(r.depth / 0.12)
-            };
-            let rest_open = blink_scale(spec.open);
-            let open_squash = blink_scale(lid.min(spec.open));
-            let s = radius_at_angle(&sil.radii, r.y.atan2(r.x) - sil.rot);
-            let tilt_rad = spec.tilt.to_radians();
-            let (lc, ls) = (tilt_rad.cos(), tilt_rad.sin());
-            let m_a = r.a * lc + r.c * ls;
-            let m_b = (r.b * lc + r.d * ls) * open_squash;
-            let m_c = -r.a * ls + r.c * lc;
-            let m_d = (-r.b * ls + r.d * lc) * open_squash;
-            let tx = r.x * s + (drift_x + decalage.x) * RAYON;
-            let ty = r.y * s + (drift_y + decalage.y) * RAYON;
-            ComposedEyeTransform {
-                w: spec.w * RAYON,
-                h: spec.h * RAYON,
-                open: spec.open,
-                rest_open,
-                open_squash,
-                alpha,
-                culled,
-                depth: r.depth,
-                matrix: [m_a, m_b, m_c, m_d, tx, ty],
-            }
-        });
-        let mut raw_eyes = raw_eyes;
-        let zero_clipping = if shown.character.is_none() {
-            fit_eyes_zero_clipping(&sil, &mut raw_eyes)
-        } else {
-            verify_eyes_zero_clipping(&sil, &raw_eyes)
-        };
+        let raw_eyes = engine_sample.eyes;
+        let sil = engine_sample.silhouette.clone();
+        let gaze = engine_sample.gaze;
+        let breath_sy = engine_sample.breath_sy;
+        let zero_clipping = engine_sample.zero_clipping;
 
         let scale_inputs: [([f64; 6], f64, f64); 2] = std::array::from_fn(|idx| {
             let mut m = raw_eyes[idx].matrix;
@@ -2278,13 +2273,13 @@ impl PlushFeltRenderer {
         } else {
             None
         };
-        let body_path = silhouette_svg_path(&sil, RAYON);
+        let body_path = engine_sample.body_path.clone();
 
         PlushFrameSample {
             character: shown.character,
             shape: shown.shape,
             state: self.state,
-            expression: active_face.id,
+            expression: self.expression,
             ink_hex: shown.ink_hex.clone(),
             time_sec: sample_t,
             body_alpha: engine_sample.body_alpha,
@@ -2292,7 +2287,7 @@ impl PlushFeltRenderer {
             body_path,
             silhouette: sil,
             gaze,
-            split: active_face.split,
+            split: engine_sample.split,
             zero_clipping,
             eye_scale: self.eye_scale,
             pad_blend: PAD_BLEND_MODE,
@@ -2636,10 +2631,14 @@ fn load_body_rgba(
     assets: &BundledPlushAssets,
     rel_path: &str,
     tint_hex: Option<&str>,
+    target_px: Option<u32>,
 ) -> Option<Arc<image::RgbaImage>> {
     match tint_hex {
-        Some(hex) => assets.tinted_rgba(rel_path, hex, None).ok(),
-        None => assets.decode_rgba(rel_path).ok(),
+        Some(hex) => assets.tinted_rgba(rel_path, hex, target_px).ok(),
+        None => match target_px {
+            Some(sz) if sz > 0 => assets.decode_rgba_resized(rel_path, sz).ok(),
+            _ => assets.decode_rgba(rel_path).ok(),
+        },
     }
 }
 
@@ -2668,9 +2667,7 @@ fn blit_viewbox_sprite(
     let y1 = (y0_f + h_f).ceil().min(f64::from(sz)) as u32;
     let op = clamp01(opacity);
     for py in y0..y1 {
-        let v = (f64::from(py) + 0.5 - y0_f) / w_f.max(1e-6);
         let vy = (f64::from(py) + 0.5 - y0_f) / h_f.max(1e-6);
-        let _ = v;
         if !(0.0..=1.0).contains(&vy) {
             continue;
         }
@@ -2705,59 +2702,109 @@ pub fn composite_plush_rgba_with_assets(
     let body_alpha = clamp01(sample.body_alpha);
 
     if body_alpha > 0.001 && body_sx.abs() > 1e-4 && body_sy.abs() > 1e-4 {
-        let avant_img = load_body_rgba(
-            assets,
-            &sample.avant_body_asset,
-            sample.avant_ink_hex.as_deref(),
-        );
-        let apres_img = load_body_rgba(
-            assets,
-            &sample.apres_body_asset,
-            sample.apres_ink_hex.as_deref(),
-        );
         let blended_body: Option<Arc<image::RgbaImage>> = match sample.transition_sample.corps {
-            TransitionBodyStage::Avant => avant_img.or(apres_img),
-            TransitionBodyStage::Apres => apres_img.or(avant_img),
-            TransitionBodyStage::Deux => match (avant_img, apres_img) {
-                (Some(av), Some(ap)) if sample.transition == PlushTransition::Warp => Some(
-                    Arc::new(warp_blend_bodies(
-                        &av,
-                        &ap,
-                        &sample.avant_radii,
-                        &sample.apres_radii,
-                        sample.transition_elapsed_sec,
-                        sz,
-                    )),
-                ),
-                (Some(av), Some(ap)) if sample.transition == PlushTransition::Dissolve => Some(
-                    Arc::new(dissolve_blend_bodies(
-                        &av,
-                        &ap,
-                        sample.transition_sample.melange,
-                        sz,
-                    )),
-                ),
-                (_, ap) => ap,
-            },
+            TransitionBodyStage::Avant => load_body_rgba(
+                assets,
+                &sample.avant_body_asset,
+                sample.avant_ink_hex.as_deref(),
+                Some(sz),
+            )
+            .or_else(|| {
+                load_body_rgba(
+                    assets,
+                    &sample.apres_body_asset,
+                    sample.apres_ink_hex.as_deref(),
+                    Some(sz),
+                )
+            }),
+            TransitionBodyStage::Apres => load_body_rgba(
+                assets,
+                &sample.apres_body_asset,
+                sample.apres_ink_hex.as_deref(),
+                Some(sz),
+            )
+            .or_else(|| {
+                load_body_rgba(
+                    assets,
+                    &sample.avant_body_asset,
+                    sample.avant_ink_hex.as_deref(),
+                    Some(sz),
+                )
+            }),
+            TransitionBodyStage::Deux => {
+                let avant_img = load_body_rgba(
+                    assets,
+                    &sample.avant_body_asset,
+                    sample.avant_ink_hex.as_deref(),
+                    Some(sz),
+                );
+                let apres_img = load_body_rgba(
+                    assets,
+                    &sample.apres_body_asset,
+                    sample.apres_ink_hex.as_deref(),
+                    Some(sz),
+                );
+                match (avant_img, apres_img) {
+                    (Some(av), Some(ap)) if sample.transition == PlushTransition::Warp => Some(
+                        Arc::new(warp_blend_bodies(
+                            &av,
+                            &ap,
+                            &sample.avant_radii,
+                            &sample.apres_radii,
+                            sample.transition_elapsed_sec,
+                            sz,
+                        )),
+                    ),
+                    (Some(av), Some(ap)) if sample.transition == PlushTransition::Dissolve => Some(
+                        Arc::new(dissolve_blend_bodies(
+                            &av,
+                            &ap,
+                            sample.transition_sample.melange,
+                            sz,
+                        )),
+                    ),
+                    (_, ap) => ap,
+                }
+            }
         };
         if let Some(body_tex) = blended_body {
-            for py in 0..sz {
-                let vb_y = ((f64::from(py) + 0.5 - half_px) / px_per_vb) / body_sy;
-                let v = (vb_y + DEMI_VIEWBOX) / VIEW_BOX;
-                if !(0.0..=1.0).contains(&v) {
-                    continue;
-                }
-                for px in 0..sz {
-                    let vb_x = ((f64::from(px) + 0.5 - half_px) / px_per_vb) / body_sx;
-                    let u = (vb_x + DEMI_VIEWBOX) / VIEW_BOX;
-                    if !(0.0..=1.0).contains(&u) {
+            let unit_scale =
+                (body_sx - 1.0).abs() < 1e-4 && (body_sy - 1.0).abs() < 1e-4;
+            if unit_scale && body_tex.width() == sz && body_tex.height() == sz {
+                let raw = body_tex.as_raw();
+                let inv_255 = 1.0 / 255.0;
+                for (dst, px) in buf.iter_mut().zip(raw.chunks_exact(4)) {
+                    let a = f64::from(px[3]) * inv_255;
+                    if a <= 1e-6 {
                         continue;
                     }
-                    let mut p = sample_rgba_premul_bilinear(&body_tex, u, v);
-                    for ch in &mut p {
-                        *ch *= body_alpha;
+                    let scale = a * body_alpha;
+                    *dst = [
+                        f64::from(px[0]) * inv_255 * scale,
+                        f64::from(px[1]) * inv_255 * scale,
+                        f64::from(px[2]) * inv_255 * scale,
+                        scale,
+                    ];
+                }
+            } else {
+                for py in 0..sz {
+                    let vb_y = ((f64::from(py) + 0.5 - half_px) / px_per_vb) / body_sy;
+                    let v = (vb_y + DEMI_VIEWBOX) / VIEW_BOX;
+                    if !(0.0..=1.0).contains(&v) {
+                        continue;
                     }
-                    buf[(py * sz + px) as usize] = p;
+                    for px in 0..sz {
+                        let vb_x = ((f64::from(px) + 0.5 - half_px) / px_per_vb) / body_sx;
+                        let u = (vb_x + DEMI_VIEWBOX) / VIEW_BOX;
+                        if !(0.0..=1.0).contains(&u) {
+                            continue;
+                        }
+                        let mut p = sample_rgba_premul_bilinear(&body_tex, u, v);
+                        for ch in &mut p {
+                            *ch *= body_alpha;
+                        }
+                        buf[(py * sz + px) as usize] = p;
+                    }
                 }
             }
         } else {
@@ -3026,6 +3073,33 @@ fn paint_plush_eye_layer(
 
 pub fn composite_plush_rgba(sample: &PlushFrameSample, pixel_size: u32) -> image::RgbaImage {
     composite_plush_rgba_with_assets(sample, pixel_size, 1.0, BundledPlushAssets::global())
+}
+
+pub fn cached_static_plush_render_image(
+    sample: &PlushFrameSample,
+    pixel_size: u32,
+) -> Arc<gpui::RenderImage> {
+    static STATIC_PLUSH_CACHE: OnceLock<Mutex<BoundedCache<Arc<gpui::RenderImage>>>> =
+        OnceLock::new();
+    let cache =
+        STATIC_PLUSH_CACHE.get_or_init(|| Mutex::new(BoundedCache::new(MAX_FRAME_CACHE_ENTRIES)));
+    let key = format!(
+        "static|{:?}|{:?}|{:?}|{:?}|{}|{:.2}|{}",
+        sample.character,
+        sample.shape,
+        sample.state,
+        sample.expression,
+        sample.ink_hex,
+        sample.eye_scale,
+        pixel_size
+    );
+    if let Some(hit) = cache.lock().get(&key) {
+        return hit;
+    }
+    let rgba = composite_plush_rgba(sample, pixel_size);
+    let rendered = rgba_to_gpui_render_image(rgba);
+    cache.lock().insert(key, rendered.clone());
+    rendered
 }
 
 fn cached_plush_render_image(sample: &PlushFrameSample, pixel_size: u32) -> Arc<gpui::RenderImage> {

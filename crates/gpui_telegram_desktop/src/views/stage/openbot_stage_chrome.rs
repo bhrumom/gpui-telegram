@@ -427,6 +427,115 @@ pub fn normalize_fabushi_plush_spec(
     (shape, hue, color_hex)
 }
 
+/// Renders a live interactive Fabushi/OpenBot assistant avatar (`PlushBot`, named plush character,
+/// or flat `bloub:*`) with explicit slot identity, hover-group propagation, `working_faces`,
+/// motion mode (`Hover` / `Always`), and pointer gaze tracking.
+#[allow(clippy::too_many_arguments)]
+pub fn render_fabushi_plush_avatar_interactive(
+    instance_key: impl Into<String>,
+    hover_group_key: Option<&str>,
+    fab: Option<&FabushiBotSummaryDto>,
+    fallback_seed: &str,
+    size_px: f32,
+    mood: AvatarMood,
+    activity: Option<AgentStepActivity>,
+    working_faces: bool,
+    motion: crate::components::bloub_avatar::AvatarMotionMode,
+    follow_pointer: bool,
+    dark_scheme: bool,
+) -> Div {
+    use crate::components::avatar::{
+        render_openbot_bot_plush_or_flat_interactive, render_plush_bot_avatar_interactive,
+    };
+    use crate::components::bloub_avatar::PlushCharacterId;
+
+    if let Some(f) = fab {
+        let seed = if f.agent_id.trim().is_empty() {
+            fallback_seed
+        } else {
+            f.agent_id.as_str()
+        };
+        let raw_shape = f.avatar_shape.trim();
+        let lower_shape = raw_shape.to_ascii_lowercase();
+        if lower_shape == "bloub" || lower_shape.starts_with("bloub:") {
+            let (_, _, hex) = normalize_fabushi_plush_spec(&f.avatar_shape, &f.avatar_color);
+            return render_openbot_bot_plush_or_flat_interactive(
+                instance_key,
+                hover_group_key,
+                raw_shape,
+                hex,
+                seed,
+                mood,
+                activity,
+                working_faces,
+                motion,
+                follow_pointer,
+                None,
+                dark_scheme,
+                size_px,
+            );
+        }
+        let stripped = lower_shape
+            .strip_prefix("plush:")
+            .unwrap_or(lower_shape.as_str());
+        if let Some(character) = PlushCharacterId::parse(stripped) {
+            return render_plush_bot_avatar_interactive(
+                instance_key,
+                hover_group_key,
+                seed,
+                None,
+                Some(character),
+                None,
+                None,
+                size_px,
+                mood,
+                activity,
+                working_faces,
+                motion,
+                follow_pointer,
+                None,
+                dark_scheme,
+            );
+        }
+        let (shape, hue, color) = normalize_fabushi_plush_spec(&f.avatar_shape, &f.avatar_color);
+        render_plush_bot_avatar_interactive(
+            instance_key,
+            hover_group_key,
+            seed,
+            shape,
+            None,
+            hue,
+            color.as_deref(),
+            size_px,
+            mood,
+            activity,
+            working_faces,
+            motion,
+            follow_pointer,
+            None,
+            dark_scheme,
+        )
+    } else {
+        render_plush_bot_avatar_interactive(
+            instance_key,
+            hover_group_key,
+            fallback_seed,
+            None,
+            None,
+            None,
+            None,
+            size_px,
+            mood,
+            activity,
+            working_faces,
+            motion,
+            follow_pointer,
+            None,
+            dark_scheme,
+        )
+    }
+}
+
 /// Renders a Fabushi/OpenBot assistant using M1's 3D tactile felt `render_plush_bot_avatar`.
 pub fn render_fabushi_plush_avatar(
     fab: Option<&FabushiBotSummaryDto>,
@@ -435,34 +544,51 @@ pub fn render_fabushi_plush_avatar(
     mood: AvatarMood,
     activity: Option<AgentStepActivity>,
 ) -> Div {
-    if let Some(f) = fab {
-        let (shape, hue, color) = normalize_fabushi_plush_spec(&f.avatar_shape, &f.avatar_color);
-        let seed = if f.agent_id.trim().is_empty() {
-            fallback_seed
-        } else {
-            f.agent_id.as_str()
-        };
-        render_plush_bot_avatar(seed, shape, hue, color.as_deref(), size_px, mood, activity)
-    } else {
-        render_plush_bot_avatar(fallback_seed, None, None, None, size_px, mood, activity)
-    }
+    let instance_key = format!(
+        "fabushi-plush|{}|{:.1}",
+        fab.map(|f| f.agent_id.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(fallback_seed),
+        size_px
+    );
+    render_fabushi_plush_avatar_interactive(
+        instance_key,
+        None,
+        fab,
+        fallback_seed,
+        size_px,
+        mood,
+        activity,
+        false,
+        crate::components::bloub_avatar::AvatarMotionMode::Hover,
+        false,
+        true,
+    )
 }
 
-/// Maps `bot_activity_state` string to M1 `AvatarMood` & optional `AgentStepActivity`.
+/// Maps `bot_activity_state` string to OpenBot `AvatarMood` & optional `AgentStepActivity`.
+/// Generic `"thinking" | "working" | "reviewing"` returns `(Working, None)` so OpenBot renders
+/// `PlushState::Thinking` (3 pulsing thinking dots + up-right gaze) in stage headers/activity rows.
 pub fn activity_str_to_openbot_mood(
     state: &str,
 ) -> (AvatarMood, Option<AgentStepActivity>) {
     match state.trim().to_ascii_lowercase().as_str() {
         "" | "idle" => (AvatarMood::Idle, None),
         "tool" | "searching" | "search" => (AvatarMood::Working, Some(AgentStepActivity::Searching)),
-        "writing" | "editing" => (AvatarMood::Working, Some(AgentStepActivity::Editing)),
-        "thinking" | "working" | "running" => {
-            (AvatarMood::Working, Some(AgentStepActivity::Working))
+        "browsing" | "browser" => (AvatarMood::Working, Some(AgentStepActivity::Browsing)),
+        "reading" | "read" => (AvatarMood::Working, Some(AgentStepActivity::Reading)),
+        "running" | "shell" | "terminal" | "coding" => {
+            (AvatarMood::Working, Some(AgentStepActivity::Running))
         }
-        "waiting" | "approval" => (AvatarMood::Waiting, None),
+        "writing" | "editing" => (AvatarMood::Working, Some(AgentStepActivity::Editing)),
+        "delegating" => (AvatarMood::Working, Some(AgentStepActivity::Delegating)),
+        "connecting" | "loading" => (AvatarMood::Connecting, None),
+        "thinking" | "working" | "reviewing" => (AvatarMood::Working, None),
+        "waiting" | "approval" | "blocked" | "awaiting_approval" => (AvatarMood::Waiting, None),
         "failed" | "error" => (AvatarMood::Failed, None),
-        "done" | "responded" => (AvatarMood::Responded, None),
-        _ => (AvatarMood::Working, Some(AgentStepActivity::Working)),
+        "done" | "responded" | "completed" => (AvatarMood::Responded, None),
+        "asleep" | "sleeping" | "paused" | "offline" => (AvatarMood::Asleep, None),
+        _ => (AvatarMood::Working, None),
     }
 }
 

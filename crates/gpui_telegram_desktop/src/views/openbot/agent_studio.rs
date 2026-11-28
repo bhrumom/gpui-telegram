@@ -1518,9 +1518,10 @@ pub fn render_first_agent_setup(
     let mut hero_props = AgentAvatarProps::new(&state.avatar_seed)
         .with_size(layout.hero_size_px)
         .with_mood(AvatarMood::Idle)
-        .with_hue_and_color(state.avatar_hue, state.avatar_color.clone());
+        .with_hue_and_color(state.avatar_hue, state.avatar_color.clone())
+        .with_motion(crate::components::bloub_avatar::AvatarMotionMode::Always)
+        .with_allow_hover_face(true);
     hero_props.shape_override = Some(selected_face.shape);
-    hero_props.expression_override = Some(selected_face.expression);
     hero_props.eye_scale = layout.shape_eye_scale;
     hero_props.follow_pointer = layout.hero_pointer_follow;
     hero_props.dark_scheme = dark;

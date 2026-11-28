@@ -1063,6 +1063,9 @@ impl CreateManagedBotBoxPeers {
             self.bot_name.trim().to_string()
         };
 
+        let hero_hover_key = "studio-hero-plush";
+        let hero_hovered =
+            crate::components::bloub_avatar::is_live_avatar_group_hovered(hero_hover_key);
         let hero_visual: AnyElement = if self.use_dynamic_avatar {
             let mut props = AgentAvatarProps::new(&hero_seed)
                 .with_size(crate::views::openbot::agent_studio::FIRST_AGENT_HERO_SIZE_PX)
@@ -1071,17 +1074,27 @@ impl CreateManagedBotBoxPeers {
                 } else {
                     AvatarMood::Idle
                 })
-                .with_hue_and_color(None, Some(active_hex.clone()));
+                .with_hue_and_color(None, Some(active_hex.clone()))
+                .with_motion(crate::components::bloub_avatar::AvatarMotionMode::Always)
+                .with_follow_pointer(true)
+                .with_allow_hover_face(true);
             props.shape_override = Some(active_shape);
-            props.expression_override = Some(if self.hero_wink_toggle {
-                BloubExpression::Heureux
-            } else {
-                active_expr
-            });
+            if self.hero_wink_toggle {
+                props.expression_override = Some(BloubExpression::Heureux);
+            } else if !hero_hovered {
+                props.expression_override = Some(active_expr);
+            }
             props.eye_scale = 1.25;
-            props.transition = PlushTransition::Cut;
+            props.transition = PlushTransition::Pop;
             props.dark_scheme = dark;
-            render_agent_avatar(&props, None, 0.0).into_any_element()
+            crate::components::bloub_avatar::render_live_agent_avatar(
+                crate::components::bloub_avatar::LiveAvatarSpec::new(
+                    "create-managed-bot-hero",
+                    props,
+                )
+                .with_hover_group(hero_hover_key),
+            )
+            .into_any_element()
         } else {
             let bg_rgb = parse_fabushi_hex_color(&active_hex).unwrap_or(0x8B5CF6);
             let initials = classic_preview_initials(if self.bot_name.trim().is_empty() {
@@ -1113,6 +1126,14 @@ impl CreateManagedBotBoxPeers {
             .flex()
             .items_center()
             .justify_center()
+            .on_hover(cx.listener(|_this, hovered: &bool, _w, cx| {
+                if crate::components::bloub_avatar::set_live_avatar_group_hover(
+                    "studio-hero-plush",
+                    *hovered,
+                ) {
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

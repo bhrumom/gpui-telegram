@@ -4,12 +4,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::components::avatar::{
-    legacy_shape_to_bloub_shape, parse_fabushi_hex_color, render_channel_avatar,
-    render_fabushi_shape_avatar, render_felt_status_badge, render_plush_bot_avatar,
-    ChannelAgentBrief, ChannelAvatarLayout, FeltStatusBadgeState,
+    legacy_shape_to_bloub_shape, parse_fabushi_hex_color, render_channel_avatar_with_hover,
+    render_felt_status_badge, render_openbot_bot_plush_or_flat_interactive,
+    render_plush_bot_avatar_interactive, ChannelAgentBrief, ChannelAvatarLayout,
+    FeltStatusBadgeState,
 };
 use crate::components::bloub_avatar::{
-    compute_working_badge_layout, PlushCharacterId, SidebarPlushRingKind,
+    compute_working_badge_layout, is_live_avatar_group_hovered, set_live_avatar_group_hover,
+    AvatarMotionMode, PlushCharacterId, SidebarPlushRingKind,
 };
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
@@ -691,22 +693,31 @@ fn map_persona_state_to_openbot(
     let raw = exec_state.unwrap_or("").trim().to_ascii_lowercase();
     match raw.as_str() {
         "failed" | "error" => (AvatarMood::Failed, None),
-        "blocked" | "awaiting_approval" | "approval" | "needs_approval" => {
+        "blocked" | "awaiting_approval" | "approval" | "needs_approval" | "waiting" => {
             (AvatarMood::Waiting, None)
         }
         "responded" | "done" | "completed" => (AvatarMood::Responded, None),
+        "asleep" | "sleeping" | "paused" | "offline" => (AvatarMood::Asleep, None),
+        "connecting" | "loading" => (AvatarMood::Connecting, None),
         "searching" | "search" => (AvatarMood::Working, Some(AgentStepActivity::Searching)),
-        "coding" | "shell" | "terminal" => (AvatarMood::Working, Some(AgentStepActivity::Running)),
+        "browsing" | "browser" => (AvatarMood::Working, Some(AgentStepActivity::Browsing)),
+        "reading" | "read" => (AvatarMood::Working, Some(AgentStepActivity::Reading)),
+        "coding" | "shell" | "terminal" | "running" => {
+            (AvatarMood::Working, Some(AgentStepActivity::Running))
+        }
         "writing" | "editing" => (AvatarMood::Working, Some(AgentStepActivity::Editing)),
-        "tool" | "working" => (AvatarMood::Working, Some(AgentStepActivity::Working)),
+        "delegating" => (AvatarMood::Working, Some(AgentStepActivity::Delegating)),
+        "tool" => (AvatarMood::Working, Some(AgentStepActivity::Searching)),
+        "thinking" | "working" | "reviewing" => (AvatarMood::Working, None),
         _ => match state {
-            GrokPersonaState::Thinking | GrokPersonaState::Loading => {
-                (AvatarMood::Working, Some(AgentStepActivity::Working))
+            GrokPersonaState::Thinking | GrokPersonaState::Working => (AvatarMood::Working, None),
+            GrokPersonaState::Loading | GrokPersonaState::Spawning => {
+                (AvatarMood::Connecting, None)
             }
             GrokPersonaState::Searching => {
                 (AvatarMood::Working, Some(AgentStepActivity::Searching))
             }
-            GrokPersonaState::Working => (AvatarMood::Working, Some(AgentStepActivity::Running)),
+            GrokPersonaState::Writing => (AvatarMood::Working, Some(AgentStepActivity::Editing)),
             GrokPersonaState::Happy
             | GrokPersonaState::Excited
             | GrokPersonaState::Proud
@@ -741,7 +752,7 @@ pub fn resolve_dialog_felt_badge_state(
     if matches!(preview_priority, DialogPreviewPriority::BlockedApproval(_))
         || matches!(
             exec.as_str(),
-            "blocked" | "awaiting_approval" | "approval" | "needs_approval"
+            "blocked" | "awaiting_approval" | "approval" | "needs_approval" | "waiting"
         )
     {
         return Some(FeltStatusBadgeState::WaitingAmber);
@@ -749,7 +760,19 @@ pub fn resolve_dialog_felt_badge_state(
     let is_working = item.typing_indicator.is_some()
         || matches!(
             exec.as_str(),
-            "working" | "thinking" | "tool" | "coding" | "writing" | "searching"
+            "working"
+                | "thinking"
+                | "tool"
+                | "coding"
+                | "writing"
+                | "searching"
+                | "running"
+                | "browsing"
+                | "reading"
+                | "editing"
+                | "delegating"
+                | "reviewing"
+                | "connecting"
         );
     if is_working {
         return Some(FeltStatusBadgeState::Working3Balls);
@@ -806,7 +829,10 @@ fn build_group_cluster_members(
     (members, briefs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_openbot_bot_avatar(
+    instance_key: &str,
+    hover_group_key: Option<&str>,
     source_id: &str,
     shape: &str,
     color: &str,
@@ -815,6 +841,9 @@ fn render_openbot_bot_avatar(
     peer_name: &str,
     avatar_size_px: f32,
     surface_bg_hex: u32,
+    working_faces: bool,
+    cutout_ring: Option<SidebarPlushRingKind>,
+    dark_scheme: bool,
 ) -> Div {
     let trimmed = shape.trim();
     if trimmed.to_ascii_lowercase().starts_with("grok2d:") {
@@ -826,34 +855,81 @@ fn render_openbot_bot_avatar(
                 .with_surface_bg(surface_bg_hex),
         );
     }
+    let (mood, activity) = map_persona_state_to_openbot(state, exec_state);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "bloub" || lower.starts_with("bloub:") {
+        let hex_color = parse_fabushi_hex_color(color)
+            .map(|rgb_u32| format!("#{:06x}", rgb_u32 & 0xFF_FFFF));
+        return render_openbot_bot_plush_or_flat_interactive(
+            instance_key,
+            hover_group_key,
+            trimmed,
+            hex_color,
+            if peer_name.trim().is_empty() {
+                source_id
+            } else {
+                peer_name
+            },
+            mood,
+            activity,
+            working_faces,
+            AvatarMotionMode::Hover,
+            false,
+            cutout_ring,
+            dark_scheme,
+            avatar_size_px,
+        );
+    }
     let stripped = trimmed
         .strip_prefix("plush:")
         .or_else(|| trimmed.strip_prefix("PLUSH:"))
         .unwrap_or(trimmed);
-    if PlushCharacterId::parse(stripped).is_some() {
-        let bg_hex = parse_fabushi_hex_color(color).unwrap_or(0x8B5CF6);
-        return render_fabushi_shape_avatar(trimmed, bg_hex, peer_name, avatar_size_px);
+    if let Some(character) = PlushCharacterId::parse(stripped) {
+        return render_plush_bot_avatar_interactive(
+            instance_key,
+            hover_group_key,
+            source_id,
+            None,
+            Some(character),
+            None,
+            None,
+            avatar_size_px,
+            mood,
+            activity,
+            working_faces,
+            AvatarMotionMode::Hover,
+            false,
+            cutout_ring,
+            dark_scheme,
+        );
     }
     let bloub_shape = BloubShape::parse(stripped)
         .or_else(|| legacy_shape_to_bloub_shape(stripped))
         .or_else(|| legacy_shape_to_bloub_shape(trimmed));
     let hex_color = parse_fabushi_hex_color(color)
         .map(|rgb_u32| format!("#{:06x}", rgb_u32 & 0xFF_FFFF));
-    let (mood, activity) = map_persona_state_to_openbot(state, exec_state);
-    render_plush_bot_avatar(
+    render_plush_bot_avatar_interactive(
+        instance_key,
+        hover_group_key,
         source_id,
         bloub_shape,
+        None,
         None,
         hex_color.as_deref(),
         avatar_size_px,
         mood,
         activity,
+        working_faces,
+        AvatarMotionMode::Hover,
+        false,
+        cutout_ring,
+        dark_scheme,
     )
 }
 
-/// Shared circular / 3D plush / channel cluster avatar renderer used by expanded dialog rows,
-/// the centered pinned chats grid, and the compact sidebar rail.
-pub(crate) fn render_dialog_avatar_with_options(
+/// Shared circular / 3D plush / channel cluster avatar renderer with live hover-group & working-face wiring.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_dialog_avatar_with_interactive_options(
     item: &DialogItemModel,
     meta: &SidebarDialogMeta,
     palette: &TdesktopThemePalette,
@@ -862,6 +938,10 @@ pub(crate) fn render_dialog_avatar_with_options(
     online_dot_border: Rgba,
     is_selected: bool,
     suppress_online_dot: bool,
+    instance_prefix: &str,
+    hover_group_key: Option<&str>,
+    is_hovered: bool,
+    working_faces: bool,
 ) -> Div {
     let avatar_size = px(avatar_size_px);
     let initials_font_px = (avatar_size_px * 0.35).clamp(12.0, 19.0);
@@ -869,11 +949,14 @@ pub(crate) fn render_dialog_avatar_with_options(
     let bot_icon_px = (avatar_size_px * 0.44).clamp(17.0, 24.0);
     let is_openbot = palette.is_apple_style();
     let is_dark = palette.mode.is_dark();
-    let ring_kind = if is_selected {
-        SidebarPlushRingKind::Selected
-    } else {
-        SidebarPlushRingKind::Default
-    };
+    let ring_kind = SidebarPlushRingKind::select_for_row(
+        is_hovered,
+        is_selected,
+        true,
+        !is_dark,
+        false,
+    );
+    let instance_key = format!("{instance_prefix}:{}", item.id);
 
     let circle_base = |bg_hex: u32| -> Div {
         div()
@@ -894,7 +977,7 @@ pub(crate) fn render_dialog_avatar_with_options(
     let kind = resolve_dialog_avatar_kind(item, meta, palette);
     let mut avatar = if is_openbot && meta.is_group && !meta.is_bot && !meta.is_saved_messages {
         let (members, briefs) = build_group_cluster_members(item.id, &item.peer_name, meta, is_dark);
-        render_channel_avatar(
+        render_channel_avatar_with_hover(
             &members,
             &briefs,
             ChannelAvatarLayout::Cluster,
@@ -905,6 +988,7 @@ pub(crate) fn render_dialog_avatar_with_options(
             Some(ring_kind),
             is_dark,
             0.0,
+            hover_group_key,
         )
     } else {
         match kind {
@@ -915,7 +999,7 @@ pub(crate) fn render_dialog_avatar_with_options(
                 if is_openbot {
                     let (members, briefs) =
                         build_group_cluster_members(seed_id, &item.peer_name, meta, is_dark);
-                    render_channel_avatar(
+                    render_channel_avatar_with_hover(
                         &members,
                         &briefs,
                         ChannelAvatarLayout::Cluster,
@@ -926,6 +1010,7 @@ pub(crate) fn render_dialog_avatar_with_options(
                         Some(ring_kind),
                         is_dark,
                         0.0,
+                        hover_group_key,
                     )
                 } else {
                     render_composite_group_avatar(
@@ -947,6 +1032,8 @@ pub(crate) fn render_dialog_avatar_with_options(
                 if is_openbot {
                     let exec_state = meta.grok_avatar.as_ref().map(|g| g.execution_state.as_str());
                     render_openbot_bot_avatar(
+                        &instance_key,
+                        hover_group_key,
                         &source_id,
                         &shape,
                         &color,
@@ -955,6 +1042,9 @@ pub(crate) fn render_dialog_avatar_with_options(
                         &item.peer_name,
                         avatar_size_px,
                         surface_bg_hex,
+                        working_faces,
+                        None,
+                        is_dark,
                     )
                 } else {
                     render_grok_bot_avatar(
@@ -967,7 +1057,28 @@ pub(crate) fn render_dialog_avatar_with_options(
                 }
             }
             DialogAvatarKind::FabushiShape { shape, bg_hex } => {
-                render_fabushi_shape_avatar(&shape, bg_hex, &item.peer_name, avatar_size_px)
+                let exec_state = meta.grok_avatar.as_ref().map(|g| g.execution_state.as_str());
+                let persona_state = if item.typing_indicator.is_some() {
+                    GrokPersonaState::Thinking
+                } else {
+                    GrokPersonaState::Idle
+                };
+                let (mood, activity) = map_persona_state_to_openbot(persona_state, exec_state);
+                render_openbot_bot_plush_or_flat_interactive(
+                    &instance_key,
+                    hover_group_key,
+                    &shape,
+                    Some(format!("#{:06x}", bg_hex & 0xFF_FFFF)),
+                    &item.peer_name,
+                    mood,
+                    activity,
+                    working_faces,
+                    AvatarMotionMode::Hover,
+                    false,
+                    None,
+                    is_dark,
+                    avatar_size_px,
+                )
             }
             DialogAvatarKind::ClassicBotIcon { bg_hex } => {
                 circle_base(bg_hex).child(tg_icon(IconName::BotRobot, bot_icon_px, 0xFFFFFF))
@@ -1009,6 +1120,34 @@ pub(crate) fn render_dialog_avatar_with_options(
     avatar
 }
 
+/// Shared circular / 3D plush / channel cluster avatar renderer used by expanded dialog rows,
+/// the centered pinned chats grid, and the compact sidebar rail.
+pub(crate) fn render_dialog_avatar_with_options(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    online_dot_border: Rgba,
+    is_selected: bool,
+    suppress_online_dot: bool,
+) -> Div {
+    render_dialog_avatar_with_interactive_options(
+        item,
+        meta,
+        palette,
+        avatar_size_px,
+        surface_bg_hex,
+        online_dot_border,
+        is_selected,
+        suppress_online_dot,
+        "sidebar-dialog",
+        None,
+        false,
+        true,
+    )
+}
+
 /// Backward-compatible wrapper around [`render_dialog_avatar_with_options`].
 pub(crate) fn render_dialog_avatar(
     item: &DialogItemModel,
@@ -1030,9 +1169,11 @@ pub(crate) fn render_dialog_avatar(
     )
 }
 
-/// Renders an OpenBot avatar with bottom-right felt status badge (`Working3Balls`, `UnreadPlum`,
-/// `WaitingAmber`, `ErrorRaspberry`, `RespondedGreen`).
-pub(crate) fn render_openbot_dialog_avatar_with_badge(
+/// Renders an interactive OpenBot sidebar avatar with hover group, `working_faces`, and
+/// bottom-right felt status badge (`Working3Balls`, `UnreadPlum`, `WaitingAmber`,
+/// `ErrorRaspberry`, `RespondedGreen`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_openbot_dialog_avatar_with_badge_interactive(
     item: &DialogItemModel,
     meta: &SidebarDialogMeta,
     palette: &TdesktopThemePalette,
@@ -1040,9 +1181,13 @@ pub(crate) fn render_openbot_dialog_avatar_with_badge(
     surface_bg_hex: u32,
     is_selected: bool,
     badge_state: Option<FeltStatusBadgeState>,
+    instance_prefix: &str,
+    hover_group_key: Option<&str>,
+    is_hovered: bool,
+    working_faces: bool,
 ) -> Div {
     let suppress_dot = badge_state.is_some() || meta.is_bot || meta.is_group;
-    let base = render_dialog_avatar_with_options(
+    let base = render_dialog_avatar_with_interactive_options(
         item,
         meta,
         palette,
@@ -1051,8 +1196,12 @@ pub(crate) fn render_openbot_dialog_avatar_with_badge(
         rgb(surface_bg_hex),
         is_selected,
         suppress_dot,
+        instance_prefix,
+        hover_group_key,
+        is_hovered,
+        working_faces,
     );
-    let now_ms = current_wall_ms();
+    let now_ms = current_wall_ms().max(1);
     let is_dark = palette.mode.is_dark();
     div()
         .relative()
@@ -1072,6 +1221,33 @@ pub(crate) fn render_openbot_dialog_avatar_with_badge(
                     .child(render_felt_status_badge(st, surface_bg_hex, is_dark, now_ms)),
             )
         })
+}
+
+/// Renders an OpenBot avatar with bottom-right felt status badge (`Working3Balls`, `UnreadPlum`,
+/// `WaitingAmber`, `ErrorRaspberry`, `RespondedGreen`).
+#[allow(dead_code)]
+pub(crate) fn render_openbot_dialog_avatar_with_badge(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    palette: &TdesktopThemePalette,
+    avatar_size_px: f32,
+    surface_bg_hex: u32,
+    is_selected: bool,
+    badge_state: Option<FeltStatusBadgeState>,
+) -> Div {
+    render_openbot_dialog_avatar_with_badge_interactive(
+        item,
+        meta,
+        palette,
+        avatar_size_px,
+        surface_bg_hex,
+        is_selected,
+        badge_state,
+        "sidebar-dialog",
+        None,
+        false,
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1160,7 +1336,9 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
         let sub_fg = ob.text_muted();
         let time_fg = ob.text_readable();
         let avatar_size_px = palette.scaled_px(row_layout.avatar_px);
-        let avatar = render_openbot_dialog_avatar_with_badge(
+        let row_hover_key = format!("sidebar-row:{}", item.id);
+        let is_row_hovered = is_live_avatar_group_hovered(&row_hover_key);
+        let avatar = render_openbot_dialog_avatar_with_badge_interactive(
             item,
             meta,
             palette,
@@ -1168,6 +1346,10 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             row_surface_hex,
             is_selected,
             row_layout.felt_badge,
+            "sidebar-row",
+            Some(&row_hover_key),
+            is_row_hovered,
+            true,
         );
 
         let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
@@ -1439,6 +1621,11 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             .opacity(row_layout.opacity)
             .when(is_selected, |el| el.bg(row_active_bg))
             .hover(move |s| if is_selected { s } else { s.bg(row_hover_bg) })
+            .on_hover(cx.listener(move |_this, hovered: &bool, _w, cx| {
+                if set_live_avatar_group_hover(&row_hover_key, *hovered) {
+                    cx.notify();
+                }
+            }))
             .flex()
             .items_center()
             .gap(px(palette.scaled_px(8.0)))

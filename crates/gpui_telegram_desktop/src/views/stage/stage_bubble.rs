@@ -1832,6 +1832,7 @@ pub fn render_message_row_openbot<V: 'static>(
                 .flex()
                 .justify_start()
                 .when(group.show_bottom_avatar, |el| {
+                    let sender_hover_key = format!("bubble-sender-avatar:{msg_id}");
                     let av_inner: AnyElement = if let Some(src) = av_src {
                         div()
                             .w(px(av_size))
@@ -1850,30 +1851,40 @@ pub fn render_message_row_openbot<V: 'static>(
                             extra.sender_hue_name.unwrap_or(""),
                         );
                         let seed = format!("sender_{}_{}", msg.sender_id, msg.sender_name);
-                        render_plush_bot_avatar(
+                        crate::components::avatar::render_plush_bot_avatar_interactive(
+                            format!("bubble-sender:{msg_id}"),
+                            Some(&sender_hover_key),
                             &seed,
+                            None,
                             None,
                             hue,
                             color_hex.as_deref(),
                             av_size,
                             openbot_contracts::avatar::AvatarMood::Idle,
                             None,
+                            false,
+                            crate::components::bloub_avatar::AvatarMotionMode::Hover,
+                            false,
+                            None,
+                            palette.mode.is_dark(),
                         )
                         .into_any_element()
                     } else if let Some(fab) = active_fabushi_bot
                         .filter(|f| !extra.is_group_chat && !f.avatar_shape.eq_ignore_ascii_case("classic"))
                     {
                         if is_apple {
-                            let (shape, hue, color) =
-                                normalize_fabushi_plush_spec(&fab.avatar_shape, &fab.avatar_color);
-                            render_plush_bot_avatar(
+                            super::openbot_stage_chrome::render_fabushi_plush_avatar_interactive(
+                                format!("bubble-sender:{msg_id}"),
+                                Some(&sender_hover_key),
+                                Some(fab),
                                 &fab.agent_id,
-                                shape,
-                                hue,
-                                color.as_deref(),
                                 av_size,
                                 openbot_contracts::avatar::AvatarMood::Idle,
                                 None,
+                                false,
+                                crate::components::bloub_avatar::AvatarMotionMode::Hover,
+                                false,
+                                palette.mode.is_dark(),
                             )
                             .into_any_element()
                         } else {
@@ -1911,6 +1922,14 @@ pub fn render_message_row_openbot<V: 'static>(
                     el.child(
                         div()
                             .id(SharedString::from(format!("group-sender-avatar-{}", msg_id)))
+                            .on_hover(cx.listener(move |_this, hovered: &bool, _w, cx| {
+                                if crate::components::bloub_avatar::set_live_avatar_group_hover(
+                                    &sender_hover_key,
+                                    *hovered,
+                                ) {
+                                    cx.notify();
+                                }
+                            }))
                             .when(is_apple && extra.is_group_chat && sender_uid > 0, |btn| {
                                 let click_name = sender_name.clone();
                                 btn.cursor_pointer().on_mouse_down(

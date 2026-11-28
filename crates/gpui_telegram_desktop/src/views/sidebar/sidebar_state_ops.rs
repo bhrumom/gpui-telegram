@@ -1011,12 +1011,44 @@ impl ChatSidebar {
     }
 
     fn is_dialog_working(&self, d: &DialogItemModel) -> bool {
+        let exec_working = self.bot_execution_states.get(&d.id).is_some_and(|raw| {
+            let st = raw.trim().to_ascii_lowercase();
+            matches!(
+                st.as_str(),
+                "working"
+                    | "thinking"
+                    | "tool"
+                    | "coding"
+                    | "writing"
+                    | "searching"
+                    | "running"
+                    | "browsing"
+                    | "reading"
+                    | "editing"
+                    | "delegating"
+                    | "reviewing"
+                    | "connecting"
+            )
+        });
         d.typing_indicator.is_some()
+            || exec_working
             || self.bot_grok_avatars.get(&d.id).is_some_and(|g| {
                 let st = g.execution_state.trim().to_ascii_lowercase();
                 matches!(
                     st.as_str(),
-                    "working" | "thinking" | "tool" | "coding" | "writing" | "searching"
+                    "working"
+                        | "thinking"
+                        | "tool"
+                        | "coding"
+                        | "writing"
+                        | "searching"
+                        | "running"
+                        | "browsing"
+                        | "reading"
+                        | "editing"
+                        | "delegating"
+                        | "reviewing"
+                        | "connecting"
                 )
             })
     }
@@ -1357,6 +1389,7 @@ impl ChatSidebar {
         self.unread_marked_ids.remove(&id);
         self.forum_topics.remove(&id);
         self.bot_grok_avatars.remove(&id);
+        self.bot_execution_states.remove(&id);
         self.bot_fabushi_visuals.remove(&id);
         self.group_member_briefs.remove(&id);
         if self.active_chat_id == Some(id) {
@@ -1436,8 +1469,27 @@ impl ChatSidebar {
         } else {
             None
         };
+        let live_exec = self.bot_execution_states.get(&item.id).cloned();
         let grok_avatar = if is_bot {
-            self.bot_grok_avatars.get(&item.id).cloned()
+            match (self.bot_grok_avatars.get(&item.id).cloned(), live_exec) {
+                (Some(mut g), Some(exec)) => {
+                    g.execution_state = exec;
+                    Some(g)
+                }
+                (Some(g), None) => Some(g),
+                (None, Some(exec)) => {
+                    let (shape, color_rgb) = fabushi_vis
+                        .clone()
+                        .unwrap_or_else(|| ("plush".to_string(), item.avatar_color));
+                    Some(BotGrokAvatarVisual {
+                        agent_id: format!("bot-{}", item.id),
+                        shape,
+                        color: format!("#{:06x}", color_rgb & 0xFF_FFFF),
+                        execution_state: exec,
+                    })
+                }
+                (None, None) => None,
+            }
         } else {
             None
         };

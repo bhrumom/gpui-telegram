@@ -1276,10 +1276,18 @@ impl AppShell {
             )
         });
         if stop_turn {
+            let active_chat_id = self.stage.read(cx).active_chat_id;
             self.stage.update(cx, |st, scx| {
                 st.set_bot_activity("idle", None);
                 scx.notify();
             });
+            if let Some(cid) = active_chat_id {
+                self.sidebar.update(cx, |sb, sb_cx| {
+                    sb.set_typing(cid, None);
+                    sb.set_bot_execution_state(cid, "idle");
+                    sb_cx.notify();
+                });
+            }
             self.composer.update(cx, |c, ccx| {
                 c.set_agent_busy(false);
                 ccx.notify();

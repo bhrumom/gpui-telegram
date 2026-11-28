@@ -3,6 +3,7 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+use crate::components::bloub_avatar::set_live_avatar_group_hover;
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::chat_sidebar::{
@@ -10,8 +11,8 @@ use crate::views::chat_sidebar::{
 };
 use crate::views::nav_rail::{NavDestination, NavRail};
 use crate::views::sidebar::dialogs_row_view::{
-    render_dialog_avatar, render_openbot_dialog_avatar_with_badge, resolve_dialog_felt_badge_state,
-    resolve_dialog_preview_priority, SidebarDialogMeta,
+    render_dialog_avatar, render_openbot_dialog_avatar_with_badge_interactive,
+    resolve_dialog_felt_badge_state, resolve_dialog_preview_priority, SidebarDialogMeta,
 };
 use crate::views::sidebar::openbot_sidebar_chrome::{
     openbot_vector_icon, OpenBotChromeIcon,
@@ -409,7 +410,8 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
                         meta,
                         &resolve_dialog_preview_priority(dialog, meta, lang_id),
                     );
-                    let avatar = render_openbot_dialog_avatar_with_badge(
+                    let hover_key = format!("sidebar-rail:{dialog_id}");
+                    let avatar = render_openbot_dialog_avatar_with_badge_interactive(
                         dialog,
                         meta,
                         palette,
@@ -417,6 +419,10 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
                         tile_surface_hex,
                         is_active,
                         badge_state,
+                        "sidebar-rail",
+                        Some(&hover_key),
+                        is_hovered,
+                        true,
                     );
 
                     div()
@@ -434,6 +440,7 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
                         .when(is_active, |el| el.bg(active_bg))
                         .when(!is_active && is_hovered, |el| el.bg(hover_bg))
                         .on_hover(cx.listener(move |this, hovered, _w, cx| {
+                            set_live_avatar_group_hover(&hover_key, *hovered);
                             let next = if *hovered { Some(dialog_id) } else { None };
                             on_d_hover(this, UnifiedSidebarAction::SetHoverDialog(next), cx);
                         }))

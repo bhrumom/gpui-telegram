@@ -6,7 +6,6 @@ use gpui_telegram_proto::{
     ComputerNodeKind, ComputerRunPolicy,
 };
 
-use crate::components::avatar::render_plush_bot_avatar;
 use crate::components::bloub_avatar::{AgentAvatarProps, render_agent_avatar};
 use crate::components::grok_bot_avatar::trigger_grok_avatar_bounce;
 use crate::i18n::tr_str;
@@ -4243,22 +4242,48 @@ pub fn render_openbot_bot_settings_root(
             let sh = shape.unwrap_or(BloubShape::Cercle);
             let seed = avatar_seed_for_face(&seed_base, sh, inspector.bot_avatar_expression, style)
                 .unwrap_or(seed_base);
-            let mut props = AgentAvatarProps::new(seed).with_size(62.0).with_mood(mood);
+            let mut props = AgentAvatarProps::new(seed)
+                .with_size(62.0)
+                .with_mood(mood)
+                .with_motion(crate::components::bloub_avatar::AvatarMotionMode::Always)
+                .with_follow_pointer(true)
+                .with_allow_hover_face(true);
             props.shape_override = Some(sh);
-            props.expression_override = Some(inspector.bot_avatar_expression);
             props.hue = hue;
             props.color = color_hex;
             props.activity = activity;
             props.dark_scheme = is_dark;
-            render_agent_avatar(&props, None, 0.0).into_any_element()
+            crate::components::bloub_avatar::render_live_agent_avatar(
+                crate::components::bloub_avatar::LiveAvatarSpec::new(
+                    format!("inspector-hero:{}", fab.bot_user_id),
+                    props,
+                ),
+            )
+            .into_any_element()
         } else {
             let seed = if fab.agent_id.trim().is_empty() {
                 model.name.as_str()
             } else {
                 fab.agent_id.as_str()
             };
-            render_plush_bot_avatar(seed, shape, hue, color_hex.as_deref(), 62.0, mood, activity)
-                .into_any_element()
+            crate::components::avatar::render_plush_bot_avatar_interactive(
+                format!("inspector-hero:{}", fab.bot_user_id),
+                None,
+                seed,
+                shape,
+                None,
+                hue,
+                color_hex.as_deref(),
+                62.0,
+                mood,
+                activity,
+                false,
+                crate::components::bloub_avatar::AvatarMotionMode::Always,
+                true,
+                None,
+                is_dark,
+            )
+            .into_any_element()
         }
     } else {
         let seed = if !clean_username.is_empty() {
@@ -4266,8 +4291,24 @@ pub fn render_openbot_bot_settings_root(
         } else {
             model.name.as_str()
         };
-        render_plush_bot_avatar(seed, None, None, None, 62.0, AvatarMood::Idle, None)
-            .into_any_element()
+        crate::components::avatar::render_plush_bot_avatar_interactive(
+            format!("inspector-hero:{seed}"),
+            None,
+            seed,
+            None,
+            None,
+            None,
+            None,
+            62.0,
+            AvatarMood::Idle,
+            None,
+            false,
+            crate::components::bloub_avatar::AvatarMotionMode::Always,
+            true,
+            None,
+            is_dark,
+        )
+        .into_any_element()
     };
 
     let hero_block = div()

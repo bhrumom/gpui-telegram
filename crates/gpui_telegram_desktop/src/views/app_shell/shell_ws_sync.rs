@@ -301,6 +301,7 @@ impl AppShell {
                 tr_str(lang, "AI 助手正在思考...", "Assistant is thinking...").to_string();
             self.sidebar.update(cx, |sb, sb_cx| {
                 sb.set_typing(active_chat_id, Some(thinking_txt.clone()));
+                sb.set_bot_execution_state(active_chat_id, "working");
                 sb_cx.notify();
             });
             self.stage.update(cx, |st, st_cx| {

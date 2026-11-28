@@ -1237,6 +1237,7 @@ pub struct BloubBotEngine {
 
     eye_scale: f64,
     initial_phase: f64,
+    decalage_disabled: bool,
 }
 
 impl BloubBotEngine {
@@ -1273,6 +1274,7 @@ impl BloubBotEngine {
 
             eye_scale: 1.0,
             initial_phase: 0.0,
+            decalage_disabled: false,
         }
     }
 
@@ -1361,6 +1363,20 @@ impl BloubBotEngine {
             return;
         }
         self.apply_expression_transition(expression_def(next), false, now_sec);
+    }
+
+    #[inline]
+    pub fn set_decalage_disabled(&mut self, disabled: bool) {
+        self.decalage_disabled = disabled;
+    }
+
+    /// Sets a custom `ExpressionDef` immediately without a morph transition (for initial construction).
+    pub fn set_expression_def_immediate(&mut self, face: ExpressionDef) {
+        self.cur_expr = face;
+        self.cur_expr_custom = true;
+        self.expr_prev = None;
+        self.expr_depart.clear();
+        self.expr_at = f64::NEG_INFINITY;
     }
 
     /// Transitions to a custom `ExpressionDef` (e.g. `PlushFeltRenderer` `ASLEEP_FACE`/`FAILED_FACE`).
@@ -1516,6 +1532,20 @@ impl BloubBotEngine {
         } else {
             LOOK_MORPH_SEC
         };
+    }
+
+    /// Sets the active `LookOverride` immediately without introducing an extra morph layer.
+    pub fn set_look_immediate(&mut self, look: LookOverride) {
+        self.look_prev = None;
+        self.look_cur = LookOverride {
+            yaw: if look.yaw.is_finite() { look.yaw } else { 0.0 },
+            pitch: if look.pitch.is_finite() { look.pitch } else { 0.0 },
+            mix: if look.mix.is_finite() { look.mix.clamp(0.0, 1.0) } else { 0.0 },
+            spin: if look.spin.is_finite() { look.spin } else { 0.0 },
+            wander: if look.wander.is_finite() { look.wander.clamp(0.0, 1.0) } else { 0.0 },
+            blink: look.blink.filter(|b| b.is_finite()).map(|b| b.clamp(0.0, 1.0)),
+        };
+        self.look_at = f64::NEG_INFINITY;
     }
 
     /// Samples the avatar frame at `now_sec` (or canonical frozen pose when `reduced_motion == true`).
@@ -1747,7 +1777,9 @@ impl BloubBotEngine {
             self.pose_composee(t)
         };
 
-        let decalage = if frozen {
+        let decalage = if self.decalage_disabled {
+            DecalageOffset::default()
+        } else if frozen {
             Self::decalage_for_face_entry(
                 self.cur_shape,
                 self.cur_state,
@@ -1757,7 +1789,9 @@ impl BloubBotEngine {
         } else {
             self.decalage_compose(t)
         };
-        let decalage = if state_meta(self.cur_state).base_body || !frozen {
+        let decalage = if self.decalage_disabled {
+            DecalageOffset::default()
+        } else if state_meta(self.cur_state).base_body || !frozen {
             if frozen && !state_meta(self.cur_state).base_face {
                 decalage_for(self.cur_shape, self.cur_state, None)
             } else {
@@ -1816,7 +1850,7 @@ impl BloubBotEngine {
             RAYON,
             self.eye_scale,
         );
-        let zero_clipping = if state_meta(self.cur_state).base_body {
+        let zero_clipping = if !self.decalage_disabled && state_meta(self.cur_state).base_body {
             fit_eyes_zero_clipping(&pose.sil, &mut eyes)
         } else {
             verify_eyes_zero_clipping(&pose.sil, &eyes)

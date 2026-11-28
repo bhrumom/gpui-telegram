@@ -27,7 +27,7 @@ pub const STAGE_TOAST_BANNER_DURATION_MS: u64 = 2_000;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 
-use crate::components::avatar::{render_plush_bot_avatar, ChannelAgentBrief};
+use crate::components::avatar::ChannelAgentBrief;
 use crate::components::tool_permission_dock::{
     render_tool_permission_dock_inline, PendingToolApproval, ToolApprovalDecision,
     ToolPermissionDock,
@@ -42,7 +42,7 @@ use crate::views::stage::history_view_highlight_manager::{
 };
 use crate::views::stage::openbot_stage_chrome::{
     activity_str_to_openbot_mood, normalize_fabushi_plush_spec, openbot_stage_icon,
-    render_fabushi_plush_avatar, OpenBotStageIcon,
+    OpenBotStageIcon,
 };
 use crate::views::stage::pinned_bar::PinnedTracker;
 use crate::views::stage::rich_meta::MessageRichMeta;
@@ -2562,14 +2562,26 @@ impl Render for ConversationStage {
                                         .rounded_full()
                                         .border_2()
                                         .border_color(ob.bg_canvas())
-                                        .child(render_plush_bot_avatar(
+                                        .child(crate::components::avatar::render_plush_bot_avatar_interactive(
+                                            format!(
+                                                "stage-channel-worker:{}:{i}:{}",
+                                                self.active_chat_id.unwrap_or(0),
+                                                name
+                                            ),
+                                            None,
                                             name,
+                                            None,
                                             None,
                                             hue,
                                             color.as_deref(),
                                             32.0,
                                             openbot_contracts::avatar::AvatarMood::Working,
-                                            Some(openbot_contracts::avatar::AgentStepActivity::Working),
+                                            None,
+                                            false,
+                                            crate::components::bloub_avatar::AvatarMotionMode::Hover,
+                                            false,
+                                            None,
+                                            self.palette.mode.is_dark(),
                                         ))
                                 }));
                             let shimmer_row = div()
@@ -2649,11 +2661,8 @@ impl Render for ConversationStage {
                                 let ob = self.palette.openbot_palette();
                                 let (mood, act) =
                                     activity_str_to_openbot_mood(&self.bot_activity_state);
-                                let seed = format!(
-                                    "bot_{}_{}",
-                                    self.active_chat_id.unwrap_or(0),
-                                    self.chat_title
-                                );
+                                let chat_id_val = self.active_chat_id.unwrap_or(0);
+                                let seed = format!("bot_{}_{}", chat_id_val, self.chat_title);
                                 let elapsed_secs = self
                                     .bot_activity_started_at_ms
                                     .map(|s| stage_now_ms().saturating_sub(s) / 1000)
@@ -2665,12 +2674,18 @@ impl Render for ConversationStage {
                                     !has_live_steps,
                                     self.reduced_motion,
                                 );
-                                let plush = render_fabushi_plush_avatar(
+                                let plush = super::stage::openbot_stage_chrome::render_fabushi_plush_avatar_interactive(
+                                    format!("stage-activity:{chat_id_val}"),
+                                    None,
                                     self.active_fabushi_bot.as_ref(),
                                     &seed,
                                     act_layout.avatar_px,
                                     mood,
                                     act,
+                                    false,
+                                    crate::components::bloub_avatar::AvatarMotionMode::Hover,
+                                    false,
+                                    self.palette.mode.is_dark(),
                                 );
                                 let steps_open = self.bot_activity_steps_expanded;
                                 let hover_bg = ob.hover();

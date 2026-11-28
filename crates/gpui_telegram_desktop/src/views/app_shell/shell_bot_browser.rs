@@ -4040,6 +4040,7 @@ impl AppShell {
             tr_str(lang, "AI 助手正在思考...", "Assistant is thinking...").to_string();
         self.sidebar.update(cx, |sb, sb_cx| {
             sb.set_typing(chat_id, Some(thinking_txt.clone()));
+            sb.set_bot_execution_state(chat_id, "working");
             sb_cx.notify();
         });
         self.stage.update(cx, |st, st_cx| {
@@ -4169,6 +4170,7 @@ impl AppShell {
                         let color = peer_avatar_color(bot_user_id.max(1) as u64);
                         shell.sidebar.update(cx, |sb, sb_cx| {
                             sb.set_typing(chat_id, None);
+                            sb.set_bot_execution_state(chat_id, "responded");
                             if let Some((_, last_txt)) = pairs_for_ui.last() {
                                 if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == chat_id) {
                                     d.last_message =
@@ -4214,6 +4216,25 @@ impl AppShell {
                             Some(session_for_cookies),
                             cx,
                         );
+                        cx.spawn(async move |weak_reset: WeakEntity<Self>, app_reset: &mut AsyncApp| {
+                            app_reset
+                                .background_executor()
+                                .timer(std::time::Duration::from_secs(5))
+                                .await;
+                            let _ = weak_reset.update(app_reset, |shell_reset, cx_reset| {
+                                shell_reset.sidebar.update(cx_reset, |sb, sb_cx| {
+                                    if sb
+                                        .bot_execution_states
+                                        .get(&chat_id)
+                                        .is_some_and(|st| st == "responded")
+                                    {
+                                        sb.set_bot_execution_state(chat_id, "idle");
+                                        sb_cx.notify();
+                                    }
+                                });
+                            });
+                        })
+                        .detach();
                         cx.notify();
                     });
 
@@ -4510,6 +4531,7 @@ impl AppShell {
 
         self.sidebar.update(cx, |sb, sb_cx| {
             sb.set_typing(chat_id, None);
+            sb.set_bot_execution_state(chat_id, "failed");
             if let Some(d) = sb.dialogs.iter_mut().find(|d| d.id == chat_id) {
                 d.last_message = super::shell_pts_updates::format_sidebar_preview(&card_text);
                 d.timestamp = ts.clone();
