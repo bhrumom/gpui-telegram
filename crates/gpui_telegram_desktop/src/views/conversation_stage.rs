@@ -699,6 +699,7 @@ pub struct ConversationStage {
     pub external_header_hosted: bool,
     pub pinned_popover_open: bool,
     pub model_picker_open: bool,
+    pub model_picker: crate::components::openbot_model_picker::OpenBotModelPickerState,
     pub active_thread_id: Option<String>,
     pub thread_tabs: Vec<(String, String)>,
     pub active_model_label: String,
@@ -859,6 +860,7 @@ impl ConversationStage {
             external_header_hosted: false,
             pinned_popover_open: false,
             model_picker_open: false,
+            model_picker: crate::components::openbot_model_picker::OpenBotModelPickerState::default(),
             active_thread_id: None,
             thread_tabs: Vec::new(),
             active_model_label: String::new(),
@@ -1186,6 +1188,7 @@ impl ConversationStage {
     /// Clears all Settings/bot model picker state on logout or account switch.
     pub fn clear_model_picker_state(&mut self) {
         self.model_picker_open = false;
+        self.model_picker = crate::components::openbot_model_picker::OpenBotModelPickerState::default();
         self.active_model_label.clear();
         self.active_thinking_effort.clear();
         self.available_models.clear();
@@ -1198,6 +1201,31 @@ impl ConversationStage {
         self.can_edit_thinking_effort = false;
         self.provider_connected = true;
         self.pending_model_badge = None;
+    }
+
+    /// Synchronizes live Settings/Magpie providers & subscriptions into the header OpenBot model picker.
+    pub fn sync_magpie_model_catalog(
+        &mut self,
+        state: &gpui_telegram_client::net::hermes_client::MagpieStateDto,
+        server_subs: &[crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto],
+        local_subs: &[crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto],
+        detected_coding: &[gpui_telegram_proto::DetectedCodingProvider],
+    ) {
+        let effective_model = (!self.active_model_label.trim().is_empty())
+            .then_some(self.active_model_label.trim())
+            .or_else(|| {
+                let m = state.active_model.trim();
+                (!m.is_empty()
+                    && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(m))
+                .then_some(m)
+            });
+        self.model_picker.sync_from_magpie(
+            state,
+            server_subs,
+            local_subs,
+            detected_coding,
+            effective_model,
+        );
     }
 
     pub fn set_live_agent_steps(&mut self, steps: Vec<AgentStepEntry>) {
@@ -1220,6 +1248,8 @@ impl ConversationStage {
         }
         if self.model_picker_open {
             self.model_picker_open = false;
+            self.model_picker.search_focused = false;
+            self.model_picker.effort_menu_open = false;
             closed = true;
         }
         if self.more_menu_open || self.ttl_submenu_open {
@@ -1418,8 +1448,19 @@ impl ConversationStage {
         &mut self,
         bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>,
     ) {
-        if bot.is_some() {
+        if let Some(ref b) = bot {
             self.is_bot_chat = true;
+            let pm = b.preferred_model.trim();
+            if !pm.is_empty()
+                && !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(pm)
+            {
+                self.active_model_label = pm.to_string();
+                self.model_picker.ensure_selected_provider(Some(pm));
+            }
+            let tl = b.thinking_level.trim();
+            if !tl.is_empty() {
+                self.active_thinking_effort = tl.to_string();
+            }
         }
         self.active_fabushi_bot = bot;
     }
@@ -2958,6 +2999,7 @@ impl Render for ConversationStage {
             };
             root = root.child(render_openbot_model_picker_popover(
                 &picker_props,
+                &self.model_picker,
                 &self.palette,
                 &self.lang_id,
                 cx,

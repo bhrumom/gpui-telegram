@@ -402,9 +402,19 @@ impl ConversationStage {
                 self.more_menu_open = false;
                 self.pinned_popover_open = false;
                 self.model_picker_open = !self.model_picker_open;
-                if self.model_picker_open && !self.model_catalog_synced {
-                    self.pending_stage_action =
-                        Some(crate::views::conversation_stage::StageAction::RefreshModelCatalog);
+                if self.model_picker_open {
+                    if !self.model_catalog_synced {
+                        self.pending_stage_action =
+                            Some(crate::views::conversation_stage::StageAction::RefreshModelCatalog);
+                    }
+                    self.model_picker.ensure_selected_provider(
+                        (!self.active_model_label.trim().is_empty())
+                            .then_some(self.active_model_label.as_str()),
+                    );
+                    self.model_picker.effort_menu_open = false;
+                } else {
+                    self.model_picker.search_focused = false;
+                    self.model_picker.effort_menu_open = false;
                 }
             }
             TopBarUiAction::SelectModel {
@@ -427,6 +437,8 @@ impl ConversationStage {
                     self.active_thinking_effort = effort.clone();
                 }
                 self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
                 self.pending_stage_action =
                     Some(crate::views::conversation_stage::StageAction::SelectModel {
                         model_id,
@@ -437,12 +449,86 @@ impl ConversationStage {
                 self.more_menu_open = false;
                 self.pinned_popover_open = false;
                 self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
                 self.pending_stage_action =
                     Some(crate::views::conversation_stage::StageAction::OpenAiProvidersSettings);
+            }
+            TopBarUiAction::ModelPickerAction(act) => {
+                use crate::components::openbot_model_picker::OpenBotModelPickerAction;
+                match act {
+                    OpenBotModelPickerAction::SelectProvider(pid) => {
+                        self.model_picker.selected_provider_id = pid;
+                        self.model_picker.legacy_expanded = false;
+                        self.model_picker.effort_menu_open = false;
+                        self.model_picker.search_query.clear();
+                    }
+                    OpenBotModelPickerAction::FocusSearch => {
+                        self.model_picker.search_focused = true;
+                        self.model_picker.effort_menu_open = false;
+                    }
+                    OpenBotModelPickerAction::ClearSearch => {
+                        self.model_picker.search_query.clear();
+                        self.model_picker.search_focused = true;
+                    }
+                    OpenBotModelPickerAction::SelectModel {
+                        provider_id,
+                        model_id,
+                    } => {
+                        self.model_picker.selected_provider_id = provider_id;
+                        let trimmed = model_id.trim();
+                        if !trimmed.is_empty() {
+                            if self.can_override_bot_model {
+                                self.bot_override_model = Some(trimmed.to_string());
+                            }
+                            self.active_model_label = trimmed.to_string();
+                        }
+                        self.model_picker_open = false;
+                        self.model_picker.search_focused = false;
+                        self.model_picker.effort_menu_open = false;
+                        self.model_picker.search_query.clear();
+                        self.pending_stage_action =
+                            Some(crate::views::conversation_stage::StageAction::SelectModel {
+                                model_id: Some(trimmed.to_string()),
+                                thinking_level: None,
+                            });
+                    }
+                    OpenBotModelPickerAction::ToggleLegacy => {
+                        self.model_picker.legacy_expanded = !self.model_picker.legacy_expanded;
+                    }
+                    OpenBotModelPickerAction::ToggleEffortMenu => {
+                        self.model_picker.effort_menu_open = !self.model_picker.effort_menu_open;
+                        self.model_picker.search_focused = false;
+                    }
+                    OpenBotModelPickerAction::SelectEffort(effort) => {
+                        self.active_thinking_effort = effort.clone();
+                        self.model_picker.effort_menu_open = false;
+                        self.pending_stage_action =
+                            Some(crate::views::conversation_stage::StageAction::SelectModel {
+                                model_id: None,
+                                thinking_level: Some(effort),
+                            });
+                    }
+                    OpenBotModelPickerAction::OpenProvidersSettings => {
+                        self.model_picker_open = false;
+                        self.model_picker.search_focused = false;
+                        self.model_picker.effort_menu_open = false;
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::OpenAiProvidersSettings,
+                        );
+                    }
+                    OpenBotModelPickerAction::Dismiss => {
+                        self.model_picker_open = false;
+                        self.model_picker.search_focused = false;
+                        self.model_picker.effort_menu_open = false;
+                    }
+                }
             }
             TopBarUiAction::TogglePinnedMessagesPopover => {
                 self.more_menu_open = false;
                 self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
                 self.pinned_popover_open = !self.pinned_popover_open;
             }
             TopBarUiAction::JumpPinnedMessage(msg_id) => {

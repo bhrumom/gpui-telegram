@@ -100,7 +100,7 @@ impl SettingsSectionType {
                 Self::LocalStorage => "数据与存储",
                 Self::Business => "商业功能",
                 Self::Computers => "电脑",
-                Self::AiProviders => "AI 订阅与模型供应商",
+                Self::AiProviders => "服务商",
                 Self::Language => "界面语言",
                 Self::Search => "搜索设置",
             }
@@ -129,7 +129,7 @@ impl SettingsSectionType {
                 Self::LocalStorage => "Data and Storage",
                 Self::Business => "Business",
                 Self::Computers => "Computers",
-                Self::AiProviders => "AI Subscriptions & Providers",
+                Self::AiProviders => "Providers",
                 Self::Language => "Language",
                 Self::Search => "Search Settings",
             }

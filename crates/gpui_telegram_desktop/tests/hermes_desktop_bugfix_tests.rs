@@ -693,7 +693,7 @@ fn magpie_ai_providers_settings_search_main_and_studio_sync_work() {
     assert_eq!(SettingsSectionType::AiProviders.id_str(), "ai_providers");
     assert_eq!(
         SettingsSectionType::AiProviders.display_title_localized(true),
-        "AI 订阅与模型供应商"
+        "服务商"
     );
     assert_eq!(
         SettingsSectionType::AiProviders.breadcrumb_path(),

@@ -12,6 +12,11 @@ use crate::components::avatar::{
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
 };
+use crate::components::openbot_model_picker::{
+    format_model_display_label, infer_provider_icon_key_from_model, openbot_effort_label,
+    render_openbot_provider_model_picker_card, render_provider_icon, OpenBotModelPickerAction,
+    OpenBotModelPickerState,
+};
 use crate::i18n::{tr_fmt, tr_key_or, tr_str};
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
 use super::openbot_stage_chrome::{
@@ -66,6 +71,7 @@ pub enum TopBarUiAction {
         thinking_level: Option<String>,
     },
     OpenAiProvidersSettings,
+    ModelPickerAction(OpenBotModelPickerAction),
     TogglePinnedMessagesPopover,
     JumpPinnedMessage(u64),
     UnpinMessage(u64),
@@ -2167,17 +2173,20 @@ pub fn render_openbot_conversation_header<V: 'static>(
         .gap(px(4.0));
 
     if layout.model_picker_visible {
-        let model_lbl = if !props.active_model_label.trim().is_empty() {
-            props.active_model_label.trim().to_string()
+        let raw_model = props.active_model_label.trim();
+        let model_lbl = if !raw_model.is_empty() {
+            format_model_display_label(raw_model)
         } else if !props.provider_connected {
             tr_str(lang_id, "未配置模型", "No model").to_string()
         } else {
             tr_str(lang_id, "跟随设置", "Settings").to_string()
         };
+        let provider_icon_key = infer_provider_icon_key_from_model(raw_model);
         let show_model_text = layout.model_picker_fit_mode != HeaderModelPickerFitMode::Icon;
         let formatted_effort = format_thinking_effort_pill(props.active_thinking_effort, lang_id);
         let show_effort = formatted_effort.is_some()
             && layout.model_picker_fit_mode == HeaderModelPickerFitMode::Full;
+        let effort_display = openbot_effort_label(props.active_thinking_effort, lang_id);
         let a_model = on_action.clone();
         let a_model_cfg = on_action.clone();
         let pill_bg = if props.model_picker_open {
@@ -2222,18 +2231,16 @@ pub fn render_openbot_conversation_header<V: 'static>(
                 .flex()
                 .items_center()
                 .gap(px(5.0))
-                .child(
-                    div()
-                        .w(px(7.0))
-                        .h(px(7.0))
-                        .rounded_full()
-                        .flex_shrink_0()
-                        .bg(if layout.model_picker_disabled {
-                            ob.text_dim()
-                        } else {
-                            ob.success()
-                        }),
-                )
+                .child(render_provider_icon(
+                    provider_icon_key,
+                    14.0,
+                    if layout.model_picker_disabled {
+                        ob.text_dim()
+                    } else {
+                        ob.text_primary()
+                    },
+                    !layout.model_picker_disabled,
+                ))
                 .when(show_model_text, |el| {
                     el.child(
                         div()
@@ -2248,15 +2255,13 @@ pub fn render_openbot_conversation_header<V: 'static>(
                     )
                 })
                 .when(show_effort, |el| {
-                    el.when_some(formatted_effort, |row, eff_lbl| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(11.5))
-                                .text_color(ob.text_muted())
-                                .child(format!("· {eff_lbl}")),
-                        )
-                    })
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.5))
+                            .text_color(ob.text_muted())
+                            .child(format!("· {effort_display}")),
+                    )
                 })
                 .when(layout.pending_badge_visible, |el| {
                     el.when_some(pending_badge, |row, badge| {
@@ -2274,7 +2279,11 @@ pub fn render_openbot_conversation_header<V: 'static>(
                     })
                 })
                 .child(openbot_stage_icon(
-                    OpenBotStageIcon::ChevronDown,
+                    if props.model_picker_open {
+                        OpenBotStageIcon::ChevronUp
+                    } else {
+                        OpenBotStageIcon::ChevronDown
+                    },
                     12.0,
                     ob.text_muted(),
                 )),
@@ -2738,305 +2747,67 @@ pub fn build_openbot_model_picker_rows(
     rows
 }
 
-/// Renders OpenBot's `ProviderModelPicker` dropdown popover anchored under the header model pill.
+/// Renders OpenBot's two-column `ProviderModelPicker` dropdown popover anchored under the header model pill.
 pub fn render_openbot_model_picker_popover<V: 'static>(
     props: &OpenBotModelPickerPopoverProps<'_>,
+    picker_state: &OpenBotModelPickerState,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
-    let ob = palette.openbot_palette();
     let a_dismiss = on_action.clone();
-    let a_open_settings_hdr = on_action.clone();
-    let hover_bg = ob.hover();
-    let rows = build_openbot_model_picker_rows(props, lang_id);
-    let efforts = [
-        ("off", tr_str(lang_id, "关", "Off")),
-        ("low", tr_str(lang_id, "轻度", "Low")),
-        ("medium", tr_str(lang_id, "标准", "Med")),
-        ("high", tr_str(lang_id, "深度", "High")),
-    ];
-
-    let provider_title = if !props.active_provider_name.trim().is_empty() {
-        props.active_provider_name.trim().to_string()
-    } else if props.catalog_synced && props.needs_provider_selection {
-        tr_str(lang_id, "未配置 AI 供应商", "No AI Provider").to_string()
-    } else {
-        tr_str(lang_id, "AI 模型", "AI Models").to_string()
-    };
-
-    let header_bar = div()
-        .px(px(10.0))
-        .py(px(7.0))
-        .border_b_1()
-        .border_color(ob.border_hairline())
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(8.0))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_size(px(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(ob.text_muted())
-                .child(provider_title),
-        )
-        .child(
-            div()
-                .id("model-picker-open-settings-link")
-                .flex_shrink_0()
-                .px(px(6.0))
-                .py(px(2.0))
-                .rounded(px(5.0))
-                .hover(move |s| s.bg(hover_bg))
-                .cursor_pointer()
-                .text_size(px(11.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(ob.text_secondary())
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        a_open_settings_hdr(this, TopBarUiAction::OpenAiProvidersSettings, cx);
-                    }),
-                )
-                .child(tr_str(lang_id, "模型设置", "Settings")),
-        );
-
-    let body: AnyElement = if rows.is_empty() {
-        let a_open_settings_empty = on_action.clone();
-        let btn_hover = ob.bg_control_hover();
-        let title_txt = if !props.catalog_synced {
-            tr_str(lang_id, "正在同步设置中的模型…", "Syncing models from Settings…")
+    let a_picker = on_action.clone();
+    let effective_state = if picker_state.providers.is_empty() && !props.models.is_empty() {
+        let mut s = picker_state.clone();
+        let display_name = if !props.active_provider_name.trim().is_empty() {
+            props.active_provider_name.trim().to_string()
         } else {
-            tr_str(lang_id, "尚未配置可用模型", "No models configured")
+            tr_str(lang_id, "已连接服务商", "Connected Provider").to_string()
         };
-        div()
-            .id("openbot-model-picker-empty")
-            .px(px(12.0))
-            .py(px(16.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ob.text_primary())
-                    .child(title_txt),
+        let default_m = (!props.settings_default_model.trim().is_empty())
+            .then_some(props.settings_default_model.trim())
+            .or_else(|| props.models.first().map(String::as_str));
+        s.catalog_synced = props.catalog_synced;
+        s.providers = vec![crate::components::openbot_model_picker::OpenBotPickerProvider {
+            id: "active".to_string(),
+            icon_key: infer_provider_icon_key_from_model(
+                default_m.unwrap_or(props.active_model),
             )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(ob.text_muted())
-                    .child(tr_str(
-                        lang_id,
-                        "请在「设置 → AI 模型供应商」中配置模型",
-                        "Configure a provider in Settings → AI Providers",
-                    )),
-            )
-            .child(
-                div()
-                    .id("model-picker-configure-btn")
-                    .mt(px(2.0))
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .rounded(px(8.0))
-                    .bg(ob.bg_control())
-                    .border_1()
-                    .border_color(ob.border_hairline())
-                    .hover(move |s| s.bg(btn_hover))
-                    .cursor_pointer()
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(ob.text_primary())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            a_open_settings_empty(this, TopBarUiAction::OpenAiProvidersSettings, cx);
-                        }),
-                    )
-                    .child(tr_str(lang_id, "前往 AI 模型设置", "Open AI Provider Settings")),
-            )
-            .into_any_element()
+            .to_string(),
+            display_name,
+            subtitle: tr_str(lang_id, "当前可用模型", "Available models").to_string(),
+            is_default_provider: true,
+            is_subscription: false,
+            models: crate::components::openbot_model_picker::classify_provider_models(
+                props.models,
+                default_m,
+                (!props.active_model.trim().is_empty()).then_some(props.active_model.trim()),
+            ),
+        }];
+        s.selected_provider_id = "active".to_string();
+        s
     } else {
-        let mut list = div()
-            .id("openbot-model-picker-scroll")
-            .max_h(px(260.0))
-            .overflow_y_scroll()
-            .p(px(6.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0));
-        for (idx, row) in rows.into_iter().enumerate() {
-            let m_clone = row.model_id.clone();
-            let a_sel = on_action.clone();
-            let is_sel = row.is_selected;
-            let is_mismatch = row.is_mismatch;
-            let row_id = if row.is_follow_settings {
-                "model-pick-follow-settings".to_string()
-            } else {
-                format!("model-pick-{idx}-{}", row.model_id)
-            };
-            list = list.child(
-                div()
-                    .id(SharedString::from(row_id))
-                    .min_h(px(30.0))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(8.0))
-                    .when(is_sel, |el| el.bg(ob.bg_control_active()))
-                    .hover(move |s| s.bg(hover_bg))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            a_sel(
-                                this,
-                                TopBarUiAction::SelectModel {
-                                    model_id: Some(m_clone.clone()),
-                                    thinking_level: None,
-                                },
-                                cx,
-                            );
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(13.0))
-                            .text_color(if is_mismatch {
-                                ob.warning()
-                            } else {
-                                ob.text_primary()
-                            })
-                            .child(row.label),
-                    )
-                    .when_some(row.badge, |el, badge| {
-                        el.child(
-                            div()
-                                .flex_shrink_0()
-                                .max_w(px(110.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .px(px(5.0))
-                                .py(px(1.0))
-                                .rounded(px(5.0))
-                                .bg(ob.bg_control())
-                                .text_size(px(10.5))
-                                .text_color(if is_mismatch {
-                                    ob.warning()
-                                } else {
-                                    ob.text_muted()
-                                })
-                                .child(badge),
-                        )
-                    })
-                    .when(is_sel, |el| {
-                        el.child(openbot_stage_icon(OpenBotStageIcon::Check, 13.0, ob.text_primary()))
-                    }),
-            );
-        }
-        list.into_any_element()
+        picker_state.clone()
     };
 
-    let active_eff_norm = if props.active_effort.trim().is_empty() {
-        "medium"
-    } else {
-        props.active_effort.trim()
-    };
-    let effort_row = props.show_thinking_effort.then(|| {
-        div()
-            .px(px(8.0))
-            .py(px(8.0))
-            .border_t_1()
-            .border_color(ob.border_hairline())
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(ob.text_muted())
-                    .child(tr_str(lang_id, "推理强度", "Effort")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(3.0))
-                    .children(efforts.into_iter().map(|(val, lbl)| {
-                        let is_sel = active_eff_norm.eq_ignore_ascii_case(val);
-                        let eff = val.to_string();
-                        let a_eff = on_action.clone();
-                        div()
-                            .id(SharedString::from(format!("model-effort-{}", val)))
-                            .px(px(6.5))
-                            .py(px(3.0))
-                            .rounded(px(6.0))
-                            .bg(if is_sel { ob.surface_light() } else { ob.bg_control() })
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if is_sel { ob.text_on_light() } else { ob.text_muted() })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    a_eff(
-                                        this,
-                                        TopBarUiAction::SelectModel {
-                                            model_id: None,
-                                            thinking_level: Some(eff.clone()),
-                                        },
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .child(lbl)
-                    })),
-            )
-    });
-
-    let mut card = div()
+    let card = div()
         .id("openbot-model-picker-popover")
         .absolute()
         .top(px(8.0))
-        .right(px(84.0))
-        .w(px(284.0))
-        .rounded(px(14.0))
-        .bg(ob.bg_surface())
-        .border_1()
-        .border_color(ob.border_strong_hairline())
-        .shadow(palette.popover_shadows())
-        .occlude()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .flex()
-        .flex_col()
-        .child(header_bar)
-        .child(body);
-    if let Some(eff_el) = effort_row {
-        card = card.child(eff_el);
-    }
+        .right(px(64.0))
+        .child(render_openbot_provider_model_picker_card(
+            "stage-model",
+            &effective_state,
+            props.active_model,
+            props.active_effort,
+            palette,
+            lang_id,
+            cx,
+            move |this, action, cx| {
+                a_picker(this, TopBarUiAction::ModelPickerAction(action), cx);
+            },
+        ));
 
     div()
         .id("openbot-model-picker-backdrop")

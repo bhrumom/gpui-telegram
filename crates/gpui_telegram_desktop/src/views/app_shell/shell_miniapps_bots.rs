@@ -249,12 +249,20 @@ impl AppShell {
         if !ai_catalog.synced && self.is_authenticated {
             self.refresh_magpie_state(cx);
         }
+        let cached_magpie = self.magpie_local.latest_state.clone();
+        let cached_server_subs = self.magpie_local.server_subscriptions.clone();
+        let cached_local_subs = self.magpie_local.cached_dtos(
+            cached_magpie.as_ref().map(|s| s.active_provider.as_str()),
+        );
         if let Some(ref existing) = self.miniapps.create_bot_box {
             existing.update(cx, |b, _| {
                 b.set_palette(pal);
                 b.set_language(lang);
                 b.set_detected_coding_providers(detected, Some(device_id));
                 b.sync_ai_models(ai_catalog);
+                if let Some(ref st) = cached_magpie {
+                    b.sync_magpie_catalog(st, &cached_server_subs, &cached_local_subs);
+                }
             });
             return existing.clone();
         }
@@ -264,6 +272,9 @@ impl AppShell {
             b.set_language(lang);
             b.set_detected_coding_providers(detected, Some(device_id));
             b.sync_ai_models(ai_catalog);
+            if let Some(ref st) = cached_magpie {
+                b.sync_magpie_catalog(st, &cached_server_subs, &cached_local_subs);
+            }
             b
         });
         let mut prev_state = (false, false, false, false, 0u8);
@@ -328,6 +339,9 @@ impl AppShell {
         });
         self.enter_compose_or_modal_isolation(cx);
         self.refresh_detected_coding_providers(cx);
+        if self.magpie_local.latest_state.is_none() && self.is_authenticated {
+            self.refresh_magpie_state(cx);
+        }
         self.main_menu_drawer.update(cx, |m, _| m.close());
         self.sidebar.update(cx, |s, scx| {
             let changed = s.is_account_popover_open || s.search_focused;
@@ -370,19 +384,38 @@ impl AppShell {
         box_ent: &Entity<CreateManagedBotBoxPeers>,
         cx: &mut Context<Self>,
     ) {
-        let (fabushi_req, template_skills, nl_prompt, creds, closed, av_shape, av_color) =
-            box_ent.update(cx, |b, _| {
-                let (av_shape, av_color) = b.effective_avatar_choice();
-                (
-                    b.take_submit_fabushi(),
-                    b.take_selected_template_skills(),
-                    b.take_submit_nl(),
-                    b.take_submit_credentials(),
-                    b.take_close(),
-                    av_shape,
-                    av_color,
-                )
-            });
+        let (
+            fabushi_req,
+            template_skills,
+            nl_prompt,
+            creds,
+            closed,
+            open_providers,
+            av_shape,
+            av_color,
+        ) = box_ent.update(cx, |b, _| {
+            let (av_shape, av_color) = b.effective_avatar_choice();
+            (
+                b.take_submit_fabushi(),
+                b.take_selected_template_skills(),
+                b.take_submit_nl(),
+                b.take_submit_credentials(),
+                b.take_close(),
+                b.take_open_providers_settings(),
+                av_shape,
+                av_color,
+            )
+        });
+        if open_providers {
+            self.clear_ime_if_create_bot_box_unoccluded(cx);
+            self.miniapps.create_bot_box = None;
+            if !self.is_compose_or_creation_modal_active(cx) {
+                self.exit_compose_or_modal_isolation(true, cx);
+            }
+            self.open_ai_providers_settings(cx);
+            cx.notify();
+            return;
+        }
         if closed {
             self.clear_ime_if_create_bot_box_unoccluded(cx);
             self.miniapps.create_bot_box = None;

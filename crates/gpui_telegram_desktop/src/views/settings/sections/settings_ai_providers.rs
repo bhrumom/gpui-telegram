@@ -95,17 +95,22 @@ pub fn sub_dto_to_account_dto(s: &MagpieSubscriptionDto) -> SubscriptionAccountD
     }
 }
 
+use crate::components::openbot_model_picker::{
+    canonical_provider_icon_key, format_model_display_label, friendly_provider_name,
+    render_chevrons_up_down, render_provider_icon,
+};
 use crate::components::ui::{
     TextInputController, delete_prev_word, pop_last_char, sanitize_paste_text,
 };
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::IconName;
 use crate::theme::palette::TdesktopThemePalette;
 use crate::views::computer_workbench::render_ime_text_preview;
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_empty_state, settings_section_header,
-    settings_subsection_title, settings_toggle_row,
+    SETTINGS_CARD_BG_DARK, SETTINGS_CARD_BG_LIGHT, SETTINGS_CARD_RADIUS_PX, settings_card,
+    settings_container, settings_empty_state, settings_subsection_title, settings_toggle_row,
 };
+use crate::views::stage::openbot_stage_chrome::{openbot_stage_icon, OpenBotStageIcon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AiProvidersTab {
@@ -186,6 +191,11 @@ pub struct SettingsAiProvidersSections {
     pub probe_result: Option<MagpieProbeResponse>,
     pub masking_preview_result: Option<MagpieMaskingPreviewResponse>,
 
+    // OpenBot Providers list & drill-down UI state
+    pub default_provider_dropdown_open: bool,
+    pub selected_subscription_detail_id: Option<String>,
+    pub editing_existing_provider_id: Option<String>,
+
     // Provider preset / custom editor state
     pub editor_open: bool,
     pub selected_preset_id: Option<String>,
@@ -240,6 +250,9 @@ impl SettingsAiProvidersSections {
             error_message: None,
             probe_result: None,
             masking_preview_result: None,
+            default_provider_dropdown_open: false,
+            selected_subscription_detail_id: None,
+            editing_existing_provider_id: None,
             editor_open: false,
             selected_preset_id: None,
             selected_region_id: None,
@@ -503,6 +516,9 @@ impl SettingsAiProvidersSections {
             .and_then(|st| st.presets.iter().find(|p| p.id == preset_id))
             .cloned();
         self.tab = AiProvidersTab::Overview;
+        self.default_provider_dropdown_open = false;
+        self.selected_subscription_detail_id = None;
+        self.editing_existing_provider_id = None;
         self.editor_open = true;
         self.editor_session_gen = self.editor_session_gen.wrapping_add(1);
         self.error_message = None;
@@ -549,9 +565,77 @@ impl SettingsAiProvidersSections {
         }
     }
 
+    /// Opens an OpenBot "其他服务商" row: prefers a matching Magpie preset, otherwise pre-fills
+    /// a clean custom provider editor with the selected provider's ID & display name.
+    pub fn open_other_provider_editor(
+        &mut self,
+        provider_key: &str,
+        display_name: &str,
+        preset_id_hint: Option<&str>,
+    ) {
+        if let Some(pid) = preset_id_hint {
+            let has_preset = self
+                .state
+                .as_ref()
+                .is_some_and(|st| st.presets.iter().any(|p| p.id == pid));
+            if has_preset {
+                self.open_preset_editor(pid);
+                return;
+            }
+        }
+        self.open_preset_editor(provider_key);
+        if self.selected_preset_id.is_none() {
+            self.draft_provider_id = provider_key.to_string();
+            self.draft_name = display_name.to_string();
+        }
+    }
+
+    /// Opens the drill-down detail view for a connected local/server subscription.
+    pub fn open_subscription_detail(&mut self, sub_id: &str) {
+        self.tab = AiProvidersTab::Overview;
+        self.default_provider_dropdown_open = false;
+        self.editor_open = false;
+        self.editing_existing_provider_id = None;
+        self.selected_subscription_detail_id = Some(sub_id.to_string());
+        self.active_field = AiProviderField::None;
+    }
+
+    /// Returns from any provider detail or editor sub-view back to the main OpenBot Providers list.
+    pub fn close_detail_view(&mut self) {
+        self.editor_open = false;
+        self.editing_existing_provider_id = None;
+        self.selected_subscription_detail_id = None;
+        self.default_provider_dropdown_open = false;
+        self.active_field = AiProviderField::None;
+    }
+
+    /// Progressive Escape handler for OpenBot Providers: closes dropdown -> exits detail/editor -> clears search.
+    pub fn handle_escape_key(&mut self) -> bool {
+        if self.default_provider_dropdown_open {
+            self.default_provider_dropdown_open = false;
+            return true;
+        }
+        if self.selected_subscription_detail_id.is_some() || self.editor_open {
+            self.close_detail_view();
+            return true;
+        }
+        if !self.preset_search.is_empty() {
+            self.preset_search.clear();
+            return true;
+        }
+        if self.active_field != AiProviderField::None {
+            self.active_field = AiProviderField::None;
+            return true;
+        }
+        false
+    }
+
     /// Populates the provider configuration editor from an existing saved provider.
     pub fn open_provider_editor(&mut self, prov: &MagpieProviderDto) {
         self.tab = AiProvidersTab::Overview;
+        self.default_provider_dropdown_open = false;
+        self.selected_subscription_detail_id = None;
+        self.editing_existing_provider_id = Some(prov.provider_id.clone());
         self.editor_open = true;
         self.editor_session_gen = self.editor_session_gen.wrapping_add(1);
         self.error_message = None;
@@ -992,6 +1076,7 @@ impl SettingsAiProvidersSections {
         pal: TdesktopThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
+        let ob = pal.openbot_palette();
         let focused = self.active_field == field;
         let preedit = if focused {
             self.ime_controller
@@ -1003,25 +1088,29 @@ impl SettingsAiProvidersSections {
         div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(5.0))
             .child(
                 div()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(pal.text_secondary))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ob.text_secondary())
                     .child(label.to_string()),
             )
             .child(
                 div()
                     .id(id)
                     .cursor_text()
-                    .min_h(px(34.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
+                    .min_h(px(36.0))
+                    .px(px(11.0))
+                    .py(px(7.0))
                     .rounded(px(8.0))
-                    .bg(rgb(pal.input_bg))
+                    .bg(ob.bg_control())
                     .border_1()
-                    .border_color(rgb(if focused { pal.accent } else { pal.border_fg }))
+                    .border_color(if focused {
+                        ob.text_primary()
+                    } else {
+                        ob.border_strong_hairline()
+                    })
                     .flex()
                     .items_center()
                     .on_mouse_down(
@@ -1112,359 +1201,505 @@ impl SettingsAiProvidersSections {
             .into_any_element()
     }
 
-    fn render_discovered_subscriptions(
+    fn openbot_card_bg(pal: TdesktopThemePalette) -> Rgba {
+        let ob = pal.openbot_palette();
+        rgb(if ob.scheme.is_dark() {
+            SETTINGS_CARD_BG_DARK
+        } else {
+            SETTINGS_CARD_BG_LIGHT
+        })
+    }
+
+    /// Resolves all connected providers (local/server subscriptions + configured API/local providers)
+    /// for both the `默认服务商` dropdown and the `已连接` grouped list.
+    fn connected_provider_entries(
         &self,
+        lang: &str,
+    ) -> Vec<(String, String, String, String, bool, bool, Option<String>, usize)> {
+        // Tuple: (id, icon_key, display_name, subtitle, is_subscription, is_active, active_model_hint, model_count)
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let subs = self.effective_subscriptions();
+        let st_opt = self.state.as_ref();
+
+        for sub in &subs {
+            if !seen.insert(sub.id.clone()) {
+                continue;
+            }
+            let icon_key = canonical_provider_icon_key(&sub.kind).to_string();
+            let display_name = friendly_provider_name(&sub.kind, &sub.label);
+            let email_like = sub
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| s.contains('@'));
+            let subtitle = if let Some(email) = email_like {
+                email.to_string()
+            } else {
+                tr_str(lang, "在这台电脑上可用", "Available on this computer").to_string()
+            };
+            let active_model = self
+                .selected_subscription_models
+                .get(&sub.id)
+                .cloned()
+                .or_else(|| {
+                    if sub.active {
+                        st_opt
+                            .map(|s| s.active_model.trim().to_string())
+                            .filter(|m| !m.is_empty())
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| sub.models.first().cloned());
+            out.push((
+                sub.id.clone(),
+                icon_key,
+                display_name,
+                subtitle,
+                true,
+                sub.active,
+                active_model,
+                sub.models.len(),
+            ));
+        }
+
+        if let Some(st) = st_opt {
+            for prov in &st.providers {
+                if prov.provider_id == "local_hermes"
+                    && (!st.allow_local_fallback || !out.is_empty())
+                {
+                    continue;
+                }
+                if !seen.insert(prov.provider_id.clone()) {
+                    continue;
+                }
+                let icon_key = canonical_provider_icon_key(
+                    prov.preset_id.as_deref().unwrap_or(&prov.provider_id),
+                )
+                .to_string();
+                let display_name = if prov.name.trim().is_empty() {
+                    friendly_provider_name(&prov.provider_id, &prov.provider_id)
+                } else {
+                    prov.name.trim().to_string()
+                };
+                let key_part = if prov.no_key_required {
+                    tr_str(lang, "免 Key · 本地", "No key · Local").to_string()
+                } else {
+                    prov.masked_key
+                        .clone()
+                        .unwrap_or_else(|| tr_str(lang, "已配置 API Key", "API Key configured").to_string())
+                };
+                let subtitle = if prov.default_model.trim().is_empty() {
+                    key_part
+                } else {
+                    format!("{} · {}", prov.default_model.trim(), key_part)
+                };
+                let is_active = !st.needs_provider_selection
+                    && (prov.is_active || prov.provider_id == st.active_provider);
+                let model_count = prov.models.len().max(usize::from(!prov.default_model.trim().is_empty()));
+                out.push((
+                    prov.provider_id.clone(),
+                    icon_key,
+                    display_name,
+                    subtitle,
+                    false,
+                    is_active,
+                    opt_non_empty(&prov.default_model),
+                    model_count,
+                ));
+            }
+        }
+        out
+    }
+
+    fn render_subscription_detail(
+        &self,
+        sub_id: &str,
         pal: TdesktopThemePalette,
         lang: &str,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
+        let ob = pal.openbot_palette();
+        let card_bg = Self::openbot_card_bg(pal);
         let subs = self.effective_subscriptions();
-        if subs.is_empty() {
+        let Some(sub) = subs.into_iter().find(|s| s.id == sub_id) else {
             return div()
-                .p(px(12.0))
-                .rounded(px(8.0))
-                .bg(rgb(pal.input_bg))
-                .border_1()
-                .border_color(rgb(pal.border_fg))
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .gap(px(12.0))
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(pal.text_secondary))
-                        .child(tr_str(
-                            lang,
-                            "未检测到本机 AI 智能体凭证（支持 Vertex AI ADC、Codex/ChatGPT、Claude Code、Gemini CLI 等）。",
-                            "No local AI agent credentials detected (Vertex AI ADC, Codex/ChatGPT, Claude, Gemini).",
-                        )),
+                        .id("magpie-sub-detail-back-missing")
+                        .cursor_pointer()
+                        .text_size(px(13.0))
+                        .text_color(ob.text_muted())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_detail_view();
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "← 返回服务商", "← Back to Providers")),
+                )
+                .into_any_element();
+        };
+
+        let icon_key = canonical_provider_icon_key(&sub.kind);
+        let display_name = friendly_provider_name(&sub.kind, &sub.label);
+        let account_sub = sub
+            .account_id
+            .clone()
+            .or_else(|| sub.plan.clone())
+            .unwrap_or_else(|| tr_str(lang, "在这台电脑上可用", "Available on this computer").to_string());
+        let is_active = sub.active;
+        let current_chosen = self
+            .selected_subscription_models
+            .get(&sub.id)
+            .cloned()
+            .or_else(|| {
+                if is_active {
+                    self.state
+                        .as_ref()
+                        .map(|st| st.active_model.trim().to_string())
+                        .filter(|m| !m.is_empty())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| sub.models.first().cloned());
+
+        let sub_id_for_act = sub.id.clone();
+        let sub_id_for_fetch = sub.id.clone();
+        let hover_bg = ob.hover();
+        let border_hairline = ob.border_hairline();
+        let border_strong = ob.border_strong_hairline();
+        let radio_bg = ob.surface_light();
+        let radio_fg = ob.text_on_light();
+        let radio_border = ob.border_strong();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+
+        let mut models_card = div()
+            .w_full()
+            .rounded(px(SETTINGS_CARD_RADIUS_PX))
+            .bg(card_bg)
+            .border_1()
+            .border_color(ob.frame_card_border())
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+
+        if sub.models.is_empty() {
+            models_card = models_card.child(
+                div()
+                    .px(px(16.0))
+                    .py(px(18.0))
+                    .text_size(px(13.0))
+                    .text_color(text_muted)
+                    .child(tr_str(
+                        lang,
+                        "尚未加载模型列表，点击上方「获取最新模型」拉取实时目录。",
+                        "No models loaded yet. Click Fetch Models above to sync the live catalog.",
+                    )),
+            );
+        } else {
+            for (idx, model_name) in sub.models.iter().enumerate() {
+                let m_id = model_name.clone();
+                let m_click = model_name.clone();
+                let sid = sub.id.clone();
+                let is_sel = current_chosen
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&m_id));
+                let m_display = format_model_display_label(&m_id);
+                models_card = models_card.child(
+                    div()
+                        .id(SharedString::from(format!("magpie-sub-{}-m-{}", sid, m_id)))
+                        .cursor_pointer()
+                        .min_h(px(44.0))
+                        .px(px(16.0))
+                        .py(px(9.0))
+                        .when(idx > 0, |el| el.border_t_1().border_color(border_hairline))
+                        .hover(move |s| s.bg(hover_bg))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let already_active_model = this
+                                    .state
+                                    .as_ref()
+                                    .is_some_and(|st| st.active_model == m_click);
+                                this.select_subscription_model(&sid, &m_click);
+                                if is_active && !already_active_model {
+                                    this.activate_subscription_action(&sid);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .child(if is_sel {
+                                    div()
+                                        .w(px(16.0))
+                                        .h(px(16.0))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(radio_bg)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(openbot_stage_icon(
+                                            OpenBotStageIcon::Check,
+                                            10.0,
+                                            radio_fg,
+                                        ))
+                                } else {
+                                    div()
+                                        .w(px(16.0))
+                                        .h(px(16.0))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .border_1()
+                                        .border_color(radio_border)
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .min_w(px(0.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .font_weight(if is_sel {
+                                                    FontWeight::MEDIUM
+                                                } else {
+                                                    FontWeight::NORMAL
+                                                })
+                                                .text_color(if is_sel { text_pri } else { text_sec })
+                                                .child(m_display.clone()),
+                                        )
+                                        .when(m_display != m_id, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(text_muted)
+                                                    .child(m_id.clone()),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .when(idx == 0, |row| {
+                            row.child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.5))
+                                    .rounded(px(5.0))
+                                    .bg(ob.bg_control_active())
+                                    .text_size(px(11.0))
+                                    .text_color(text_muted)
+                                    .child(tr_str(lang, "默认", "Default")),
+                            )
+                        }),
                 );
+            }
         }
 
         div()
             .flex()
             .flex_col()
-            .gap(px(10.0))
-            .children(subs.into_iter().map(|sub| {
-                let sub_id = sub.id.clone();
-                let sub_id_for_act = sub.id.clone();
-                let is_active = sub.active;
-                let card_border_col = if is_active { pal.accent } else { pal.border_fg };
-                let plan_label = match sub.plan.as_deref().map(str::trim) {
-                    Some("vertex_magpie") | Some("vertex_adc") => "Vertex ADC".to_string(),
-                    Some("code_assist") => "Code Assist".to_string(),
-                    Some(p) if !p.is_empty() => p.to_string(),
-                    _ => match sub.kind.as_str() {
-                        "google_vertex" | "google-vertex" => "Vertex ADC".to_string(),
-                        "codex_chatgpt" | "codex" => "ChatGPT Plus / Team".to_string(),
-                        "claude_code" | "claude" => "Claude CLI".to_string(),
-                        "gemini_code_assist" | "gemini" => "Gemini CLI".to_string(),
-                        _ => sub.kind.clone(),
-                    },
-                };
-                let display_label = sub
-                    .label
-                    .strip_prefix("Magpie ")
-                    .unwrap_or(&sub.label)
-                    .trim_end_matches(" (Magpie)")
-                    .to_string();
-                let account_str = sub.account_id.clone().unwrap_or_else(|| sub.kind.clone());
-
+            .gap(px(14.0))
+            // Back bar
+            .child(
                 div()
-                    .id(SharedString::from(format!("magpie-sub-card-{}", sub_id)))
-                    .w_full()
-                    .p(px(12.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(pal.input_bg))
-                    .border_1()
-                    .border_color(rgb(card_border_col))
-                    .hover(move |s| s.border_color(rgb(pal.accent)))
                     .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    // Header row: Icon + Title/Plan/Subtitle + Active Badge
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .w_full()
+                            .id("magpie-sub-detail-back-btn")
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .text_size(px(13.0))
+                            .text_color(text_muted)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_detail_view();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "← 服务商", "← Providers")),
+                    ),
+            )
+            // Provider summary card
+            .child(
+                div()
+                    .id(SharedString::from(format!("magpie-sub-card-{}", sub.id)))
+                    .w_full()
+                    .px(px(16.0))
+                    .py(px(14.0))
+                    .rounded(px(SETTINGS_CARD_RADIUS_PX))
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(ob.frame_card_border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
                             .flex()
-                            .items_start()
-                            .justify_between()
-                            .gap(px(10.0))
+                            .items_center()
+                            .gap(px(12.0))
+                            .min_w(px(0.0))
                             .child(
                                 div()
+                                    .w(px(36.0))
+                                    .h(px(36.0))
+                                    .rounded(px(9.0))
+                                    .bg(ob.bg_control())
+                                    .border_1()
+                                    .border_color(border_hairline)
                                     .flex()
-                                    .items_start()
-                                    .gap(px(10.0))
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .w(px(36.0))
-                                            .h(px(36.0))
-                                            .rounded(px(8.0))
-                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                if is_active { pal.accent } else { pal.border_fg },
-                                                0.18,
-                                            ))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(tg_icon(
-                                                IconName::BotRobot,
-                                                20.0,
-                                                if is_active { pal.accent } else { pal.text_secondary },
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(3.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(pal.text_primary))
-                                                    .child(display_label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_wrap()
-                                                    .items_center()
-                                                    .gap(px(6.0))
-                                                    .child(
-                                                        div()
-                                                            .px(px(6.0))
-                                                            .py(px(1.5))
-                                                            .rounded(px(4.0))
-                                                            .bg(TdesktopThemePalette::rgba_with_alpha(
-                                                                pal.accent, 0.16,
-                                                            ))
-                                                            .text_size(px(10.0))
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(rgb(pal.accent))
-                                                            .child(plan_label),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.0))
-                                                            .text_color(rgb(pal.text_secondary))
-                                                            .child(format!("{} · {}", account_str, sub.kind)),
-                                                    ),
-                                            ),
-                                    ),
+                                    .items_center()
+                                    .justify_center()
+                                    .child(render_provider_icon(icon_key, 20.0, text_pri, true)),
                             )
                             .child(
                                 div()
-                                    .flex_shrink_0()
-                                    .px(px(8.0))
-                                    .py(px(3.5))
-                                    .rounded(px(6.0))
-                                    .bg(if is_active {
-                                        rgb(pal.success)
-                                    } else {
-                                        TdesktopThemePalette::rgba_with_alpha(pal.text_secondary, 0.14)
-                                    })
-                                    .border_1()
-                                    .border_color(rgb(if is_active { pal.success } else { pal.border_fg }))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(if is_active {
-                                        pal.active_button_fg
-                                    } else {
-                                        pal.text_secondary
-                                    }))
-                                    .child(if is_active {
-                                        tr_str(lang, "已激活 / 当前生效", "Active / Current")
-                                    } else {
-                                        tr_str(lang, "未激活 / 点击切换", "Inactive / Click to switch")
-                                    }),
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .min_w(px(0.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(15.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(text_pri)
+                                            .child(display_name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(text_muted)
+                                            .child(format!("{} · {}", account_sub, sub.kind)),
+                                    ),
                             ),
                     )
-                    // Available Models Badges
-                    .when(!sub.models.is_empty(), |el| {
-                        let sub_id_for_models = sub_id.clone();
-                        let sub_id_for_fetch = sub_id.clone();
-                        let current_chosen = self.selected_subscription_models.get(&sub_id).cloned();
-                        let model_count = sub.models.len();
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(10.5))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(pal.text_secondary))
-                                                .child(if lang.starts_with("zh") {
-                                                    format!("可用模型 ({model_count} 个，点击选择激活模型):")
-                                                } else {
-                                                    format!("Available Models ({model_count}, click to select target):")
-                                                }),
-                                        )
-                                        .child(Self::pill_btn(
-                                            SharedString::from(format!("fetch-sub-models-{}", sub_id_for_fetch)),
-                                            tr_str(lang, "获取模型", "Fetch Models"),
-                                            pal.card_bg,
-                                            pal.accent,
-                                            move |this, _| {
-                                                this.loading = true;
-                                                this.pending_event = Some(
-                                                    SettingsAiProvidersEvent::FetchSubscriptionModels(
-                                                        sub_id_for_fetch.clone(),
-                                                    ),
-                                                );
-                                            },
-                                            cx,
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(6.0))
-                                        .children(sub.models.iter().map(|model_name| {
-                                            let m_name = model_name.clone();
-                                            let m_click = model_name.clone();
-                                            let sid = sub_id_for_models.clone();
-                                            let is_m_selected = current_chosen
-                                                .as_ref()
-                                                .map_or(false, |c| c == &m_name)
-                                                || (current_chosen.is_none()
-                                                    && is_active
-                                                    && self
-                                                        .state
-                                                        .as_ref()
-                                                        .map_or(false, |st| st.active_model == m_name));
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "magpie-sub-{}-m-{}",
-                                                    sid, m_name
-                                                )))
-                                                .cursor_pointer()
-                                                .px(px(7.0))
-                                                .py(px(2.5))
-                                                .rounded(px(5.0))
-                                                .bg(rgb(if is_m_selected {
-                                                    pal.accent
-                                                } else {
-                                                    pal.card_bg
-                                                }))
-                                                .border_1()
-                                                .border_color(rgb(if is_m_selected {
-                                                    pal.accent
-                                                } else {
-                                                    pal.border_fg
-                                                }))
-                                                .text_size(px(10.5))
-                                                .font_weight(if is_m_selected {
-                                                    FontWeight::BOLD
-                                                } else {
-                                                    FontWeight::NORMAL
-                                                })
-                                                .text_color(rgb(if is_m_selected {
-                                                    pal.active_button_fg
-                                                } else {
-                                                    pal.text_primary
-                                                }))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        let active_now = is_active;
-                                                        let already_active_model = this
-                                                            .state
-                                                            .as_ref()
-                                                            .is_some_and(|st| st.active_model == m_click);
-                                                        this.select_subscription_model(&sid, &m_click);
-                                                        if active_now && !already_active_model {
-                                                            this.activate_subscription_action(&sid);
-                                                        }
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(m_name)
-                                        })),
-                                ),
-                        )
-                    })
-                    // Action Footer: Status prompt & Activate Button
                     .child(
                         div()
-                            .pt(px(4.0))
-                            .border_t_1()
-                            .border_color(rgb(pal.border_fg))
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap(px(8.0))
+                            .flex_shrink_0()
                             .child(
                                 div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(if is_active {
-                                        pal.success
-                                    } else {
-                                        pal.text_secondary
-                                    }))
-                                    .child(if is_active {
-                                        tr_str(
-                                            lang,
-                                            "★ 官方 AI Bot 已绑定此本地凭据，对话零配置可用",
-                                            "★ Official AI Bot bound to this credential, zero config needed",
-                                        )
-                                    } else {
-                                        tr_str(
-                                            lang,
-                                            "一键设为主要模型供应商，免手动配置 API Key",
-                                            "One-click activate to use without manual API key",
-                                        )
-                                    }),
+                                    .id(SharedString::from(format!(
+                                        "fetch-sub-models-{}",
+                                        sub_id_for_fetch
+                                    )))
+                                    .cursor_pointer()
+                                    .h(px(32.0))
+                                    .px(px(12.0))
+                                    .rounded(px(8.0))
+                                    .bg(ob.bg_control())
+                                    .border_1()
+                                    .border_color(border_strong)
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text_pri)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.loading = true;
+                                            this.pending_event = Some(
+                                                SettingsAiProvidersEvent::FetchSubscriptionModels(
+                                                    sub_id_for_fetch.clone(),
+                                                ),
+                                            );
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "获取最新模型", "Fetch Models")),
                             )
                             .child(if is_active {
                                 div()
                                     .id(SharedString::from(format!(
                                         "magpie-sub-active-btn-{}",
-                                        sub_id
+                                        sub.id
                                     )))
-                                    .px(px(10.0))
-                                    .py(px(4.0))
-                                    .rounded(px(6.0))
-                                    .bg(TdesktopThemePalette::rgba_with_alpha(
-                                        pal.success, 0.16,
-                                    ))
+                                    .h(px(32.0))
+                                    .px(px(12.0))
+                                    .rounded(px(8.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.14))
                                     .border_1()
-                                    .border_color(rgb(pal.success))
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(pal.success))
-                                    .child(tr_str(lang, "当前主要供应商", "Current Primary"))
+                                    .border_color(TdesktopThemePalette::rgba_with_alpha(
+                                        pal.success, 0.36,
+                                    ))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.success())
+                                    .child(tr_str(lang, "当前默认", "Default"))
                             } else {
-                                Self::pill_btn(
-                                    SharedString::from(format!(
+                                div()
+                                    .id(SharedString::from(format!(
                                         "magpie-activate-sub-btn-{}",
-                                        sub_id
-                                    )),
-                                    tr_str(
-                                        lang,
-                                        "激活此智能体 / 设为主要供应商",
-                                        "Activate Agent / Set as Primary",
-                                    ),
-                                    pal.accent,
-                                    pal.active_button_fg,
-                                    move |this, _| {
-                                        this.activate_subscription_action(&sub_id_for_act);
-                                    },
-                                    cx,
-                                )
+                                        sub_id_for_act
+                                    )))
+                                    .cursor_pointer()
+                                    .h(px(32.0))
+                                    .px(px(12.0))
+                                    .rounded(px(8.0))
+                                    .bg(radio_bg)
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(radio_fg)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.activate_subscription_action(&sub_id_for_act);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "设为默认服务商", "Set as Default"))
                             }),
-                    )
-            }))
+                    ),
+            )
+            // Models list section header
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text_sec)
+                    .child(if lang.starts_with("zh") {
+                        format!("可用模型 ({})", sub.models.len())
+                    } else {
+                        format!("Available Models ({})", sub.models.len())
+                    }),
+            )
+            .child(models_card)
+            .into_any_element()
     }
 
     fn render_overview_tab(
@@ -1476,17 +1711,113 @@ impl SettingsAiProvidersSections {
         if self.editor_open {
             return self.render_provider_editor(pal, lang, cx);
         }
+        if let Some(ref detail_sub_id) = self.selected_subscription_detail_id {
+            return self.render_subscription_detail(detail_sub_id, pal, lang, cx);
+        }
+
+        let ob = pal.openbot_palette();
+        let card_bg = Self::openbot_card_bg(pal);
+        let bg_control = ob.bg_control();
+        let bg_control_hover = ob.bg_control_hover();
+        let bg_active = ob.bg_control_active();
+        let hover_bg = ob.hover();
+        let border_hairline = ob.border_hairline();
+        let border_strong = ob.border_strong_hairline();
+        let frame_border = ob.frame_card_border();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+        let amber_bg = TdesktopThemePalette::rgba_with_alpha(0xD97706, 0.16);
+        let amber_border = TdesktopThemePalette::rgba_with_alpha(0xF59E0B, 0.34);
+        let amber_fg = rgb(if ob.scheme.is_dark() { 0xF5A524 } else { 0xB45309 });
+        let green_bg = TdesktopThemePalette::rgba_with_alpha(pal.success, 0.14);
+        let green_border = TdesktopThemePalette::rgba_with_alpha(pal.success, 0.32);
 
         let st_opt = self.state.as_ref();
-        let needs_sel = st_opt.is_none_or(|s| s.needs_provider_selection);
-        let subs = self.effective_subscriptions();
-        let providers = st_opt.map(|s| s.providers.clone()).unwrap_or_default();
+        let connected = self.connected_provider_entries(lang);
+        let active_default = connected
+            .iter()
+            .find(|e| e.5)
+            .or_else(|| connected.first())
+            .cloned();
         let presets = st_opt.map(|s| s.presets.clone()).unwrap_or_default();
         let q = self.preset_search.trim().to_ascii_lowercase();
+
+        // Filter connected rows by search query
+        let filtered_connected: Vec<_> = connected
+            .iter()
+            .filter(|(id, icon, name, sub, _, _, model, _)| {
+                q.is_empty()
+                    || id.to_ascii_lowercase().contains(&q)
+                    || icon.to_ascii_lowercase().contains(&q)
+                    || name.to_ascii_lowercase().contains(&q)
+                    || sub.to_ascii_lowercase().contains(&q)
+                    || model
+                        .as_deref()
+                        .is_some_and(|m| m.to_ascii_lowercase().contains(&q))
+            })
+            .cloned()
+            .collect();
+
+        // Track connected canonical icon keys & IDs so `其他服务商` stays clean & deduplicated
+        let connected_icon_keys: std::collections::HashSet<&str> = connected
+            .iter()
+            .map(|(_, icon, _, _, _, _, _, _)| icon.as_str())
+            .collect();
+        let connected_ids: std::collections::HashSet<String> = connected
+            .iter()
+            .map(|(id, _, _, _, _, _, _, _)| id.to_ascii_lowercase())
+            .collect();
+
+        // OpenBot core providers shown at top of `其他服务商` when not yet connected
+        const OPENBOT_CORE_OTHERS: [(&str, &str, Option<&str>, &str, &str); 8] = [
+            ("grok", "Grok", Some("xai"), "未下载", "Not downloaded"),
+            ("gemini", "Gemini", Some("google"), "未下载", "Not downloaded"),
+            ("cursor", "Cursor", None, "未下载", "Not downloaded"),
+            ("cline", "Cline", None, "未下载", "Not downloaded"),
+            ("pi", "Pi", None, "未下载", "Not downloaded"),
+            ("codex", "ChatGPT", Some("openai"), "未连接", "Not connected"),
+            ("claude", "Claude", Some("anthropic"), "未连接", "Not connected"),
+            ("opencode", "OpenCode", None, "未下载", "Not downloaded"),
+        ];
+
+        let mut covered_preset_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut core_other_rows: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+        if self.category == AiPresetCategory::All {
+            for (icon_key, name, preset_hint, sub_zh, sub_en) in OPENBOT_CORE_OTHERS {
+                if connected_icon_keys.contains(icon_key) {
+                    if let Some(pid) = preset_hint {
+                        covered_preset_ids.insert(pid.to_string());
+                    }
+                    continue;
+                }
+                let matches_q = q.is_empty()
+                    || icon_key.contains(&q)
+                    || name.to_ascii_lowercase().contains(&q)
+                    || preset_hint.is_some_and(|p| p.contains(&q));
+                if !matches_q {
+                    continue;
+                }
+                if let Some(pid) = preset_hint {
+                    covered_preset_ids.insert(pid.to_string());
+                }
+                core_other_rows.push((
+                    icon_key.to_string(),
+                    icon_key.to_string(),
+                    name.to_string(),
+                    tr_str(lang, sub_zh, sub_en).to_string(),
+                    preset_hint.map(str::to_string),
+                ));
+            }
+        }
 
         let filtered_presets: Vec<MagpiePresetDto> = presets
             .into_iter()
             .filter(|p| {
+                if covered_preset_ids.contains(&p.id) || connected_ids.contains(&p.id.to_ascii_lowercase()) {
+                    return false;
+                }
                 let cat_ok = match self.category {
                     AiPresetCategory::All => true,
                     AiPresetCategory::Vendor => p.kind == "vendor",
@@ -1506,349 +1837,795 @@ impl SettingsAiProvidersSections {
             })
             .collect();
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            // 1. Subscription status & fallback guard
-            .child(
-                settings_card(pal)
-                    .child(
+        // 1. Default Provider Card (`默认服务商`)
+        let default_dropdown_list = self.default_provider_dropdown_open.then(|| {
+            let mut list = div()
+                .id("openbot-default-provider-menu")
+                .mt(px(12.0))
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(border_hairline)
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            if connected.is_empty() {
+                list = list.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(8.0))
+                        .text_size(px(12.5))
+                        .text_color(text_muted)
+                        .child(tr_str(
+                            lang,
+                            "尚未连接服务商，请先在下方连接订阅或配置 API Key。",
+                            "No connected providers yet. Connect one below first.",
+                        )),
+                );
+            } else {
+                for (idx, (id, icon_key, name, subtitle, is_sub, is_active, _, _)) in
+                    connected.iter().enumerate()
+                {
+                    let id_click = id.clone();
+                    let is_sub_click = *is_sub;
+                    let is_act = *is_active;
+                    list = list.child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(settings_subsection_title(
-                                tr_str(lang, "本地 AI 订阅与智能体发现", "Discovered AI Subscriptions & Agents"),
-                                pal,
-                            ))
-                            .child(Self::pill_btn(
-                                "magpie-scan-subs-btn",
-                                tr_str(lang, "扫描本地订阅", "Rescan Local"),
-                                pal.input_bg,
-                                pal.accent,
-                                |this, _| {
-                                    this.loading = true;
-                                    this.pending_event =
-                                        Some(SettingsAiProvidersEvent::ScanSubscriptions);
-                                },
-                                cx,
-                            )),
-                    )
-                    .when(needs_sel, |el| {
-                        el.child(
-                            div()
-                                .p(px(10.0))
-                                .rounded(px(8.0))
-                                .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.14))
-                                .border_1()
-                                .border_color(rgb(pal.accent))
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(tr_str(
-                                            lang,
-                                            "未检测到激活的 AI 订阅或已配置供应商",
-                                            "No Active AI Subscription or Configured Provider",
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(pal.text_secondary))
-                                        .child(tr_str(
-                                            lang,
-                                            "请在下方选择一个已发现的本地智能体并点击「激活」，或配置模型供应商以启用 AI 对话。",
-                                            "Activate a discovered local agent below, or configure a provider preset to enable AI chat replies.",
-                                        )),
-                                ),
-                        )
-                    })
-                    .child(self.render_discovered_subscriptions(pal, lang, cx))
-                    .when(subs.is_empty() && !needs_sel, |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(pal.text_secondary))
-                                .child(tr_str(
-                                    lang,
-                                    "当前通过已配置的模型供应商提供服务。",
-                                    "Serving via configured API/Local provider.",
-                                )),
-                        )
-                    })
-                    .child(settings_toggle_row(
-                        IconName::BotRobot,
-                        tr_str(lang, "无供应商时允许本地回退 (fabushi-local)", "Allow local Fabushi fallback when unconfigured"),
-                        None,
-                        self.draft_allow_local_fallback,
-                        pal,
-                        |this| {
-                            this.draft_allow_local_fallback = !this.draft_allow_local_fallback;
-                            this.pending_event = Some(SettingsAiProvidersEvent::ToggleAllowLocalFallback(
-                                this.draft_allow_local_fallback,
-                            ));
-                        },
-                        cx,
-                    )),
-            )
-            // 2. Configured providers
-            .child(
-                settings_card(pal)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(settings_subsection_title(
-                                tr_str(lang, "已配置供应商", "Configured Providers"),
-                                pal,
-                            ))
-                            .child(Self::pill_btn(
-                                "magpie-add-custom-btn",
-                                tr_str(lang, "+ 自定义供应商", "+ Custom"),
-                                pal.accent,
-                                pal.active_button_fg,
-                                |this, _| this.open_preset_editor("custom-openai"),
-                                cx,
-                            )),
-                    )
-                    .when(providers.is_empty(), |el| {
-                        el.child(settings_empty_state(
-                            IconName::BotRobot,
-                            tr_str(lang, "尚未配置外部 AI 供应商", "No providers configured yet"),
-                            pal,
-                        ))
-                    })
-                    .children(providers.into_iter().map(|prov| {
-                        let pid_act = prov.provider_id.clone();
-                        let pid_probe = prov.provider_id.clone();
-                        let pid_del = prov.provider_id.clone();
-                        let model_probe = opt_non_empty(&prov.default_model);
-                        let prov_edit = prov.clone();
-                        div()
-                            .p(px(9.0))
+                            .id(SharedString::from(format!("default-prov-opt-{idx}")))
+                            .cursor_pointer()
+                            .h(px(36.0))
+                            .px(px(10.0))
                             .rounded(px(8.0))
-                            .bg(rgb(pal.input_bg))
-                            .border_1()
-                            .border_color(rgb(if prov.is_active { pal.accent } else { pal.border_fg }))
+                            .when(is_act, |el| el.bg(bg_active))
+                            .hover(move |s| if is_act { s } else { s.bg(hover_bg) })
                             .flex()
-                            .flex_col()
-                            .gap(px(6.0))
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.default_provider_dropdown_open = false;
+                                    if is_sub_click {
+                                        this.activate_subscription_action(&id_click);
+                                    } else {
+                                        this.pending_event =
+                                            Some(SettingsAiProvidersEvent::SaveProvider(
+                                                MagpieSaveProviderRequest {
+                                                    provider_id: Some(id_click.clone()),
+                                                    enabled: Some(true),
+                                                    activate: true,
+                                                    ..Default::default()
+                                                },
+                                            ));
+                                    }
+                                    cx.notify();
+                                }),
+                            )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .min_w(px(0.0))
+                                    .child(render_provider_icon(icon_key, 16.0, text_pri, true))
                                     .child(
                                         div()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(rgb(pal.text_primary))
-                                                    .child(format!(
-                                                        "{} ({}) · {}",
-                                                        prov.name, prov.provider_id, prov.default_model
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(pal.text_secondary))
-                                                    .child(format!(
-                                                        "{} · {}",
-                                                        prov.api_mode,
-                                                        if prov.no_key_required {
-                                                            "no-key".to_string()
-                                                        } else {
-                                                            prov.masked_key.unwrap_or_else(|| "missing key".to_string())
-                                                        }
-                                                    )),
-                                            ),
+                                            .text_size(px(13.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .child(name.clone()),
                                     )
-                                    .when(prov.is_active, |el| {
-                                        el.child(
-                                            div()
-                                                .px(px(7.0))
-                                                .py(px(2.0))
-                                                .rounded(px(5.0))
-                                                .bg(rgb(pal.success))
-                                                .text_size(px(10.5))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(rgb(pal.active_button_fg))
-                                                .child(tr_str(lang, "当前使用", "Active")),
-                                        )
-                                    }),
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(text_muted)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(subtitle.clone()),
+                                    ),
+                            )
+                            .when(is_act, |row| {
+                                row.child(openbot_stage_icon(
+                                    OpenBotStageIcon::Check,
+                                    13.0,
+                                    text_pri,
+                                ))
+                            }),
+                    );
+                }
+            }
+            list
+        });
+
+        let (def_icon, def_name) = match &active_default {
+            Some((_, icon, name, _, _, _, _, _)) => (icon.as_str(), name.clone()),
+            None => ("generic", tr_str(lang, "未选择", "None").to_string()),
+        };
+
+        let default_provider_card = div()
+            .id("openbot-default-provider-card")
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(SETTINGS_CARD_RADIUS_PX))
+            .bg(card_bg)
+            .border_1()
+            .border_color(frame_border)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(text_pri)
+                                    .child(tr_str(lang, "默认服务商", "Default provider")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(text_muted)
+                                    .child(tr_str(
+                                        lang,
+                                        "新助手默认使用该服务商。",
+                                        "New agents use this provider by default.",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("openbot-default-provider-select")
+                            .cursor_pointer()
+                            .min_w(px(176.0))
+                            .h(px(34.0))
+                            .px(px(11.0))
+                            .rounded(px(8.0))
+                            .bg(bg_control)
+                            .border_1()
+                            .border_color(if self.default_provider_dropdown_open {
+                                text_muted
+                            } else {
+                                border_strong
+                            })
+                            .hover(move |s| s.bg(bg_control_hover))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.default_provider_dropdown_open =
+                                        !this.default_provider_dropdown_open;
+                                    cx.notify();
+                                }),
                             )
                             .child(
                                 div()
                                     .flex()
-                                    .flex_wrap()
-                                    .gap(px(6.0))
-                                    .when(!prov.is_active, |row| {
-                                        row.child(Self::pill_btn(
-                                            "magpie-activate-prov-btn",
-                                            tr_str(lang, "设为默认", "Activate"),
-                                            pal.accent,
-                                            pal.active_button_fg,
-                                            move |this, _| {
-                                                this.pending_event = Some(SettingsAiProvidersEvent::SaveProvider(
-                                                    MagpieSaveProviderRequest {
-                                                        provider_id: Some(pid_act.clone()),
-                                                        enabled: Some(true),
-                                                        activate: true,
-                                                        ..Default::default()
-                                                    },
-                                                ));
-                                            },
-                                            cx,
-                                        ))
-                                    })
-                                    .child(Self::pill_btn(
-                                        "magpie-probe-prov-btn",
-                                        tr_str(lang, "测试连通", "Probe"),
-                                        pal.card_bg,
-                                        pal.accent,
-                                        move |this, _| {
-                                            this.pending_event = Some(SettingsAiProvidersEvent::ProbeProvider {
-                                                provider_id: pid_probe.clone(),
-                                                model: model_probe.clone(),
-                                            });
-                                        },
-                                        cx,
-                                    ))
-                                    .child(Self::pill_btn(
-                                        "magpie-edit-prov-btn",
-                                        tr_str(lang, "编辑", "Edit"),
-                                        pal.card_bg,
-                                        pal.text_primary,
-                                        move |this, _| this.open_provider_editor(&prov_edit),
-                                        cx,
-                                    ))
-                                    .when(prov.provider_id != "local_hermes", |row| {
-                                        row.child(Self::pill_btn(
-                                            "magpie-del-prov-btn",
-                                            tr_str(lang, "删除", "Delete"),
-                                            pal.card_bg,
-                                            pal.danger,
-                                            move |this, _| {
-                                                this.pending_event = Some(
-                                                    SettingsAiProvidersEvent::DeleteProvider(pid_del.clone()),
-                                                );
-                                            },
-                                            cx,
-                                        ))
-                                    }),
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(render_provider_icon(def_icon, 15.0, text_pri, true))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .child(def_name),
+                                    ),
                             )
-                    })),
-            )
-            // 3. Built-in 45+ Preset Catalog
-            .child(
-                settings_card(pal)
-                    .child(settings_subsection_title(
-                        tr_str(lang, "选择供应商预设", "Choose Provider Preset"),
-                        pal,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(6.0))
-                            .children(
-                                [
-                                    (AiPresetCategory::All, tr_str(lang, "全部", "All")),
-                                    (AiPresetCategory::Vendor, tr_str(lang, "官方厂商", "Vendors")),
-                                    (AiPresetCategory::Relay, tr_str(lang, "聚合中转", "Relays")),
-                                    (AiPresetCategory::Local, tr_str(lang, "本地推理", "Local")),
-                                    (AiPresetCategory::Custom, tr_str(lang, "远程/自定义", "Remote & Custom")),
-                                ]
-                                .into_iter()
-                                .map(|(cat, lbl)| {
-                                    let active = self.category == cat;
-                                    Self::pill_btn(
-                                        "magpie-cat-filter-btn",
-                                        lbl,
-                                        if active { pal.accent } else { pal.input_bg },
-                                        if active { pal.active_button_fg } else { pal.text_secondary },
-                                        move |this, _| this.category = cat,
-                                        cx,
-                                    )
-                                }),
-                            ),
-                    )
-                    .child(self.render_input_field(
-                        "magpie-preset-search-input",
-                        AiProviderField::PresetSearch,
-                        tr_str(lang, "搜索预设 / 模型", "Filter presets or models"),
-                        &self.preset_search,
-                        tr_str(lang, "输入 deepseek / kimi / gemini / ollama...", "Search deepseek / kimi / gemini / ollama..."),
-                        false,
-                        pal,
-                        cx,
-                    ))
-                    .when(filtered_presets.is_empty(), |el| {
-                        el.child(settings_empty_state(
-                            IconName::Search,
-                            tr_str(lang, "没有匹配的供应商预设", "No matching presets"),
-                            pal,
-                        ))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(8.0))
-                            .children(filtered_presets.into_iter().map(|p| {
-                                let pid = p.id.clone();
-                                let badge = if p.no_key {
-                                    tr_str(lang, "免 Key", "No Key")
-                                } else {
-                                    "API Key"
-                                };
-                                div()
-                                    .id(SharedString::from(format!("magpie-preset-card-{}", p.id)))
-                                    .cursor_pointer()
-                                    .w(px(148.0))
-                                    .p(px(9.0))
-                                    .rounded(px(8.0))
-                                    .bg(rgb(pal.input_bg))
-                                    .border_1()
-                                    .border_color(rgb(pal.border_fg))
-                                    .hover(move |s| s.border_color(rgb(pal.accent)))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(3.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.open_preset_editor(&pid);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(pal.text_primary))
-                                            .child(p.short_name.unwrap_or(p.name)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .text_color(rgb(pal.text_secondary))
-                                            .child(format!("{} · {}", badge, p.default_model)),
-                                    )
-                            })),
+                            .child(render_chevrons_up_down(12.0, text_muted)),
                     ),
             )
+            .when_some(default_dropdown_list, |card, menu| card.child(menu));
+
+        // 2. Connected Section (`已连接`) with `全部更新` + `🔍 搜索服务商`
+        let search_focused = self.active_field == AiProviderField::PresetSearch;
+        let search_preedit = if search_focused {
+            self.ime_controller
+                .as_ref()
+                .and_then(|c| c.read(cx).ime_preedit.clone())
+        } else {
+            None
+        };
+
+        let connected_toolbar = div()
+            .w_full()
+            .pt(px(6.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text_sec)
+                    .child(tr_str(lang, "已连接", "Connected")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("magpie-scan-subs-btn")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(11.0))
+                            .rounded(px(8.0))
+                            .bg(bg_control)
+                            .border_1()
+                            .border_color(border_strong)
+                            .hover(move |s| s.bg(bg_control_hover))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.loading = true;
+                                    this.pending_event =
+                                        Some(SettingsAiProvidersEvent::ScanSubscriptions);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if self.loading {
+                                tr_str(lang, "同步中...", "Syncing...")
+                            } else {
+                                tr_str(lang, "全部更新", "Update all")
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("magpie-preset-search-input")
+                            .cursor_text()
+                            .w(px(196.0))
+                            .h(px(30.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(bg_control)
+                            .border_1()
+                            .border_color(if search_focused {
+                                text_muted
+                            } else {
+                                border_hairline
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ensure_ime_controller(cx);
+                                    this.active_field = AiProviderField::PresetSearch;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(openbot_stage_icon(
+                                OpenBotStageIcon::Search,
+                                13.0,
+                                text_muted,
+                            ))
+                            .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(
+                                render_ime_text_preview(
+                                    &self.preset_search,
+                                    search_preedit.as_deref(),
+                                    tr_str(lang, "搜索服务商", "Search providers"),
+                                    search_focused,
+                                    false,
+                                    pal.text_primary,
+                                    pal,
+                                ),
+                            )),
+                    ),
+            );
+
+        let mut connected_card = div()
+            .w_full()
+            .rounded(px(SETTINGS_CARD_RADIUS_PX))
+            .bg(card_bg)
+            .border_1()
+            .border_color(frame_border)
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+
+        if filtered_connected.is_empty() {
+            connected_card = connected_card.child(
+                div()
+                    .px(px(16.0))
+                    .py(px(16.0))
+                    .text_size(px(13.0))
+                    .text_color(text_muted)
+                    .child(if q.is_empty() {
+                        tr_str(
+                            lang,
+                            "未检测到已连接的服务商。点击「全部更新」扫描本机凭证，或从下方「其他服务商」添加。",
+                            "No connected providers yet. Click Update all to scan local credentials, or add one below.",
+                        )
+                    } else {
+                        tr_str(lang, "已连接列表中无匹配服务商", "No matching connected providers")
+                    }),
+            );
+        } else {
+            let saved_providers = st_opt.map(|s| s.providers.clone()).unwrap_or_default();
+            for (idx, (id, icon_key, name, subtitle, is_sub, is_active, active_model, model_count)) in
+                filtered_connected.into_iter().enumerate()
+            {
+                let id_for_click = id.clone();
+                let prov_dto_opt = if !is_sub {
+                    saved_providers
+                        .iter()
+                        .find(|p| p.provider_id == id)
+                        .cloned()
+                } else {
+                    None
+                };
+                let badge_el: Option<AnyElement> = if is_active {
+                    let badge_txt = active_model
+                        .as_deref()
+                        .map(format_model_display_label)
+                        .unwrap_or_else(|| tr_str(lang, "当前默认", "Default").to_string());
+                    Some(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.5))
+                            .rounded(px(6.0))
+                            .bg(green_bg)
+                            .border_1()
+                            .border_color(green_border)
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.success())
+                            .child(badge_txt)
+                            .into_any_element(),
+                    )
+                } else if is_sub && model_count == 0 {
+                    Some(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.5))
+                            .rounded(px(6.0))
+                            .bg(amber_bg)
+                            .border_1()
+                            .border_color(amber_border)
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(amber_fg)
+                            .child(tr_str(lang, "可获取模型", "Fetch models"))
+                            .into_any_element(),
+                    )
+                } else if model_count > 0 {
+                    Some(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.5))
+                            .rounded(px(6.0))
+                            .bg(amber_bg)
+                            .border_1()
+                            .border_color(amber_border)
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(amber_fg)
+                            .child(if lang.starts_with("zh") {
+                                format!("{model_count} 个模型")
+                            } else {
+                                format!("{model_count} models")
+                            })
+                            .into_any_element(),
+                    )
+                } else {
+                    None
+                };
+
+                connected_card = connected_card.child(
+                    div()
+                        .id(SharedString::from(format!("magpie-sub-card-{}", id)))
+                        .cursor_pointer()
+                        .w_full()
+                        .min_h(px(58.0))
+                        .px(px(16.0))
+                        .py(px(11.0))
+                        .when(idx > 0, |el| el.border_t_1().border_color(border_hairline))
+                        .hover(move |s| s.bg(hover_bg))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                if is_sub {
+                                    this.open_subscription_detail(&id_for_click);
+                                } else if let Some(ref dto) = prov_dto_opt {
+                                    this.open_provider_editor(dto);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .w(px(28.0))
+                                        .h(px(28.0))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(render_provider_icon(
+                                            &icon_key, 20.0, text_pri, true,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(text_pri)
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(name),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .text_color(text_muted)
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(subtitle),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .when_some(badge_el, |row, b| row.child(b))
+                                .child(openbot_stage_icon(
+                                    OpenBotStageIcon::ChevronRight,
+                                    14.0,
+                                    text_muted,
+                                )),
+                        ),
+                );
+            }
+        }
+
+        // 3. Other Providers Section (`其他服务商`)
+        let categories = [
+            (AiPresetCategory::All, tr_str(lang, "全部", "All")),
+            (AiPresetCategory::Vendor, tr_str(lang, "官方", "Vendors")),
+            (AiPresetCategory::Relay, tr_str(lang, "中转", "Relays")),
+            (AiPresetCategory::Local, tr_str(lang, "本地", "Local")),
+            (AiPresetCategory::Custom, tr_str(lang, "自定义", "Custom")),
+        ];
+
+        let others_header = div()
+            .w_full()
+            .pt(px(6.0))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text_sec)
+                    .child(tr_str(lang, "其他服务商", "Other providers")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .children(categories.into_iter().enumerate().map(|(cidx, (cat, lbl))| {
+                        let active = self.category == cat;
+                        div()
+                            .id(SharedString::from(format!("magpie-cat-filter-btn-{cidx}")))
+                            .cursor_pointer()
+                            .h(px(24.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .when(active, |el| el.bg(bg_active))
+                            .hover(move |s| if active { s } else { s.bg(hover_bg) })
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.5))
+                            .font_weight(if active {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active { text_pri } else { text_muted })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.category = cat;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(lbl)
+                    }))
+                    .child(
+                        div()
+                            .id("magpie-add-custom-btn")
+                            .cursor_pointer()
+                            .ml(px(4.0))
+                            .h(px(26.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .bg(bg_control)
+                            .border_1()
+                            .border_color(border_strong)
+                            .hover(move |s| s.bg(bg_control_hover))
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_preset_editor("custom-openai");
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "+ 自定义", "+ Custom")),
+                    ),
+            );
+
+        let mut others_card = div()
+            .w_full()
+            .rounded(px(SETTINGS_CARD_RADIUS_PX))
+            .bg(card_bg)
+            .border_1()
+            .border_color(frame_border)
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+
+        let mut other_row_idx = 0usize;
+        for (prov_key, icon_key, name, subtitle, preset_hint) in core_other_rows {
+            let idx = other_row_idx;
+            other_row_idx += 1;
+            let key_click = prov_key.clone();
+            let name_click = name.clone();
+            let hint_click = preset_hint.clone();
+            others_card = others_card.child(
+                div()
+                    .id(SharedString::from(format!("openbot-other-prov-{}", prov_key)))
+                    .cursor_pointer()
+                    .w_full()
+                    .min_h(px(56.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .when(idx > 0, |el| el.border_t_1().border_color(border_hairline))
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_other_provider_editor(
+                                &key_click,
+                                &name_click,
+                                hint_click.as_deref(),
+                            );
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(render_provider_icon(&icon_key, 20.0, text_pri, true)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(14.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(text_muted)
+                                            .child(subtitle),
+                                    ),
+                            ),
+                    )
+                    .child(openbot_stage_icon(
+                        OpenBotStageIcon::ChevronRight,
+                        14.0,
+                        text_muted,
+                    )),
+            );
+        }
+
+        for p in filtered_presets {
+            let idx = other_row_idx;
+            other_row_idx += 1;
+            let pid = p.id.clone();
+            let icon_key = canonical_provider_icon_key(&p.id);
+            let title = p.short_name.unwrap_or(p.name);
+            let subtitle = if p.no_key {
+                if p.default_model.trim().is_empty() {
+                    tr_str(lang, "免 Key · 本地", "No Key · Local").to_string()
+                } else {
+                    format!("{} · {}", tr_str(lang, "免 Key", "No Key"), p.default_model)
+                }
+            } else if p.default_model.trim().is_empty() {
+                tr_str(lang, "未配置 · API Key", "Not configured · API Key").to_string()
+            } else {
+                format!("API Key · {}", p.default_model)
+            };
+            others_card = others_card.child(
+                div()
+                    .id(SharedString::from(format!("magpie-preset-card-{}", p.id)))
+                    .cursor_pointer()
+                    .w_full()
+                    .min_h(px(56.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .when(idx > 0, |el| el.border_t_1().border_color(border_hairline))
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_preset_editor(&pid);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(render_provider_icon(icon_key, 20.0, text_pri, true)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(14.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(text_muted)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(subtitle),
+                                    ),
+                            ),
+                    )
+                    .child(openbot_stage_icon(
+                        OpenBotStageIcon::ChevronRight,
+                        14.0,
+                        text_muted,
+                    )),
+            );
+        }
+
+        if other_row_idx == 0 {
+            others_card = others_card.child(
+                div()
+                    .px(px(16.0))
+                    .py(px(16.0))
+                    .text_size(px(13.0))
+                    .text_color(text_muted)
+                    .child(tr_str(lang, "没有匹配的其他服务商", "No matching providers")),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(default_provider_card)
+            .child(connected_toolbar)
+            .child(connected_card)
+            .child(others_header)
+            .child(others_card)
+            .child(settings_card(pal).child(settings_toggle_row(
+                IconName::BotRobot,
+                tr_str(
+                    lang,
+                    "无服务商时允许本地回退 (fabushi-local)",
+                    "Allow local fallback when unconfigured",
+                ),
+                None,
+                self.draft_allow_local_fallback,
+                pal,
+                |this| {
+                    this.draft_allow_local_fallback = !this.draft_allow_local_fallback;
+                    this.pending_event = Some(SettingsAiProvidersEvent::ToggleAllowLocalFallback(
+                        this.draft_allow_local_fallback,
+                    ));
+                },
+                cx,
+            )))
             .into_any_element()
     }
 
@@ -1858,6 +2635,17 @@ impl SettingsAiProvidersSections {
         lang: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let ob = pal.openbot_palette();
+        let hover_bg = ob.hover();
+        let bg_control = ob.bg_control();
+        let bg_active = ob.bg_control_active();
+        let border_strong = ob.border_strong_hairline();
+        let text_pri = ob.text_primary();
+        let text_sec = ob.text_secondary();
+        let text_muted = ob.text_muted();
+        let cta_bg = ob.surface_light();
+        let cta_fg = ob.text_on_light();
+
         let preset_opt = self.current_preset().cloned();
         let regions = preset_opt.as_ref().map(|p| p.regions.clone()).unwrap_or_default();
         let protocols = preset_opt
@@ -1890,47 +2678,151 @@ impl SettingsAiProvidersSections {
             .as_ref()
             .and_then(|p| p.key_hint.clone())
             .unwrap_or_else(|| "sk-...".to_string());
+        let icon_key = canonical_provider_icon_key(
+            self.selected_preset_id
+                .as_deref()
+                .unwrap_or(&self.draft_provider_id),
+        );
+        let existing_pid = self.editing_existing_provider_id.clone();
 
         div()
             .flex()
             .flex_col()
-            .gap(px(10.0))
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .id("magpie-editor-back-btn")
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .text_size(px(13.0))
+                            .text_color(text_muted)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.close_detail_view();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "← 服务商", "← Providers")),
+                    )
+                    .when_some(existing_pid.clone(), |row, pid| {
+                        let pid_probe = pid.clone();
+                        let pid_del = pid.clone();
+                        let model_probe = opt_non_empty(&self.draft_model);
+                        row.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("magpie-probe-prov-btn")
+                                        .cursor_pointer()
+                                        .h(px(28.0))
+                                        .px(px(10.0))
+                                        .rounded(px(7.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(border_strong)
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(12.0))
+                                        .text_color(text_pri)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.pending_event = Some(
+                                                    SettingsAiProvidersEvent::ProbeProvider {
+                                                        provider_id: pid_probe.clone(),
+                                                        model: model_probe.clone(),
+                                                    },
+                                                );
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "测试连通", "Probe")),
+                                )
+                                .when(pid != "local_hermes", |el| {
+                                    el.child(
+                                        div()
+                                            .id("magpie-del-prov-btn")
+                                            .cursor_pointer()
+                                            .h(px(28.0))
+                                            .px(px(10.0))
+                                            .rounded(px(7.0))
+                                            .bg(bg_control)
+                                            .border_1()
+                                            .border_color(border_strong)
+                                            .hover(move |s| s.bg(hover_bg))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(12.0))
+                                            .text_color(ob.danger())
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.pending_event = Some(
+                                                        SettingsAiProvidersEvent::DeleteProvider(
+                                                            pid_del.clone(),
+                                                        ),
+                                                    );
+                                                    this.close_detail_view();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(tr_str(lang, "删除", "Delete")),
+                                    )
+                                }),
+                        )
+                    }),
+            )
             .child(
                 settings_card(pal)
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .child(settings_subsection_title(
-                                &format!(
-                                    "{}: {}",
-                                    tr_str(lang, "配置模型供应商", "Configure Provider"),
-                                    if self.draft_name.is_empty() {
-                                        &self.draft_provider_id
+                            .gap(px(10.0))
+                            .pb(px(4.0))
+                            .child(
+                                div()
+                                    .w(px(32.0))
+                                    .h(px(32.0))
+                                    .rounded(px(8.0))
+                                    .bg(bg_control)
+                                    .border_1()
+                                    .border_color(ob.border_hairline())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(render_provider_icon(icon_key, 18.0, text_pri, true)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(text_pri)
+                                    .child(if self.draft_name.is_empty() {
+                                        self.draft_provider_id.clone()
                                     } else {
-                                        &self.draft_name
-                                    }
-                                ),
-                                pal,
-                            ))
-                            .child(Self::pill_btn(
-                                "magpie-editor-back-btn",
-                                tr_str(lang, "返回目录", "Back to Catalog"),
-                                pal.input_bg,
-                                pal.text_primary,
-                                |this, _| {
-                                    this.editor_open = false;
-                                    this.active_field = AiProviderField::None;
-                                },
-                                cx,
-                            )),
+                                        self.draft_name.clone()
+                                    }),
+                            ),
                     )
                     .when_some(note, |el, n| {
                         el.child(
                             div()
-                                .text_size(px(11.5))
-                                .text_color(rgb(pal.text_secondary))
+                                .text_size(px(12.0))
+                                .text_color(text_muted)
                                 .child(n),
                         )
                     })
@@ -1944,26 +2836,34 @@ impl SettingsAiProvidersSections {
                                     div()
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(pal.text_secondary))
+                                        .text_color(text_sec)
                                         .child(tr_str(lang, "区域 / 计费通道", "Region / Plan")),
                                 )
                                 .child(div().flex().flex_wrap().gap(px(6.0)).children(
-                                    regions.into_iter().map(|r| {
+                                    regions.into_iter().enumerate().map(|(idx, r)| {
                                         let active =
                                             self.selected_region_id.as_deref() == Some(r.id.as_str());
                                         let rid = r.id.clone();
-                                        Self::pill_btn(
-                                            "magpie-region-pill",
-                                            &r.name,
-                                            if active { pal.accent } else { pal.input_bg },
-                                            if active {
-                                                pal.active_button_fg
-                                            } else {
-                                                pal.text_primary
-                                            },
-                                            move |this, _| this.select_region(&rid),
-                                            cx,
-                                        )
+                                        div()
+                                            .id(SharedString::from(format!("magpie-region-pill-{idx}")))
+                                            .cursor_pointer()
+                                            .px(px(10.0))
+                                            .py(px(5.0))
+                                            .rounded(px(7.0))
+                                            .bg(if active { cta_bg } else { bg_control })
+                                            .border_1()
+                                            .border_color(if active { cta_bg } else { border_strong })
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if active { cta_fg } else { text_pri })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.select_region(&rid);
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(r.name)
                                     }),
                                 )),
                         )
@@ -1977,32 +2877,40 @@ impl SettingsAiProvidersSections {
                                 div()
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.text_secondary))
+                                    .text_color(text_sec)
                                     .child(tr_str(lang, "协议格式", "Protocol")),
                             )
                             .child(div().flex().flex_wrap().gap(px(6.0)).children(
-                                protocols.into_iter().map(|proto| {
+                                protocols.into_iter().enumerate().map(|(idx, proto)| {
                                     let active = self.draft_api_mode == proto;
                                     let p_clone = proto.clone();
-                                    Self::pill_btn(
-                                        "magpie-proto-pill",
-                                        &proto,
-                                        if active { pal.accent } else { pal.input_bg },
-                                        if active {
-                                            pal.active_button_fg
-                                        } else {
-                                            pal.text_primary
-                                        },
-                                        move |this, _| this.select_protocol(&p_clone),
-                                        cx,
-                                    )
+                                    div()
+                                        .id(SharedString::from(format!("magpie-proto-pill-{idx}")))
+                                        .cursor_pointer()
+                                        .px(px(10.0))
+                                        .py(px(5.0))
+                                        .rounded(px(7.0))
+                                        .bg(if active { cta_bg } else { bg_control })
+                                        .border_1()
+                                        .border_color(if active { cta_bg } else { border_strong })
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(if active { cta_fg } else { text_pri })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.select_protocol(&p_clone);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(proto)
                                 }),
                             )),
                     )
                     .child(self.render_input_field(
                         "magpie-field-provider-id",
                         AiProviderField::ProviderId,
-                        tr_str(lang, "供应商 ID", "Provider ID"),
+                        tr_str(lang, "服务商 ID", "Provider ID"),
                         &self.draft_provider_id,
                         "deepseek",
                         false,
@@ -2031,17 +2939,28 @@ impl SettingsAiProvidersSections {
                     ))
                     .when(!suggested_models.is_empty(), |el| {
                         el.child(div().flex().flex_wrap().gap(px(5.0)).children(
-                            suggested_models.into_iter().map(|m| {
+                            suggested_models.into_iter().enumerate().map(|(idx, m)| {
                                 let active = self.draft_model == m;
                                 let m_val = m.clone();
-                                Self::pill_btn(
-                                    "magpie-model-chip",
-                                    &m,
-                                    if active { pal.accent } else { pal.input_bg },
-                                    if active { pal.active_button_fg } else { pal.text_primary },
-                                    move |this, _| this.draft_model = m_val.clone(),
-                                    cx,
-                                )
+                                div()
+                                    .id(SharedString::from(format!("magpie-model-chip-{idx}")))
+                                    .cursor_pointer()
+                                    .px(px(9.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(if active { bg_active } else { bg_control })
+                                    .border_1()
+                                    .border_color(if active { text_muted } else { border_strong })
+                                    .text_xs()
+                                    .text_color(if active { text_pri } else { text_sec })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.draft_model = m_val.clone();
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(m)
                             }),
                         ))
                     })
@@ -2077,30 +2996,59 @@ impl SettingsAiProvidersSections {
                         div()
                             .flex()
                             .flex_wrap()
+                            .items_center()
                             .gap(px(8.0))
-                            .pt(px(4.0))
-                            .child(Self::pill_btn(
-                                "magpie-save-provider-btn",
-                                tr_str(lang, "保存并启用", "Save & Activate"),
-                                pal.accent,
-                                pal.active_button_fg,
-                                |this, _| {
-                                    this.submit_provider_form();
-                                },
-                                cx,
-                            ))
+                            .pt(px(6.0))
+                            .child(
+                                div()
+                                    .id("magpie-save-provider-btn")
+                                    .cursor_pointer()
+                                    .h(px(34.0))
+                                    .px(px(16.0))
+                                    .rounded(px(8.0))
+                                    .bg(cta_bg)
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cta_fg)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.submit_provider_form();
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(lang, "保存并启用", "Save & Activate")),
+                            )
                             .when_some(keys_url, |row, kurl| {
-                                row.child(Self::pill_btn(
-                                    "magpie-copy-keys-url-btn",
-                                    tr_str(lang, "复制获取 Key 链接", "Copy Key Console URL"),
-                                    pal.input_bg,
-                                    pal.text_link,
-                                    move |this, _| {
-                                        this.pending_event =
-                                            Some(SettingsAiProvidersEvent::CopyText(kurl.clone()));
-                                    },
-                                    cx,
-                                ))
+                                row.child(
+                                    div()
+                                        .id("magpie-copy-keys-url-btn")
+                                        .cursor_pointer()
+                                        .h(px(34.0))
+                                        .px(px(12.0))
+                                        .rounded(px(8.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(border_strong)
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(12.5))
+                                        .text_color(text_pri)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.pending_event =
+                                                    Some(SettingsAiProvidersEvent::CopyText(
+                                                        kurl.clone(),
+                                                    ));
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "复制获取 Key 链接", "Copy Key Console URL")),
+                                )
                             }),
                     ),
             )
@@ -2526,71 +3474,139 @@ impl Render for SettingsAiProvidersSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_ime_controller(cx);
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
+
+        let text_pri = ob.text_primary();
+        let text_muted = ob.text_muted();
+        let bg_control = ob.bg_control();
+        let bg_surface = ob.bg_surface();
+        let border_hairline = ob.border_hairline();
+        let border_strong = ob.border_strong_hairline();
+        let hover_bg = ob.hover();
 
         let sub_tabs = [
             (
+                0usize,
                 AiProvidersTab::Overview,
-                tr_str(&lang, "订阅与供应商", "Providers & Presets"),
+                tr_str(&lang, "服务商", "Providers"),
             ),
             (
+                1usize,
                 AiProvidersTab::Routing,
-                tr_str(&lang, "路由组与策略", "Groups & Routing"),
+                tr_str(&lang, "路由组", "Routing"),
             ),
             (
+                2usize,
                 AiProvidersTab::PrivacyImport,
-                tr_str(&lang, "脱敏与导入", "Masking & Import"),
+                tr_str(&lang, "脱敏与导入", "Privacy & Import"),
             ),
         ];
+        let has_banners = self.error_message.is_some()
+            || self.status_message.is_some()
+            || self.probe_result.is_some();
 
         settings_container(pal)
-            .child(settings_section_header(
-                IconName::BotRobot,
-                tr_str(&lang, "AI 订阅与模型供应商", "AI Subscriptions & Providers"),
-                Some(tr_str(
-                    &lang,
-                    "内置 AI 网关：自动发现本机订阅、45+ 供应商预设、智能路由与隐私脱敏",
-                    "Built-in AI gateway: local subscriptions, 45+ provider presets, smart routing, and privacy masking",
-                )),
-                pal,
-            ))
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(8.0))
-                    .children(sub_tabs.into_iter().map(|(t, label)| {
-                        let active = self.tab == t;
-                        Self::pill_btn(
-                            "magpie-subtab-btn",
-                            label,
-                            if active { pal.accent } else { pal.card_bg },
-                            if active { pal.active_button_fg } else { pal.text_primary },
-                            move |this, _| {
-                                this.tab = t;
-                                this.active_field = AiProviderField::None;
-                            },
-                            cx,
-                        )
-                    }))
-                    .child(Self::pill_btn(
-                        "magpie-refresh-state-btn",
-                        if self.loading {
-                            tr_str(&lang, "同步中...", "Syncing...")
-                        } else {
-                            tr_str(&lang, "刷新", "Refresh")
-                        },
-                        pal.input_bg,
-                        pal.text_secondary,
-                        |this, _| {
-                            this.loading = true;
-                            this.pending_event = Some(SettingsAiProvidersEvent::RefreshState);
-                        },
-                        cx,
-                    )),
+                    .justify_between()
+                    .gap(px(12.0))
+                    .pb(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(text_pri)
+                            .child(tr_str(&lang, "服务商", "Providers")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .p(px(2.0))
+                                    .rounded(px(9.0))
+                                    .bg(bg_control)
+                                    .border_1()
+                                    .border_color(border_hairline)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .children(sub_tabs.into_iter().map(|(idx, t, label)| {
+                                        let active = self.tab == t;
+                                        div()
+                                            .id(SharedString::from(format!("magpie-subtab-{}", idx)))
+                                            .cursor_pointer()
+                                            .h(px(26.0))
+                                            .px(px(10.0))
+                                            .rounded(px(7.0))
+                                            .when(active, |el| {
+                                                el.bg(bg_surface)
+                                                    .border_1()
+                                                    .border_color(border_strong)
+                                            })
+                                            .when(!active, |el| el.hover(move |s| s.bg(hover_bg)))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(12.0))
+                                            .font_weight(if active {
+                                                FontWeight::MEDIUM
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
+                                            .text_color(if active { text_pri } else { text_muted })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.tab = t;
+                                                    this.close_detail_view();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(label.to_string())
+                                    })),
+                            )
+                            .when(self.tab != AiProvidersTab::Overview, |row| {
+                                row.child(
+                                    div()
+                                        .id("magpie-refresh-state-btn")
+                                        .cursor_pointer()
+                                        .h(px(30.0))
+                                        .px(px(10.0))
+                                        .rounded(px(8.0))
+                                        .bg(bg_control)
+                                        .border_1()
+                                        .border_color(border_strong)
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(12.0))
+                                        .text_color(text_pri)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.loading = true;
+                                                this.pending_event =
+                                                    Some(SettingsAiProvidersEvent::RefreshState);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if self.loading {
+                                            tr_str(&lang, "同步中...", "Syncing...")
+                                        } else {
+                                            tr_str(&lang, "刷新", "Refresh")
+                                        }),
+                                )
+                            }),
+                    ),
             )
-            .child(self.render_status_banners(pal))
+            .when(has_banners, |col| col.child(self.render_status_banners(pal)))
             .child(match self.tab {
                 AiProvidersTab::Overview => self.render_overview_tab(pal, &lang, cx),
                 AiProvidersTab::Routing => self.render_routing_tab(pal, &lang, cx),
@@ -2969,5 +3985,86 @@ mod tests {
         assert_eq!(eff5.len(), 1);
         assert_eq!(eff5[0].id, "google_vertex:local@mac");
         assert!(eff5[0].active, "local subscription must reflect active_provider from server state");
+    }
+
+    #[std::prelude::v1::test]
+    fn openbot_providers_connected_entries_detail_and_escape_flow_work() {
+        let pal = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x5288C1, 14, 12);
+        let mut view = SettingsAiProvidersSections::new_live(pal, "zh-CN");
+        let mut st = sample_state();
+        st.active_provider = "codex:1".to_string();
+        st.needs_provider_selection = false;
+        st.subscriptions = vec![
+            MagpieSubscriptionDto {
+                id: "codex:1".to_string(),
+                kind: "codex_chatgpt".to_string(),
+                label: "Codex / ChatGPT".to_string(),
+                email: Some("dev@openai.com".to_string()),
+                account_id: Some("dev@openai.com".to_string()),
+                active: true,
+                default_model: Some("gpt-6-luna".to_string()),
+                ..Default::default()
+            },
+            MagpieSubscriptionDto {
+                id: "claude:1".to_string(),
+                kind: "claude_code".to_string(),
+                label: "Claude Code".to_string(),
+                email: None,
+                account_id: None,
+                active: false,
+                default_model: Some("claude-sonnet-4-6".to_string()),
+                ..Default::default()
+            },
+        ];
+        st.providers = vec![MagpieProviderDto {
+            provider_id: "deepseek".to_string(),
+            preset_id: Some("deepseek".to_string()),
+            name: "DeepSeek".to_string(),
+            default_model: "deepseek-chat".to_string(),
+            masked_key: Some("sk-***1234".to_string()),
+            is_active: false,
+            ..Default::default()
+        }];
+        view.sync_state(st);
+
+        let entries = view.connected_provider_entries("zh-CN");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, "codex:1");
+        assert_eq!(entries[0].2, "ChatGPT");
+        assert_eq!(entries[0].3, "dev@openai.com");
+        assert!(entries[0].5); // active
+        assert_eq!(entries[1].2, "Claude");
+        assert_eq!(entries[1].3, "在这台电脑上可用");
+        assert_eq!(entries[2].0, "deepseek");
+        assert_eq!(entries[2].2, "DeepSeek");
+
+        // Progressive Escape cascade: dropdown -> subscription detail -> search
+        view.default_provider_dropdown_open = true;
+        assert!(view.handle_escape_key());
+        assert!(!view.default_provider_dropdown_open);
+
+        view.open_subscription_detail("codex:1");
+        assert_eq!(view.selected_subscription_detail_id.as_deref(), Some("codex:1"));
+        assert!(view.handle_escape_key());
+        assert!(view.selected_subscription_detail_id.is_none());
+
+        // Clicking an OpenBot "其他服务商" row opens matching preset or prefilled custom editor
+        view.open_other_provider_editor("deepseek", "DeepSeek", Some("deepseek"));
+        assert!(view.editor_open);
+        assert_eq!(view.selected_preset_id.as_deref(), Some("deepseek"));
+        assert!(view.handle_escape_key());
+        assert!(!view.editor_open);
+
+        view.open_other_provider_editor("grok", "Grok", Some("xai"));
+        assert!(view.editor_open);
+        assert_eq!(view.draft_provider_id, "grok");
+        assert_eq!(view.draft_name, "Grok");
+        view.close_detail_view();
+        assert!(!view.editor_open);
+
+        view.preset_search = "claude".to_string();
+        assert!(view.handle_escape_key());
+        assert!(view.preset_search.is_empty());
+        assert!(!view.handle_escape_key());
     }
 }

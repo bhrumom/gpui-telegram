@@ -1124,6 +1124,22 @@ impl SettingsRouter {
                 return false;
             }
         }
+        if self.settings_section == SettingsSectionType::AiProviders {
+            if let Some(ref ap) = self.settings_ai_providers {
+                let unwound_subpage = ap.update(cx, |view, vcx| {
+                    let consumed = view.handle_escape_key();
+                    if consumed {
+                        vcx.notify();
+                    }
+                    consumed
+                });
+                if unwound_subpage {
+                    self.last_active_input_key = self.current_active_input_key(cx);
+                    cx.notify();
+                    return true;
+                }
+            }
+        }
         if let Some(prev) = self.settings_stack.pop() {
             self.clear_all_preedits(cx);
             self.settings_section = prev;
@@ -1818,12 +1834,20 @@ impl SettingsRouter {
                 handled
             }
             SettingsSectionType::AiProviders => {
-                if !matches!(key, "backspace" | "delete" | "tab" | "enter") {
+                if !matches!(key, "backspace" | "delete" | "tab" | "enter" | "escape") {
                     return Some(false);
                 }
                 let ap = self.ensure_ai_providers(cx);
                 let handled = ap.update(cx, |ap, ap_cx| {
-                    ap.handle_non_char_key(key, _is_shift, false, ap_cx)
+                    if key == "escape" {
+                        let consumed = ap.handle_escape_key();
+                        if consumed {
+                            ap_cx.notify();
+                        }
+                        consumed
+                    } else {
+                        ap.handle_non_char_key(key, _is_shift, false, ap_cx)
+                    }
                 });
                 handled
             }

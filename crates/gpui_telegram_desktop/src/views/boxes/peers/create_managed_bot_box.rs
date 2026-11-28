@@ -14,9 +14,16 @@ use crate::components::avatar::{
     legacy_shape_to_bloub_shape, parse_fabushi_hex_color, render_plush_bot_avatar,
 };
 use crate::components::bloub_avatar::{render_agent_avatar, AgentAvatarProps};
+use crate::components::openbot_model_picker::{
+    openbot_effort_label, render_openbot_provider_model_picker_card, render_provider_icon,
+    OpenBotModelPickerAction, OpenBotModelPickerState,
+};
 use crate::i18n::tr_str;
 use crate::theme::openbot_palette::parse_css_color_to_rgba;
-use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
+use crate::theme::TdesktopThemePalette;
+use crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto;
+use crate::views::stage::openbot_stage_chrome::{openbot_stage_icon, OpenBotStageIcon};
+use gpui_telegram_client::net::hermes_client::MagpieStateDto;
 use gpui_telegram_proto::miniapp_contracts::{
     CreateFabushiBotRequest, CLASSIC_INITIALS_AVATAR_SHAPE,
 };
@@ -143,15 +150,6 @@ fn template_category_label_zh(cat: BotTemplateCategory) -> &'static str {
 fn template_plush_avatar_spec(idx: usize) -> String {
     let shape = STUDIO_FACE_CHOICES[idx % STUDIO_FACE_CHOICES.len()].0;
     format!("plush:{}", shape.as_str())
-}
-
-fn thinking_level_label(level: &str, lang: &str) -> &'static str {
-    match level {
-        "off" => tr_str(lang, "关", "Off"),
-        "low" => tr_str(lang, "低", "Low"),
-        "high" => tr_str(lang, "高", "High"),
-        _ => tr_str(lang, "中", "Med"),
-    }
 }
 
 fn resolve_studio_shape_and_expr(avatar_shape: &str) -> (BloubShape, BloubExpression) {
@@ -350,6 +348,8 @@ pub struct CreateManagedBotBoxPeers {
     pub language_id: String,
     pub auto_avatar_color: bool,
     pub model_picker_open: bool,
+    pub model_picker: OpenBotModelPickerState,
+    pub pending_open_providers_settings: bool,
     pub advanced_open: bool,
     pub hero_wink_toggle: bool,
     pub ai_models: crate::views::drawer::InspectorAiModelCatalog,
@@ -407,6 +407,8 @@ impl CreateManagedBotBoxPeers {
             language_id: "en".to_string(),
             auto_avatar_color: true,
             model_picker_open: false,
+            model_picker: OpenBotModelPickerState::default(),
+            pending_open_providers_settings: false,
             advanced_open: false,
             hero_wink_toggle: false,
             ai_models: crate::views::drawer::InspectorAiModelCatalog::default(),
@@ -592,12 +594,131 @@ impl CreateManagedBotBoxPeers {
         self.active_field = 1;
         self.is_submitting = false;
         self.model_picker_open = false;
+        self.model_picker.search_focused = false;
+        self.model_picker.effort_menu_open = false;
+        self.model_picker.ensure_selected_provider(
+            (!self.preferred_model.trim().is_empty()).then_some(self.preferred_model.as_str()),
+        );
         self.status_message = None;
         if self.avatar_shape == "blob" && self.avatar_color == "blue" {
             self.avatar_shape = "plush:cercle".to_string();
             self.avatar_color = STUDIO_AUTO_HEX.to_string();
             self.auto_avatar_color = true;
         }
+    }
+
+    /// Synchronizes live Settings/Magpie providers & subscriptions into the OpenBot model picker.
+    pub fn sync_magpie_catalog(
+        &mut self,
+        state: &MagpieStateDto,
+        server_subs: &[SubscriptionAccountDto],
+        local_subs: &[SubscriptionAccountDto],
+    ) {
+        let cur_model = (!self.preferred_model.trim().is_empty())
+            .then_some(self.preferred_model.as_str());
+        self.model_picker.sync_from_magpie(
+            state,
+            server_subs,
+            local_subs,
+            &self.detected_coding_providers,
+            cur_model,
+        );
+    }
+
+    /// Applies an interaction event emitted by the shared OpenBot two-column model picker popover.
+    pub fn handle_model_picker_action(&mut self, action: OpenBotModelPickerAction) {
+        match action {
+            OpenBotModelPickerAction::SelectProvider(pid) => {
+                self.model_picker.selected_provider_id = pid;
+                self.model_picker.legacy_expanded = false;
+                self.model_picker.effort_menu_open = false;
+                self.model_picker.search_query.clear();
+            }
+            OpenBotModelPickerAction::FocusSearch => {
+                self.model_picker.search_focused = true;
+                self.model_picker.effort_menu_open = false;
+                self.active_field = 5;
+            }
+            OpenBotModelPickerAction::ClearSearch => {
+                self.model_picker.search_query.clear();
+                self.model_picker.search_focused = true;
+                self.active_field = 5;
+            }
+            OpenBotModelPickerAction::SelectModel {
+                provider_id,
+                model_id,
+            } => {
+                self.model_picker.selected_provider_id = provider_id;
+                self.preferred_model = model_id;
+                self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
+                self.model_picker.search_query.clear();
+                if self.active_field == 5 {
+                    self.active_field = 1;
+                }
+            }
+            OpenBotModelPickerAction::ToggleLegacy => {
+                self.model_picker.legacy_expanded = !self.model_picker.legacy_expanded;
+            }
+            OpenBotModelPickerAction::ToggleEffortMenu => {
+                self.model_picker.effort_menu_open = !self.model_picker.effort_menu_open;
+                self.model_picker.search_focused = false;
+            }
+            OpenBotModelPickerAction::SelectEffort(effort) => {
+                self.thinking_level = effort;
+                self.model_picker.effort_menu_open = false;
+            }
+            OpenBotModelPickerAction::OpenProvidersSettings => {
+                self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
+                self.pending_open_providers_settings = true;
+            }
+            OpenBotModelPickerAction::Dismiss => {
+                self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
+                if self.active_field == 5 {
+                    self.active_field = 1;
+                }
+            }
+        }
+    }
+
+    /// Handles `Escape` layered inside the modal: closes effort menu -> model picker -> returns `false`
+    /// when the outer modal itself should close.
+    pub fn handle_escape_in_modal(&mut self) -> bool {
+        if self.model_picker_open {
+            if self.model_picker.effort_menu_open {
+                self.model_picker.effort_menu_open = false;
+            } else {
+                self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                if self.active_field == 5 {
+                    self.active_field = 1;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Handles `Enter` inside the modal: when the model picker search is open, selects the top
+    /// filtered model instead of prematurely submitting the creation form.
+    pub fn handle_enter_key(&mut self) {
+        if self.model_picker_open {
+            if let Some((provider_id, model_id)) = self.model_picker.first_filtered_model() {
+                self.handle_model_picker_action(OpenBotModelPickerAction::SelectModel {
+                    provider_id,
+                    model_id,
+                });
+            } else {
+                self.handle_model_picker_action(OpenBotModelPickerAction::Dismiss);
+            }
+            return;
+        }
+        self.submit();
     }
 
     pub fn open_template_creator(&mut self) {
@@ -645,6 +766,7 @@ impl CreateManagedBotBoxPeers {
                 2 => &self.bot_username,
                 3 => &self.description,
                 4 => &self.preferred_model,
+                5 => &self.model_picker.search_query,
                 _ => &self.bot_name,
             }
         } else if self.is_ai_mode || self.active_field == 0 {
@@ -673,6 +795,7 @@ impl CreateManagedBotBoxPeers {
                 2 => self.bot_username.clear(),
                 3 => self.description.clear(),
                 4 => self.preferred_model.clear(),
+                5 => self.model_picker.search_query.clear(),
                 _ => self.bot_name.clear(),
             }
         } else if self.is_ai_mode || self.active_field == 0 {
@@ -727,6 +850,7 @@ impl CreateManagedBotBoxPeers {
                 2 => self.bot_username.push_str(s),
                 3 => self.description.push_str(s),
                 4 => self.preferred_model.push_str(s),
+                5 => self.model_picker.search_query.push_str(s),
                 _ => self.bot_name.push_str(s),
             }
         } else if self.is_ai_mode || self.active_field == 0 {
@@ -772,6 +896,9 @@ impl CreateManagedBotBoxPeers {
                 }
                 4 => {
                     self.preferred_model.pop();
+                }
+                5 => {
+                    self.model_picker.search_query.pop();
                 }
                 _ => {
                     self.bot_name.pop();
@@ -905,6 +1032,12 @@ impl CreateManagedBotBoxPeers {
     pub fn take_close(&mut self) -> bool {
         let was = self.pending_close;
         self.pending_close = false;
+        was
+    }
+
+    pub fn take_open_providers_settings(&mut self) -> bool {
+        let was = self.pending_open_providers_settings;
+        self.pending_open_providers_settings = false;
         was
     }
 
@@ -1767,7 +1900,6 @@ impl Render for CreateManagedBotBoxPeers {
 
         let bg_canvas = ob.bg_canvas();
         let bg_control = ob.bg_control();
-        let bg_surface = ob.bg_surface();
         let bg_active = ob.bg_control_active();
         let hover_bg = ob.hover();
         let border_subtle = ob.border();
@@ -1863,38 +1995,6 @@ impl Render for CreateManagedBotBoxPeers {
                                 }),
                             ),
                     )
-                    .child(
-                        mode_pill("create-bot-tab-coding", tr_str(lang, "编程", "Coding"), is_coding)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.open_coding_agent_creator();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        mode_pill("create-bot-tab-ai", "AI", is_ai).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.open_ai_creator();
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        mode_pill("create-bot-tab-manual", "Token", is_token).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.is_coding_agent_mode = false;
-                                this.is_template_mode = false;
-                                this.is_fabushi_mode = false;
-                                this.is_ai_mode = false;
-                                this.active_field = 1;
-                                cx.notify();
-                            }),
-                        ),
-                    )
                     .child(div().w(px(1.0)).h(px(14.0)).mx(px(4.0)).bg(border_strong))
                     .child(
                         div()
@@ -1921,11 +2021,11 @@ impl Render for CreateManagedBotBoxPeers {
                     ),
             );
 
-        let model_display = self.studio_model_display_label(lang);
-        let think_display = thinking_level_label(&self.thinking_level, lang);
-        let studio_model_opts = self.studio_model_options(lang);
-        let has_live_studio_models = studio_model_opts.len() > 1;
-        let studio_models_synced = self.ai_models.synced;
+        let live_default_label = self.studio_model_display_label(lang);
+        let (model_provider_icon_key, model_display) = self
+            .model_picker
+            .resolve_trigger_display(&self.preferred_model, &live_default_label);
+        let think_display = openbot_effort_label(&self.thinking_level, lang);
 
         let fabushi_body = is_fabushi.then(|| {
             let avatar_picker = self.render_studio_avatar_picker(pal, cx);
@@ -1934,121 +2034,6 @@ impl Render for CreateManagedBotBoxPeers {
             let desc_active = self.active_field == 3;
             let user_active = self.active_field == 2;
             let model_field_active = self.active_field == 4;
-
-            let model_dropdown = self.model_picker_open.then(|| {
-                let mut opts_col = div()
-                    .id("studio-model-picker-scroll")
-                    .max_h(px(200.0))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(studio_model_opts.into_iter().enumerate().map(|(idx, (id_val, lbl))| {
-                        let selected = self.preferred_model.trim().eq_ignore_ascii_case(&id_val);
-                        let owned = id_val.clone();
-                        div()
-                            .id(SharedString::from(format!("studio-model-opt-{idx}")))
-                            .cursor_pointer()
-                            .min_h(px(30.0))
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .when(selected, |el| el.bg(bg_active))
-                            .hover(move |s| if selected { s } else { s.bg(hover_bg) })
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(13.0))
-                            .text_color(if selected { text_pri } else { text_sec })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.preferred_model = owned.clone();
-                                    this.model_picker_open = false;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(lbl)
-                    }));
-                if !has_live_studio_models {
-                    opts_col = opts_col.child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .text_size(px(11.5))
-                            .text_color(text_muted)
-                            .child(if studio_models_synced {
-                                tr_str(
-                                    lang,
-                                    "设置中尚未配置可用模型，请先在「设置 → AI 模型供应商」中配置",
-                                    "No models configured yet — configure a provider in Settings → AI Providers",
-                                )
-                            } else {
-                                tr_str(
-                                    lang,
-                                    "正在同步设置中的模型列表…",
-                                    "Syncing available models from Settings…",
-                                )
-                            }),
-                    );
-                }
-                div()
-                    .id("studio-model-picker-dropdown")
-                    .w_full()
-                    .p(px(8.0))
-                    .rounded(px(10.0))
-                    .bg(bg_surface)
-                    .border_1()
-                    .border_color(border_strong)
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(opts_col)
-                    .child(div().h(px(1.0)).w_full().bg(border_subtle))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(text_muted)
-                                    .child(tr_str(lang, "推理深度", "Reasoning")),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .children(["off", "low", "medium", "high"].into_iter().enumerate().map(|(idx, lvl)| {
-                                        let active = self.thinking_level == lvl;
-                                        let owned = lvl.to_string();
-                                        div()
-                                            .id(SharedString::from(format!("fab-think-pick-{idx}")))
-                                            .cursor_pointer()
-                                            .h(px(24.0))
-                                            .px(px(8.0))
-                                            .rounded(px(6.0))
-                                            .when(active, |el| el.bg(bg_active))
-                                            .hover(move |s| if active { s } else { s.bg(hover_bg) })
-                                            .flex()
-                                            .items_center()
-                                            .text_size(px(12.0))
-                                            .text_color(if active { text_pri } else { text_muted })
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.thinking_level = owned.clone();
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(thinking_level_label(lvl, lang))
-                                    })),
-                            ),
-                    )
-            });
 
             let advanced_section = self.advanced_open.then(|| {
                 div()
@@ -2336,6 +2321,19 @@ impl Render for CreateManagedBotBoxPeers {
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
                                                 this.model_picker_open = !this.model_picker_open;
+                                                if this.model_picker_open {
+                                                    this.model_picker.ensure_selected_provider(
+                                                        (!this.preferred_model.trim().is_empty())
+                                                            .then_some(this.preferred_model.as_str()),
+                                                    );
+                                                    this.model_picker.effort_menu_open = false;
+                                                } else {
+                                                    this.model_picker.search_focused = false;
+                                                    this.model_picker.effort_menu_open = false;
+                                                    if this.active_field == 5 {
+                                                        this.active_field = 1;
+                                                    }
+                                                }
                                                 cx.notify();
                                             }),
                                         )
@@ -2353,11 +2351,24 @@ impl Render for CreateManagedBotBoxPeers {
                                                 .gap(px(6.0))
                                                 .text_size(px(13.0))
                                                 .text_color(text_sec)
+                                                .child(render_provider_icon(
+                                                    model_provider_icon_key,
+                                                    15.0,
+                                                    text_sec,
+                                                    true,
+                                                ))
                                                 .child(format!("{model_display} · {think_display}"))
-                                                .child(tg_icon_rgba(IconName::ChevronDown, 12.0, text_muted)),
+                                                .child(openbot_stage_icon(
+                                                    if self.model_picker_open {
+                                                        OpenBotStageIcon::ChevronUp
+                                                    } else {
+                                                        OpenBotStageIcon::ChevronDown
+                                                    },
+                                                    12.0,
+                                                    text_muted,
+                                                )),
                                         ),
                                 )
-                                .when_some(model_dropdown, |el, dd| el.child(dd))
                                 .child(
                                     div()
                                         .id("studio-advanced-toggle")
@@ -2473,8 +2484,42 @@ impl Render for CreateManagedBotBoxPeers {
                 )
         });
 
+        let floating_model_picker = (is_fabushi && self.model_picker_open).then(|| {
+            let card = render_openbot_provider_model_picker_card(
+                "studio-model",
+                &self.model_picker,
+                &self.preferred_model,
+                &self.thinking_level,
+                &pal,
+                lang,
+                cx,
+                |this, action, cx| {
+                    this.handle_model_picker_action(action);
+                    cx.notify();
+                },
+            );
+            div()
+                .id("studio-model-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .pb(px(150.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.handle_model_picker_action(OpenBotModelPickerAction::Dismiss);
+                        cx.notify();
+                    }),
+                )
+                .child(deferred(card).with_priority(50))
+        });
+
         div()
             .id("create-managed-bot-modal")
+            .relative()
             .w(px(860.0))
             .max_w(px(900.0))
             .max_h(px(740.0))
@@ -2630,6 +2675,7 @@ impl Render for CreateManagedBotBoxPeers {
                     })
                     .when_some(secondary_submit, |el, btn| el.child(btn)),
             )
+            .when_some(floating_model_picker, |el, overlay| el.child(overlay))
             .into_any_element()
     }
 }
@@ -2744,5 +2790,91 @@ mod tests {
             box_ui.effective_avatar_choice(),
             (Some(CLASSIC_INITIALS_AVATAR_SHAPE.to_string()), None)
         );
+    }
+
+    #[std::prelude::v1::test]
+    fn test_openbot_model_picker_actions_search_escape_and_header_cleanup() {
+        let mut box_ui = CreateManagedBotBoxPeers::new();
+        box_ui.open_fabushi_creator();
+
+        // Sync live Magpie state into the New Agent modal's two-column OpenBot model picker
+        let magpie = gpui_telegram_client::net::hermes_client::MagpieStateDto {
+            active_provider: "codex:local".to_string(),
+            active_model: "gpt-6-luna".to_string(),
+            needs_provider_selection: false,
+            ..Default::default()
+        };
+        let subs = vec![
+            crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto {
+                id: "codex:local".to_string(),
+                account_id: Some("dev@example.com".to_string()),
+                kind: "codex_chatgpt".to_string(),
+                label: "ChatGPT".to_string(),
+                plan: Some("plus".to_string()),
+                models: vec![
+                    "gpt-6.2-sol".to_string(),
+                    "gpt-6-luna".to_string(),
+                    "gpt-4o".to_string(),
+                ],
+                active: true,
+            },
+            crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto {
+                id: "claude:local".to_string(),
+                account_id: None,
+                kind: "claude_code".to_string(),
+                label: "Claude".to_string(),
+                plan: None,
+                models: vec!["claude-sonnet-4-6".to_string()],
+                active: false,
+            },
+        ];
+        box_ui.sync_magpie_catalog(&magpie, &[], &subs);
+        assert_eq!(box_ui.model_picker.selected_provider_id, "codex:local");
+        assert_eq!(
+            box_ui
+                .model_picker
+                .resolve_trigger_display(&box_ui.preferred_model, "GPT-6-Luna"),
+            ("codex", "GPT-6-Luna".to_string())
+        );
+
+        // Open picker, focus search (field 5), type filter, press Enter to pick first match
+        box_ui.model_picker_open = true;
+        box_ui.handle_model_picker_action(OpenBotModelPickerAction::FocusSearch);
+        assert_eq!(box_ui.active_field, 5);
+        box_ui.push_text("4o");
+        assert_eq!(box_ui.model_picker.search_query, "4o");
+        box_ui.handle_enter_key();
+        assert_eq!(box_ui.preferred_model, "gpt-4o");
+        assert!(!box_ui.model_picker_open);
+
+        // Switch provider rail, toggle effort menu, select High, and verify progressive Escape cascade
+        box_ui.model_picker_open = true;
+        box_ui.handle_model_picker_action(OpenBotModelPickerAction::SelectProvider(
+            "claude:local".to_string(),
+        ));
+        assert_eq!(box_ui.model_picker.selected_provider_id, "claude:local");
+        box_ui.handle_model_picker_action(OpenBotModelPickerAction::ToggleEffortMenu);
+        assert!(box_ui.model_picker.effort_menu_open);
+        assert!(box_ui.handle_escape_in_modal());
+        assert!(!box_ui.model_picker.effort_menu_open);
+        assert!(box_ui.model_picker_open);
+        box_ui.handle_model_picker_action(OpenBotModelPickerAction::SelectEffort(
+            "high".to_string(),
+        ));
+        assert_eq!(box_ui.thinking_level, "high");
+
+        // Clicking '+' inside provider rail closes modal popover and signals opening Providers settings
+        box_ui.handle_model_picker_action(OpenBotModelPickerAction::OpenProvidersSettings);
+        assert!(!box_ui.model_picker_open);
+        assert!(box_ui.take_open_providers_settings());
+        assert!(!box_ui.take_open_providers_settings());
+
+        // Header source guard: removed 编程 / AI / Token tabs next to 助手 in production render code
+        let src = include_str!("create_managed_bot_box.rs");
+        let prod_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(prod_src.contains("create-bot-tab-fabushi"));
+        assert!(!prod_src.contains("create-bot-tab-coding"));
+        assert!(!prod_src.contains("create-bot-tab-ai"));
+        assert!(!prod_src.contains("create-bot-tab-manual"));
     }
 }

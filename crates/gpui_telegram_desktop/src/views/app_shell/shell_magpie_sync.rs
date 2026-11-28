@@ -306,6 +306,10 @@ impl AppShell {
         );
         let catalog_for_creator = inspector_catalog.clone();
         let state_for_ws = state.clone();
+        let state_for_pickers = state.clone();
+        let server_subs_for_pickers = self.magpie_local.server_subscriptions.clone();
+        let local_dtos_for_pickers = local_dtos.clone();
+        let detected_coding = self.coding_host.detected_providers.clone();
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref ap) = sr.settings_ai_providers {
                 ap.update(scx, |view, vcx| {
@@ -332,13 +336,27 @@ impl AppShell {
             insp.sync_ai_models(inspector_catalog);
             icx.notify();
         });
-        if let Some(ref creator) = self.miniapps.create_bot_box {
+        if let Some(ref creator) = self.miniapps.create_bot_box.clone() {
             creator.update(cx, |b, bcx| {
                 b.sync_ai_models(catalog_for_creator);
+                b.sync_magpie_catalog(
+                    &state_for_pickers,
+                    &server_subs_for_pickers,
+                    &local_dtos_for_pickers,
+                );
                 bcx.notify();
             });
         }
         self.sync_model_picker_to_stage(cx);
+        self.stage.update(cx, |st, stcx| {
+            st.sync_magpie_model_catalog(
+                &state_for_pickers,
+                &server_subs_for_pickers,
+                &local_dtos_for_pickers,
+                &detected_coding,
+            );
+            stcx.notify();
+        });
         cx.notify();
     }
 

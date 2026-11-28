@@ -7,6 +7,7 @@ pub mod dialog_row;
 pub mod grok_bot_avatar;
 pub mod inline_keyboard;
 pub mod macos_permission_modal;
+pub mod openbot_model_picker;
 pub mod talk_mode_orb;
 pub mod thinking_bubble;
 pub mod tool_permission_dock;

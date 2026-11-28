@@ -154,7 +154,7 @@ impl Render for SettingsMainSections {
         });
 
         let links = [
-            (IconName::BotRobot, tr_str(lang, "AI 订阅与模型供应商", "AI Subscriptions & Providers"), SettingsSectionType::AiProviders, ai_badge.as_str()),
+            (IconName::BotRobot, tr_str(lang, "服务商", "Providers"), SettingsSectionType::AiProviders, ai_badge.as_str()),
             (IconName::ContactsUsers, tr_str(lang, "编辑资料", "Edit Profile"), SettingsSectionType::Information, ""),
             (IconName::Speaker, tr_str(lang, "通知与声音", "Notifications and Sounds"), SettingsSectionType::Notifications, ""),
             (IconName::Lock, tr_str(lang, "隐私与安全", "Privacy and Security"), SettingsSectionType::PrivacySecurity, ""),

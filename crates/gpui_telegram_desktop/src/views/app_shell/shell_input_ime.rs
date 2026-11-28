@@ -49,6 +49,7 @@ pub(crate) enum ShellInputTarget {
     OpenBotInput,
     SidebarSearch,
     StageSearch,
+    StageModelPickerSearch,
     Composer,
     Absorbed,
 }
@@ -315,8 +316,14 @@ impl AppShell {
         if sb.search_focused {
             return ShellInputTarget::SidebarSearch;
         }
-        if self.stage.read(cx).search_open {
-            return ShellInputTarget::StageSearch;
+        {
+            let st = self.stage.read(cx);
+            if st.model_picker_open && st.model_picker.search_focused {
+                return ShellInputTarget::StageModelPickerSearch;
+            }
+            if st.search_open {
+                return ShellInputTarget::StageSearch;
+            }
         }
         if self.should_hide_composer(cx) {
             return ShellInputTarget::Absorbed;
@@ -770,6 +777,10 @@ impl AppShell {
                 (self.sidebar.read(cx).search_query.clone(), pre())
             }
             ShellInputTarget::StageSearch => (self.stage.read(cx).search_query.clone(), pre()),
+            ShellInputTarget::StageModelPickerSearch => (
+                self.stage.read(cx).model_picker.search_query.clone(),
+                pre(),
+            ),
             ShellInputTarget::Composer => {
                 let c = self.composer.read(cx);
                 (
@@ -927,6 +938,12 @@ impl AppShell {
                 self.stage.update(cx, |st, stcx| {
                     st.search_query.clear();
                     st.recompute_search_matches();
+                    stcx.notify();
+                });
+            }
+            ShellInputTarget::StageModelPickerSearch => {
+                self.stage.update(cx, |st, stcx| {
+                    st.model_picker.search_query.clear();
                     stcx.notify();
                 });
             }
@@ -1189,6 +1206,14 @@ impl AppShell {
                     });
                 }
             }
+            ShellInputTarget::StageModelPickerSearch => {
+                if !clean.is_empty() {
+                    self.stage.update(cx, |st, stcx| {
+                        st.model_picker.search_query.push_str(&clean);
+                        stcx.notify();
+                    });
+                }
+            }
             ShellInputTarget::Composer => {
                 self.composer.update(cx, |c, ccx| {
                     if !clean.is_empty() {
@@ -1393,13 +1418,24 @@ impl AppShell {
             return true;
         }
         // Step 11 — Z #5b: CreateManagedBotBox
-        if self
+        if let Some(box_ent) = self
             .miniapps
             .create_bot_box
             .as_ref()
-            .is_some_and(|b| b.read(cx).is_visible)
+            .filter(|b| b.read(cx).is_visible)
+            .cloned()
         {
             self.clear_all_ime_preedits(cx);
+            let handled_inner = box_ent.update(cx, |b, bcx| {
+                let consumed = b.handle_escape_in_modal();
+                if consumed {
+                    bcx.notify();
+                }
+                consumed
+            });
+            if handled_inner {
+                return true;
+            }
             self.miniapps.create_bot_box = None;
             if !self.is_compose_or_creation_modal_active(cx) {
                 self.exit_compose_or_modal_isolation(true, cx);
@@ -1745,6 +1781,22 @@ impl AppShell {
                 st.active_context_menu = None;
                 st.context_menu_reactions_expanded = false;
                 st.reaction_picker_msg_id = None;
+                stcx.notify();
+            });
+            return true;
+        }
+        if self.stage.read(cx).model_picker_open {
+            self.clear_all_ime_preedits(cx);
+            self.stage.update(cx, |st, stcx| {
+                if st.model_picker.effort_menu_open {
+                    st.model_picker.effort_menu_open = false;
+                } else if !st.model_picker.search_query.is_empty() {
+                    st.model_picker.search_query.clear();
+                } else {
+                    st.model_picker_open = false;
+                    st.model_picker.search_focused = false;
+                    st.model_picker.effort_menu_open = false;
+                }
                 stcx.notify();
             });
             return true;
@@ -2140,7 +2192,7 @@ impl AppShell {
                     "enter" => {
                         if !(self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
                             box_ent.update(cx, |b, bcx| {
-                                b.submit();
+                                b.handle_enter_key();
                                 bcx.notify();
                             });
                         }
@@ -2703,6 +2755,39 @@ impl AppShell {
                 }
                 _ => false,
             },
+            ShellInputTarget::StageModelPickerSearch => match key {
+                "backspace" => {
+                    if self.ime.ime_preedit.take().is_none() {
+                        self.stage.update(cx, |st, stcx| {
+                            backspace_string(&mut st.model_picker.search_query, is_alt);
+                            stcx.notify();
+                        });
+                    }
+                    cx.notify();
+                    true
+                }
+                "enter" => {
+                    if !(self.take_ime_preedit_commit(cx) || self.ime.take_just_committed()) {
+                        self.stage.update(cx, |st, stcx| {
+                            if let Some((provider_id, model_id)) = st.model_picker.first_filtered_model() {
+                                st.handle_topbar_action(
+                                    crate::views::stage::stage_bars::TopBarUiAction::ModelPickerAction(
+                                        crate::components::openbot_model_picker::OpenBotModelPickerAction::SelectModel {
+                                            provider_id,
+                                            model_id,
+                                        },
+                                    ),
+                                    stcx,
+                                );
+                            }
+                            stcx.notify();
+                        });
+                    }
+                    cx.notify();
+                    true
+                }
+                _ => false,
+            },
             ShellInputTarget::Composer => {
                 if key == "enter" && self.ime.take_just_committed() {
                     self.composer.update(cx, |c, ccx| {
@@ -3055,7 +3140,8 @@ impl AppShell {
             | ShellInputTarget::MiniAppInput(_)
             | ShellInputTarget::AppleCompose
             | ShellInputTarget::SidebarSearch
-            | ShellInputTarget::StageSearch => {
+            | ShellInputTarget::StageSearch
+            | ShellInputTarget::StageModelPickerSearch => {
                 self.ime.ime_preedit = Some(new_text.to_string());
                 self.ime.clear_commit_fence();
             }
@@ -3223,7 +3309,7 @@ impl EntityInputHandler for AppShell {
                 let caret_y = element_bounds.origin.y + element_bounds.size.height - px(52.0);
                 Some(Bounds::new(point(caret_x, caret_y), size(px(2.0), px(18.0))))
             }
-            ShellInputTarget::StageSearch => {
+            ShellInputTarget::StageSearch | ShellInputTarget::StageModelPickerSearch => {
                 let apple_w = self.apple_sidebar.read(cx).effective_width();
                 let sb_w = self.sidebar.read(cx).effective_width();
                 let caret_x = element_bounds.origin.x
