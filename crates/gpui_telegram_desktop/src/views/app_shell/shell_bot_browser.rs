@@ -1330,6 +1330,11 @@ impl AppShell {
                     &self.magpie_local.discovered_items,
                     Some(&uid_str),
                 );
+                crate::views::app_shell::local_subscription_bridge::apply_local_subscription_health_to_fabushi_for_user(
+                    &host,
+                    &self.magpie_local.discovered_health,
+                    Some(&uid_str),
+                );
                 self.bot_browser.hydrated_subscriptions_fingerprint = Some(
                     discovered_subscriptions_fingerprint(&self.magpie_local.discovered_items),
                 );
@@ -3797,6 +3802,11 @@ impl AppShell {
 
         if let Some(ref host) = self.bot_browser.local_fabushi {
             hydrate_local_subscriptions_into_fabushi_for_user(host, &items, uid_str.as_deref());
+            crate::views::app_shell::local_subscription_bridge::apply_local_subscription_health_to_fabushi_for_user(
+                host,
+                &self.magpie_local.discovered_health,
+                uid_str.as_deref(),
+            );
         }
 
         let (Some(unlocked_key), Some(user_id)) = (
@@ -4570,6 +4580,24 @@ impl AppShell {
         });
         if self.is_chat_visible_for_toast(chat_id, cx) {
             self.show_chat_toast(chat_id, toast_summary, 3200, cx);
+        }
+        let lower_err = err.to_ascii_lowercase();
+        if lower_err.contains("provider_error")
+            || lower_err.contains("all providers exhausted")
+            || lower_err.contains("oauth")
+            || lower_err.contains("invalid_grant")
+            || lower_err.contains("authentication")
+            || lower_err.contains("token refresh failed")
+            || lower_err.contains("http 401")
+            || lower_err.contains("http 403")
+        {
+            if let Some(ref host) = self.bot_browser.local_fabushi {
+                if let Some(uid) = self.session_sync.user_id {
+                    host.core_engine().persist_user_providers_state(&uid.to_string());
+                }
+                host.sync_all_providers();
+            }
+            self.refresh_magpie_state(cx);
         }
     }
 

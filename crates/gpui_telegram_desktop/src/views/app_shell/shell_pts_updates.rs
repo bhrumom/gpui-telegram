@@ -842,7 +842,17 @@ impl AppShell {
     ) {
         match event {
             UpdateEvent::NewMessage(msg) => {
+                let triggers_provider_refresh = matches!(
+                    &msg.content,
+                    gpui_telegram_proto::message::MessageContent::Text { text, .. }
+                        if text.contains("PROVIDER_ERROR")
+                            || text.contains("OAuth token refresh failed")
+                            || text.contains("invalid_grant")
+                );
                 self.apply_new_message_event(chat_id, msg, cx);
+                if triggers_provider_refresh {
+                    self.refresh_magpie_state(cx);
+                }
             }
             UpdateEvent::EditMessage(msg) => {
                 let chat_u64 = if msg.chat_id.0 > 0 {
@@ -857,8 +867,12 @@ impl AppShell {
                     .inline_keyboard
                     .as_deref()
                     .map(proto_keyboard_to_stage);
+                let mut triggers_provider_refresh = false;
                 if let gpui_telegram_proto::message::MessageContent::Text { text, .. } = msg.content
                 {
+                    triggers_provider_refresh = text.contains("PROVIDER_ERROR")
+                        || text.contains("OAuth token refresh failed")
+                        || text.contains("invalid_grant");
                     let mut is_latest_message = false;
                     let mut has_history_for_chat = false;
                     self.stage.update(cx, |st, st_cx| {
@@ -897,6 +911,9 @@ impl AppShell {
                             }
                         });
                     }
+                }
+                if triggers_provider_refresh {
+                    self.refresh_magpie_state(cx);
                 }
                 cx.notify();
             }

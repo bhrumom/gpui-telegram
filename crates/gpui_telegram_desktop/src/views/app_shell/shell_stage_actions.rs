@@ -1763,6 +1763,16 @@ impl AppShell {
             self.open_ai_providers_settings(cx);
             return;
         }
+        if let Some(pid) = trimmed.strip_prefix("hermes:reauth:") {
+            let pid_clean = pid.trim().to_string();
+            self.reauthenticate_provider_or_subscription(pid_clean, None, cx);
+            return;
+        }
+        if let Some(pid) = trimmed.strip_prefix("hermes:refresh_provider:") {
+            let pid_clean = pid.trim().to_string();
+            self.refresh_and_activate_provider(pid_clean, None, cx);
+            return;
+        }
 
         if matches!(
             lower.as_str(),
@@ -2525,9 +2535,30 @@ impl AppShell {
                     }
                 }
                 StageAction::SelectModel {
+                    provider_id,
                     model_id,
                     thinking_level,
                 } => {
+                    if let Some(ref pid) = provider_id {
+                        if !pid.trim().is_empty()
+                            && !self.is_provider_selectable_in_current_state(pid)
+                        {
+                            let lang = self.active_lang_id().to_string();
+                            let msg = tr_str(
+                                &lang,
+                                "该服务商当前不可用，请检查凭据或重新登录",
+                                "This provider is unavailable — please check credentials",
+                            )
+                            .to_string();
+                            if let Some(cid) = active_chat {
+                                self.show_chat_toast(cid, msg, 2800, cx);
+                            } else {
+                                self.show_non_chat_toast(msg, 2800, cx);
+                            }
+                            self.sync_model_picker_to_stage(cx);
+                            return;
+                        }
+                    }
                     let viewer_uid = self.session_sync.user_id;
                     let active_fab = self
                         .stage
@@ -2582,6 +2613,7 @@ impl AppShell {
                                     model_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
                                 {
                                     self.switch_active_settings_model(
+                                        provider_id.clone(),
                                         m.to_string(),
                                         active_chat,
                                         cx,
@@ -2593,15 +2625,32 @@ impl AppShell {
                         }
                     } else if let Some(raw_model) = model_id {
                         let trimmed = raw_model.trim().to_string();
+                        let should_switch_provider = provider_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .is_some_and(|pid| {
+                                self.magpie_local.latest_state.as_ref().is_none_or(|st| {
+                                    st.needs_provider_selection || st.active_provider != pid
+                                })
+                            });
                         if is_strict_fabushi_owner {
                             if let Some(bid) = bot_id {
                                 self.patch_fabushi_bot_from_ui(
                                     bid,
                                     gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
-                                        preferred_model: Some(trimmed),
+                                        preferred_model: Some(trimmed.clone()),
                                         ..Default::default()
                                     },
                                     active_chat,
+                                    cx,
+                                );
+                            }
+                            if should_switch_provider && !trimmed.is_empty() {
+                                self.switch_active_settings_model(
+                                    provider_id.clone(),
+                                    trimmed,
+                                    None,
                                     cx,
                                 );
                             }
@@ -2610,10 +2659,18 @@ impl AppShell {
                                 self.persist_bot_computer_profile(
                                     bid,
                                     gpui_telegram_proto::UpdateBotComputerRequest {
-                                        preferred_model: Some(trimmed),
+                                        preferred_model: Some(trimmed.clone()),
                                         ..Default::default()
                                     },
                                     false,
+                                    cx,
+                                );
+                            }
+                            if should_switch_provider && !trimmed.is_empty() {
+                                self.switch_active_settings_model(
+                                    provider_id.clone(),
+                                    trimmed,
+                                    None,
                                     cx,
                                 );
                             }
@@ -2631,7 +2688,12 @@ impl AppShell {
                                 );
                             }
                         } else if !trimmed.is_empty() {
-                            self.switch_active_settings_model(trimmed, active_chat, cx);
+                            self.switch_active_settings_model(
+                                provider_id,
+                                trimmed,
+                                active_chat,
+                                cx,
+                            );
                         } else {
                             self.sync_model_picker_to_stage(cx);
                         }
@@ -2640,8 +2702,26 @@ impl AppShell {
                 StageAction::OpenAiProvidersSettings => {
                     self.open_ai_providers_settings(cx);
                 }
+                StageAction::InspectAiProviderSettings(pid) => {
+                    self.open_ai_provider_for_recovery(pid, cx);
+                }
                 StageAction::RefreshModelCatalog => {
                     self.refresh_magpie_state(cx);
+                }
+                StageAction::ReauthenticateAiProvider {
+                    provider_id,
+                    kind_hint,
+                } => {
+                    self.reauthenticate_provider_or_subscription(provider_id, kind_hint, cx);
+                }
+                StageAction::CancelAiProviderReauth => {
+                    self.cancel_provider_reauth(cx);
+                }
+                StageAction::RefreshAndActivateAiProvider(pid) => {
+                    self.refresh_and_activate_provider(pid, None, cx);
+                }
+                StageAction::RefreshAllAiProviders => {
+                    self.run_magpie_subscription_scan(cx);
                 }
                 StageAction::DecideToolApproval {
                     approval_id,

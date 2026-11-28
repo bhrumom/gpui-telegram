@@ -540,3 +540,56 @@ fn e2ee_vault_bundle_excludes_loopback_proxies_and_rotating_oauth_on_push_and_pu
     assert!(snap_b.synced_codex_oauths.is_empty());
     assert_eq!(snap_b.active_provider_id, "openai_static");
 }
+
+#[test]
+fn server_400_provider_unavailable_is_not_bypassed_by_legacy_fallback() {
+    let provider_upsert_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let calls_clone = Arc::clone(&provider_upsert_calls);
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let base_url = rt.block_on(spawn_mock_http_server(move |method, path, _body| {
+        if method == "POST" && path.contains("/subscriptions/") && path.ends_with("/activate") {
+            return (
+                400,
+                json!({
+                    "error": "provider_unavailable",
+                    "message": "Google Vertex AI OAuth 授权已失效 (invalid_grant)，请重新登录"
+                })
+                .to_string(),
+            );
+        }
+        if method == "POST" && path == "/api/v1/hermes/magpie/providers" {
+            *calls_clone.lock().unwrap() += 1;
+            return (200, json!({ "ok": true }).to_string());
+        }
+        (404, json!({ "error": "not_found" }).to_string())
+    }));
+
+    let client = Arc::new(TelegramClient::new(ClientConfig {
+        server_url: base_url.clone(),
+        ..Default::default()
+    }));
+    let vertex = sample_vertex_item();
+    let vertex_id = vertex.account.id.clone();
+
+    let err = rt
+        .block_on(activate_subscription_with_local_fallback(
+            &client,
+            &base_url,
+            "tok-test",
+            &vertex_id,
+            Some("gemini-2.5-pro"),
+            &[vertex],
+        ))
+        .err()
+        .expect("server 400 provider_unavailable must return Err");
+    assert!(
+        err.contains("invalid_grant"),
+        "expected server invalid_grant message to be surfaced, got: {err}"
+    );
+    assert_eq!(
+        *provider_upsert_calls.lock().unwrap(),
+        0,
+        "explicit 400 provider_unavailable must NOT fall back to legacy /providers upsert"
+    );
+}

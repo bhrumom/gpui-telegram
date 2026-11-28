@@ -11,7 +11,8 @@ use axum::Json;
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use gpui_telegram_agent::hermes::providers::{
-    ApiMode, ClientSubscriptionSyncItem, CredentialEntry, CredentialPool, MagpiePresetApplyInput,
+    classify_provider_auth_error_code, format_provider_unavailable_reason, ApiMode,
+    ClientSubscriptionSyncItem, CredentialEntry, CredentialPool, MagpiePresetApplyInput,
     ModelProfile, ProviderChatMessage, ProviderConfig, ProviderError, ProviderMessageRole,
     ProviderRequest, ProviderResponse, ProviderRouter, ProviderRouterState, ProviderStreamEvent,
     ProviderToolCall, ProviderToolSpec, SubscriptionAccount, SubscriptionKind,
@@ -50,6 +51,11 @@ pub struct MagpieProviderView {
     pub no_key_required: bool,
     pub routing_strategy: Option<String>,
     pub headers: HashMap<String, String>,
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 fn redact_provider_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
@@ -70,6 +76,25 @@ fn sanitize_subscription_account(sub: &SubscriptionAccount) -> SubscriptionAccou
     sanitized
 }
 
+fn subscription_to_state_json(sub: &SubscriptionAccount, snap: &ProviderRouterState) -> Value {
+    let sanitized = sanitize_subscription_account(sub);
+    let avail = ProviderRouter::provider_availability_in_state(snap, &sanitized.id);
+    let mut val = serde_json::to_value(&sanitized).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("usable".to_string(), json!(avail.usable));
+        if let Some(code) = avail.error_code {
+            obj.insert("unavailable_code".to_string(), json!(code));
+        }
+        if let Some(reason) = avail.reason {
+            obj.insert("unavailable_reason".to_string(), json!(reason));
+        }
+        if !avail.usable {
+            obj.insert("active".to_string(), json!(false));
+        }
+    }
+    val
+}
+
 fn provider_to_magpie_view(cfg: &ProviderConfig, snap: &ProviderRouterState) -> MagpieProviderView {
     let mut models = Vec::new();
     if !cfg.default_model.trim().is_empty() {
@@ -86,6 +111,7 @@ fn provider_to_magpie_view(cfg: &ProviderConfig, snap: &ProviderRouterState) -> 
         }
     }
     let masked_key = cfg.credentials.entries.first().map(|e| e.masked_key());
+    let avail = ProviderRouter::provider_availability_in_state(snap, &cfg.id);
     MagpieProviderView {
         provider_id: cfg.id.clone(),
         name: cfg.name.clone(),
@@ -100,13 +126,16 @@ fn provider_to_magpie_view(cfg: &ProviderConfig, snap: &ProviderRouterState) -> 
         enabled: cfg.enabled,
         has_api_key: !cfg.credentials.is_empty(),
         masked_key,
-        is_active: cfg.id == snap.active_provider_id,
+        is_active: avail.usable && cfg.id == snap.active_provider_id,
         preset_id: cfg.preset_id.clone(),
         region_id: cfg.region_id.clone(),
         is_subscription: cfg.is_subscription,
         no_key_required: cfg.no_key_required,
         routing_strategy: cfg.routing_strategy.map(|s| s.as_str().to_string()),
         headers: redact_provider_headers(&cfg.headers),
+        usable: avail.usable,
+        unavailable_code: avail.error_code,
+        unavailable_reason: avail.reason,
     }
 }
 
@@ -131,10 +160,10 @@ fn build_magpie_state_json_for_user(state: &AppState, user_id: UserId) -> Value 
 
     let mut groups: Vec<&RoutingGroup> = snap.routing_groups.values().collect();
     groups.sort_by(|a, b| a.id.cmp(&b.id));
-    let subscriptions: Vec<SubscriptionAccount> = snap
+    let subscriptions: Vec<Value> = snap
         .subscriptions
         .iter()
-        .map(sanitize_subscription_account)
+        .map(|s| subscription_to_state_json(s, &snap))
         .collect();
 
     json!({
@@ -166,6 +195,10 @@ pub async fn magpie_state_get(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    let router = user_router(&state, auth.user_id);
+    if router.verify_all_providers_availability(false).await {
+        persist_user_router(&state, auth.user_id);
+    }
     (
         StatusCode::OK,
         Json(build_magpie_state_json_for_user(&state, auth.user_id)),
@@ -339,6 +372,23 @@ async fn upsert_provider_impl(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    let mut req_no_activate = MagpieUpsertProviderRequest {
+        preset_id: req.preset_id.clone(),
+        provider_id: req.provider_id.clone(),
+        name: req.name.clone(),
+        region_id: req.region_id.clone(),
+        api_key: req.api_key.clone(),
+        api_mode: req.api_mode.clone(),
+        base_url: req.base_url.clone(),
+        default_model: req.default_model.clone(),
+        custom_headers: req.custom_headers.clone(),
+        enabled: req.enabled,
+        no_key_required: req.no_key_required,
+        activate: false,
+        allow_local_fallback: req.allow_local_fallback,
+    };
+    let want_activate = req.activate;
+
     let saved_cfg = if let Some(preset_id) = preset_id_clean {
         let protocol_override = match req.api_mode.as_deref() {
             Some(raw) if !raw.trim().is_empty() => match ApiMode::parse(raw) {
@@ -363,7 +413,7 @@ async fn upsert_provider_impl(
             custom_headers: req.custom_headers.clone(),
             provider_id_override: path_id_override.clone().or_else(|| req.provider_id.clone()),
             display_name_override: req.name.clone(),
-            activate: req.activate,
+            activate: false,
         };
         match router.apply_magpie_preset(input) {
             Ok(mut cfg) => {
@@ -386,7 +436,8 @@ async fn upsert_provider_impl(
             }
         }
     } else {
-        match apply_custom_or_existing_provider(&router, &req, path_id_override.as_deref()) {
+        req_no_activate.activate = false;
+        match apply_custom_or_existing_provider(&router, &req_no_activate, path_id_override.as_deref()) {
             Ok(cfg) => cfg,
             Err(resp) => return resp,
         }
@@ -396,6 +447,42 @@ async fn upsert_provider_impl(
         router.set_allow_local_fallback(allow_local);
     }
 
+    if saved_cfg.id != "local_hermes" {
+        let avail = router.verify_provider_availability(&saved_cfg.id, true).await;
+        if want_activate {
+            if !avail.usable {
+                router.reconcile_active_provider();
+                persist_user_router(&state, user_id);
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "provider_unavailable",
+                    avail
+                        .reason
+                        .as_deref()
+                        .unwrap_or("该服务商当前不可用，请检查凭据或网络连接"),
+                );
+            }
+            if let Err(err) = router.set_active(&saved_cfg.id, Some(&saved_cfg.default_model)) {
+                router.reconcile_active_provider();
+                persist_user_router(&state, user_id);
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "provider_activation_error",
+                    &err.to_string(),
+                );
+            }
+        }
+    } else if want_activate {
+        if let Err(err) = router.set_active(&saved_cfg.id, Some(&saved_cfg.default_model)) {
+            return err_resp(
+                StatusCode::BAD_REQUEST,
+                "provider_activation_error",
+                &err.to_string(),
+            );
+        }
+    }
+
+    router.reconcile_active_provider();
     persist_user_router(&state, user_id);
     let snap = router.snapshot();
     let view = provider_to_magpie_view(&saved_cfg, &snap);
@@ -612,6 +699,8 @@ pub async fn magpie_provider_probe(
     let started = Instant::now();
     match tmp_router.complete(prov_req, None).await {
         Ok(resp) => {
+            u_router.mark_provider_usable(&cfg.id);
+            persist_user_router(&state, auth.user_id);
             let latency_ms = started.elapsed().as_millis() as u64;
             let preview: String = resp.content.trim().chars().take(160).collect();
             (
@@ -628,6 +717,19 @@ pub async fn magpie_provider_probe(
                 .into_response()
         }
         Err(err) => {
+            if matches!(
+                err,
+                ProviderError::Authentication(_)
+                    | ProviderError::Configuration(_)
+                    | ProviderError::Transport(_)
+            ) {
+                let msg = err.to_string();
+                let code = classify_provider_auth_error_code(&msg);
+                let reason = format_provider_unavailable_reason(&cfg.id, &msg);
+                u_router.mark_provider_unavailable(&cfg.id, code, reason);
+                u_router.reconcile_active_provider();
+                persist_user_router(&state, auth.user_id);
+            }
             let latency_ms = started.elapsed().as_millis() as u64;
             (
                 StatusCode::OK,
@@ -645,6 +747,61 @@ pub async fn magpie_provider_probe(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct MagpieRefreshProviderRequest {
+    #[serde(default = "default_true")]
+    pub activate: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// POST /api/v1/hermes/magpie/providers/{id}/refresh
+/// Force-refreshes a provider or subscription's credentials and live availability (re-scanning
+/// host-local CLI credentials when running on loopback), clears stale failure state upon recovery,
+/// and optionally atomically re-activates it.
+pub async fn magpie_provider_refresh(
+    auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<MagpieRefreshProviderRequest>>,
+) -> Response {
+    let clean_id = id.trim();
+    if clean_id.is_empty() {
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            "invalid_provider_id",
+            "Provider ID must not be empty",
+        );
+    }
+    let req = body.map(|b| b.0).unwrap_or(MagpieRefreshProviderRequest {
+        activate: true,
+        model: None,
+    });
+    let _sync_guard = ACTIVATE_SYNC_LOCK.lock().await;
+    let router = user_router(&state, auth.user_id);
+    let rescan_local = is_loopback_bind_host(&state.config.host);
+    let (target_id, avail, activated) = router
+        .refresh_and_verify_provider(clean_id, rescan_local, req.activate, req.model.as_deref())
+        .await;
+    persist_user_router(&state, auth.user_id);
+    let snap = router.snapshot();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": avail.usable,
+            "provider_id": target_id,
+            "usable": avail.usable,
+            "activated": activated,
+            "active_provider_id": snap.active_provider_id,
+            "active_model": snap.active_model,
+            "unavailable_code": avail.error_code,
+            "unavailable_reason": avail.reason,
+            "state": build_magpie_state_json_for_user(&state, auth.user_id),
+        })),
+    )
+        .into_response()
+}
+
 /// POST /api/v1/hermes/magpie/subscriptions/scan
 pub async fn magpie_subscriptions_scan(
     auth: AuthBearer,
@@ -654,24 +811,20 @@ pub async fn magpie_subscriptions_scan(
     // Only scan host-local OS credential paths when running on a local loopback server.
     // On multi-tenant remote cloud servers (`0.0.0.0`), subscriptions come strictly from each
     // user's client-side `POST /subscriptions/sync` so server OS credentials can never leak.
-    let (subscriptions, scanned_at_ms) = if is_loopback_bind_host(&state.config.host) {
+    let scanned_at_ms = if is_loopback_bind_host(&state.config.host) {
         let reg = router.refresh_local_subscriptions();
-        persist_user_router(&state, auth.user_id);
-        let subs: Vec<SubscriptionAccount> = reg
-            .accounts
-            .iter()
-            .map(sanitize_subscription_account)
-            .collect();
-        (subs, reg.scanned_at_ms)
+        reg.scanned_at_ms
     } else {
-        let snap = router.snapshot();
-        let subs: Vec<SubscriptionAccount> = snap
-            .subscriptions
-            .iter()
-            .map(sanitize_subscription_account)
-            .collect();
-        (subs, Utc::now().timestamp_millis())
+        Utc::now().timestamp_millis()
     };
+    let _ = router.verify_all_providers_availability(true).await;
+    persist_user_router(&state, auth.user_id);
+    let snap = router.snapshot();
+    let subscriptions: Vec<Value> = snap
+        .subscriptions
+        .iter()
+        .map(|s| subscription_to_state_json(s, &snap))
+        .collect();
     (
         StatusCode::OK,
         Json(json!({
@@ -696,7 +849,8 @@ pub struct MagpieSubscriptionsSyncRequest {
 /// POST /api/v1/hermes/magpie/subscriptions/sync
 /// Accepts cross-device-safe client-discovered AI subscriptions (e.g. Vertex AI ADC, static
 /// remote API keys), rejects loopback proxies and rotating/ephemeral OAuth sessions, prunes any
-/// legacy non-cross-device subscription entries, persists encrypted at rest, and returns sanitized state.
+/// legacy non-cross-device subscription entries, verifies credential availability before
+/// auto-activating, persists encrypted at rest, and returns sanitized state.
 pub async fn magpie_subscriptions_sync(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
@@ -710,12 +864,23 @@ pub async fn magpie_subscriptions_sync(
     let synced_count = syncable.len();
     let router = user_router(&state, auth.user_id);
     router.prune_non_cross_device_subscriptions();
-    let reg = router.ingest_client_subscriptions(syncable, req.auto_activate);
+    let reg = router.ingest_client_subscriptions(syncable, false);
+    let _ = router.verify_all_providers_availability(true).await;
+    if req.auto_activate {
+        let snap_now = router.snapshot();
+        if router.needs_provider_selection() || snap_now.active_provider_id == "local_hermes" {
+            if let Some(best_id) = router.find_best_available_subscription() {
+                let _ = router.activate_subscription_atomic(&best_id, None);
+            }
+        }
+    }
+    router.reconcile_active_provider();
     persist_user_router(&state, auth.user_id);
-    let subscriptions: Vec<SubscriptionAccount> = reg
-        .accounts
+    let snap_after = router.snapshot();
+    let subscriptions: Vec<Value> = snap_after
+        .subscriptions
         .iter()
-        .map(sanitize_subscription_account)
+        .map(|s| subscription_to_state_json(s, &snap_after))
         .collect();
     (
         StatusCode::OK,
@@ -768,6 +933,12 @@ pub struct SubscriptionAccountDto {
     pub plan: Option<String>,
     pub models: Vec<String>,
     pub active: bool,
+    #[serde(default = "default_true")]
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -783,12 +954,14 @@ pub async fn magpie_subscriptions_get(
 ) -> Response {
     let router = user_router(&state, auth.user_id);
     let snap = router.snapshot();
-    let subs = if snap.subscriptions.is_empty() && is_loopback_bind_host(&state.config.host) {
-        router.refresh_discovered_subscriptions().accounts
-    } else {
-        snap.subscriptions.clone()
-    };
+    if snap.subscriptions.is_empty() && is_loopback_bind_host(&state.config.host) {
+        let _ = router.refresh_discovered_subscriptions();
+    }
+    if router.verify_all_providers_availability(false).await {
+        persist_user_router(&state, auth.user_id);
+    }
     let current_snap = router.snapshot();
+    let subs = current_snap.subscriptions.clone();
 
     let dtos: Vec<SubscriptionAccountDto> = subs
         .iter()
@@ -824,7 +997,8 @@ pub async fn magpie_subscriptions_get(
                 }
             };
 
-            let is_active = s.id == current_snap.active_provider_id;
+            let avail = ProviderRouter::provider_availability_in_state(&current_snap, &s.id);
+            let is_active = avail.usable && s.id == current_snap.active_provider_id;
 
             SubscriptionAccountDto {
                 id: s.id.clone(),
@@ -834,6 +1008,9 @@ pub async fn magpie_subscriptions_get(
                 plan: s.plan.clone(),
                 models,
                 active: is_active,
+                usable: avail.usable,
+                unavailable_code: avail.error_code,
+                unavailable_reason: avail.reason,
             }
         })
         .collect();
@@ -868,6 +1045,26 @@ pub async fn magpie_subscription_activate(
 
     let _sync_guard = ACTIVATE_SYNC_LOCK.lock().await;
     let router = user_router(&state, auth.user_id);
+    let Some(target_id) = router.resolve_subscription_target_id(&id) else {
+        return err_resp(
+            StatusCode::NOT_FOUND,
+            "subscription_not_found",
+            &format!("Subscription or provider '{}' not found", id.trim()),
+        );
+    };
+    let avail = router.verify_provider_availability(&target_id, true).await;
+    if !avail.usable {
+        router.reconcile_active_provider();
+        persist_user_router(&state, auth.user_id);
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            "provider_unavailable",
+            avail
+                .reason
+                .as_deref()
+                .unwrap_or("该订阅当前不可用，请重新登录授权后再试"),
+        );
+    }
     let res = router.activate_subscription_atomic(&id, req.model.as_deref());
     match res {
         Ok((cfg, active_model)) => {
@@ -881,6 +1078,11 @@ pub async fn magpie_subscription_activate(
                 })),
             )
                 .into_response()
+        }
+        Err(ProviderError::Authentication(msg)) => {
+            router.reconcile_active_provider();
+            persist_user_router(&state, auth.user_id);
+            err_resp(StatusCode::BAD_REQUEST, "provider_unavailable", &msg)
         }
         Err(err) => err_resp(
             StatusCode::NOT_FOUND,
@@ -1988,7 +2190,11 @@ pub async fn magpie_gateway_models(
             "Authenticated Bearer token or x-api-key is required to list user models",
         );
     };
-    let snap = user_router(&state, uid).snapshot();
+    let router = user_router(&state, uid);
+    if router.verify_all_providers_availability(false).await {
+        persist_user_router(&state, uid);
+    }
+    let snap = router.snapshot();
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     let now = Utc::now().timestamp();
@@ -2005,6 +2211,15 @@ pub async fn magpie_gateway_models(
         }
     }
     for prof in snap.model_profiles.values() {
+        let owner_usable = if prof.provider_id == "local_hermes" {
+            snap.allow_local_fallback
+        } else {
+            snap.providers.contains_key(&prof.provider_id)
+                && ProviderRouter::provider_availability_in_state(&snap, &prof.provider_id).usable
+        };
+        if !owner_usable {
+            continue;
+        }
         if seen.insert(prof.model.clone()) {
             data.push(json!({
                 "id": prof.model,
@@ -2015,6 +2230,10 @@ pub async fn magpie_gateway_models(
         }
     }
     for p in snap.providers.values() {
+        let usable = ProviderRouter::provider_availability_in_state(&snap, &p.id).usable;
+        if !usable {
+            continue;
+        }
         if !p.default_model.trim().is_empty() && seen.insert(p.default_model.clone()) {
             data.push(json!({
                 "id": p.default_model,

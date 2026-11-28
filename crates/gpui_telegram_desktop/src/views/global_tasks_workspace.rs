@@ -541,7 +541,7 @@ impl GlobalTasksWorkspace {
         self.status_summary.has_active_subscription = state.has_active_subscription;
         self.status_summary.has_configured_provider = state.has_configured_provider;
         self.status_summary.needs_provider_selection = state.needs_provider_selection;
-        if let Some(active) = state.providers.iter().find(|p| p.is_active) {
+        if let Some(active) = state.providers.iter().find(|p| p.is_active && p.is_selectable()) {
             if !active.api_mode.trim().is_empty() {
                 self.active_api_mode = active.api_mode.clone();
                 self.status_summary.api_mode = active.api_mode.clone();

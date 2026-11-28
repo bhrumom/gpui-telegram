@@ -2976,7 +2976,10 @@ pub fn render_openbot_model_picker_popover<V: 'static>(
 ) -> AnyElement {
     let a_dismiss = on_action.clone();
     let a_picker = on_action.clone();
-    let effective_state = if picker_state.providers.is_empty() && !props.models.is_empty() {
+    let effective_state = if picker_state.providers.is_empty()
+        && !props.needs_provider_selection
+        && !props.models.is_empty()
+    {
         let mut s = picker_state.clone();
         let display_name = if !props.active_provider_name.trim().is_empty() {
             props.active_provider_name.trim().to_string()
@@ -2989,6 +2992,7 @@ pub fn render_openbot_model_picker_popover<V: 'static>(
         s.catalog_synced = props.catalog_synced;
         s.providers = vec![crate::components::openbot_model_picker::OpenBotPickerProvider {
             id: "active".to_string(),
+            kind: "active".to_string(),
             icon_key: infer_provider_icon_key_from_model(
                 default_m.unwrap_or(props.active_model),
             )
@@ -2997,6 +3001,9 @@ pub fn render_openbot_model_picker_popover<V: 'static>(
             subtitle: tr_str(lang_id, "当前可用模型", "Available models").to_string(),
             is_default_provider: true,
             is_subscription: false,
+            usable: true,
+            unavailable_code: None,
+            unavailable_reason: None,
             models: crate::components::openbot_model_picker::classify_provider_models(
                 props.models,
                 default_m,

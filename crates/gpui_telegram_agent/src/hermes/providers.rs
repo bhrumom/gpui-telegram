@@ -1125,6 +1125,182 @@ pub struct ProviderRouter {
     codex_managers: Arc<Mutex<HashMap<String, Arc<CodexTokenManager>>>>,
 }
 
+/// Default TTL (60s) for reusing cached live availability checks on passive state reads.
+pub const PROVIDER_HEALTH_CHECK_TTL_MS: i64 = 60_000;
+
+/// Verified runtime / credential availability status for a provider or subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAvailabilityStatus {
+    #[serde(default = "default_true")]
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub checked_at_ms: i64,
+}
+
+impl Default for ProviderAvailabilityStatus {
+    fn default() -> Self {
+        Self {
+            usable: true,
+            reason: None,
+            error_code: None,
+            checked_at_ms: 0,
+        }
+    }
+}
+
+impl ProviderAvailabilityStatus {
+    pub fn usable_at(now_ms: i64) -> Self {
+        Self {
+            usable: true,
+            reason: None,
+            error_code: None,
+            checked_at_ms: now_ms,
+        }
+    }
+
+    pub fn unavailable_at(
+        now_ms: i64,
+        error_code: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let r = reason.into();
+        let c = error_code.into();
+        Self {
+            usable: false,
+            reason: (!r.trim().is_empty()).then_some(r),
+            error_code: (!c.trim().is_empty()).then_some(c),
+            checked_at_ms: now_ms,
+        }
+    }
+}
+
+/// Classifies an authentication/credential error message into a stable machine-readable code.
+pub fn classify_provider_auth_error_code(err_msg: &str) -> &'static str {
+    let lower = err_msg.to_ascii_lowercase();
+    if lower.contains("invalid_grant") {
+        "oauth_invalid_grant"
+    } else if lower.contains("invalid_client") || lower.contains("unauthorized_client") {
+        "oauth_invalid_client"
+    } else if lower.contains("error sending request")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("connection reset")
+    {
+        "unreachable"
+    } else if lower.contains("refresh_token_reused")
+        || lower.contains("token refresh failed")
+        || lower.contains("oauth error")
+    {
+        "oauth_refresh_failed"
+    } else if lower.contains("expired") || lower.contains("过期") {
+        "token_expired"
+    } else if lower.contains("http 401")
+        || lower.contains("401 unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+    {
+        "auth_401"
+    } else if lower.contains("http 403")
+        || lower.contains("403 forbidden")
+        || lower.contains("permission_denied")
+    {
+        "auth_403"
+    } else if lower.contains("missing")
+        || lower.contains("no api credentials")
+        || lower.contains("未检测到有效")
+    {
+        "missing_credentials"
+    } else if lower.contains("http error") {
+        "unreachable"
+    } else {
+        "auth_failed"
+    }
+}
+
+/// Formats a concise, actionable, secret-free unavailability reason for UI and API responses.
+pub fn format_provider_unavailable_reason(provider_id: &str, err_msg: &str) -> String {
+    let lower = err_msg.to_ascii_lowercase();
+    let pid_lower = provider_id.to_ascii_lowercase();
+    let is_vertex = pid_lower.contains("vertex") || lower.contains("vertex");
+    let is_codex = pid_lower.contains("codex") || lower.contains("codex");
+    if lower.contains("invalid_grant") {
+        if is_vertex {
+            return "Google Vertex AI OAuth 授权已过期或被撤销 (invalid_grant)，请点击「重新登录」完成授权后自动激活".to_string();
+        }
+        if is_codex {
+            return "Codex / ChatGPT 授权已过期或被撤销 (invalid_grant)，请点击「重新登录」完成登录".to_string();
+        }
+        return "OAuth 授权已过期或被撤销 (invalid_grant)，请点击「重新登录」重新授权".to_string();
+    }
+    if lower.contains("invalid_client") || lower.contains("unauthorized_client") {
+        if is_vertex {
+            return "Google Vertex AI OAuth 客户端凭据无效，请点击「重新登录」重新授权".to_string();
+        }
+        return "OAuth 客户端凭据无效，请点击「重新登录」重新授权".to_string();
+    }
+    if lower.contains("error sending request")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("dns")
+        || lower.contains("connection reset")
+    {
+        if is_vertex {
+            return "无法连接 Google 认证服务器 (oauth2.googleapis.com)，请检查网络或代理后点击「刷新激活」".to_string();
+        }
+        if is_codex {
+            return "无法连接 OpenAI / ChatGPT 认证服务，请检查网络或代理后点击「刷新激活」或「重新登录」".to_string();
+        }
+        return "无法连接服务商或认证服务器（网络/代理异常），请检查网络后点击「刷新激活」".to_string();
+    }
+    if lower.contains("refresh_token_reused")
+        || lower.contains("token refresh failed")
+        || lower.contains("oauth error")
+    {
+        if is_codex {
+            return "Codex / ChatGPT 登录令牌刷新失败或已失效，请点击「重新登录」恢复使用".to_string();
+        }
+        if is_vertex {
+            return "Google Vertex AI 登录令牌刷新失败，请点击「重新登录」重新授权".to_string();
+        }
+        return "OAuth 登录令牌刷新失败，请点击「重新登录」重新授权".to_string();
+    }
+    if lower.contains("http 401")
+        || lower.contains("401 unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+    {
+        if is_codex {
+            return "Codex / ChatGPT 认证失败 (401)：登录已失效，请点击「重新登录」恢复使用".to_string();
+        }
+        return "认证失败 (401)：API Key 或访问令牌无效/已过期，请更新密钥或重新登录".to_string();
+    }
+    if lower.contains("http 403")
+        || lower.contains("403 forbidden")
+        || lower.contains("permission_denied")
+    {
+        if is_vertex {
+            return "Google Vertex AI 访问被拒绝 (403)：请检查项目权限与 Vertex AI API 开通状态".to_string();
+        }
+        return "访问被拒绝 (403)：当前凭据无权访问该服务或模型".to_string();
+    }
+    let clean = err_msg.trim();
+    if clean.is_empty() {
+        return "服务商当前不可用，请检查凭据或网络连接".to_string();
+    }
+    let compact: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 180 {
+        let head: String = compact.chars().take(179).collect();
+        format!("{head}…")
+    } else {
+        compact
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRouterState {
     pub providers: HashMap<String, ProviderConfig>,
@@ -1149,6 +1325,8 @@ pub struct ProviderRouterState {
     pub synced_vertex_adcs: HashMap<String, VertexAdcCredentials>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub synced_codex_oauths: HashMap<String, CodexOAuthCredentials>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_health: HashMap<String, ProviderAvailabilityStatus>,
 }
 
 /// Returns `true` when `p` is safe to sync across devices (or to a remote server).
@@ -1264,9 +1442,17 @@ pub fn sanitize_router_state_for_cross_device(
         .synced_vertex_adcs
         .retain(|id, _| !removed_ids.contains(id));
     clean
+        .provider_health
+        .retain(|id, _| !removed_ids.contains(id));
+    clean
         .fallback_chain
         .retain(|t| !removed_ids.contains(&t.provider_id));
-    if removed_ids.contains(&clean.active_provider_id) {
+    if removed_ids.contains(&clean.active_provider_id)
+        || clean
+            .provider_health
+            .get(&clean.active_provider_id)
+            .is_some_and(|h| !h.usable)
+    {
         if let Some((next_id, next_model)) = clean
             .providers
             .values()
@@ -1379,6 +1565,7 @@ impl ProviderRouter {
                 recent_route_traces: Vec::new(),
                 synced_vertex_adcs: HashMap::new(),
                 synced_codex_oauths: HashMap::new(),
+                provider_health: HashMap::new(),
             })),
             route_metrics: Arc::new(Mutex::new(RouteRuntimeMetrics::default())),
             http_client,
@@ -1711,21 +1898,31 @@ impl ProviderRouter {
     }
 
     pub fn register_provider(&self, config: ProviderConfig) {
-        let old_adc_path = {
+        let (old_adc_path, old_codex_path, config_changed) = {
             let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard
-                .providers
-                .get(&config.id)
-                .and_then(|p| p.headers.get("x-adc-source-path").cloned())
+            let old = guard.providers.get(&config.id);
+            let old_adc = old.and_then(|p| p.headers.get("x-adc-source-path").cloned());
+            let old_codex = old.and_then(|p| p.headers.get("x-codex-source-path").cloned());
+            let changed = old.is_none_or(|p| {
+                p.base_url != config.base_url
+                    || p.api_mode != config.api_mode
+                    || p.enabled != config.enabled
+                    || p.no_key_required != config.no_key_required
+                    || p.credentials.entries.len() != config.credentials.entries.len()
+                    || p.credentials
+                        .entries
+                        .iter()
+                        .zip(config.credentials.entries.iter())
+                        .any(|(a, b)| a.api_key != b.api_key)
+                    || p.headers.get("x-adc-source-path") != config.headers.get("x-adc-source-path")
+                    || p.headers.get("x-codex-source-path")
+                        != config.headers.get("x-codex-source-path")
+                    || p.headers.get("x-vertex-token-url")
+                        != config.headers.get("x-vertex-token-url")
+            });
+            (old_adc, old_codex, changed)
         };
         let new_adc_path = config.headers.get("x-adc-source-path").cloned();
-        let old_codex_path = {
-            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard
-                .providers
-                .get(&config.id)
-                .and_then(|p| p.headers.get("x-codex-source-path").cloned())
-        };
         let new_codex_path = config.headers.get("x-codex-source-path").cloned();
         let is_vertex_cfg = config.api_mode == ApiMode::GoogleVertex
             || config.preset_id.as_deref() == Some("google-vertex")
@@ -1740,6 +1937,9 @@ impl ProviderRouter {
         {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             guard.providers.insert(id.clone(), config);
+            if config_changed {
+                guard.provider_health.remove(&id);
+            }
         }
         if new_adc_path != old_adc_path {
             if let Ok(mut vm) = self.vertex_managers.lock() {
@@ -1768,6 +1968,7 @@ impl ProviderRouter {
         }
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let removed = guard.providers.remove(provider_id).is_some();
+        guard.provider_health.remove(provider_id);
         if guard.active_provider_id == provider_id {
             guard.active_provider_id = "local_hermes".to_string();
             guard.active_model = "hermes-local-v1".to_string();
@@ -1796,6 +1997,17 @@ impl ProviderRouter {
                 "Provider '{provider_id}' is disabled"
             )));
         }
+        if provider_id != "local_hermes" {
+            if let Some(health) = guard.provider_health.get(provider_id) {
+                if !health.usable {
+                    return Err(ProviderError::Authentication(
+                        health.reason.clone().unwrap_or_else(|| {
+                            format!("Provider '{provider_id}' is unavailable")
+                        }),
+                    ));
+                }
+            }
+        }
         let resolved_model = model
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1818,16 +2030,20 @@ impl ProviderRouter {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((prov, model)) = trimmed.split_once('/') {
             if let Some(cfg) = guard.providers.get(prov).cloned() {
-                let resolved = if cfg.api_mode != ApiMode::LocalHermes
-                    && is_legacy_placeholder_model(model, prov, &cfg.base_url)
+                if prov == "local_hermes"
+                    || guard.provider_health.get(prov).is_none_or(|h| h.usable)
                 {
-                    cfg.default_model.clone()
-                } else {
-                    model.trim().to_string()
-                };
-                guard.active_provider_id = prov.to_string();
-                guard.active_model = resolved.clone();
-                return (prov.to_string(), resolved);
+                    let resolved = if cfg.api_mode != ApiMode::LocalHermes
+                        && is_legacy_placeholder_model(model, prov, &cfg.base_url)
+                    {
+                        cfg.default_model.clone()
+                    } else {
+                        model.trim().to_string()
+                    };
+                    guard.active_provider_id = prov.to_string();
+                    guard.active_model = resolved.clone();
+                    return (prov.to_string(), resolved);
+                }
             }
         }
         if let Some(active_cfg) = guard.providers.get(&guard.active_provider_id).cloned() {
@@ -1839,7 +2055,12 @@ impl ProviderRouter {
             }
         }
         if let Some(profile) = guard.model_profiles.get(trimmed).cloned() {
-            if guard.providers.contains_key(&profile.provider_id) {
+            if guard.providers.contains_key(&profile.provider_id)
+                && guard
+                    .provider_health
+                    .get(&profile.provider_id)
+                    .is_none_or(|h| h.usable)
+            {
                 guard.active_provider_id = profile.provider_id.clone();
             }
             guard.active_model = profile.model;
@@ -1916,13 +2137,30 @@ impl ProviderRouter {
         guard.recent_route_traces = state.recent_route_traces.clone();
         guard.synced_vertex_adcs = state.synced_vertex_adcs.clone();
         guard.synced_codex_oauths = state.synced_codex_oauths.clone();
-        let synced_adcs = state.synced_vertex_adcs.clone();
+        guard.provider_health = state.provider_health.clone();
+        let synced_adcs: Vec<(String, VertexAdcCredentials, Option<String>)> = state
+            .synced_vertex_adcs
+            .iter()
+            .map(|(pid, adc)| {
+                let token_url = state
+                    .providers
+                    .get(pid)
+                    .and_then(|p| p.headers.get("x-vertex-token-url"))
+                    .filter(|u| is_loopback_server_url(u))
+                    .cloned();
+                (pid.clone(), adc.clone(), token_url)
+            })
+            .collect();
         let synced_codex = state.synced_codex_oauths.clone();
         drop(guard);
 
         if !synced_adcs.is_empty() {
-            for (pid, adc) in synced_adcs {
-                self.register_vertex_token_manager(&pid, VertexTokenManager::new(adc));
+            for (pid, adc, token_url) in synced_adcs {
+                let mut mgr = VertexTokenManager::new(adc);
+                if let Some(url) = token_url {
+                    mgr = mgr.with_token_url(url);
+                }
+                self.register_vertex_token_manager(&pid, mgr);
             }
         }
         if !synced_codex.is_empty() {
@@ -1976,12 +2214,57 @@ impl ProviderRouter {
         list
     }
 
+    fn is_subscription_expired_without_refresh(
+        guard: &ProviderRouterState,
+        s: &SubscriptionAccount,
+        now_ms: i64,
+    ) -> bool {
+        let has_refresh_backing = guard.synced_vertex_adcs.contains_key(&s.id)
+            || guard.synced_codex_oauths.contains_key(&s.id)
+            || (matches!(
+                s.kind,
+                SubscriptionKind::GoogleVertex | SubscriptionKind::CodexChatGpt
+            ) && !s.source_path.trim().is_empty()
+                && std::path::Path::new(&s.source_path).is_file())
+            || guard.providers.get(&s.id).is_some_and(|p| {
+                p.enabled
+                    && (p
+                        .headers
+                        .get("x-adc-source-path")
+                        .is_some_and(|path| std::path::Path::new(path).is_file())
+                        || p.headers
+                            .get("x-codex-source-path")
+                            .is_some_and(|path| std::path::Path::new(path).is_file()))
+            });
+        if has_refresh_backing {
+            return false;
+        }
+        if s.expires_at_ms.is_some_and(|exp| exp <= now_ms) {
+            return true;
+        }
+        if let Some(tok) = s.access_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            if extract_jwt_exp_ms(tok).is_some_and(|exp| exp <= now_ms) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn is_provider_usable(guard: &ProviderRouterState, p: &ProviderConfig) -> bool {
         if !p.enabled || p.id == "local_hermes" || p.api_mode == ApiMode::LocalHermes {
             return false;
         }
+        if guard.provider_health.get(&p.id).is_some_and(|h| !h.usable) {
+            return false;
+        }
         if !p.is_subscription {
             return !p.credentials.is_empty() || p.no_key_required;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        if let Some(sub) = guard.subscriptions.iter().find(|s| s.id == p.id) {
+            if Self::is_subscription_expired_without_refresh(guard, sub, now_ms) {
+                return false;
+            }
         }
         !p.credentials.is_empty()
             || guard.synced_vertex_adcs.contains_key(&p.id)
@@ -2001,6 +2284,13 @@ impl ProviderRouter {
     }
 
     fn is_subscription_backed(guard: &ProviderRouterState, s: &SubscriptionAccount) -> bool {
+        if guard.provider_health.get(&s.id).is_some_and(|h| !h.usable) {
+            return false;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        if Self::is_subscription_expired_without_refresh(guard, s, now_ms) {
+            return false;
+        }
         guard.providers.get(&s.id).is_none_or(|p| p.enabled)
             && (s.access_token.as_deref().is_some_and(|t| !t.trim().is_empty())
                 || guard.synced_vertex_adcs.contains_key(&s.id)
@@ -2020,6 +2310,618 @@ impl ProviderRouter {
                                 .get("x-codex-source-path")
                                 .is_some_and(|path| std::path::Path::new(path).is_file()))
                 }))
+    }
+
+    /// Computes the effective availability status for a provider or subscription ID from
+    /// structural configuration and recorded runtime/verification health.
+    pub fn provider_availability(&self, id: &str) -> ProviderAvailabilityStatus {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::provider_availability_in_state(&guard, id)
+    }
+
+    /// Computes the effective availability status for `id` inside a snapshot of `ProviderRouterState`.
+    pub fn provider_availability_in_state(
+        guard: &ProviderRouterState,
+        id: &str,
+    ) -> ProviderAvailabilityStatus {
+        let now_ms = Utc::now().timestamp_millis();
+        if id == "local_hermes" {
+            return if guard.allow_local_fallback {
+                ProviderAvailabilityStatus::usable_at(now_ms)
+            } else {
+                ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "disabled",
+                    "未启用本地回退运行模式",
+                )
+            };
+        }
+        if let Some(cfg) = guard.providers.get(id) {
+            if !cfg.enabled {
+                return ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "disabled",
+                    "该服务商已禁用",
+                );
+            }
+        }
+        if let Some(health) = guard.provider_health.get(id) {
+            if !health.usable {
+                return health.clone();
+            }
+        }
+        if let Some(sub) = guard.subscriptions.iter().find(|s| s.id == id) {
+            if Self::is_subscription_expired_without_refresh(guard, sub, now_ms) {
+                return ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "token_expired",
+                    "订阅访问令牌已过期，请重新登录授权",
+                );
+            }
+            if !Self::is_subscription_backed(guard, sub) {
+                return ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "missing_credentials",
+                    "未检测到可用的订阅凭据或访问令牌",
+                );
+            }
+        }
+        if let Some(cfg) = guard.providers.get(id) {
+            if !Self::is_provider_usable(guard, cfg) {
+                return ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "missing_credentials",
+                    "未配置有效的 API Key 或凭据",
+                );
+            }
+        }
+        guard
+            .provider_health
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| ProviderAvailabilityStatus::usable_at(0))
+    }
+
+    /// Marks `provider_id` as verified usable at the current timestamp.
+    pub fn mark_provider_usable(&self, provider_id: &str) {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .provider_health
+            .insert(provider_id.to_string(), ProviderAvailabilityStatus::usable_at(now_ms));
+    }
+
+    /// Marks `provider_id` as unavailable with a machine-readable code and concise reason.
+    pub fn mark_provider_unavailable(
+        &self,
+        provider_id: &str,
+        error_code: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.provider_health.insert(
+            provider_id.to_string(),
+            ProviderAvailabilityStatus::unavailable_at(now_ms, error_code, reason),
+        );
+        for s in &mut guard.subscriptions {
+            if s.id == provider_id {
+                s.active = false;
+            }
+        }
+    }
+
+    /// Clears cached availability status for `provider_id` so the next check verifies fresh credentials.
+    pub fn clear_provider_health(&self, provider_id: &str) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.provider_health.remove(provider_id);
+    }
+
+    /// Ensures `active_provider_id` always points to a currently usable provider (or demotes to
+    /// `local_hermes` with `needs_provider_selection() == true` when no usable provider remains).
+    /// Returns `true` if `active_provider_id` or subscription active flags changed.
+    pub fn reconcile_active_provider(&self) -> bool {
+        let changed = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_active = guard.active_provider_id.clone();
+            let prev_model = guard.active_model.clone();
+            let active_still_usable = prev_active != "local_hermes"
+                && guard
+                    .providers
+                    .get(&prev_active)
+                    .is_some_and(|p| Self::is_provider_usable(&guard, p));
+
+            if !active_still_usable {
+                let mut candidates: Vec<(String, String, u8)> = guard
+                    .providers
+                    .values()
+                    .filter(|p| Self::is_provider_usable(&guard, p))
+                    .map(|p| {
+                        let prio = if !p.is_subscription {
+                            0
+                        } else if p.api_mode == ApiMode::GoogleVertex {
+                            1
+                        } else if p.api_mode == ApiMode::CodexResponses {
+                            2
+                        } else {
+                            3
+                        };
+                        (p.id.clone(), p.default_model.clone(), prio)
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+                if let Some((next_id, next_model, _)) = candidates.into_iter().next() {
+                    guard.active_provider_id = next_id;
+                    guard.active_model = next_model;
+                } else {
+                    guard.active_provider_id = "local_hermes".to_string();
+                    guard.active_model = "hermes-local-v1".to_string();
+                }
+            }
+
+            let cur_active = guard.active_provider_id.clone();
+            let desired_active_flags: Vec<bool> = guard
+                .subscriptions
+                .iter()
+                .map(|s| {
+                    cur_active != "local_hermes"
+                        && s.id == cur_active
+                        && Self::is_subscription_backed(&guard, s)
+                })
+                .collect();
+            let mut sub_flags_changed = false;
+            for (s, should_be_active) in guard.subscriptions.iter_mut().zip(desired_active_flags) {
+                if s.active != should_be_active {
+                    s.active = should_be_active;
+                    sub_flags_changed = true;
+                }
+            }
+
+            guard.active_provider_id != prev_active
+                || guard.active_model != prev_model
+                || sub_flags_changed
+        };
+        if changed {
+            self.rebuild_default_fallback_chain();
+        }
+        changed
+    }
+
+    /// Actively verifies whether a single provider/subscription ID is usable right now.
+    ///
+    /// Performs structural validation unconditionally, and performs live OAuth token refresh /
+    /// lightweight endpoint authentication checks whenever `!is_offline_test_mode()` or when the
+    /// target OAuth/API URL is a local loopback test endpoint (`127.0.0.1` / `localhost`).
+    pub async fn verify_provider_availability(
+        &self,
+        provider_id: &str,
+        force: bool,
+    ) -> ProviderAvailabilityStatus {
+        let now_ms = Utc::now().timestamp_millis();
+        if provider_id == "local_hermes" {
+            return self.provider_availability(provider_id);
+        }
+
+        let (cfg_opt, sub_opt, cached_health) = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                guard.providers.get(provider_id).cloned(),
+                guard.subscriptions.iter().find(|s| s.id == provider_id).cloned(),
+                guard.provider_health.get(provider_id).cloned(),
+            )
+        };
+
+        if !force {
+            if let Some(ref h) = cached_health {
+                if h.checked_at_ms > 0
+                    && now_ms.saturating_sub(h.checked_at_ms) < PROVIDER_HEALTH_CHECK_TTL_MS
+                {
+                    if let Some(ref cfg) = cfg_opt {
+                        if !cfg.enabled {
+                            return ProviderAvailabilityStatus::unavailable_at(
+                                now_ms,
+                                "disabled",
+                                "该服务商已禁用",
+                            );
+                        }
+                    }
+                    return h.clone();
+                }
+            }
+        }
+
+        let Some(cfg) = cfg_opt else {
+            if let Some(sub) = sub_opt {
+                let st = self.provider_availability(&sub.id);
+                return st;
+            }
+            return ProviderAvailabilityStatus::unavailable_at(
+                now_ms,
+                "not_found",
+                format!("未找到服务商 '{provider_id}'"),
+            );
+        };
+
+        if !cfg.enabled {
+            let st = ProviderAvailabilityStatus::unavailable_at(now_ms, "disabled", "该服务商已禁用");
+            return st;
+        }
+
+        let offline = is_offline_test_mode()
+            || (is_running_in_rust_test_harness() && !env_truthy("HERMES_FORCE_LIVE_HEALTH_CHECK"));
+
+        // 1. Google Vertex AI: verify OAuth2 ADC token refresh (catches invalid_grant immediately!)
+        if cfg.api_mode == ApiMode::GoogleVertex
+            || sub_opt
+                .as_ref()
+                .is_some_and(|s| s.kind == SubscriptionKind::GoogleVertex)
+        {
+            let has_static_key = cfg
+                .credentials
+                .entries
+                .iter()
+                .any(|e| !e.api_key.trim().is_empty());
+            if has_static_key {
+                self.mark_provider_usable(provider_id);
+                return ProviderAvailabilityStatus::usable_at(now_ms);
+            }
+            let Some(mgr) = self.get_or_create_vertex_manager(provider_id, &cfg) else {
+                let reason = "未检测到有效的 Google Vertex AI ADC 凭据，请运行 `gcloud auth application-default login`";
+                self.mark_provider_unavailable(provider_id, "missing_credentials", reason);
+                return ProviderAvailabilityStatus::unavailable_at(
+                    now_ms,
+                    "missing_credentials",
+                    reason,
+                );
+            };
+            let is_loopback_tok = is_loopback_server_url(mgr.token_url());
+            if offline && !is_loopback_tok {
+                if let Some(h) = cached_health.filter(|h| !h.usable) {
+                    return h;
+                }
+                return ProviderAvailabilityStatus::usable_at(now_ms);
+            }
+            if force {
+                mgr.invalidate_cached_token();
+            }
+            let refresh_res = tokio::time::timeout(
+                Duration::from_secs(8),
+                mgr.get_or_refresh_token(&self.http_client, now_ms),
+            )
+            .await;
+            return match refresh_res {
+                Ok(Ok(_tok)) => {
+                    self.mark_provider_usable(provider_id);
+                    ProviderAvailabilityStatus::usable_at(now_ms)
+                }
+                Ok(Err(e)) => {
+                    let msg = format!("Google Vertex AI OAuth token refresh failed: {e}");
+                    let code = classify_provider_auth_error_code(&msg);
+                    let reason = format_provider_unavailable_reason(provider_id, &msg);
+                    self.mark_provider_unavailable(provider_id, code, reason.clone());
+                    ProviderAvailabilityStatus::unavailable_at(now_ms, code, reason)
+                }
+                Err(_) => {
+                    let reason = "Google Vertex AI OAuth 令牌验证超时，请检查网络连接";
+                    self.mark_provider_unavailable(provider_id, "unreachable", reason);
+                    ProviderAvailabilityStatus::unavailable_at(now_ms, "unreachable", reason)
+                }
+            };
+        }
+
+        // 2. Codex / ChatGPT OAuth: verify JWT freshness or refresh token
+        if cfg.api_mode == ApiMode::CodexResponses
+            || sub_opt
+                .as_ref()
+                .is_some_and(|s| s.kind == SubscriptionKind::CodexChatGpt)
+        {
+            let existing_tok = cfg
+                .credentials
+                .entries
+                .first()
+                .map(|e| e.api_key.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    sub_opt
+                        .as_ref()
+                        .and_then(|s| s.access_token.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+            let jwt_fresh = existing_tok.as_deref().is_some_and(|t| {
+                extract_jwt_exp_ms(t).is_none_or(|exp| exp > now_ms + 60_000)
+            });
+            if jwt_fresh {
+                if let Some(h) = cached_health.filter(|h| !h.usable && !force) {
+                    return h;
+                }
+                self.mark_provider_usable(provider_id);
+                return ProviderAvailabilityStatus::usable_at(now_ms);
+            }
+            if let Some(mgr) = self.get_or_create_codex_manager(provider_id, &cfg) {
+                let is_loopback_tok = is_loopback_server_url(mgr.token_url());
+                if offline && !is_loopback_tok {
+                    if let Some(h) = cached_health.filter(|h| !h.usable) {
+                        return h;
+                    }
+                    return ProviderAvailabilityStatus::usable_at(now_ms);
+                }
+                let refresh_res = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    mgr.get_or_refresh_token(&self.http_client, now_ms),
+                )
+                .await;
+                return match refresh_res {
+                    Ok(Ok(refreshed)) => {
+                        {
+                            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(p) = guard.providers.get_mut(provider_id) {
+                                if let Some(entry) = p.credentials.entries.first_mut() {
+                                    entry.api_key = refreshed;
+                                }
+                            }
+                        }
+                        self.mark_provider_usable(provider_id);
+                        ProviderAvailabilityStatus::usable_at(now_ms)
+                    }
+                    Ok(Err(e)) => {
+                        let msg = format!("Codex OAuth token refresh failed: {e}");
+                        let code = classify_provider_auth_error_code(&msg);
+                        let reason = format_provider_unavailable_reason(provider_id, &msg);
+                        self.mark_provider_unavailable(provider_id, code, reason.clone());
+                        ProviderAvailabilityStatus::unavailable_at(now_ms, code, reason)
+                    }
+                    Err(_) => {
+                        let reason = "Codex OAuth 令牌验证超时，请检查网络连接";
+                        self.mark_provider_unavailable(provider_id, "unreachable", reason);
+                        ProviderAvailabilityStatus::unavailable_at(now_ms, "unreachable", reason)
+                    }
+                };
+            }
+            let reason = if existing_tok.is_some() {
+                "Codex 访问令牌已过期，请重新登录 Codex CLI"
+            } else {
+                "未检测到有效的 Codex 凭据"
+            };
+            self.mark_provider_unavailable(provider_id, "token_expired", reason);
+            return ProviderAvailabilityStatus::unavailable_at(now_ms, "token_expired", reason);
+        }
+
+        // 3. Subscription expiry check (non-refreshable OAuth subscriptions)
+        if let Some(ref sub) = sub_opt {
+            if sub.expires_at_ms.is_some_and(|exp| exp <= now_ms) {
+                let reason = "订阅授权已过期，请重新登录该工具后扫描更新";
+                self.mark_provider_unavailable(provider_id, "token_expired", reason);
+                return ProviderAvailabilityStatus::unavailable_at(now_ms, "token_expired", reason);
+            }
+        }
+
+        // 4. Static API-key / local / custom providers
+        let api_key = cfg
+            .credentials
+            .entries
+            .first()
+            .map(|e| e.api_key.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if !cfg.no_key_required && api_key.is_none() {
+            let reason = "未配置 API Key 或访问令牌";
+            self.mark_provider_unavailable(provider_id, "missing_credentials", reason);
+            return ProviderAvailabilityStatus::unavailable_at(
+                now_ms,
+                "missing_credentials",
+                reason,
+            );
+        }
+
+        let base_url = cfg.base_url.trim();
+        if base_url.is_empty() || is_cloudcode_pa_url(base_url) {
+            if let Some(h) = cached_health.filter(|h| !h.usable && !force) {
+                return h;
+            }
+            self.mark_provider_usable(provider_id);
+            return ProviderAvailabilityStatus::usable_at(now_ms);
+        }
+
+        let is_loopback_base = is_loopback_server_url(base_url);
+        if offline && !is_loopback_base {
+            if let Some(h) = cached_health.filter(|h| !h.usable) {
+                return h;
+            }
+            return ProviderAvailabilityStatus::usable_at(now_ms);
+        }
+
+        // Lightweight read-only GET /models probe:
+        // - 2xx => verified usable
+        // - 401/403 => definitely invalid credentials (mark unavailable!)
+        // - 404/405/501 => endpoint reachable, relay doesn't implement /models (keep usable)
+        // - connection/DNS/timeout error => unreachable (mark unavailable!)
+        let models_url = format!("{}/models", base_url.trim_end_matches('/'));
+        let mut req_builder = self.http_client.get(&models_url);
+        match cfg.api_mode {
+            ApiMode::AnthropicMessages => {
+                if let Some(ref k) = api_key {
+                    req_builder = req_builder
+                        .header("x-api-key", k)
+                        .header("anthropic-version", "2023-06-01");
+                }
+            }
+            ApiMode::GeminiGenerateContent => {
+                if let Some(ref k) = api_key {
+                    req_builder = req_builder.header("x-goog-api-key", k);
+                }
+            }
+            _ => {
+                if let Some(ref k) = api_key {
+                    req_builder = req_builder.bearer_auth(k);
+                }
+            }
+        }
+        for (hk, hv) in &cfg.headers {
+            if !hk.starts_with("x-adc-")
+                && !hk.starts_with("x-codex-")
+                && !hk.starts_with("x-vertex-")
+            {
+                req_builder = req_builder.header(hk.as_str(), hv.as_str());
+            }
+        }
+
+        let timeout_secs = if is_loopback_base { 2 } else { 5 };
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), req_builder.send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status().as_u16();
+                if status == 401 || status == 403 {
+                    let msg = format!("HTTP {status}");
+                    let code = classify_provider_auth_error_code(&msg);
+                    let reason = format_provider_unavailable_reason(provider_id, &msg);
+                    self.mark_provider_unavailable(provider_id, code, reason.clone());
+                    ProviderAvailabilityStatus::unavailable_at(now_ms, code, reason)
+                } else {
+                    self.mark_provider_usable(provider_id);
+                    ProviderAvailabilityStatus::usable_at(now_ms)
+                }
+            }
+            Ok(Err(e)) => {
+                let reason = if is_loopback_base {
+                    format!("本地服务未启动或无法连接 ({base_url})")
+                } else {
+                    format!("无法连接到上游接口: {e}")
+                };
+                self.mark_provider_unavailable(provider_id, "unreachable", reason.clone());
+                ProviderAvailabilityStatus::unavailable_at(now_ms, "unreachable", reason)
+            }
+            Err(_) => {
+                let reason = if is_loopback_base {
+                    format!("本地服务连接超时 ({base_url})")
+                } else {
+                    "连接上游接口超时，请检查网络或代理设置".to_string()
+                };
+                self.mark_provider_unavailable(provider_id, "unreachable", reason.clone());
+                ProviderAvailabilityStatus::unavailable_at(now_ms, "unreachable", reason)
+            }
+        }
+    }
+
+    /// Concurrently verifies all non-`local_hermes` providers & subscriptions and reconciles
+    /// `active_provider_id` so dead/expired credentials are immediately marked unusable and demoted.
+    /// Returns `true` if any provider health or active selection changed.
+    pub async fn verify_all_providers_availability(&self, force: bool) -> bool {
+        let (before_health, target_ids): (
+            HashMap<String, ProviderAvailabilityStatus>,
+            Vec<String>,
+        ) = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ids: Vec<String> = guard
+                .providers
+                .keys()
+                .filter(|id| id.as_str() != "local_hermes")
+                .cloned()
+                .collect();
+            for s in &guard.subscriptions {
+                if !ids.contains(&s.id) {
+                    ids.push(s.id.clone());
+                }
+            }
+            ids.sort();
+            (guard.provider_health.clone(), ids)
+        };
+
+        if !target_ids.is_empty() {
+            let mut join_set = tokio::task::JoinSet::new();
+            for id in target_ids {
+                let router = self.clone();
+                join_set.spawn(async move {
+                    let _ = router.verify_provider_availability(&id, force).await;
+                });
+            }
+            while join_set.join_next().await.is_some() {}
+        }
+
+        let reconciled = self.reconcile_active_provider();
+        let after_health = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.provider_health.clone()
+        };
+        reconciled || before_health != after_health
+    }
+
+    /// Force-refreshes credentials and live availability for a single provider or subscription,
+    /// optionally re-scanning host-local credentials (loopback server only) and atomically
+    /// re-activating it upon successful verification.
+    pub async fn refresh_and_verify_provider(
+        &self,
+        provider_id: &str,
+        rescan_local: bool,
+        activate: bool,
+        model_override: Option<&str>,
+    ) -> (String, ProviderAvailabilityStatus, bool) {
+        if rescan_local {
+            let _ = self.refresh_local_subscriptions();
+        }
+        let target_id = self
+            .resolve_subscription_target_id(provider_id)
+            .unwrap_or_else(|| provider_id.trim().to_string());
+
+        // Clear stale cached availability and cached OAuth token managers so fresh credentials take effect.
+        self.clear_provider_health(&target_id);
+        if let Ok(mut vm) = self.vertex_managers.lock() {
+            if let Some((mgr, _)) = vm.get(&target_id) {
+                mgr.invalidate_cached_token();
+            }
+            if rescan_local {
+                vm.remove(&target_id);
+            }
+        }
+        if let Ok(mut cm) = self.codex_managers.lock() {
+            if let Some(mgr) = cm.get(&target_id) {
+                mgr.invalidate_cached_token();
+            }
+            if rescan_local {
+                cm.remove(&target_id);
+            }
+        }
+
+        let avail = self.verify_provider_availability(&target_id, true).await;
+        if !avail.usable {
+            self.reconcile_active_provider();
+            return (target_id, avail, false);
+        }
+
+        if !activate {
+            return (target_id, avail, false);
+        }
+
+        let clean_model = model_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let is_sub = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.subscriptions.iter().any(|s| s.id == target_id)
+                || guard
+                    .providers
+                    .get(&target_id)
+                    .is_some_and(|p| p.is_subscription)
+        };
+
+        let activated = if is_sub {
+            self.activate_subscription_atomic(&target_id, clean_model)
+                .is_ok()
+        } else {
+            {
+                let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(cfg) = guard.providers.get_mut(&target_id) {
+                    cfg.enabled = true;
+                    if let Some(m) = clean_model {
+                        cfg.default_model = m.to_string();
+                    }
+                }
+            }
+            self.set_active(&target_id, clean_model).is_ok()
+        };
+
+        (target_id, avail, activated)
     }
 
     pub fn has_active_subscription(&self) -> bool {
@@ -2301,10 +3203,10 @@ impl ProviderRouter {
                         CodexTokenManager::from_logins_json_str(&raw, login_id)
                     } else {
                         CodexTokenManager::from_logins_json_str(&raw, login_id)
-                            .or_else(|| CodexTokenManager::from_auth_json_str(&raw))
+                            .or_else(|| CodexTokenManager::from_auth_json_str(&raw).map(|m| m.with_persist_path(&p)))
                     }
                 } else {
-                    CodexTokenManager::from_auth_json_str(&raw)
+                    CodexTokenManager::from_auth_json_str(&raw).map(|m| m.with_persist_path(&p))
                 }
             } else {
                 None
@@ -2335,7 +3237,7 @@ impl ProviderRouter {
                 .or_else(|| resolve_home_dir().map(|h| h.join(".codex")))?;
             let auth_path = codex_dir.join("auth.json");
             let raw = std::fs::read_to_string(&auth_path).ok()?;
-            CodexTokenManager::from_auth_json_str(&raw)
+            CodexTokenManager::from_auth_json_str(&raw).map(|m| m.with_persist_path(&auth_path))
         });
 
         if let Some(mut mgr) = created {
@@ -2556,7 +3458,7 @@ impl ProviderRouter {
         auto_activate: bool,
     ) -> SubscriptionRegistry {
         let now_ms = Utc::now().timestamp_millis();
-        let mut vertex_to_register: Vec<(String, VertexAdcCredentials)> = Vec::new();
+        let mut vertex_to_register: Vec<(String, VertexAdcCredentials, Option<String>)> = Vec::new();
         let mut codex_to_register: Vec<(String, CodexOAuthCredentials, Option<String>)> = Vec::new();
 
         {
@@ -2594,6 +3496,45 @@ impl ProviderRouter {
                     }
                 }
 
+                let loopback_vertex_token_url = cfg
+                    .headers
+                    .get("x-vertex-token-url")
+                    .filter(|u| is_loopback_server_url(u))
+                    .cloned();
+
+                // Detect whether credentials/endpoints actually changed so fresh logins clear
+                // previous failures, while re-syncing the exact same revoked/expired credential
+                // preserves its recorded `usable: false` health status.
+                let creds_changed = {
+                    let vertex_changed = match (&item.vertex_adc, guard.synced_vertex_adcs.get(&acc.id)) {
+                        (Some(new_adc), Some(old_adc)) => vertex_creds_differ(new_adc, old_adc),
+                        (Some(_), None) | (None, Some(_)) => true,
+                        (None, None) => false,
+                    };
+                    let codex_changed = match (&item.codex_oauth, guard.synced_codex_oauths.get(&acc.id)) {
+                        (Some(new_o), Some(old_o)) => {
+                            new_o.refresh_token != old_o.refresh_token
+                                || new_o.client_id != old_o.client_id
+                                || new_o.token_url != old_o.token_url
+                        }
+                        (Some(_), None) | (None, Some(_)) => true,
+                        (None, None) => false,
+                    };
+                    let provider_changed = guard.providers.get(&cfg.id).is_none_or(|old_p| {
+                        old_p.base_url != cfg.base_url
+                            || old_p.api_mode != cfg.api_mode
+                            || old_p.headers.get("x-vertex-token-url")
+                                != cfg.headers.get("x-vertex-token-url")
+                            || (!cfg.credentials.is_empty()
+                                && old_p.credentials.entries.first().map(|e| e.api_key.as_str())
+                                    != cfg.credentials.entries.first().map(|e| e.api_key.as_str()))
+                    });
+                    vertex_changed || codex_changed || provider_changed
+                };
+                if creds_changed {
+                    guard.provider_health.remove(&acc.id);
+                }
+
                 register_subscription_model_profiles(&mut guard, &cfg);
                 if let Some(existing) = guard.providers.get_mut(&cfg.id) {
                     existing.name = cfg.name;
@@ -2618,7 +3559,7 @@ impl ProviderRouter {
 
                 if let Some(adc) = item.vertex_adc {
                     guard.synced_vertex_adcs.insert(acc.id.clone(), adc.clone());
-                    vertex_to_register.push((acc.id.clone(), adc));
+                    vertex_to_register.push((acc.id.clone(), adc, loopback_vertex_token_url));
                 }
                 if let Some(oauth) = item.codex_oauth {
                     guard
@@ -2668,6 +3609,7 @@ impl ProviderRouter {
                     let opt_pair = guard
                         .providers
                         .get(&sub_id)
+                        .filter(|cfg| Self::is_provider_usable(&guard, cfg))
                         .map(|cfg| (cfg.id.clone(), cfg.default_model.clone()));
                     if let Some((pid, model)) = opt_pair {
                         guard.active_provider_id = pid;
@@ -2678,14 +3620,22 @@ impl ProviderRouter {
 
             if !guard.active_provider_id.is_empty() && guard.active_provider_id != "local_hermes" {
                 let active_id = guard.active_provider_id.clone();
+                let active_usable = guard
+                    .providers
+                    .get(&active_id)
+                    .is_some_and(|p| Self::is_provider_usable(&guard, p));
                 for s in &mut guard.subscriptions {
-                    s.active = s.id == active_id;
+                    s.active = active_usable && s.id == active_id;
                 }
             }
         }
 
-        for (pid, adc) in vertex_to_register {
-            self.register_vertex_token_manager(&pid, VertexTokenManager::new(adc));
+        for (pid, adc, token_url) in vertex_to_register {
+            let mut mgr = VertexTokenManager::new(adc);
+            if let Some(url) = token_url {
+                mgr = mgr.with_token_url(url);
+            }
+            self.register_vertex_token_manager(&pid, mgr);
         }
         for (pid, oauth, access_tok) in codex_to_register {
             let mut mgr = CodexTokenManager::new(oauth.refresh_token);
@@ -2735,6 +3685,9 @@ impl ProviderRouter {
             });
             guard.synced_codex_oauths.clear();
             guard
+                .provider_health
+                .retain(|id, _| !to_remove.contains(id));
+            guard
                 .fallback_chain
                 .retain(|t| !to_remove.contains(&t.provider_id));
             if to_remove.contains(&guard.active_provider_id) {
@@ -2762,6 +3715,31 @@ impl ProviderRouter {
             self.rebuild_default_fallback_chain();
         }
         removed_ids.len()
+    }
+
+    /// Resolves a subscription alias/ID (e.g. `"google_vertex"`, `"codex"`, or exact ID) to its
+    /// canonical provider/subscription ID if registered.
+    pub fn resolve_subscription_target_id(&self, id: &str) -> Option<String> {
+        let trimmed_id = id.trim();
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .subscriptions
+            .iter()
+            .find(|s| s.id == trimmed_id || s.account_id.as_deref() == Some(trimmed_id))
+            .or_else(|| {
+                guard.subscriptions.iter().find(|s| {
+                    (trimmed_id == "google_vertex" && s.kind == SubscriptionKind::GoogleVertex)
+                        || (trimmed_id == "google-vertex" && s.kind == SubscriptionKind::GoogleVertex)
+                        || (trimmed_id == "codex" && s.kind == SubscriptionKind::CodexChatGpt)
+                })
+            })
+            .map(|s| s.id.clone())
+            .or_else(|| {
+                guard
+                    .providers
+                    .contains_key(trimmed_id)
+                    .then(|| trimmed_id.to_string())
+            })
     }
 
     pub fn find_best_available_subscription(&self) -> Option<String> {
@@ -2865,6 +3843,24 @@ impl ProviderRouter {
             )));
         };
 
+        if let Some(health) = guard.provider_health.get(&target_provider_id) {
+            if !health.usable {
+                return Err(ProviderError::Authentication(
+                    health.reason.clone().unwrap_or_else(|| {
+                        format!("Subscription or provider '{target_provider_id}' is unavailable")
+                    }),
+                ));
+            }
+        }
+        if let Some(ref sub) = sub_match {
+            let now_ms = Utc::now().timestamp_millis();
+            if Self::is_subscription_expired_without_refresh(&guard, sub, now_ms) {
+                return Err(ProviderError::Authentication(
+                    "订阅访问令牌已过期，请重新登录授权".to_string(),
+                ));
+            }
+        }
+
         let (default_model, result_cfg) = {
             let target_cfg = guard
                 .providers
@@ -2911,6 +3907,7 @@ impl ProviderRouter {
             )));
         };
         cfg.credentials.add_entry(entry);
+        guard.provider_health.remove(provider_id);
         Ok(())
     }
 
@@ -3040,6 +4037,15 @@ impl ProviderRouter {
         stream_tx: Option<mpsc::Sender<ProviderStreamEvent>>,
     ) -> Result<ProviderResponse, ProviderError> {
         let state = self.snapshot();
+        if state.active_provider_id != "local_hermes"
+            && state
+                .provider_health
+                .get(&state.active_provider_id)
+                .is_some_and(|h| !h.usable)
+        {
+            self.reconcile_active_provider();
+        }
+        let state = self.snapshot();
         if self.needs_provider_selection() || state.active_provider_id == "local_hermes" {
             if let Some(sub_id) = self.find_best_available_subscription() {
                 if let Ok(cfg) = self.activate_subscription(&sub_id, None) {
@@ -3152,11 +4158,122 @@ impl ProviderRouter {
                 }
             };
 
-            push_unique_target(state.active_provider_id.clone(), requested_model.clone(), "primary");
-            if let Some(cfg) = active_cfg {
+            // 1. Explicit `provider_id/model` syntax routes directly to that usable provider.
+            let mut routed_explicit_owner = false;
+            if let Some((explicit_pid, explicit_mdl)) = requested_model.split_once('/') {
+                if let Some(target_cfg) = state.providers.get(explicit_pid) {
+                    if target_cfg.id == "local_hermes" || Self::is_provider_usable(&state, target_cfg) {
+                        push_unique_target(
+                            target_cfg.id.clone(),
+                            explicit_mdl.trim().to_string(),
+                            "explicit_provider_model",
+                        );
+                        routed_explicit_owner = true;
+                    }
+                }
+            }
+
+            // 2. If `requested_model` is explicitly owned by another usable provider (and NOT by
+            //    the currently active provider), prioritize that owning provider so selecting a
+            //    model from another provider in the two-column picker routes cleanly.
+            if !routed_explicit_owner && !requested_model.trim().is_empty() {
+                let active_owns_model = active_cfg.is_some_and(|cfg| {
+                    cfg.default_model.eq_ignore_ascii_case(&requested_model)
+                        || cfg
+                            .fallback_models
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(&requested_model))
+                        || state.model_profiles.values().any(|mp| {
+                            mp.provider_id == cfg.id
+                                && (mp.model.eq_ignore_ascii_case(&requested_model)
+                                    || mp.id.eq_ignore_ascii_case(&requested_model))
+                        })
+                });
+                if !active_owns_model {
+                    let owner_pid = state
+                        .providers
+                        .values()
+                        .find(|p| {
+                            p.id != state.active_provider_id
+                                && Self::is_provider_usable(&state, p)
+                                && (p.default_model.eq_ignore_ascii_case(&requested_model)
+                                    || p.fallback_models
+                                        .iter()
+                                        .any(|m| m.eq_ignore_ascii_case(&requested_model)))
+                        })
+                        .map(|p| p.id.clone())
+                        .or_else(|| {
+                            state.model_profiles.values().find_map(|mp| {
+                                if mp.provider_id != state.active_provider_id
+                                    && (mp.model.eq_ignore_ascii_case(&requested_model)
+                                        || mp.id.eq_ignore_ascii_case(&requested_model))
+                                {
+                                    state
+                                        .providers
+                                        .get(&mp.provider_id)
+                                        .filter(|p| Self::is_provider_usable(&state, p))
+                                        .map(|p| p.id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                    if let Some(pid) = owner_pid {
+                        push_unique_target(pid, requested_model.clone(), "model_owner");
+                        routed_explicit_owner = true;
+                    }
+                }
+            }
+
+            if !routed_explicit_owner
+                && (state.active_provider_id == "local_hermes"
+                    || active_cfg.is_some_and(|c| Self::is_provider_usable(&state, c)))
+            {
+                let primary_model = match active_cfg {
+                    Some(cfg) if !cfg.default_model.trim().is_empty() => {
+                        let req_lower = requested_model.trim().to_ascii_lowercase();
+                        let cfg_lists_model = cfg.default_model.eq_ignore_ascii_case(&requested_model)
+                            || cfg
+                                .fallback_models
+                                .iter()
+                                .any(|m| m.eq_ignore_ascii_case(&requested_model));
+                        let foreign_vendor_mismatch = !cfg_lists_model
+                            && match cfg.api_mode {
+                                ApiMode::GoogleVertex => {
+                                    req_lower.starts_with("gpt-")
+                                        || req_lower.starts_with("o1")
+                                        || req_lower.starts_with("o3")
+                                        || req_lower.starts_with("o4")
+                                        || req_lower.contains("codex")
+                                }
+                                ApiMode::CodexResponses => {
+                                    req_lower.starts_with("gemini-")
+                                        || req_lower.starts_with("claude-")
+                                }
+                                _ => false,
+                            };
+                        if foreign_vendor_mismatch {
+                            cfg.default_model.clone()
+                        } else {
+                            requested_model.clone()
+                        }
+                    }
+                    _ => requested_model.clone(),
+                };
+                push_unique_target(
+                    state.active_provider_id.clone(),
+                    primary_model,
+                    "primary",
+                );
+            }
+            if let Some(cfg) = active_cfg.filter(|c| Self::is_provider_usable(&state, c)) {
                 for fb_model in &cfg.fallback_models {
                     if !fb_model.trim().is_empty() {
-                        push_unique_target(state.active_provider_id.clone(), fb_model.clone(), "provider_fallback");
+                        push_unique_target(
+                            state.active_provider_id.clone(),
+                            fb_model.clone(),
+                            "provider_fallback",
+                        );
                     }
                 }
                 if cfg.id == "magpie_local"
@@ -3168,7 +4285,17 @@ impl ProviderRouter {
                 }
             }
             for target in &state.fallback_chain {
-                push_unique_target(target.provider_id.clone(), target.model.clone(), "fallback_chain");
+                if state
+                    .providers
+                    .get(&target.provider_id)
+                    .is_some_and(|p| Self::is_provider_usable(&state, p))
+                {
+                    push_unique_target(
+                        target.provider_id.clone(),
+                        target.model.clone(),
+                        "fallback_chain",
+                    );
+                }
             }
             if state.active_provider_id == "magpie_local" || state.active_provider_id == "codex_oauth" {
                 let mut extra_providers: Vec<&ProviderConfig> = state
@@ -3408,6 +4535,9 @@ impl ProviderRouter {
                     }
                     self.enrich_cost(&mut resp);
                     let latency_ms = started.elapsed().as_millis() as u64;
+                    if resp.provider_id != "local_hermes" {
+                        self.mark_provider_usable(&resp.provider_id);
+                    }
                     self.record_route_success(
                         &requested_model_raw,
                         &resp.provider_id,
@@ -3426,8 +4556,14 @@ impl ProviderRouter {
                         return Err(err);
                     }
                     self.record_route_failure(&provider_id, &model, &err);
-                    if matches!(err, ProviderError::Authentication(_)) {
+                    if let ProviderError::Authentication(ref auth_msg) = err {
                         auth_failed_providers.insert(provider_id.clone());
+                        if provider_id != "local_hermes" {
+                            let code = classify_provider_auth_error_code(auth_msg);
+                            let reason = format_provider_unavailable_reason(&provider_id, auth_msg);
+                            self.mark_provider_unavailable(&provider_id, code, reason);
+                            self.reconcile_active_provider();
+                        }
                     }
                     // Do not concatenate a fallback provider's stream onto already-emitted partial output.
                     if emitted_to_caller.load(std::sync::atomic::Ordering::SeqCst) {
@@ -3465,11 +4601,29 @@ impl ProviderRouter {
         {
             request.model = cfg.default_model.clone();
         }
-        let mut resp = self
+        match self
             .execute_single_provider(&cfg, request, stream_tx.as_ref())
-            .await?;
-        self.enrich_cost(&mut resp);
-        Ok(resp)
+            .await
+        {
+            Ok(mut resp) => {
+                if resp.provider_id != "local_hermes" {
+                    self.mark_provider_usable(&resp.provider_id);
+                }
+                self.enrich_cost(&mut resp);
+                Ok(resp)
+            }
+            Err(err) => {
+                if let ProviderError::Authentication(ref auth_msg) = err {
+                    if provider_id != "local_hermes" {
+                        let code = classify_provider_auth_error_code(auth_msg);
+                        let reason = format_provider_unavailable_reason(provider_id, auth_msg);
+                        self.mark_provider_unavailable(provider_id, code, reason);
+                        self.reconcile_active_provider();
+                    }
+                }
+                Err(err)
+            }
+        }
     }
 
     fn enrich_cost(&self, resp: &mut ProviderResponse) {
@@ -3817,6 +4971,7 @@ impl ProviderRouter {
             for (k, v) in &cfg.headers {
                 if !k.starts_with("x-adc-")
                     && !k.starts_with("x-codex-")
+                    && !k.starts_with("x-vertex-")
                     && !k.eq_ignore_ascii_case("x-goog-user-project")
                 {
                     builder = builder.header(k.as_str(), v.as_str());
@@ -11155,5 +12310,314 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
         let parsed_body: Value = serde_json::from_str(body).expect("json body");
         assert_eq!(parsed_body["model"].as_str(), Some("gemini-2.5-pro"));
         assert!(parsed_body["request"]["contents"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_vertex_invalid_grant_marks_unusable_demotes_active_and_recovers_on_new_creds() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_token = Arc::new(AtomicBool::new(false));
+        let accept_flag = Arc::clone(&accept_token);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let ok_now = accept_flag.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let (status, body) = if ok_now {
+                        (
+                            "200 OK",
+                            r#"{"access_token":"ya29.recovered-token","expires_in":3600,"token_type":"Bearer"}"#,
+                        )
+                    } else {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_grant","error_description":"Bad Request"}"#,
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let make_vertex_item = |refresh_token: &str| {
+            let mut headers = BTreeMap::new();
+            headers.insert("x-goog-user-project".to_string(), "proj-vertex".to_string());
+            headers.insert(
+                "x-vertex-token-url".to_string(),
+                format!("http://{addr}/token"),
+            );
+            magpie_gateway::ClientSubscriptionSyncItem {
+                account: SubscriptionAccount {
+                    id: "google_vertex:user@example.com".to_string(),
+                    kind: SubscriptionKind::GoogleVertex,
+                    label: "Google Vertex AI (user@example.com)".to_string(),
+                    email: Some("user@example.com".to_string()),
+                    account_id: Some("proj-vertex".to_string()),
+                    plan: Some("vertex_adc".to_string()),
+                    active: true,
+                    base_url: Some("https://aiplatform.googleapis.com/v1".to_string()),
+                    protocol: magpie_gateway::ProtocolKind::GeminiGenerateContent,
+                    default_model: Some("gemini-2.5-flash".to_string()),
+                    source_path: String::new(),
+                    expires_at_ms: None,
+                    access_token: None,
+                    headers: headers.clone(),
+                },
+                access_token: None,
+                raw_headers: headers,
+                vertex_adc: Some(magpie_gateway::VertexAdcCredentials {
+                    client_id: "cid".to_string(),
+                    client_secret: "csec".to_string(),
+                    refresh_token: refresh_token.to_string(),
+                    quota_project_id: Some("proj-vertex".to_string()),
+                    account: Some("user@example.com".to_string()),
+                }),
+                codex_oauth: None,
+                region_id: Some("global".to_string()),
+                available_models: vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()],
+            }
+        };
+
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+        router.ingest_client_subscriptions(vec![make_vertex_item("revoked-rt-1")], true);
+        assert_eq!(router.active_info().0, "google_vertex:user@example.com");
+
+        // 1. Live availability check catches 400 invalid_grant, marks unusable, and demotes active provider
+        let changed = router.verify_all_providers_availability(true).await;
+        assert!(changed);
+        let avail = router.provider_availability("google_vertex:user@example.com");
+        assert!(!avail.usable);
+        assert_eq!(avail.error_code.as_deref(), Some("oauth_invalid_grant"));
+        assert!(
+            avail.reason.as_deref().unwrap_or("").contains("invalid_grant"),
+            "unexpected reason: {:?}",
+            avail.reason
+        );
+        assert_eq!(router.active_info().0, "local_hermes");
+        assert!(router.needs_provider_selection());
+
+        // 2. Activating the unavailable subscription MUST fail with Authentication error
+        let act_err = router
+            .activate_subscription_atomic("google_vertex:user@example.com", Some("gemini-2.5-pro"))
+            .unwrap_err();
+        assert!(
+            matches!(act_err, ProviderError::Authentication(_)),
+            "expected Authentication error, got: {act_err:?}"
+        );
+
+        // 3. Re-syncing the IDENTICAL dead credentials preserves `usable: false` and does NOT auto-activate
+        router.ingest_client_subscriptions(vec![make_vertex_item("revoked-rt-1")], true);
+        assert!(!router.provider_availability("google_vertex:user@example.com").usable);
+        assert!(router.needs_provider_selection());
+
+        // 4. Updating credentials to a valid refresh token clears stale failure and recovers on verification
+        accept_token.store(true, Ordering::SeqCst);
+        router.ingest_client_subscriptions(vec![make_vertex_item("fresh-rt-2")], false);
+        let recovered = router
+            .verify_provider_availability("google_vertex:user@example.com", true)
+            .await;
+        assert!(recovered.usable);
+        let (cfg, model) = router
+            .activate_subscription_atomic("google_vertex:user@example.com", Some("gemini-2.5-pro"))
+            .expect("recovered subscription should activate");
+        assert_eq!(cfg.id, "google_vertex:user@example.com");
+        assert_eq!(model, "gemini-2.5-pro");
+        assert!(!router.needs_provider_selection());
+    }
+
+    #[tokio::test]
+    async fn test_runtime_complete_auth_error_invalidates_provider_and_routes_cross_provider_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Dead provider returning 401
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = dead_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"error":{"message":"invalid_grant: Bad Request"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // Healthy provider returning 200 OK
+        let ok_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = ok_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"healthy-provider-reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+        let dead_cfg = ProviderConfig::openai_compatible(
+            "broken_vertex_proxy",
+            "Broken Provider",
+            format!("http://{dead_addr}/v1"),
+            "gemini-2.5-flash",
+            "sk-dead",
+        );
+        let ok_cfg = ProviderConfig::openai_compatible(
+            "healthy_deepseek",
+            "Healthy DeepSeek",
+            format!("http://{ok_addr}/v1"),
+            "deepseek-chat",
+            "sk-healthy",
+        );
+        router.register_provider(dead_cfg);
+        router.register_provider(ok_cfg);
+        router.set_active("broken_vertex_proxy", Some("gemini-2.5-flash")).unwrap();
+
+        // 1. Selecting a model owned by `healthy_deepseek` while `broken_vertex_proxy` is active
+        // MUST route directly to `healthy_deepseek` instead of hitting the dead provider!
+        let cross_req = ProviderRequest {
+            model: "deepseek-chat".to_string(),
+            system_tiers: Vec::new(),
+            messages: vec![ProviderChatMessage::user("hi")],
+            tools: Vec::new(),
+            temperature: Some(0.1),
+            max_tokens: Some(32),
+            thinking_budget_tokens: None,
+            stream: false,
+            metadata: Value::Null,
+        };
+        let cross_resp = router
+            .complete(cross_req, None)
+            .await
+            .expect("cross-provider model should route to owning usable provider");
+        assert_eq!(cross_resp.provider_id, "healthy_deepseek");
+        assert_eq!(cross_resp.content, "healthy-provider-reply");
+
+        // 2. When `broken_vertex_proxy` is called directly and fails with 401/invalid_grant,
+        // it is permanently marked unavailable and demoted from active_provider_id.
+        router.set_fallback_chain(Vec::new());
+        let dead_req = ProviderRequest {
+            model: "gemini-2.5-flash".to_string(),
+            system_tiers: Vec::new(),
+            messages: vec![ProviderChatMessage::user("hi")],
+            tools: Vec::new(),
+            temperature: Some(0.1),
+            max_tokens: Some(32),
+            thinking_budget_tokens: None,
+            stream: false,
+            metadata: Value::Null,
+        };
+        let err = router.complete(dead_req, None).await.unwrap_err();
+        assert!(matches!(err, ProviderError::Authentication(_)));
+        assert!(!router.provider_availability("broken_vertex_proxy").usable);
+        assert_eq!(
+            router.active_info().0,
+            "healthy_deepseek",
+            "reconcile_active_provider should automatically demote dead provider to next usable provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_and_verify_provider_recovers_and_guards_cross_vendor_model() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 1. Network failure during OAuth refresh classifies cleanly as `unreachable`
+        let net_err = "Provider authentication error: Google Vertex AI OAuth token refresh failed: HTTP error: error sending request for url (https://oauth2.googleapis.com/token)";
+        assert_eq!(classify_provider_auth_error_code(net_err), "unreachable");
+        let reason = format_provider_unavailable_reason("google_vertex:user@gmail.com", net_err);
+        assert!(reason.contains("刷新激活"), "expected refresh hint in reason: {reason}");
+
+        // 2. refresh_and_verify_provider stays blocked on 401 and atomically recovers once 200 OK
+        let healthy = Arc::new(AtomicBool::new(false));
+        let healthy_srv = Arc::clone(&healthy);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let is_ok = healthy_srv.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = if is_ok {
+                        let body = r#"{"data":[{"id":"gpt-5.4"}]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        let body = r#"{"error":{"message":"invalid_api_key"}}"#;
+                        format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+        router.register_provider(ProviderConfig::openai_compatible(
+            "recoverable_openai",
+            "Recoverable OpenAI",
+            format!("http://{addr}/v1"),
+            "gpt-5.4",
+            "sk-test-key",
+        ));
+
+        let (pid1, st1, act1) = router
+            .refresh_and_verify_provider("recoverable_openai", false, true, None)
+            .await;
+        assert_eq!(pid1, "recoverable_openai");
+        assert!(!st1.usable);
+        assert_eq!(st1.error_code.as_deref(), Some("auth_401"));
+        assert!(!act1);
+        assert!(router.needs_provider_selection());
+
+        healthy.store(true, Ordering::SeqCst);
+        let (pid2, st2, act2) = router
+            .refresh_and_verify_provider("recoverable_openai", false, true, Some("gpt-5.4"))
+            .await;
+        assert_eq!(pid2, "recoverable_openai");
+        assert!(st2.usable);
+        assert!(act2);
+        assert_eq!(router.active_info().0, "recoverable_openai");
+        assert!(!router.needs_provider_selection());
     }
 }

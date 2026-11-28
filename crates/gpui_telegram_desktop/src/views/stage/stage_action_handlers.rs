@@ -500,6 +500,7 @@ impl ConversationStage {
                 self.model_picker.effort_menu_open = false;
                 self.pending_stage_action =
                     Some(crate::views::conversation_stage::StageAction::SelectModel {
+                        provider_id: None,
                         model_id,
                         thinking_level,
                     });
@@ -517,6 +518,11 @@ impl ConversationStage {
                 use crate::components::openbot_model_picker::OpenBotModelPickerAction;
                 match act {
                     OpenBotModelPickerAction::SelectProvider(pid) => {
+                        if !self.model_picker.providers.is_empty()
+                            && !self.model_picker.is_provider_selectable(&pid)
+                        {
+                            return;
+                        }
                         self.model_picker.selected_provider_id = pid;
                         self.model_picker.legacy_expanded = false;
                         self.model_picker.effort_menu_open = false;
@@ -534,6 +540,14 @@ impl ConversationStage {
                         provider_id,
                         model_id,
                     } => {
+                        if !self.model_picker.providers.is_empty()
+                            && provider_id != "active"
+                            && !self.model_picker.is_provider_selectable(&provider_id)
+                        {
+                            return;
+                        }
+                        let selected_pid = (provider_id != "active" && !provider_id.trim().is_empty())
+                            .then(|| provider_id.clone());
                         self.model_picker.selected_provider_id = provider_id;
                         let trimmed = model_id.trim();
                         if !trimmed.is_empty() {
@@ -548,6 +562,7 @@ impl ConversationStage {
                         self.model_picker.search_query.clear();
                         self.pending_stage_action =
                             Some(crate::views::conversation_stage::StageAction::SelectModel {
+                                provider_id: selected_pid,
                                 model_id: Some(trimmed.to_string()),
                                 thinking_level: None,
                             });
@@ -564,9 +579,48 @@ impl ConversationStage {
                         self.model_picker.effort_menu_open = false;
                         self.pending_stage_action =
                             Some(crate::views::conversation_stage::StageAction::SelectModel {
+                                provider_id: None,
                                 model_id: None,
                                 thinking_level: Some(effort),
                             });
+                    }
+                    OpenBotModelPickerAction::ToggleUnavailableExpanded => {
+                        self.model_picker.unavailable_expanded =
+                            !self.model_picker.unavailable_expanded;
+                    }
+                    OpenBotModelPickerAction::ReauthenticateProvider {
+                        provider_id,
+                        kind_hint,
+                    } => {
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::ReauthenticateAiProvider {
+                                provider_id,
+                                kind_hint,
+                            },
+                        );
+                    }
+                    OpenBotModelPickerAction::CancelReauthenticate => {
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::CancelAiProviderReauth,
+                        );
+                    }
+                    OpenBotModelPickerAction::RefreshAndActivateProvider(pid) => {
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::RefreshAndActivateAiProvider(pid),
+                        );
+                    }
+                    OpenBotModelPickerAction::RefreshAllProviders => {
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::RefreshAllAiProviders,
+                        );
+                    }
+                    OpenBotModelPickerAction::InspectProviderSettings(pid) => {
+                        self.model_picker_open = false;
+                        self.model_picker.search_focused = false;
+                        self.model_picker.effort_menu_open = false;
+                        self.pending_stage_action = Some(
+                            crate::views::conversation_stage::StageAction::InspectAiProviderSettings(pid),
+                        );
                     }
                     OpenBotModelPickerAction::OpenProvidersSettings => {
                         self.model_picker_open = false;
@@ -1080,6 +1134,35 @@ impl ConversationStage {
                         self.show_toast_banner(toast, cx);
                     }
                 }
+            }
+            BubbleUiAction::ReauthenticateProvider {
+                provider_id,
+                kind_hint,
+            } => {
+                self.pending_stage_action = Some(
+                    crate::views::conversation_stage::StageAction::ReauthenticateAiProvider {
+                        provider_id,
+                        kind_hint,
+                    },
+                );
+            }
+            BubbleUiAction::RefreshAndActivateProvider(pid) => {
+                self.pending_stage_action = Some(
+                    crate::views::conversation_stage::StageAction::RefreshAndActivateAiProvider(pid),
+                );
+            }
+            BubbleUiAction::RefreshAiProviders => {
+                self.pending_stage_action = Some(
+                    crate::views::conversation_stage::StageAction::RefreshAllAiProviders,
+                );
+            }
+            BubbleUiAction::OpenAiProvidersSettings(pid_opt) => {
+                self.pending_stage_action = Some(match pid_opt.filter(|p| !p.trim().is_empty()) {
+                    Some(pid) => {
+                        crate::views::conversation_stage::StageAction::InspectAiProviderSettings(pid)
+                    }
+                    None => crate::views::conversation_stage::StageAction::OpenAiProvidersSettings,
+                });
             }
         }
         cx.notify();

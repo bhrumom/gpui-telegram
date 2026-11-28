@@ -22,7 +22,8 @@ use crate::net::{
     HttpClient, HttpClientError, MagpieDeleteProviderResponse, MagpieGroupsRequest,
     MagpieGroupsResponse, MagpieImportRequest, MagpieImportResponse, MagpieMaskingConfigDto,
     MagpieMaskingPreviewRequest, MagpieMaskingPreviewResponse, MagpieMaskingUpdateResponse,
-    MagpieProbeRequest, MagpieProbeResponse, MagpieSaveProviderRequest,
+    MagpieProbeRequest, MagpieProbeResponse, MagpieRefreshProviderRequest,
+    MagpieRefreshProviderResponse, MagpieSaveProviderRequest,
     MagpieSaveProviderResponse, MagpieStateDto, MagpieSubscriptionsScanResponse,
     OpenAiChatCompletionsRequest, PendingComputerCommandDto,
     RegisterLocalComputerRequest, RemoteComputerCommandRequest, RemoteComputerCommandResult,
@@ -1798,6 +1799,19 @@ impl TelegramClient {
         self.ensure_pinned_session(expected_epoch, token)?;
         self.hermes
             .magpie_probe_provider(token, provider_id, req)
+            .await
+    }
+
+    pub async fn hermes_magpie_refresh_provider_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        provider_id: &str,
+        req: Option<&MagpieRefreshProviderRequest>,
+    ) -> std::result::Result<MagpieRefreshProviderResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.hermes
+            .magpie_refresh_provider(token, provider_id, req)
             .await
     }
 

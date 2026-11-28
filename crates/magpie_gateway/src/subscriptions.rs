@@ -523,6 +523,121 @@ pub struct CodexTokenManager {
     token_url: String,
     cache: std::sync::RwLock<Option<CachedVertexToken>>,
     lead_time_ms: i64,
+    persist_path: Option<PathBuf>,
+}
+
+/// Atomically persists a Codex CLI-compatible `auth.json` under `codex_home` with `0600` Unix permissions.
+pub fn persist_codex_auth_json(
+    codex_home: &Path,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    api_key: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(codex_home)?;
+    let auth_path = codex_home.join("auth.json");
+    let account_id = [id_token, access_token].into_iter().find_map(|tok| {
+        decode_jwt_payload(tok).and_then(|claims| {
+            non_empty_str(
+                claims
+                    .get("https://api.openai.com/auth")
+                    .and_then(|a| a.get("chatgpt_account_id")),
+            )
+            .or_else(|| non_empty_str(claims.get("account_id")))
+        })
+    });
+    let mut tokens = serde_json::Map::new();
+    tokens.insert("id_token".to_string(), Value::String(id_token.to_string()));
+    tokens.insert(
+        "access_token".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    tokens.insert(
+        "refresh_token".to_string(),
+        Value::String(refresh_token.to_string()),
+    );
+    if let Some(acct) = account_id {
+        tokens.insert("account_id".to_string(), Value::String(acct));
+    }
+
+    let mut root = serde_json::Map::new();
+    root.insert("auth_mode".to_string(), Value::String("chatgpt".to_string()));
+    root.insert(
+        "OPENAI_API_KEY".to_string(),
+        match api_key.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(k) => Value::String(k.to_string()),
+            None => Value::Null,
+        },
+    );
+    root.insert("tokens".to_string(), Value::Object(tokens));
+    root.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+
+    write_private_json_atomic(&auth_path, &Value::Object(root))?;
+    Ok(auth_path)
+}
+
+fn write_private_json_atomic(path: &Path, doc: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = PathBuf::from(format!("{}.{}.tmp", path.display(), uuid::Uuid::new_v4()));
+    let payload = serde_json::to_vec_pretty(doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp_path, payload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn update_codex_auth_json_tokens(
+    path: &Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    id_token: Option<&str>,
+) -> std::io::Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut doc: Value = serde_json::from_str(&raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let Some(root) = doc.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex auth.json root is not an object",
+        ));
+    };
+    let tokens = root
+        .entry("tokens")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(tok_map) = tokens.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex auth.json tokens is not an object",
+        ));
+    };
+    tok_map.insert(
+        "access_token".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    if let Some(rt) = refresh_token.filter(|s| !s.trim().is_empty()) {
+        tok_map.insert("refresh_token".to_string(), Value::String(rt.to_string()));
+    }
+    if let Some(idt) = id_token.filter(|s| !s.trim().is_empty()) {
+        tok_map.insert("id_token".to_string(), Value::String(idt.to_string()));
+    }
+    root.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+    write_private_json_atomic(path, &doc)
 }
 
 impl CodexTokenManager {
@@ -539,6 +654,7 @@ impl CodexTokenManager {
             token_url,
             cache: std::sync::RwLock::new(None),
             lead_time_ms: DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS,
+            persist_path: None,
         }
     }
 
@@ -612,6 +728,12 @@ impl CodexTokenManager {
 
     pub fn with_token_url(mut self, url: impl Into<String>) -> Self {
         self.token_url = url.into();
+        self
+    }
+
+    /// Configures an on-disk `auth.json` path that receives atomic token write-back on refresh.
+    pub fn with_persist_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.persist_path = Some(path.into());
         self
     }
 
@@ -704,10 +826,20 @@ impl CodexTokenManager {
             .map_err(|e| TokenRefreshError::Parse(format!("{e}: {}", redact_oauth_error_body(&body))))?;
         let access_token = non_empty_str(val.get("access_token"))
             .ok_or_else(|| TokenRefreshError::Parse("Missing access_token in Codex refresh response".to_string()))?;
-        if let Some(rotated_rt) = non_empty_str(val.get("refresh_token")) {
+        let rotated_rt = non_empty_str(val.get("refresh_token"));
+        let rotated_id = non_empty_str(val.get("id_token"));
+        if let Some(ref rt) = rotated_rt {
             if let Ok(mut guard) = self.refresh_token.write() {
-                *guard = rotated_rt;
+                *guard = rt.clone();
             }
+        }
+        if let Some(ref path) = self.persist_path {
+            let _ = update_codex_auth_json_tokens(
+                path,
+                &access_token,
+                rotated_rt.as_deref(),
+                rotated_id.as_deref(),
+            );
         }
         let expires_in = val.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
         let token_type = non_empty_str(val.get("token_type")).unwrap_or_else(|| "Bearer".to_string());
@@ -2549,6 +2681,75 @@ http_headers = { "x-openai-actor-authorization" = "magpie" }
             let bodies = seen_rts.lock().unwrap();
             assert!(bodies[0].contains("refresh_token=rt_initial_1"));
             assert!(bodies[1].contains("refresh_token=rt_rotated_2"));
+        });
+    }
+
+    #[test]
+    fn test_persist_codex_auth_json_and_token_manager_writeback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use base64::Engine as _;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let tmp = std::env::temp_dir().join(format!(
+                "magpie-codex-persist-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                br#"{"email":"codex.user@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_persist_42","chatgpt_plan_type":"pro"}}"#,
+            );
+            let fake_id_jwt = format!("{header}.{payload}.sig");
+
+            let auth_path = persist_codex_auth_json(
+                &tmp,
+                &fake_id_jwt,
+                "access_initial_1",
+                "rt_persist_1",
+                None,
+            )
+            .expect("persist_codex_auth_json must succeed");
+            assert!(auth_path.exists());
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+            assert_eq!(parsed["auth_mode"].as_str(), Some("chatgpt"));
+            assert_eq!(parsed["tokens"]["refresh_token"].as_str(), Some("rt_persist_1"));
+            assert_eq!(parsed["tokens"]["account_id"].as_str(), Some("acct_persist_42"));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp_body = r#"{"access_token":"access_rotated_2","refresh_token":"rt_persist_2","expires_in":3600,"token_type":"Bearer"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+
+            let client = reqwest::Client::new();
+            let mgr = CodexTokenManager::new("rt_persist_1")
+                .with_token_url(format!("http://{addr}/oauth/token"))
+                .with_persist_path(&auth_path);
+            let tok = mgr.get_or_refresh_token(&client, 10_000).await.unwrap();
+            assert_eq!(tok, "access_rotated_2");
+
+            let updated: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+            assert_eq!(updated["tokens"]["access_token"].as_str(), Some("access_rotated_2"));
+            assert_eq!(updated["tokens"]["refresh_token"].as_str(), Some("rt_persist_2"));
+            assert_eq!(updated["tokens"]["account_id"].as_str(), Some("acct_persist_42"));
+
+            let _ = std::fs::remove_dir_all(&tmp);
         });
     }
 }

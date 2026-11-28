@@ -658,6 +658,7 @@ fn test_stage_header_model_picker_and_bot_creator_never_use_fake_models() {
     assert_eq!(
         stage.pending_stage_action,
         Some(StageAction::SelectModel {
+            provider_id: None,
             model_id: None,
             thinking_level: Some("high".to_string()),
         })

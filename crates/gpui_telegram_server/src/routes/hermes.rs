@@ -3133,6 +3133,12 @@ pub(crate) async fn execute_bot_turn_streamed(
         );
     }
 
+    if consumer.terminal_error.is_some() {
+        state
+            .fabushi_core()
+            .persist_user_providers_state(&params.sender_id.0.to_string());
+    }
+
     if let Some(g) = exec_guard.as_mut() {
         if let Some(ref err) = consumer.terminal_error {
             g.mark_failed(err.clone());

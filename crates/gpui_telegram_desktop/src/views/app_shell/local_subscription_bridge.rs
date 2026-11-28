@@ -15,17 +15,21 @@
 //!    `POST /api/v1/hermes/magpie/providers` endpoint, while keeping all locally discovered cards
 //!    visible in the UI and maintaining a background token keep-alive refresher.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bot_browser::e2ee_sync::AiOauthVaultBundle;
 use chrono::Utc;
 use gpui_telegram_agent::fabushi_bot::FabushiBotHost;
 use gpui_telegram_agent::hermes::providers::{
+    classify_provider_auth_error_code, format_provider_unavailable_reason,
     sanitize_router_state_for_cross_device, ApiMode, ProviderRouter, ProviderRouterState,
 };
-use gpui_telegram_client::net::hermes_client::{MagpieSaveProviderRequest, MagpieStateDto};
+use gpui_telegram_client::net::hermes_client::{
+    MagpieProbeRequest, MagpieRefreshProviderRequest, MagpieSaveProviderRequest, MagpieStateDto,
+};
 use gpui_telegram_client::TelegramClient;
 use magpie_gateway::{
     default_models_for_subscription_kind, discover_syncable_subscriptions_in_home,
@@ -41,11 +45,52 @@ use crate::views::settings::sections::settings_ai_providers::{
     SubscriptionAccountDto, SubscriptionActivateRequest, SubscriptionActivateResponse,
 };
 
-/// Per-`AppShell` state for client-side local AI subscription discovery and legacy token keep-alive.
+/// Verified local availability status for a discovered subscription item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSubscriptionHealth {
+    pub usable: bool,
+    pub error_code: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl LocalSubscriptionHealth {
+    pub fn usable() -> Self {
+        Self {
+            usable: true,
+            error_code: None,
+            reason: None,
+        }
+    }
+
+    pub fn unavailable(error_code: impl Into<String>, reason: impl Into<String>) -> Self {
+        let code = error_code.into();
+        let msg = reason.into();
+        Self {
+            usable: false,
+            error_code: (!code.trim().is_empty()).then_some(code),
+            reason: (!msg.trim().is_empty()).then_some(msg),
+        }
+    }
+}
+
+/// Active interactive browser/CLI re-authentication session for a provider/subscription.
+#[derive(Debug)]
+pub struct ActiveProviderReauth {
+    pub provider_id: String,
+    pub display_name: String,
+    pub status_zh: String,
+    pub status_en: String,
+    pub generation: u64,
+    pub cancel_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Per-`AppShell` state for client-side local AI subscription discovery, re-auth, and legacy token keep-alive.
 #[derive(Debug, Default)]
 pub struct ShellMagpieLocalState {
     /// Cached client-discovered local subscription bundles (secrets redacted in `Debug`).
     pub discovered_items: Vec<ClientSubscriptionSyncItem>,
+    /// Verified local availability per discovered subscription ID.
+    pub discovered_health: HashMap<String, LocalSubscriptionHealth>,
     /// Latest live `MagpieStateDto` fetched from Settings/Magpie backend for cross-view sync.
     pub latest_state: Option<MagpieStateDto>,
     /// Latest server-fetched subscription DTOs for cross-view model catalog sync.
@@ -58,6 +103,12 @@ pub struct ShellMagpieLocalState {
     pub active_legacy_subscription_id: Option<String>,
     /// Currently active model override for the legacy-synced subscription.
     pub active_legacy_model: Option<String>,
+    /// Currently running interactive browser/CLI re-authentication session, if any.
+    pub reauth_in_progress: Option<ActiveProviderReauth>,
+    /// Generation counter for interactive re-authentication sessions.
+    pub reauth_generation: u64,
+    /// Provider/subscription IDs currently executing a force refresh & re-activate check.
+    pub refreshing_provider_ids: HashSet<String>,
 }
 
 impl ShellMagpieLocalState {
@@ -65,20 +116,43 @@ impl ShellMagpieLocalState {
         Self::default()
     }
 
+    pub fn cancel_active_reauth(&mut self) -> bool {
+        self.reauth_generation = self.reauth_generation.wrapping_add(1);
+        if let Some(active) = self.reauth_in_progress.take() {
+            let _ = active.cancel_tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn reset_on_logout(&mut self) {
+        self.cancel_active_reauth();
         self.discovered_items.clear();
+        self.discovered_health.clear();
         self.latest_state = None;
         self.server_subscriptions.clear();
         self.bootstrapped_auth_generation = None;
         self.legacy_keepalive_generation = self.legacy_keepalive_generation.wrapping_add(1);
         self.active_legacy_subscription_id = None;
         self.active_legacy_model = None;
+        self.refreshing_provider_ids.clear();
+    }
+
+    pub fn is_local_item_usable(&self, id: &str) -> bool {
+        self.discovered_health.get(id).is_none_or(|h| h.usable)
     }
 
     pub fn cached_dtos(&self, active_provider: Option<&str>) -> Vec<SubscriptionAccountDto> {
         self.discovered_items
             .iter()
-            .map(|item| sync_item_to_account_dto(item, active_provider))
+            .map(|item| {
+                sync_item_to_account_dto_with_health(
+                    item,
+                    active_provider,
+                    self.discovered_health.get(&item.account.id),
+                )
+            })
             .collect()
     }
 }
@@ -111,6 +185,16 @@ pub fn sync_item_to_account_dto(
     item: &ClientSubscriptionSyncItem,
     active_provider: Option<&str>,
 ) -> SubscriptionAccountDto {
+    sync_item_to_account_dto_with_health(item, active_provider, None)
+}
+
+/// Converts a client-discovered `ClientSubscriptionSyncItem` into a UI `SubscriptionAccountDto`,
+/// incorporating verified local health (`LocalSubscriptionHealth`) when available.
+pub fn sync_item_to_account_dto_with_health(
+    item: &ClientSubscriptionSyncItem,
+    active_provider: Option<&str>,
+    health: Option<&LocalSubscriptionHealth>,
+) -> SubscriptionAccountDto {
     let acc = &item.account;
     let mut models = if !item.available_models.is_empty() {
         item.available_models.clone()
@@ -131,10 +215,39 @@ pub fn sync_item_to_account_dto(
         }
     }
 
-    let active = active_provider.is_some_and(|ap| {
-        ap == acc.id
-            || (acc.kind == SubscriptionKind::GoogleVertex && ap == "magpie_provider:google-vertex")
-    });
+    let now_ms = Utc::now().timestamp_millis();
+    let (mut usable, mut unavailable_code, mut unavailable_reason) = health
+        .map(|h| (h.usable, h.error_code.clone(), h.reason.clone()))
+        .unwrap_or((true, None, None));
+    if usable {
+        let non_refreshable =
+            acc.kind != SubscriptionKind::GoogleVertex && acc.kind != SubscriptionKind::CodexChatGpt;
+        if non_refreshable && acc.expires_at_ms.is_some_and(|exp| exp <= now_ms) {
+            usable = false;
+            unavailable_code = Some("token_expired".to_string());
+            unavailable_reason = Some("登录凭据已过期，请点击「重新登录」".to_string());
+        } else if !acc.active
+            && item.vertex_adc.is_none()
+            && item.codex_oauth.is_none()
+            && item
+                .access_token
+                .as_deref()
+                .or(acc.access_token.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
+            usable = false;
+            unavailable_code = Some("missing_credentials".to_string());
+            unavailable_reason = Some("未检测到有效凭据，请点击「重新登录」".to_string());
+        }
+    }
+
+    let active = usable
+        && active_provider.is_some_and(|ap| {
+            ap == acc.id
+                || (acc.kind == SubscriptionKind::GoogleVertex && ap == "magpie_provider:google-vertex")
+        });
 
     SubscriptionAccountDto {
         id: acc.id.clone(),
@@ -144,7 +257,315 @@ pub fn sync_item_to_account_dto(
         plan: acc.plan.clone(),
         models,
         active,
+        usable,
+        unavailable_code,
+        unavailable_reason,
     }
+}
+
+fn vertex_token_url_from_item(item: &ClientSubscriptionSyncItem) -> Option<String> {
+    item.raw_headers
+        .iter()
+        .chain(item.account.headers.iter())
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-vertex-token-url"))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn is_local_offline_test_mode() -> bool {
+    if std::env::var_os("HERMES_FORCE_LIVE_HEALTH_CHECK").is_some() {
+        return false;
+    }
+    if cfg!(test)
+        || std::env::var_os("GPUI_OFFLINE_TEST").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("NEXTEST_RUN_ID").is_some()
+    {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let parent_dir = exe.parent()?;
+            let parent = parent_dir.file_name()?.to_str()?;
+            let stem = exe.file_stem()?.to_str()?;
+            let in_deps = parent == "deps" && stem.contains('-');
+            let has_hash_suffix = stem.rsplit_once('-').is_some_and(|(_, suffix)| {
+                suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            let in_cargo_build_out = parent == "out"
+                && has_hash_suffix
+                && parent_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some("build");
+            Some(in_deps || in_cargo_build_out)
+        })
+        .unwrap_or(false)
+}
+
+async fn verify_single_discovered_subscription(
+    http: &reqwest::Client,
+    item: &ClientSubscriptionSyncItem,
+) -> LocalSubscriptionHealth {
+    let now_ms = Utc::now().timestamp_millis();
+    let offline_test = is_local_offline_test_mode();
+    let acc = &item.account;
+
+    match acc.kind {
+        SubscriptionKind::GoogleVertex => {
+            if let Some(ref adc) = item.vertex_adc {
+                if adc.refresh_token.trim().is_empty() || adc.client_id.trim().is_empty() {
+                    return LocalSubscriptionHealth::unavailable(
+                        "missing_credentials",
+                        "Google Vertex AI ADC 凭据不完整，请点击「重新登录」完成授权",
+                    );
+                }
+                let custom_token_url = vertex_token_url_from_item(item);
+                let is_loopback_token_url = custom_token_url
+                    .as_deref()
+                    .is_some_and(is_loopback_server_url);
+                if offline_test && !is_loopback_token_url {
+                    return LocalSubscriptionHealth::usable();
+                }
+                let mut mgr = VertexTokenManager::new(adc.clone());
+                if let Some(url) = custom_token_url {
+                    mgr = mgr.with_token_url(url);
+                }
+                match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    mgr.get_or_refresh_token(http, now_ms),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => LocalSubscriptionHealth::usable(),
+                    Ok(Err(e)) => {
+                        let raw = e.to_string();
+                        let code = classify_provider_auth_error_code(&raw);
+                        LocalSubscriptionHealth::unavailable(
+                            code,
+                            format_provider_unavailable_reason(&acc.id, &raw),
+                        )
+                    }
+                    Err(_) => LocalSubscriptionHealth::unavailable(
+                        "unreachable",
+                        "Google Vertex AI OAuth 验证超时，请检查网络连接",
+                    ),
+                }
+            } else if let Some(tok) = item
+                .access_token
+                .as_deref()
+                .or(acc.access_token.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let expired = acc.expires_at_ms.is_some_and(|exp| exp <= now_ms)
+                    || extract_jwt_exp_ms(tok).is_some_and(|exp| exp <= now_ms);
+                if expired {
+                    LocalSubscriptionHealth::unavailable(
+                        "token_expired",
+                        "Google Vertex AI 访问令牌已过期，请点击「重新登录」",
+                    )
+                } else {
+                    LocalSubscriptionHealth::usable()
+                }
+            } else {
+                LocalSubscriptionHealth::unavailable(
+                    "missing_credentials",
+                    "缺少 Google Vertex AI 凭据，请点击「重新登录」",
+                )
+            }
+        }
+        SubscriptionKind::CodexChatGpt => {
+            let access_tok = item
+                .access_token
+                .as_deref()
+                .or(acc.access_token.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(tok) = access_tok {
+                let is_fresh = extract_jwt_exp_ms(tok).is_none_or(|exp| {
+                    exp > now_ms.saturating_add(DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS)
+                });
+                if is_fresh && acc.expires_at_ms.is_none_or(|exp| exp > now_ms) {
+                    return LocalSubscriptionHealth::usable();
+                }
+            }
+            if let Some(ref oauth) = item.codex_oauth {
+                if !oauth.refresh_token.trim().is_empty() {
+                    let is_loopback_token_url = oauth
+                        .token_url
+                        .as_deref()
+                        .is_some_and(is_loopback_server_url);
+                    if offline_test && !is_loopback_token_url {
+                        return LocalSubscriptionHealth::usable();
+                    }
+                    let mut mgr = CodexTokenManager::new(oauth.refresh_token.clone());
+                    if let Some(ref cid) = oauth.client_id {
+                        if !cid.trim().is_empty() {
+                            mgr = mgr.with_client_id(cid.clone());
+                        }
+                    }
+                    if let Some(ref url) = oauth.token_url {
+                        if !url.trim().is_empty() {
+                            mgr = mgr.with_token_url(url.clone());
+                        }
+                    }
+                    if acc.source_path.ends_with("auth.json") {
+                        mgr = mgr.with_persist_path(PathBuf::from(&acc.source_path));
+                    }
+                    return match tokio::time::timeout(
+                        Duration::from_secs(8),
+                        mgr.get_or_refresh_token(http, now_ms),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => LocalSubscriptionHealth::usable(),
+                        Ok(Err(e)) => {
+                            let raw = e.to_string();
+                            let code = classify_provider_auth_error_code(&raw);
+                            LocalSubscriptionHealth::unavailable(
+                                code,
+                                format_provider_unavailable_reason(&acc.id, &raw),
+                            )
+                        }
+                        Err(_) => LocalSubscriptionHealth::unavailable(
+                            "unreachable",
+                            "Codex / ChatGPT OAuth 验证超时，请检查网络连接",
+                        ),
+                    };
+                }
+            }
+            if access_tok.is_some() {
+                LocalSubscriptionHealth::unavailable(
+                    "token_expired",
+                    "Codex / ChatGPT OAuth 令牌已过期，请点击「重新登录」",
+                )
+            } else {
+                LocalSubscriptionHealth::unavailable(
+                    "missing_credentials",
+                    "缺少 Codex / ChatGPT 登录凭据，请点击「重新登录」",
+                )
+            }
+        }
+        _ => {
+            let tok = item
+                .access_token
+                .as_deref()
+                .or(acc.access_token.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if tok.is_none() {
+                return LocalSubscriptionHealth::unavailable(
+                    "missing_credentials",
+                    "未检测到有效凭据，请点击「重新登录」",
+                );
+            }
+            if acc.expires_at_ms.is_some_and(|exp| exp <= now_ms)
+                || tok.and_then(extract_jwt_exp_ms).is_some_and(|exp| exp <= now_ms)
+            {
+                return LocalSubscriptionHealth::unavailable(
+                    "token_expired",
+                    "登录凭据已过期，请点击「重新登录」",
+                );
+            }
+            if let Some(base_url) = acc
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let is_loopback = is_loopback_server_url(base_url);
+                if is_loopback {
+                    let probe_url = format!("{}/models", base_url.trim_end_matches('/'));
+                    let mut req = http.get(&probe_url);
+                    if let Some(t) = tok {
+                        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+                    }
+                    return match tokio::time::timeout(Duration::from_millis(1500), req.send()).await {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status();
+                            if status == reqwest::StatusCode::UNAUTHORIZED
+                                || status == reqwest::StatusCode::FORBIDDEN
+                            {
+                                let msg = format!("HTTP {}", status.as_u16());
+                                LocalSubscriptionHealth::unavailable(
+                                    classify_provider_auth_error_code(&msg),
+                                    format_provider_unavailable_reason(&acc.id, &msg),
+                                )
+                            } else {
+                                LocalSubscriptionHealth::usable()
+                            }
+                        }
+                        Ok(Err(_)) | Err(_) => LocalSubscriptionHealth::unavailable(
+                            "unreachable",
+                            "本地代理服务未运行或无法连接",
+                        ),
+                    };
+                } else if !offline_test && acc.kind == SubscriptionKind::ClaudeCode {
+                    let probe_url = format!("{}/models", base_url.trim_end_matches('/'));
+                    let mut req = http
+                        .get(&probe_url)
+                        .header("anthropic-version", "2023-06-01");
+                    if let Some(t) = tok {
+                        if t.starts_with("sk-ant-oat") {
+                            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+                        } else {
+                            req = req.header("x-api-key", t);
+                        }
+                    }
+                    if let Ok(Ok(resp)) =
+                        tokio::time::timeout(Duration::from_secs(5), req.send()).await
+                    {
+                        let status = resp.status();
+                        if status == reqwest::StatusCode::UNAUTHORIZED
+                            || status == reqwest::StatusCode::FORBIDDEN
+                        {
+                            let msg = format!("HTTP {}", status.as_u16());
+                            return LocalSubscriptionHealth::unavailable(
+                                classify_provider_auth_error_code(&msg),
+                                format_provider_unavailable_reason(&acc.id, &msg),
+                            );
+                        }
+                    }
+                }
+            }
+            LocalSubscriptionHealth::usable()
+        }
+    }
+}
+
+/// Concurrently verifies whether each client-discovered local subscription is usable right now
+/// (e.g., testing Google Vertex AI OAuth refresh token exchange to catch `invalid_grant` early).
+pub async fn verify_discovered_subscriptions(
+    items: &[ClientSubscriptionSyncItem],
+) -> HashMap<String, LocalSubscriptionHealth> {
+    if items.is_empty() {
+        return HashMap::new();
+    }
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut join_set = tokio::task::JoinSet::new();
+    for item in items.iter().cloned() {
+        let http_cl = http.clone();
+        join_set.spawn(async move {
+            let id = item.account.id.clone();
+            let status = verify_single_discovered_subscription(&http_cl, &item).await;
+            (id, status)
+        });
+    }
+    let mut out = HashMap::with_capacity(items.len());
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((id, status)) = res {
+            out.insert(id, status);
+        }
+    }
+    out
 }
 
 /// Orders active locally discovered subscriptions by activation priority:
@@ -191,7 +612,10 @@ pub async fn resolve_fresh_bearer_token(
     match item.account.kind {
         SubscriptionKind::GoogleVertex => {
             if let Some(ref adc) = item.vertex_adc {
-                let mgr = VertexTokenManager::new(adc.clone());
+                let mut mgr = VertexTokenManager::new(adc.clone());
+                if let Some(url) = vertex_token_url_from_item(item) {
+                    mgr = mgr.with_token_url(url);
+                }
                 return mgr
                     .get_or_refresh_token(http_client, now_ms)
                     .await
@@ -359,6 +783,7 @@ struct NativeSyncResponse {
 pub struct LocalSubscriptionSyncOutcome {
     pub state: Option<MagpieStateDto>,
     pub local_items: Vec<ClientSubscriptionSyncItem>,
+    pub local_health: HashMap<String, LocalSubscriptionHealth>,
     pub used_legacy_fallback: bool,
     pub auto_activated_id: Option<String>,
     pub auto_activated_label: Option<String>,
@@ -393,6 +818,7 @@ pub async fn sync_local_subscriptions_to_server(
         .unwrap_or_else(|e| LocalSubscriptionSyncOutcome {
             state: None,
             local_items: items_fallback,
+            local_health: HashMap::new(),
             used_legacy_fallback: false,
             auto_activated_id: None,
             auto_activated_label: None,
@@ -440,12 +866,14 @@ async fn sync_local_subscriptions_to_server_inner(
     } else {
         items
     };
+    let mut local_health = verify_discovered_subscriptions(&items).await;
     if items.is_empty() && !target_is_remote {
         check_pinned_epoch(pinned, token)?;
         let state = client.hermes.magpie_state(token).await.ok();
         return Ok(LocalSubscriptionSyncOutcome {
             state,
             local_items: items,
+            local_health,
             used_legacy_fallback: false,
             auto_activated_id: None,
             auto_activated_label: None,
@@ -481,9 +909,29 @@ async fn sync_local_subscriptions_to_server_inner(
                         client.hermes.magpie_state(token).await.ok()
                     }
                 };
+                if let Some(ref st) = state {
+                    for s in &st.subscriptions {
+                        if !s.is_selectable() {
+                            local_health.insert(
+                                s.id.clone(),
+                                LocalSubscriptionHealth::unavailable(
+                                    s.unavailable_code.clone().unwrap_or_default(),
+                                    s.unavailable_reason.clone().unwrap_or_default(),
+                                ),
+                            );
+                        }
+                    }
+                }
                 let (act_id, act_label, act_model) = state
                     .as_ref()
-                    .filter(|s| !s.active_provider.is_empty() && s.active_provider != "local_hermes")
+                    .filter(|s| {
+                        !s.needs_provider_selection
+                            && !s.active_provider.is_empty()
+                            && s.active_provider != "local_hermes"
+                            && local_health
+                                .get(&s.active_provider)
+                                .is_none_or(|h| h.usable)
+                    })
                     .map(|s| {
                         let lbl = items
                             .iter()
@@ -500,6 +948,7 @@ async fn sync_local_subscriptions_to_server_inner(
                 return Ok(LocalSubscriptionSyncOutcome {
                     state,
                     local_items: items,
+                    local_health,
                     used_legacy_fallback: false,
                     auto_activated_id: act_id,
                     auto_activated_label: act_label,
@@ -524,6 +973,14 @@ async fn sync_local_subscriptions_to_server_inner(
         let candidates = pick_ordered_bootstrap_candidates(&items);
         let mut last_err: Option<String> = None;
         for cand in candidates {
+            if let Some(h) = local_health.get(&cand.account.id).filter(|h| !h.usable) {
+                last_err = Some(format!(
+                    "{}: {}",
+                    cand.account.label,
+                    h.reason.as_deref().unwrap_or("凭据不可用")
+                ));
+                continue;
+            }
             check_pinned_epoch(pinned, token)?;
             match resolve_fresh_bearer_token(&http, &cand).await {
                 Ok(bearer) => {
@@ -535,6 +992,7 @@ async fn sync_local_subscriptions_to_server_inner(
                             return Ok(LocalSubscriptionSyncOutcome {
                                 state: Some(saved.state),
                                 local_items: items,
+                                local_health,
                                 used_legacy_fallback: true,
                                 auto_activated_id: Some(cand.account.id.clone()),
                                 auto_activated_label: Some(cand.account.label.clone()),
@@ -548,6 +1006,12 @@ async fn sync_local_subscriptions_to_server_inner(
                     }
                 }
                 Err(e) => {
+                    let code = classify_provider_auth_error_code(&e);
+                    let formatted = format_provider_unavailable_reason(&cand.account.id, &e);
+                    local_health.insert(
+                        cand.account.id.clone(),
+                        LocalSubscriptionHealth::unavailable(code, formatted),
+                    );
                     last_err = Some(format!("{}: {e}", cand.account.label));
                 }
             }
@@ -555,6 +1019,7 @@ async fn sync_local_subscriptions_to_server_inner(
         return Ok(LocalSubscriptionSyncOutcome {
             state: current_state,
             local_items: items,
+            local_health,
             used_legacy_fallback: true,
             auto_activated_id: None,
             auto_activated_label: None,
@@ -566,6 +1031,7 @@ async fn sync_local_subscriptions_to_server_inner(
     Ok(LocalSubscriptionSyncOutcome {
         state: current_state,
         local_items: items,
+        local_health,
         used_legacy_fallback: true,
         auto_activated_id: None,
         auto_activated_label: None,
@@ -667,7 +1133,8 @@ async fn activate_subscription_with_local_fallback_inner(
         .send()
         .await
     {
-        if resp.status().is_success() {
+        let status = resp.status();
+        if status.is_success() {
             if let Ok(parsed) = resp.json::<SubscriptionActivateResponse>().await {
                 check_pinned_epoch(pinned, token)?;
                 let state = client.hermes.magpie_state(token).await.ok();
@@ -678,6 +1145,24 @@ async fn activate_subscription_with_local_fallback_inner(
                     used_legacy_fallback: false,
                 });
             }
+        } else if status != reqwest::StatusCode::NOT_FOUND
+            && status != reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            // Explicit server rejection (e.g. 400 `provider_unavailable` after OAuth verification):
+            // NEVER bypass with legacy fallback.
+            let body = resp.text().await.unwrap_or_default();
+            let parsed_msg = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .or_else(|| v.get("error"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                });
+            let err_msg = parsed_msg
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("Server rejected activation ({status})"));
+            return Err(err_msg);
         }
     }
 
@@ -997,11 +1482,338 @@ pub fn is_provider_router_usable(router: &ProviderRouter) -> bool {
         return false;
     }
     let (active_id, active_model, active_mode) = router.active_info();
-    (active_mode != ApiMode::LocalHermes
+    let active_ok = active_mode != ApiMode::LocalHermes
         && active_id != "local_hermes"
-        && !active_model.eq_ignore_ascii_case("hermes-local-v1"))
-        || router.has_configured_provider()
-        || router.has_active_subscription()
+        && !active_model.eq_ignore_ascii_case("hermes-local-v1")
+        && router.provider_availability(&active_id).usable;
+    active_ok || router.has_configured_provider() || router.has_active_subscription()
+}
+
+/// Outcome of a one-click refresh & re-activate attempt for a provider or subscription.
+pub struct ProviderRefreshOutcome {
+    pub provider_id: String,
+    pub usable: bool,
+    pub activated: bool,
+    pub active_model: Option<String>,
+    pub unavailable_code: Option<String>,
+    pub unavailable_reason: Option<String>,
+    pub state: Option<MagpieStateDto>,
+    pub local_items: Vec<ClientSubscriptionSyncItem>,
+    pub local_health: HashMap<String, LocalSubscriptionHealth>,
+    pub used_legacy_fallback: bool,
+}
+
+/// Discovers all local subscriptions under `$HOME` regardless of whether the remote cloud server
+/// accepts cross-device sync (used for in-process `FabushiBotHost` refresh after local re-login).
+pub fn discover_all_local_subscriptions_in_home() -> Vec<ClientSubscriptionSyncItem> {
+    if std::env::var_os("GPUI_OFFLINE_TEST").is_some() {
+        return Vec::new();
+    }
+    let Some(home) = resolve_local_home_dir() else {
+        return Vec::new();
+    };
+    let codex_override = std::env::var_os("CODEX_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    discover_syncable_subscriptions_in_home(&home, codex_override.as_deref(), false)
+}
+
+/// Force-refreshes local & server credentials for `target_id` (optionally matching by `kind_hint`
+/// when a user re-logged into a different account email for the same subscription family),
+/// verifies availability live, and atomically activates it when usable.
+pub async fn refresh_and_activate_provider_or_subscription_pinned(
+    client: &Arc<TelegramClient>,
+    expected_epoch: u64,
+    base_url: &str,
+    token: &str,
+    target_id: &str,
+    kind_hint: Option<SubscriptionKind>,
+    model_override: Option<&str>,
+) -> Result<ProviderRefreshOutcome, String> {
+    client
+        .ensure_pinned_session(expected_epoch, token)
+        .map_err(|e| format!("Session changed before provider refresh: {e}"))?;
+
+    let scan_base = base_url.to_string();
+    let mut local_items = tokio::task::spawn_blocking(move || {
+        discover_local_subscriptions_for_server(&scan_base)
+    })
+    .await
+    .unwrap_or_default();
+
+    if let Ok(cat) =
+        fetch_live_models_catalog_pinned(client, expected_epoch, base_url, token, false).await
+    {
+        enrich_items_with_live_catalog(&mut local_items, &cat);
+    }
+
+    let mut local_health = verify_discovered_subscriptions(&local_items).await;
+
+    // Resolve whether `target_id` (or `kind_hint`) maps to a freshly discovered local subscription.
+    let matched_local = local_items
+        .iter()
+        .find(|i| {
+            i.account.id == target_id
+                || (i.account.kind == SubscriptionKind::GoogleVertex
+                    && target_id == "magpie_provider:google-vertex")
+        })
+        .or_else(|| {
+            kind_hint.and_then(|kind| {
+                local_items
+                    .iter()
+                    .find(|i| {
+                        i.account.kind == kind
+                            && local_health.get(&i.account.id).is_none_or(|h| h.usable)
+                    })
+                    .or_else(|| local_items.iter().find(|i| i.account.kind == kind))
+            })
+        })
+        .cloned();
+
+    if let Some(local_item) = matched_local {
+        let resolved_id = local_item.account.id.clone();
+        if let Some(h) = local_health.get(&resolved_id).filter(|h| !h.usable).cloned() {
+            // Still sync so server records the fresh health status cleanly.
+            let sync_outcome = sync_local_subscriptions_to_server_pinned(
+                client,
+                expected_epoch,
+                base_url,
+                token,
+                local_items,
+                false,
+            )
+            .await?;
+            return Ok(ProviderRefreshOutcome {
+                provider_id: resolved_id,
+                usable: false,
+                activated: false,
+                active_model: None,
+                unavailable_code: h.error_code,
+                unavailable_reason: h.reason,
+                state: sync_outcome.state,
+                local_items: sync_outcome.local_items,
+                local_health: sync_outcome.local_health,
+                used_legacy_fallback: sync_outcome.used_legacy_fallback,
+            });
+        }
+
+        let sync_outcome = sync_local_subscriptions_to_server_pinned(
+            client,
+            expected_epoch,
+            base_url,
+            token,
+            local_items,
+            false,
+        )
+        .await?;
+        let act_res = activate_subscription_with_local_fallback_pinned(
+            client,
+            expected_epoch,
+            base_url,
+            token,
+            &resolved_id,
+            model_override,
+            &sync_outcome.local_items,
+        )
+        .await;
+        return match act_res {
+            Ok(act) => {
+                let mut health = sync_outcome.local_health;
+                health.insert(resolved_id.clone(), LocalSubscriptionHealth::usable());
+                Ok(ProviderRefreshOutcome {
+                    provider_id: act.active_provider_id,
+                    usable: true,
+                    activated: true,
+                    active_model: Some(act.active_model),
+                    unavailable_code: None,
+                    unavailable_reason: None,
+                    state: act.state.or(sync_outcome.state),
+                    local_items: sync_outcome.local_items,
+                    local_health: health,
+                    used_legacy_fallback: act.used_legacy_fallback,
+                })
+            }
+            Err(err) => {
+                let code = classify_provider_auth_error_code(&err);
+                let mut health = sync_outcome.local_health;
+                health.insert(
+                    resolved_id.clone(),
+                    LocalSubscriptionHealth::unavailable(code, err.clone()),
+                );
+                let refreshed_state = client
+                    .hermes_magpie_state_with_token(token, expected_epoch)
+                    .await
+                    .ok()
+                    .or(sync_outcome.state);
+                Ok(ProviderRefreshOutcome {
+                    provider_id: resolved_id,
+                    usable: false,
+                    activated: false,
+                    active_model: None,
+                    unavailable_code: Some(code.to_string()),
+                    unavailable_reason: Some(err),
+                    state: refreshed_state,
+                    local_items: sync_outcome.local_items,
+                    local_health: health,
+                    used_legacy_fallback: sync_outcome.used_legacy_fallback,
+                })
+            }
+        };
+    }
+
+    // Server-side API-key / custom / local / server-managed subscription refresh endpoint.
+    let refresh_req = MagpieRefreshProviderRequest {
+        activate: true,
+        model: model_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+    match client
+        .hermes_magpie_refresh_provider_with_token(
+            token,
+            expected_epoch,
+            target_id,
+            Some(&refresh_req),
+        )
+        .await
+    {
+        Ok(resp) => {
+            if resp.usable {
+                local_health.insert(resp.provider_id.clone(), LocalSubscriptionHealth::usable());
+            } else {
+                local_health.insert(
+                    resp.provider_id.clone(),
+                    LocalSubscriptionHealth::unavailable(
+                        resp.unavailable_code.clone().unwrap_or_default(),
+                        resp.unavailable_reason.clone().unwrap_or_default(),
+                    ),
+                );
+            }
+            Ok(ProviderRefreshOutcome {
+                provider_id: resp.provider_id,
+                usable: resp.usable,
+                activated: resp.activated,
+                active_model: (!resp.active_model.trim().is_empty()).then_some(resp.active_model),
+                unavailable_code: resp.unavailable_code,
+                unavailable_reason: resp.unavailable_reason,
+                state: Some(resp.state),
+                local_items,
+                local_health,
+                used_legacy_fallback: false,
+            })
+        }
+        Err(err) => {
+            // Legacy server fallback when `/providers/{id}/refresh` returns 404/405:
+            // probe first, and only activate when probe succeeds.
+            let err_str = err.to_string();
+            if err_str.contains("404") || err_str.contains("405") {
+                let probe_req = MagpieProbeRequest {
+                    model: model_override.map(str::to_string),
+                    prompt: Some("Reply with OK".to_string()),
+                };
+                let probe = client
+                    .hermes_magpie_probe_provider_with_token(
+                        token,
+                        expected_epoch,
+                        target_id,
+                        Some(&probe_req),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if probe.ok {
+                    let save_req = MagpieSaveProviderRequest {
+                        provider_id: Some(target_id.to_string()),
+                        default_model: model_override.map(str::to_string),
+                        enabled: Some(true),
+                        activate: true,
+                        ..Default::default()
+                    };
+                    let saved = client
+                        .hermes_magpie_save_provider_with_token(token, expected_epoch, &save_req)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(ProviderRefreshOutcome {
+                        provider_id: target_id.to_string(),
+                        usable: true,
+                        activated: true,
+                        active_model: Some(saved.state.active_model.clone()),
+                        unavailable_code: None,
+                        unavailable_reason: None,
+                        state: Some(saved.state),
+                        local_items,
+                        local_health,
+                        used_legacy_fallback: true,
+                    });
+                }
+                let reason = probe
+                    .error
+                    .unwrap_or_else(|| "连通性检测失败，服务商当前不可用".to_string());
+                let code = classify_provider_auth_error_code(&reason);
+                let state = client
+                    .hermes_magpie_state_with_token(token, expected_epoch)
+                    .await
+                    .ok();
+                return Ok(ProviderRefreshOutcome {
+                    provider_id: target_id.to_string(),
+                    usable: false,
+                    activated: false,
+                    active_model: None,
+                    unavailable_code: Some(code.to_string()),
+                    unavailable_reason: Some(reason),
+                    state,
+                    local_items,
+                    local_health,
+                    used_legacy_fallback: true,
+                });
+            }
+            Err(err_str)
+        }
+    }
+}
+
+/// Applies locally verified subscription availability onto the in-process `FabushiBotHost`
+/// so dead/revoked local credentials (e.g. Google Vertex AI `invalid_grant`) are immediately
+/// marked unavailable and demoted from `active_provider_id` in local Fabushi execution too.
+pub fn apply_local_subscription_health_to_fabushi_for_user(
+    host: &FabushiBotHost,
+    health: &HashMap<String, LocalSubscriptionHealth>,
+    user_id: Option<&str>,
+) {
+    if health.is_empty() {
+        return;
+    }
+    let core = host.core_engine();
+    let router = if let Some(uid) = user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        core.providers_for_user(uid)
+    } else {
+        core.providers().clone()
+    };
+    let mut changed = false;
+    for (id, status) in health {
+        if status.usable {
+            router.mark_provider_usable(id);
+            changed = true;
+        } else {
+            let code = status
+                .error_code
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or("local_verify_failed");
+            let msg = status
+                .reason
+                .clone()
+                .unwrap_or_else(|| "凭据验证失败，当前不可用".to_string());
+            router.mark_provider_unavailable(id, code, msg);
+            changed = true;
+        }
+    }
+    if router.reconcile_active_provider() || changed {
+        if let Some(uid) = user_id.map(str::trim).filter(|s| !s.is_empty()) {
+            core.persist_user_providers_state(uid);
+        }
+        host.sync_all_providers();
+    }
 }
 
 /// Hydrates locally discovered AI OAuth / ADC subscriptions directly into the desktop's
@@ -1245,5 +2057,60 @@ mod tests {
             c_req.custom_headers.get("ChatGPT-Account-ID").map(String::as_str),
             Some("acct_team_1")
         );
+    }
+
+    #[test]
+    fn verify_discovered_subscriptions_catches_vertex_invalid_grant_locally() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"error":"invalid_grant","error_description":"Bad Request"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+
+            let mut vertex = sample_vertex_item();
+            vertex.raw_headers.insert(
+                "x-vertex-token-url".to_string(),
+                format!("http://{addr}/token"),
+            );
+            let health = verify_discovered_subscriptions(&[vertex.clone()]).await;
+            let status = health
+                .get(&vertex.account.id)
+                .expect("vertex health entry present");
+            assert!(
+                !status.usable,
+                "revoked Vertex OAuth refresh token must be marked unusable"
+            );
+            assert_eq!(status.error_code.as_deref(), Some("oauth_invalid_grant"));
+            let r = status.reason.as_deref().unwrap_or("");
+            assert!(
+                r.contains("invalid_grant"),
+                "expected invalid_grant in reason, got: {r}"
+            );
+
+            let dto = sync_item_to_account_dto_with_health(
+                &vertex,
+                Some(&vertex.account.id),
+                health.get(&vertex.account.id),
+            );
+            assert!(!dto.usable);
+            assert!(!dto.active, "unusable subscription must never be marked active");
+            assert_eq!(dto.unavailable_code.as_deref(), Some("oauth_invalid_grant"));
+            assert!(dto.unavailable_reason.as_deref().is_some_and(|s| s.contains("invalid_grant")));
+        });
     }
 }

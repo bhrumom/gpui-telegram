@@ -350,6 +350,7 @@ pub struct CreateManagedBotBoxPeers {
     pub model_picker_open: bool,
     pub model_picker: OpenBotModelPickerState,
     pub pending_open_providers_settings: bool,
+    pub pending_provider_recovery_action: Option<OpenBotModelPickerAction>,
     pub advanced_open: bool,
     pub hero_wink_toggle: bool,
     pub ai_models: crate::views::drawer::InspectorAiModelCatalog,
@@ -409,6 +410,7 @@ impl CreateManagedBotBoxPeers {
             model_picker_open: false,
             model_picker: OpenBotModelPickerState::default(),
             pending_open_providers_settings: false,
+            pending_provider_recovery_action: None,
             advanced_open: false,
             hero_wink_toggle: false,
             ai_models: crate::views::drawer::InspectorAiModelCatalog::default(),
@@ -625,10 +627,24 @@ impl CreateManagedBotBoxPeers {
         );
     }
 
+    pub fn sync_provider_recovery_progress(
+        &mut self,
+        reauth_provider_id: Option<String>,
+        refreshing_provider_ids: Vec<String>,
+    ) {
+        self.model_picker
+            .sync_recovery_progress(reauth_provider_id, refreshing_provider_ids);
+    }
+
     /// Applies an interaction event emitted by the shared OpenBot two-column model picker popover.
     pub fn handle_model_picker_action(&mut self, action: OpenBotModelPickerAction) {
         match action {
             OpenBotModelPickerAction::SelectProvider(pid) => {
+                if !self.model_picker.providers.is_empty()
+                    && !self.model_picker.is_provider_selectable(&pid)
+                {
+                    return;
+                }
                 self.model_picker.selected_provider_id = pid;
                 self.model_picker.legacy_expanded = false;
                 self.model_picker.effort_menu_open = false;
@@ -648,6 +664,11 @@ impl CreateManagedBotBoxPeers {
                 provider_id,
                 model_id,
             } => {
+                if !self.model_picker.providers.is_empty()
+                    && !self.model_picker.is_provider_selectable(&provider_id)
+                {
+                    return;
+                }
                 self.model_picker.selected_provider_id = provider_id;
                 self.preferred_model = model_id;
                 self.model_picker_open = false;
@@ -668,6 +689,38 @@ impl CreateManagedBotBoxPeers {
             OpenBotModelPickerAction::SelectEffort(effort) => {
                 self.thinking_level = effort;
                 self.model_picker.effort_menu_open = false;
+            }
+            OpenBotModelPickerAction::ToggleUnavailableExpanded => {
+                self.model_picker.unavailable_expanded = !self.model_picker.unavailable_expanded;
+            }
+            OpenBotModelPickerAction::ReauthenticateProvider {
+                provider_id,
+                kind_hint,
+            } => {
+                self.pending_provider_recovery_action =
+                    Some(OpenBotModelPickerAction::ReauthenticateProvider {
+                        provider_id,
+                        kind_hint,
+                    });
+            }
+            OpenBotModelPickerAction::CancelReauthenticate => {
+                self.pending_provider_recovery_action =
+                    Some(OpenBotModelPickerAction::CancelReauthenticate);
+            }
+            OpenBotModelPickerAction::RefreshAndActivateProvider(pid) => {
+                self.pending_provider_recovery_action =
+                    Some(OpenBotModelPickerAction::RefreshAndActivateProvider(pid));
+            }
+            OpenBotModelPickerAction::RefreshAllProviders => {
+                self.pending_provider_recovery_action =
+                    Some(OpenBotModelPickerAction::RefreshAllProviders);
+            }
+            OpenBotModelPickerAction::InspectProviderSettings(pid) => {
+                self.model_picker_open = false;
+                self.model_picker.search_focused = false;
+                self.model_picker.effort_menu_open = false;
+                self.pending_provider_recovery_action =
+                    Some(OpenBotModelPickerAction::InspectProviderSettings(pid));
             }
             OpenBotModelPickerAction::OpenProvidersSettings => {
                 self.model_picker_open = false;
@@ -1039,6 +1092,10 @@ impl CreateManagedBotBoxPeers {
         let was = self.pending_open_providers_settings;
         self.pending_open_providers_settings = false;
         was
+    }
+
+    pub fn take_provider_recovery_action(&mut self) -> Option<OpenBotModelPickerAction> {
+        self.pending_provider_recovery_action.take()
     }
 
     /// Renders OpenBot's `FirstAgentSetup` avatar studio block: `72x72px` interactive 3D plush
@@ -2838,6 +2895,7 @@ mod tests {
                     "gpt-4o".to_string(),
                 ],
                 active: true,
+                ..Default::default()
             },
             crate::views::settings::sections::settings_ai_providers::SubscriptionAccountDto {
                 id: "claude:local".to_string(),
@@ -2847,6 +2905,7 @@ mod tests {
                 plan: None,
                 models: vec!["claude-sonnet-4-6".to_string()],
                 active: false,
+                ..Default::default()
             },
         ];
         box_ui.sync_magpie_catalog(&magpie, &[], &subs);

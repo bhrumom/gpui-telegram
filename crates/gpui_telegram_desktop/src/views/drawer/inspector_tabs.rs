@@ -539,8 +539,28 @@ impl InspectorAiModelCatalog {
                 .collect()
         };
 
+        // Conservatively merge state.subscriptions usability into merged_subs
+        for s in &state.subscriptions {
+            if let Some(existing) = merged_subs.iter_mut().find(|m| m.id == s.id) {
+                if !s.is_selectable() {
+                    existing.usable = false;
+                    existing.active = false;
+                    if existing.unavailable_reason.is_none() {
+                        existing.unavailable_reason = s.unavailable_reason.clone();
+                    }
+                }
+            }
+        }
+
         for local in local_subs {
             if let Some(existing) = merged_subs.iter_mut().find(|s| s.id == local.id) {
+                if !local.is_selectable() {
+                    existing.usable = false;
+                    existing.active = false;
+                    if existing.unavailable_reason.is_none() {
+                        existing.unavailable_reason = local.unavailable_reason.clone();
+                    }
+                }
                 if !local.models.is_empty() {
                     let mut combined = local.models.clone();
                     for m in &existing.models {
@@ -555,8 +575,21 @@ impl InspectorAiModelCatalog {
             }
         }
 
+        // Cross-check subscriptions against matching state.providers entries
+        for sub in &mut merged_subs {
+            if let Some(prov) = state.providers.iter().find(|p| p.provider_id == sub.id) {
+                if !prov.is_selectable() {
+                    sub.usable = false;
+                    sub.active = false;
+                    if sub.unavailable_reason.is_none() {
+                        sub.unavailable_reason = prov.unavailable_reason.clone();
+                    }
+                }
+            }
+        }
+
         let active_pid_raw = state.active_provider.trim();
-        let active_sub = if state.needs_provider_selection {
+        let active_sub_raw = if state.needs_provider_selection {
             None
         } else {
             merged_subs
@@ -570,26 +603,40 @@ impl InspectorAiModelCatalog {
                 .or_else(|| {
                     active_pid_raw
                         .is_empty()
-                        .then(|| merged_subs.iter().find(|sub| sub.active))
+                        .then(|| merged_subs.iter().find(|sub| sub.active && sub.is_selectable()))
                         .flatten()
                 })
         };
+        let active_sub = active_sub_raw.filter(|s| s.is_selectable());
 
-        let active_prov = if state.needs_provider_selection {
+        let active_prov_raw = if state.needs_provider_selection {
             None
         } else {
             state
                 .providers
                 .iter()
                 .find(|p| !active_pid_raw.is_empty() && p.provider_id == active_pid_raw)
-                .or_else(|| state.providers.iter().find(|p| p.is_active))
+                .or_else(|| state.providers.iter().find(|p| p.is_active && p.is_selectable()))
         };
+        let active_prov = active_prov_raw.filter(|p| p.is_selectable());
+
+        let active_explicitly_unavailable = !active_pid_raw.is_empty()
+            && active_pid_raw != "local_hermes"
+            && (active_sub_raw.is_some_and(|s| !s.is_selectable())
+                || active_prov_raw.is_some_and(|p| !p.is_selectable()));
 
         let allow_local = active_pid_raw == "local_hermes"
             && state.allow_local_fallback
             && !state.needs_provider_selection;
 
-        let active_provider_id = if state.needs_provider_selection {
+        let effective_needs_selection = state.needs_provider_selection
+            || active_explicitly_unavailable
+            || (active_sub.is_none()
+                && active_prov.is_none()
+                && !allow_local
+                && (active_pid_raw.is_empty() || active_pid_raw == "local_hermes"));
+
+        let active_provider_id = if effective_needs_selection {
             String::new()
         } else if !active_pid_raw.is_empty() {
             active_pid_raw.to_string()
@@ -601,7 +648,7 @@ impl InspectorAiModelCatalog {
             String::new()
         };
 
-        let active_provider_name = if state.needs_provider_selection {
+        let active_provider_name = if effective_needs_selection {
             String::new()
         } else if let Some(sub) = active_sub {
             sub.label
@@ -618,7 +665,7 @@ impl InspectorAiModelCatalog {
             String::new()
         };
 
-        let active_model = if state.needs_provider_selection {
+        let active_model = if effective_needs_selection {
             String::new()
         } else if Self::is_usable_model(&state.active_model, allow_local) {
             state.active_model.trim().to_string()
@@ -647,7 +694,7 @@ impl InspectorAiModelCatalog {
             }
         };
 
-        if !state.needs_provider_selection {
+        if !effective_needs_selection {
             push_active_model(&active_model);
             if let Some(sub) = active_sub {
                 for m in &sub.models {
@@ -684,6 +731,29 @@ impl InspectorAiModelCatalog {
         for group in &state.routing_groups {
             let gid = group.id.trim();
             if !gid.is_empty() {
+                let any_member_usable = group.members.is_empty()
+                    || group.members.iter().any(|m| {
+                        if !m.enabled {
+                            return false;
+                        }
+                        let member_pid = m
+                            .target
+                            .split_once('/')
+                            .map(|(p, _)| p.trim())
+                            .unwrap_or_else(|| m.target.trim());
+                        state
+                            .providers
+                            .iter()
+                            .find(|p| p.provider_id == member_pid)
+                            .is_none_or(|p| p.is_selectable())
+                            && merged_subs
+                                .iter()
+                                .find(|s| s.id == member_pid)
+                                .is_none_or(|s| s.is_selectable())
+                    });
+                if !any_member_usable {
+                    continue;
+                }
                 let target = format!("group/{gid}");
                 if !routing_group_models
                     .iter()
@@ -698,7 +768,7 @@ impl InspectorAiModelCatalog {
             active_provider_id,
             active_provider_name,
             active_model,
-            needs_provider_selection: state.needs_provider_selection,
+            needs_provider_selection: effective_needs_selection,
             synced: true,
             active_provider_models,
             routing_group_models,

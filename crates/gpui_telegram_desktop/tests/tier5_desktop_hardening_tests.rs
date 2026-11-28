@@ -5648,6 +5648,7 @@ async fn t5_35_body(app: AsyncApp) {
             plan: Some("pro".into()),
             models: vec!["gpt-5".into()],
             active: true,
+            ..Default::default()
         };
         shell.tasks_workspace.update(cx, |w, _| {
             w.sync_magpie_state(state.clone());
@@ -8283,6 +8284,7 @@ async fn t5_43_body(app: AsyncApp) {
                 plan: None,
                 models: vec!["gpt-5".into()],
                 active: true,
+                ..Default::default()
             }];
             shell.magpie_local.bootstrapped_auth_generation = Some(42);
             let prev_keepalive = shell.magpie_local.legacy_keepalive_generation;

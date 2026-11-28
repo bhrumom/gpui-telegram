@@ -118,8 +118,9 @@ pub use hermes_client::{
     MagpieMaskingConfigDto, MagpieMaskingHitDto, MagpieMaskingPreviewRequest,
     MagpieMaskingPreviewResponse, MagpieMaskingUpdateResponse, MagpiePresetDto,
     MagpiePresetRegionDto, MagpieProbeRequest, MagpieProbeResponse, MagpieProviderDto,
-    MagpieRouteTraceDto, MagpieRoutingGroupDto, MagpieRoutingGroupMemberDto,
-    MagpieSaveProviderRequest, MagpieSaveProviderResponse, MagpieStateDto, MagpieSubscriptionDto,
+    MagpieRefreshProviderRequest, MagpieRefreshProviderResponse, MagpieRouteTraceDto,
+    MagpieRoutingGroupDto, MagpieRoutingGroupMemberDto, MagpieSaveProviderRequest,
+    MagpieSaveProviderResponse, MagpieStateDto, MagpieSubscriptionDto,
     MagpieSubscriptionsScanResponse, OpenAiChatCompletionsRequest, OpenAiChatMessage,
 };
 pub use gpui_telegram_proto::user_vault::{

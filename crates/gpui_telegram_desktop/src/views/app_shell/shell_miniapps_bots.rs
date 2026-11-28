@@ -391,6 +391,7 @@ impl AppShell {
             creds,
             closed,
             open_providers,
+            recovery_action,
             av_shape,
             av_color,
         ) = box_ent.update(cx, |b, _| {
@@ -402,10 +403,42 @@ impl AppShell {
                 b.take_submit_credentials(),
                 b.take_close(),
                 b.take_open_providers_settings(),
+                b.take_provider_recovery_action(),
                 av_shape,
                 av_color,
             )
         });
+        if let Some(act) = recovery_action {
+            use crate::components::openbot_model_picker::OpenBotModelPickerAction;
+            match act {
+                OpenBotModelPickerAction::ReauthenticateProvider {
+                    provider_id,
+                    kind_hint,
+                } => {
+                    self.reauthenticate_provider_or_subscription(provider_id, kind_hint, cx);
+                }
+                OpenBotModelPickerAction::CancelReauthenticate => {
+                    self.cancel_provider_reauth(cx);
+                }
+                OpenBotModelPickerAction::RefreshAndActivateProvider(pid) => {
+                    self.refresh_and_activate_provider(pid, None, cx);
+                }
+                OpenBotModelPickerAction::RefreshAllProviders => {
+                    self.run_magpie_subscription_scan(cx);
+                }
+                OpenBotModelPickerAction::InspectProviderSettings(pid) => {
+                    self.clear_ime_if_create_bot_box_unoccluded(cx);
+                    self.miniapps.create_bot_box = None;
+                    if !self.is_compose_or_creation_modal_active(cx) {
+                        self.exit_compose_or_modal_isolation(true, cx);
+                    }
+                    self.open_ai_provider_for_recovery(pid, cx);
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if open_providers {
             self.clear_ime_if_create_bot_box_unoccluded(cx);
             self.miniapps.create_bot_box = None;

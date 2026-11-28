@@ -453,11 +453,20 @@ pub enum StageAction {
         label: String,
     },
     SelectModel {
+        provider_id: Option<String>,
         model_id: Option<String>,
         thinking_level: Option<String>,
     },
     OpenAiProvidersSettings,
+    InspectAiProviderSettings(String),
     RefreshModelCatalog,
+    ReauthenticateAiProvider {
+        provider_id: String,
+        kind_hint: Option<String>,
+    },
+    CancelAiProviderReauth,
+    RefreshAndActivateAiProvider(String),
+    RefreshAllAiProviders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1303,6 +1312,16 @@ impl ConversationStage {
             detected_coding,
             effective_model,
         );
+    }
+
+    /// Synchronizes active browser re-login and force-refresh progress into the OpenBot model picker.
+    pub fn sync_provider_recovery_progress(
+        &mut self,
+        reauth_provider_id: Option<String>,
+        refreshing_provider_ids: Vec<String>,
+    ) {
+        self.model_picker
+            .sync_recovery_progress(reauth_provider_id, refreshing_provider_ids);
     }
 
     pub fn set_live_agent_steps(&mut self, steps: Vec<AgentStepEntry>) {

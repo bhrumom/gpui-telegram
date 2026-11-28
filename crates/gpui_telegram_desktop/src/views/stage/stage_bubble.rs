@@ -11,6 +11,9 @@ use crate::components::avatar::render_plush_bot_avatar;
 use crate::components::grok_bot_avatar::{render_grok_persona_avatar, GrokPersonaState};
 use crate::i18n::tr_str;
 use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::views::app_shell::provider_reauth::{
+    classify_provider_recovery, infer_subscription_kind, UnavailableBadgeTone,
+};
 use crate::views::openbot::conversation::compute_message_preview;
 use crate::views::openbot::steps_and_trace::{AgentStepEntry, AgentStepKind, STEPS_MAX_HEIGHT};
 use super::cards::bot_assist_card::{
@@ -258,6 +261,14 @@ pub enum BubbleUiAction {
         sender_name: String,
     },
     RetryFailedMessage(u64),
+    // Provider auth / availability recovery actions directly inside error step cards
+    ReauthenticateProvider {
+        provider_id: String,
+        kind_hint: Option<String>,
+    },
+    RefreshAndActivateProvider(String),
+    RefreshAiProviders,
+    OpenAiProvidersSettings(Option<String>),
 }
 
 /// Optional OpenBot-specific per-row context passed into `render_message_row_openbot`.
@@ -280,6 +291,11 @@ pub struct StructuredErrorCard {
     pub concise_reason: String,
     pub raw_payload: String,
     pub is_json: bool,
+    pub is_provider_error: bool,
+    pub is_provider_auth_error: bool,
+    pub failed_provider_id: Option<String>,
+    pub failed_provider_kind: Option<String>,
+    pub unavailable_code: Option<String>,
 }
 
 fn make_row_height_probe_canvas(
@@ -2336,6 +2352,138 @@ fn render_bottom_meta_strip(
         .into_any_element()
 }
 
+fn extract_failed_provider_from_error(raw: &str) -> (Option<String>, Option<String>) {
+    // 1. Parse `All providers exhausted: <provider_id>/<model>: ...`
+    let lower = raw.to_ascii_lowercase();
+    if let Some(pos) = lower.find("all providers exhausted:") {
+        let rest = raw[pos + "all providers exhausted:".len()..].trim();
+        let first_entry = rest.split(" | ").next().unwrap_or(rest).trim();
+        // Split `<provider_id>/<model>: <error>` — provider_id may contain `:` (e.g. `google_vertex:user@gmail.com`)
+        let target_spec = first_entry
+            .split(": ")
+            .next()
+            .unwrap_or(first_entry)
+            .trim();
+        if let Some((pid, _model)) = target_spec.split_once('/') {
+            let pid_clean = pid.trim();
+            if !pid_clean.is_empty() && !pid_clean.contains(' ') {
+                let kind_hint = infer_subscription_kind(pid_clean, None)
+                    .map(|k| k.as_str().to_string());
+                return (Some(pid_clean.to_string()), kind_hint);
+            }
+        }
+    }
+
+    // 2. Heuristic detection for named subscriptions & OAuth endpoints
+    if lower.contains("google_vertex")
+        || lower.contains("google vertex")
+        || lower.contains("oauth2.googleapis.com")
+        || lower.contains("aiplatform.googleapis.com")
+    {
+        return (
+            Some("google_vertex".to_string()),
+            Some("google_vertex".to_string()),
+        );
+    }
+    if lower.contains("codex")
+        || lower.contains("chatgpt.com/backend-api")
+        || lower.contains("auth.openai.com")
+    {
+        return (
+            Some("codex".to_string()),
+            Some("codex_chatgpt".to_string()),
+        );
+    }
+    if lower.contains("claude_code")
+        || lower.contains("claude code")
+        || lower.contains("api.anthropic.com")
+    {
+        return (
+            Some("claude_code".to_string()),
+            Some("claude_code".to_string()),
+        );
+    }
+    if lower.contains("github_copilot") || lower.contains("copilot") {
+        return (
+            Some("github_copilot".to_string()),
+            Some("github_copilot".to_string()),
+        );
+    }
+    if lower.contains("gemini_code_assist") || lower.contains("antigravity") {
+        return (
+            Some("gemini_code_assist".to_string()),
+            Some("gemini_code_assist".to_string()),
+        );
+    }
+    (None, None)
+}
+
+fn friendly_provider_label_for_error(pid: Option<&str>, kind: Option<&str>) -> String {
+    if let Some(sub_kind) = infer_subscription_kind(pid.unwrap_or(""), kind) {
+        return match sub_kind {
+            magpie_gateway::SubscriptionKind::CodexChatGpt => "Codex / ChatGPT".to_string(),
+            magpie_gateway::SubscriptionKind::GoogleVertex => "Google Vertex AI".to_string(),
+            magpie_gateway::SubscriptionKind::ClaudeCode => "Claude Code".to_string(),
+            magpie_gateway::SubscriptionKind::GitHubCopilot => "GitHub Copilot".to_string(),
+            magpie_gateway::SubscriptionKind::GeminiCodeAssist => "Gemini".to_string(),
+            magpie_gateway::SubscriptionKind::Antigravity => "Antigravity".to_string(),
+            magpie_gateway::SubscriptionKind::GrokSuperGrok => "SuperGrok".to_string(),
+        };
+    }
+    pid.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "AI 服务商".to_string())
+}
+
+fn build_actionable_provider_reason(
+    raw: &str,
+    pid: Option<&str>,
+    kind: Option<&str>,
+    code: &str,
+) -> String {
+    let provider_lbl = friendly_provider_label_for_error(pid, kind);
+    let lower = raw.to_ascii_lowercase();
+    let supports_relogin = infer_subscription_kind(pid.unwrap_or(""), kind).is_some();
+    match code {
+        "oauth_invalid_grant" | "token_expired" | "oauth_refresh_failed" => {
+            if supports_relogin {
+                format!("{provider_lbl} 登录授权已过期或失效，点击下方「重新登录」即可恢复使用")
+            } else {
+                format!("{provider_lbl} 凭据已过期或失效，请点击「刷新激活」或前往「服务商设置」更新")
+            }
+        }
+        "unreachable" => {
+            if lower.contains("oauth2.googleapis.com") || lower.contains("auth.openai.com") {
+                format!(
+                    "{provider_lbl} 刷新登录令牌时无法连接认证服务器（请检查网络/代理），恢复后点击「刷新激活」或「重新登录」"
+                )
+            } else {
+                format!(
+                    "{provider_lbl} 网络连接失败或超时（请检查网络/代理或本地服务），点击「刷新激活」重试"
+                )
+            }
+        }
+        "auth_401" | "auth_403" | "oauth_invalid_client" | "missing_credentials" | "auth_failed" => {
+            if supports_relogin {
+                format!("{provider_lbl} 认证失败或凭据无效，点击下方「重新登录」或「刷新激活」恢复")
+            } else {
+                format!("{provider_lbl} 认证失败（API Key 无效或权限不足），请前往「服务商设置」更新密钥")
+            }
+        }
+        "rate_limited" => {
+            format!("{provider_lbl} 触发频率或配额限制 (429)，可稍后重试或在顶部切换其他可用服务商")
+        }
+        _ => {
+            if supports_relogin {
+                format!("{provider_lbl} 请求失败，可点击下方「重新登录」或「刷新激活」恢复服务")
+            } else {
+                format!("{provider_lbl} 请求失败，可点击「刷新激活」或在「服务商设置」检查配置")
+            }
+        }
+    }
+}
+
 /// Detects raw JSON error walls (e.g. Gemini/OpenAI HTTP 400 tool-schema dumps) or prefixed
 /// provider/tool failure cards and extracts a concise human summary + raw payload for OpenBot's
 /// collapsible `AgentSteps` failed-step drawer (`UI-F10`).
@@ -2345,13 +2493,15 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
         return None;
     }
 
-    const ERROR_PREFIXES: [&str; 9] = [
+    const ERROR_PREFIXES: [&str; 11] = [
         "⚠️ **执行失败",
         "⚠️ **AI 服务请求失败",
         "⚠️ **本地 AI 执行失败",
+        "⚠️ **未配置可用的 AI 供应商",
         "⚠️ **无法启动 AI 回复",
         "⚠️ **执行异常",
         "⚠️ **AI Provider Request Failed",
+        "⚠️ **AI Provider Not Ready",
         "⚠️ **Local AI Turn Failed",
         "PROVIDER_ERROR:",
         "tool_error:",
@@ -2420,6 +2570,11 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
                     concise_reason: short_reason,
                     raw_payload: trimmed.to_string(),
                     is_json: true,
+                    is_provider_error: false,
+                    is_provider_auth_error: false,
+                    failed_provider_id: None,
+                    failed_provider_kind: None,
+                    unavailable_code: None,
                 });
             }
         } else {
@@ -2442,20 +2597,58 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
                     concise_reason: "Model provider returned an invalid request payload".to_string(),
                     raw_payload: trimmed.to_string(),
                     is_json: true,
+                    is_provider_error: false,
+                    is_provider_auth_error: false,
+                    failed_provider_id: None,
+                    failed_provider_kind: None,
+                    unavailable_code: None,
                 });
             }
         }
     }
 
-    // Case 2: Prefixed provider/tool failure card containing JSON / HTTP error traces / long wall
+    // Case 2: Prefixed provider/tool failure card containing JSON / HTTP error traces / provider auth or request failures
     if let Some(prefix) = matched_prefix {
+        let lower = trimmed.to_ascii_lowercase();
         let has_embedded_json = trimmed.contains('{') && trimmed.contains('}');
         let has_http_trace = trimmed.contains("HTTP 4")
             || trimmed.contains("HTTP 5")
             || trimmed.contains("status=")
             || trimmed.contains("fieldViolations")
             || trimmed.contains("function_declarations");
-        if has_embedded_json || has_http_trace || trimmed.chars().count() > 180 {
+        let is_provider_auth_error = lower.contains("provider_error")
+            || lower.contains("provider authentication error")
+            || lower.contains("invalid_grant")
+            || lower.contains("oauth token refresh failed")
+            || lower.contains("token refresh failed")
+            || lower.contains("refresh_token_reused")
+            || lower.contains("token expired")
+            || lower.contains("401 unauthorized")
+            || lower.contains("http 401")
+            || lower.contains("http 403")
+            || lower.contains("authentication_error")
+            || lower.contains("invalid api key")
+            || lower.contains("missing api key");
+        let is_provider_prefix = matches!(
+            prefix,
+            "⚠️ **AI 服务请求失败"
+                | "⚠️ **AI Provider Request Failed"
+                | "⚠️ **未配置可用的 AI 供应商"
+                | "⚠️ **AI Provider Not Ready"
+                | "PROVIDER_ERROR:"
+        );
+        let is_provider_error = is_provider_prefix
+            || is_provider_auth_error
+            || lower.contains("all providers exhausted")
+            || lower.contains("provider transport error")
+            || lower.contains("provider rate limited")
+            || lower.contains("provider upstream http");
+
+        if has_embedded_json
+            || has_http_trace
+            || is_provider_error
+            || trimmed.chars().count() > 180
+        {
             let title_line = trimmed
                 .lines()
                 .next()
@@ -2472,6 +2665,27 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
                 .unwrap_or("执行失败")
                 .to_string();
 
+            let (failed_provider_id, failed_provider_kind) = if is_provider_error {
+                extract_failed_provider_from_error(trimmed)
+            } else {
+                (None, None)
+            };
+
+            let unavailable_code = if is_provider_error {
+                if lower.contains("http 429") || lower.contains("rate limited") {
+                    Some("rate_limited".to_string())
+                } else {
+                    Some(
+                        gpui_telegram_agent::hermes::providers::classify_provider_auth_error_code(
+                            trimmed,
+                        )
+                        .to_string(),
+                    )
+                }
+            } else {
+                None
+            };
+
             let mut concise = String::new();
             if let (Some(j_start), Some(j_end)) = (trimmed.find('{'), trimmed.rfind('}')) {
                 if j_start < j_end {
@@ -2482,6 +2696,16 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
                     }
                 }
             }
+            if concise.is_empty() && is_provider_error {
+                if let Some(ref code) = unavailable_code {
+                    concise = build_actionable_provider_reason(
+                        trimmed,
+                        failed_provider_id.as_deref(),
+                        failed_provider_kind.as_deref(),
+                        code,
+                    );
+                }
+            }
             if concise.is_empty() {
                 let after_colon = title_line
                     .split_once('：')
@@ -2490,16 +2714,28 @@ pub fn extract_structured_error_payload(text: &str) -> Option<StructuredErrorCar
                     .unwrap_or("");
                 if !after_colon.is_empty() && !after_colon.starts_with('{') {
                     concise = after_colon.to_string();
+                } else if let Some(body_line) = trimmed
+                    .lines()
+                    .skip(1)
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                {
+                    concise = body_line.to_string();
                 } else {
                     concise = "Provider or tool call returned an error response".to_string();
                 }
             }
-            let concise_reason: String = concise.chars().take(120).collect();
+            let concise_reason: String = concise.chars().take(160).collect();
             return Some(StructuredErrorCard {
                 summary_title,
                 concise_reason,
                 raw_payload: trimmed.to_string(),
                 is_json: has_embedded_json,
+                is_provider_error,
+                is_provider_auth_error,
+                failed_provider_id,
+                failed_provider_kind,
+                unavailable_code,
             });
         }
     }
@@ -2518,15 +2754,196 @@ fn render_structured_error_step_card<V: 'static>(
 ) -> AnyElement {
     let ob = palette.openbot_palette();
     let a_toggle = on_action.clone();
-    let a_copy = on_action;
+    let a_copy = on_action.clone();
     let raw_copy = err.raw_payload.clone();
     let hover_bg = ob.hover();
-    let danger_bg = ob
-        .rgba("--openbot-danger-soft")
-        .unwrap_or_else(|| TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.14));
-    let danger_border = ob
-        .rgba("--openbot-danger-border")
-        .unwrap_or_else(|| ob.danger());
+    let bg_control = ob.bg_control();
+    let border_strong = ob.border_strong_hairline();
+    let cta_bg = ob.surface_light();
+    let cta_fg = ob.text_on_light();
+
+    let recovery_opt = err.is_provider_error.then(|| {
+        let pid = err.failed_provider_id.as_deref().unwrap_or("");
+        let kind = err.failed_provider_kind.as_deref();
+        let is_sub = infer_subscription_kind(pid, kind).is_some();
+        classify_provider_recovery(
+            pid,
+            kind,
+            is_sub,
+            err.unavailable_code.as_deref(),
+            Some(&err.raw_payload),
+        )
+    });
+
+    let (badge_bg, badge_fg, card_border, badge_lbl): (gpui::Hsla, gpui::Rgba, gpui::Hsla, &str) =
+        match recovery_opt.as_ref().map(|r| r.tone) {
+            Some(UnavailableBadgeTone::Expired) => (
+                gpui::hsla(0.09, 0.85, 0.50, 0.16),
+                gpui::rgb(0xF59E0B),
+                gpui::hsla(0.09, 0.85, 0.50, 0.42),
+                tr_str(lang_id, "已过期", "Expired"),
+            ),
+            Some(UnavailableBadgeTone::Network) => (
+                gpui::hsla(0.58, 0.72, 0.52, 0.16),
+                gpui::rgb(0x38BDF8),
+                gpui::hsla(0.58, 0.72, 0.52, 0.42),
+                tr_str(lang_id, "无法连接", "Unreachable"),
+            ),
+            _ => (
+                ob.rgba("--openbot-danger-soft")
+                    .unwrap_or_else(|| TdesktopThemePalette::rgba_with_alpha(palette.danger, 0.14))
+                    .into(),
+                ob.danger(),
+                ob.rgba("--openbot-danger-border")
+                    .unwrap_or_else(|| ob.danger())
+                    .into(),
+                if err.is_provider_auth_error {
+                    tr_str(lang_id, "认证失败", "Auth Failed")
+                } else {
+                    tr_str(lang_id, "失败", "Failed")
+                },
+            ),
+        };
+
+    let recovery_bar = recovery_opt.map(|recovery| {
+        let pid_opt = err.failed_provider_id.clone();
+        let kind_hint = err
+            .failed_provider_kind
+            .clone()
+            .or_else(|| recovery.subscription_kind.map(|k| k.as_str().to_string()));
+        let provider_label = friendly_provider_label_for_error(
+            pid_opt.as_deref(),
+            kind_hint.as_deref(),
+        );
+        let on_reauth = on_action.clone();
+        let on_refresh = on_action.clone();
+        let on_settings = on_action.clone();
+        let pid_reauth = pid_opt
+            .clone()
+            .or_else(|| kind_hint.clone())
+            .unwrap_or_default();
+        let pid_refresh = pid_opt.clone();
+        let pid_settings = pid_opt.clone();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .pt(px(2.0))
+            .when(recovery.supports_browser_relogin && !pid_reauth.is_empty(), |row| {
+                let kh = kind_hint.clone();
+                let pr = pid_reauth.clone();
+                let relogin_label = if lang_id.starts_with("zh") {
+                    format!("重新登录 {provider_label}")
+                } else {
+                    format!("Re-login {provider_label}")
+                };
+                row.child(
+                    div()
+                        .id(("agent-step-error-reauth", msg_id))
+                        .cursor_pointer()
+                        .h(px(26.0))
+                        .px(px(10.0))
+                        .rounded(px(6.5))
+                        .bg(cta_bg)
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cta_fg)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                on_reauth(
+                                    this,
+                                    BubbleUiAction::ReauthenticateProvider {
+                                        provider_id: pr.clone(),
+                                        kind_hint: kh.clone(),
+                                    },
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(relogin_label),
+                )
+            })
+            .child(
+                div()
+                    .id(("agent-step-error-refresh", msg_id))
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(9.0))
+                    .rounded(px(6.5))
+                    .bg(if recovery.supports_browser_relogin {
+                        bg_control
+                    } else {
+                        cta_bg
+                    })
+                    .when(recovery.supports_browser_relogin, |el| {
+                        el.border_1()
+                            .border_color(border_strong)
+                            .hover(move |s| s.bg(hover_bg))
+                    })
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if recovery.supports_browser_relogin {
+                        ob.text_primary()
+                    } else {
+                        cta_fg
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let act = match pid_refresh.clone() {
+                                Some(pid) if !pid.trim().is_empty() => {
+                                    BubbleUiAction::RefreshAndActivateProvider(pid)
+                                }
+                                _ => BubbleUiAction::RefreshAiProviders,
+                            };
+                            on_refresh(this, act, cx);
+                        }),
+                    )
+                    .child(if pid_opt.is_some() {
+                        tr_str(lang_id, "刷新激活", "Refresh & Activate")
+                    } else {
+                        tr_str(lang_id, "刷新服务商", "Refresh Providers")
+                    }),
+            )
+            .child(
+                div()
+                    .id(("agent-step-error-settings", msg_id))
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(9.0))
+                    .rounded(px(6.5))
+                    .bg(bg_control)
+                    .border_1()
+                    .border_color(border_strong)
+                    .hover(move |s| s.bg(hover_bg))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.5))
+                    .text_color(ob.text_secondary())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            on_settings(
+                                this,
+                                BubbleUiAction::OpenAiProvidersSettings(pid_settings.clone()),
+                                cx,
+                            );
+                        }),
+                    )
+                    .child(tr_str(lang_id, "服务商设置", "Provider Settings")),
+            )
+    });
 
     div()
         .id(SharedString::from(format!("agent-step-error-card-{}", msg_id)))
@@ -2535,7 +2952,7 @@ fn render_structured_error_step_card<V: 'static>(
         .rounded(px(14.0))
         .bg(ob.bg_surface())
         .border_1()
-        .border_color(danger_border)
+        .border_color(card_border)
         .p(px(12.0))
         .flex()
         .flex_col()
@@ -2551,17 +2968,17 @@ fn render_structured_error_step_card<V: 'static>(
                         .px(px(7.0))
                         .py(px(2.0))
                         .rounded_full()
-                        .bg(danger_bg)
+                        .bg(badge_bg)
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(openbot_stage_icon(OpenBotStageIcon::AlertCircle, 12.0, ob.danger()))
+                        .child(openbot_stage_icon(OpenBotStageIcon::AlertCircle, 12.0, badge_fg))
                         .child(
                             div()
                                 .text_size(px(11.0))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(ob.danger())
-                                .child(tr_str(lang_id, "失败", "Failed")),
+                                .text_color(badge_fg)
+                                .child(badge_lbl),
                         ),
                 )
                 .child(
@@ -2581,13 +2998,12 @@ fn render_structured_error_step_card<V: 'static>(
             div()
                 .w_full()
                 .min_w(px(0.0))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
                 .text_size(px(12.5))
-                .text_color(ob.text_muted())
+                .line_height(px(17.5))
+                .text_color(ob.text_secondary())
                 .child(err.concise_reason.clone()),
         )
+        .when_some(recovery_bar, |col, bar| col.child(bar))
         .child(
             div()
                 .flex()
@@ -2821,6 +3237,55 @@ mod tests {
     fn ignores_normal_assistant_prose_and_short_json() {
         assert!(extract_structured_error_payload("Hello! Here is your summary.").is_none());
         assert!(extract_structured_error_payload("{\"hello\": \"world\"}").is_none());
+    }
+
+    #[std::prelude::v1::test]
+    fn extracts_vertex_and_codex_provider_errors_with_actionable_recovery() {
+        let vertex_invalid_grant = "⚠️ **执行失败 (PROVIDER_ERROR)**：Provider authentication error: Google Vertex AI OAuth token refresh failed: OAuth error (400 Bad Request): invalid_grant: Bad Request";
+        let card1 = extract_structured_error_payload(vertex_invalid_grant)
+            .expect("short invalid_grant PROVIDER_ERROR must render as recoverable card");
+        assert!(card1.is_provider_error);
+        assert!(card1.is_provider_auth_error);
+        assert_eq!(card1.failed_provider_id.as_deref(), Some("google_vertex"));
+        assert_eq!(card1.failed_provider_kind.as_deref(), Some("google_vertex"));
+        assert_eq!(card1.unavailable_code.as_deref(), Some("oauth_invalid_grant"));
+        assert!(
+            card1.concise_reason.contains("重新登录"),
+            "expected re-login hint, got: {}",
+            card1.concise_reason
+        );
+
+        let vertex_net = "⚠️ **AI 服务请求失败**\n\nAll providers exhausted: google_vertex:bhrum21@gmail.com/gpt-6.2-sol: Provider authentication error: Google Vertex AI OAuth token refresh failed: HTTP error: error sending request for url (https://oauth2.googleapis.com/token)";
+        let card2 = extract_structured_error_payload(vertex_net)
+            .expect("All providers exhausted Vertex network failure must render as recoverable card");
+        assert!(card2.is_provider_error);
+        assert_eq!(
+            card2.failed_provider_id.as_deref(),
+            Some("google_vertex:bhrum21@gmail.com")
+        );
+        assert_eq!(card2.failed_provider_kind.as_deref(), Some("google_vertex"));
+        assert_eq!(card2.unavailable_code.as_deref(), Some("unreachable"));
+        assert!(
+            card2.concise_reason.contains("刷新激活"),
+            "expected refresh hint, got: {}",
+            card2.concise_reason
+        );
+
+        let codex_expired = "⚠️ **AI 服务请求失败**\n\nAll providers exhausted: codex:alice@example.com/gpt-6.2-sol: Provider authentication error: Codex OAuth token refresh failed: HTTP 401";
+        let card3 = extract_structured_error_payload(codex_expired)
+            .expect("Codex failure must extract codex provider ID and recovery guidance");
+        assert!(card3.is_provider_error);
+        assert!(card3.is_provider_auth_error);
+        assert_eq!(
+            card3.failed_provider_id.as_deref(),
+            Some("codex:alice@example.com")
+        );
+        assert_eq!(card3.failed_provider_kind.as_deref(), Some("codex_chatgpt"));
+        assert!(
+            card3.concise_reason.contains("重新登录"),
+            "expected re-login hint for Codex, got: {}",
+            card3.concise_reason
+        );
     }
 
     #[std::prelude::v1::test]

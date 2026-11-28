@@ -14,6 +14,9 @@ use gpui_telegram_proto::{CodingProviderKind, DetectedCodingProvider};
 
 use crate::i18n::tr_str;
 use crate::theme::TdesktopThemePalette;
+use crate::views::app_shell::provider_reauth::{
+    classify_provider_recovery, UnavailableBadgeTone,
+};
 use crate::views::settings::sections::settings_ai_providers::{
     sub_dto_to_account_dto, SubscriptionAccountDto,
 };
@@ -600,11 +603,15 @@ pub struct OpenBotPickerModelItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenBotPickerProvider {
     pub id: String,
+    pub kind: String,
     pub icon_key: String,
     pub display_name: String,
     pub subtitle: String,
     pub is_default_provider: bool,
     pub is_subscription: bool,
+    pub usable: bool,
+    pub unavailable_code: Option<String>,
+    pub unavailable_reason: Option<String>,
     pub models: Vec<OpenBotPickerModelItem>,
 }
 
@@ -616,7 +623,10 @@ pub struct OpenBotModelPickerState {
     pub search_focused: bool,
     pub legacy_expanded: bool,
     pub effort_menu_open: bool,
+    pub unavailable_expanded: bool,
     pub catalog_synced: bool,
+    pub reauth_provider_id: Option<String>,
+    pub refreshing_provider_ids: Vec<String>,
     pub providers: Vec<OpenBotPickerProvider>,
 }
 
@@ -633,6 +643,15 @@ pub enum OpenBotModelPickerAction {
     ToggleLegacy,
     ToggleEffortMenu,
     SelectEffort(String),
+    ToggleUnavailableExpanded,
+    ReauthenticateProvider {
+        provider_id: String,
+        kind_hint: Option<String>,
+    },
+    CancelReauthenticate,
+    RefreshAndActivateProvider(String),
+    RefreshAllProviders,
+    InspectProviderSettings(String),
     OpenProvidersSettings,
     Dismiss,
 }
@@ -785,8 +804,32 @@ impl OpenBotModelPickerState {
                 .map(sub_dto_to_account_dto)
                 .collect()
         };
+        for s in &state.subscriptions {
+            if let Some(existing) = merged_subs.iter_mut().find(|m| m.id == s.id) {
+                if !s.is_selectable() {
+                    existing.usable = false;
+                    existing.active = false;
+                    if existing.unavailable_code.is_none() {
+                        existing.unavailable_code = s.unavailable_code.clone();
+                    }
+                    if existing.unavailable_reason.is_none() {
+                        existing.unavailable_reason = s.unavailable_reason.clone();
+                    }
+                }
+            }
+        }
         for local in local_subs {
             if let Some(existing) = merged_subs.iter_mut().find(|s| s.id == local.id) {
+                if !local.is_selectable() {
+                    existing.usable = false;
+                    existing.active = false;
+                    if existing.unavailable_code.is_none() {
+                        existing.unavailable_code = local.unavailable_code.clone();
+                    }
+                    if existing.unavailable_reason.is_none() {
+                        existing.unavailable_reason = local.unavailable_reason.clone();
+                    }
+                }
                 if !local.models.is_empty() {
                     let mut combined = local.models.clone();
                     for m in &existing.models {
@@ -800,6 +843,20 @@ impl OpenBotModelPickerState {
                 merged_subs.push(local.clone());
             }
         }
+        for sub in &mut merged_subs {
+            if let Some(prov) = state.providers.iter().find(|p| p.provider_id == sub.id) {
+                if !prov.is_selectable() {
+                    sub.usable = false;
+                    sub.active = false;
+                    if sub.unavailable_code.is_none() {
+                        sub.unavailable_code = prov.unavailable_code.clone();
+                    }
+                    if sub.unavailable_reason.is_none() {
+                        sub.unavailable_reason = prov.unavailable_reason.clone();
+                    }
+                }
+            }
+        }
 
         let active_pid = state.active_provider.trim();
         let active_model_opt = (!state.active_model.trim().is_empty())
@@ -811,9 +868,11 @@ impl OpenBotModelPickerState {
             if !seen_ids.insert(sub.id.clone()) {
                 continue;
             }
+            let usable = sub.is_selectable();
             let icon_key = canonical_provider_icon_key(&sub.kind).to_string();
             let display_name = friendly_provider_name(&sub.kind, &sub.label);
-            let is_default_provider = !state.needs_provider_selection
+            let is_default_provider = usable
+                && !state.needs_provider_selection
                 && (sub.active
                     || sub.id == active_pid
                     || (sub.kind == "google_vertex" && active_pid == "magpie_provider:google-vertex"));
@@ -847,24 +906,29 @@ impl OpenBotModelPickerState {
             let models = classify_provider_models(&sub.models, default_m, current_selected_model);
             providers.push(OpenBotPickerProvider {
                 id: sub.id.clone(),
+                kind: sub.kind.clone(),
                 icon_key,
                 display_name,
                 subtitle: cli_subtitle,
                 is_default_provider,
                 is_subscription: true,
+                usable,
+                unavailable_code: sub.unavailable_code.clone(),
+                unavailable_reason: sub.unavailable_reason.clone(),
                 models,
             });
         }
 
         for prov in &state.providers {
             if prov.provider_id == "local_hermes"
-                && (!state.allow_local_fallback || !providers.is_empty())
+                && (!state.allow_local_fallback || providers.iter().any(|p| p.usable))
             {
                 continue;
             }
             if !seen_ids.insert(prov.provider_id.clone()) {
                 continue;
             }
+            let usable = prov.is_selectable();
             let mut raw_models = prov.models.clone();
             if !prov.default_model.trim().is_empty() {
                 raw_models.insert(0, prov.default_model.trim().to_string());
@@ -890,7 +954,8 @@ impl OpenBotModelPickerState {
             } else {
                 prov.api_mode.clone()
             };
-            let is_default_provider = !state.needs_provider_selection
+            let is_default_provider = usable
+                && !state.needs_provider_selection
                 && (prov.is_active || prov.provider_id == active_pid);
             let default_m = if is_default_provider {
                 active_model_opt.or_else(|| {
@@ -902,23 +967,62 @@ impl OpenBotModelPickerState {
             let models = classify_provider_models(&raw_models, default_m, current_selected_model);
             providers.push(OpenBotPickerProvider {
                 id: prov.provider_id.clone(),
+                kind: prov
+                    .preset_id
+                    .clone()
+                    .unwrap_or_else(|| prov.api_mode.clone()),
                 icon_key,
                 display_name,
                 subtitle,
                 is_default_provider,
                 is_subscription: prov.is_subscription,
+                usable,
+                unavailable_code: prov.unavailable_code.clone(),
+                unavailable_reason: prov.unavailable_reason.clone(),
                 models,
             });
         }
 
         // Put default/active provider first when ordering isn't already established, preserving stable order
         self.providers = providers;
+        if self.unavailable_providers().is_empty() {
+            self.unavailable_expanded = false;
+        }
         self.ensure_selected_provider(current_selected_model);
     }
 
-    /// Returns the live synced providers list (never fabricates hardcoded placeholder models).
+    /// Updates live re-login and refresh progress indicators shown on unavailable recovery rows.
+    pub fn sync_recovery_progress(
+        &mut self,
+        reauth_provider_id: Option<String>,
+        refreshing_provider_ids: Vec<String>,
+    ) {
+        self.reauth_provider_id = reauth_provider_id;
+        self.refreshing_provider_ids = refreshing_provider_ids;
+    }
+
+    pub fn is_provider_reauthing(&self, provider_id: &str) -> bool {
+        self.reauth_provider_id.as_deref() == Some(provider_id)
+    }
+
+    pub fn is_provider_refreshing(&self, provider_id: &str) -> bool {
+        self.refreshing_provider_ids.iter().any(|p| p == provider_id)
+    }
+
+    /// Returns ONLY usable, selectable live synced providers (never fabricates hardcoded placeholder models
+    /// and never exposes unavailable/failed providers as selectable).
     pub fn effective_providers(&self) -> Vec<OpenBotPickerProvider> {
-        self.providers.clone()
+        self.providers.iter().filter(|p| p.usable).cloned().collect()
+    }
+
+    /// Returns discovered/configured providers that are currently unavailable and excluded from selection.
+    pub fn unavailable_providers(&self) -> Vec<&OpenBotPickerProvider> {
+        self.providers.iter().filter(|p| !p.usable).collect()
+    }
+
+    /// Returns `true` when `provider_id` is currently synced and usable/selectable.
+    pub fn is_provider_selectable(&self, provider_id: &str) -> bool {
+        self.providers.iter().any(|p| p.id == provider_id && p.usable)
     }
 
     /// Ensures `selected_provider_id` points to a valid provider tab (preferring the provider
@@ -971,10 +1075,13 @@ impl OpenBotModelPickerState {
                     .unwrap_or_else(|| format_model_display_label(trimmed));
                 return (canonical_provider_icon_key(&prov.icon_key), lbl);
             }
-            return (
-                infer_provider_icon_key_from_model(trimmed),
-                format_model_display_label(trimmed),
-            );
+            if !list.is_empty() || !self.catalog_synced {
+                return (
+                    infer_provider_icon_key_from_model(trimmed),
+                    format_model_display_label(trimmed),
+                );
+            }
+            return ("generic", fallback_label.to_string());
         }
         if let Some(def_prov) = list
             .iter()
@@ -1040,6 +1147,7 @@ pub fn render_openbot_provider_model_picker_card<V: 'static>(
     let radio_border = ob.border_strong();
 
     let providers = state.effective_providers();
+    let unavailable_providers = state.unavailable_providers();
     let selected_provider = providers
         .iter()
         .find(|p| p.id == state.selected_provider_id)
@@ -1485,6 +1593,594 @@ pub fn render_openbot_provider_model_picker_card<V: 'static>(
         }
 
         right_panel = right_panel.child(model_list);
+        if !unavailable_providers.is_empty() {
+            let unavail_count = unavailable_providers.len();
+            let on_toggle_unavail = on_action.clone();
+            let on_refresh_all = on_action.clone();
+            let mut unavail_section = div()
+                .mx(px(8.0))
+                .mb(px(6.0))
+                .rounded(px(7.0))
+                .bg(bg_control)
+                .border_1()
+                .border_color(border_hairline)
+                .flex()
+                .flex_col();
+
+            unavail_section = unavail_section.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{id_prefix}-hidden-unavailable-hint")))
+                            .cursor_pointer()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    on_toggle_unavail(
+                                        this,
+                                        OpenBotModelPickerAction::ToggleUnavailableExpanded,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .flex_shrink_0()
+                                    .bg(gpui::rgb(0xF59E0B)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(11.0))
+                                    .text_color(text_sec)
+                                    .child(if lang.starts_with("zh") {
+                                        format!("{unavail_count} 个服务商已过期/不可用")
+                                    } else {
+                                        format!("{unavail_count} expired/unavailable")
+                                    }),
+                            )
+                            .child(openbot_stage_icon(
+                                if state.unavailable_expanded {
+                                    OpenBotStageIcon::ChevronUp
+                                } else {
+                                    OpenBotStageIcon::ChevronDown
+                                },
+                                11.0,
+                                text_muted,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{id_prefix}-unavail-refresh-all")))
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .hover(move |s| s.bg(hover_bg))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    on_refresh_all(
+                                        this,
+                                        OpenBotModelPickerAction::RefreshAllProviders,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(tr_str(lang, "刷新", "Refresh")),
+                    ),
+            );
+
+            if state.unavailable_expanded {
+                let mut drawer = div()
+                    .id(SharedString::from(format!("{id_prefix}-unavail-drawer-scroll")))
+                    .max_h(px(136.0))
+                    .overflow_y_scroll()
+                    .border_t_1()
+                    .border_color(border_hairline)
+                    .p(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0));
+
+                for (u_idx, up) in unavailable_providers.iter().enumerate() {
+                    let recovery = classify_provider_recovery(
+                        &up.id,
+                        Some(&up.kind),
+                        up.is_subscription,
+                        up.unavailable_code.as_deref(),
+                        up.unavailable_reason.as_deref(),
+                    );
+                    let badge_fg = match recovery.tone {
+                        UnavailableBadgeTone::Expired => gpui::rgb(0xF59E0B),
+                        UnavailableBadgeTone::Network => gpui::rgb(0x38BDF8),
+                        _ => ob.danger(),
+                    };
+                    let is_reauthing = state.is_provider_reauthing(&up.id);
+                    let is_refreshing = state.is_provider_refreshing(&up.id);
+                    let pid_primary = up.id.clone();
+                    let pid_refresh = up.id.clone();
+                    let kind_hint = recovery.subscription_kind.map(|k| k.as_str().to_string());
+                    let on_primary = on_action.clone();
+                    let on_refresh = on_action.clone();
+                    let reason_short = up
+                        .unavailable_reason
+                        .as_deref()
+                        .unwrap_or(tr_str(
+                            lang,
+                            "凭据已失效或无法连接，当前不可选",
+                            "Credentials invalid or unreachable",
+                        ))
+                        .to_string();
+
+                    drawer = drawer.child(
+                        div()
+                            .w_full()
+                            .px(px(7.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(bg_surface)
+                            .border_1()
+                            .border_color(border_hairline)
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.0))
+                                            .min_w(px(0.0))
+                                            .child(render_provider_icon(
+                                                &up.icon_key,
+                                                13.0,
+                                                text_muted,
+                                                true,
+                                            ))
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.0))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(text_pri)
+                                                    .child(up.display_name.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(10.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(badge_fg)
+                                            .child(tr_str(lang, recovery.badge_zh, recovery.badge_en)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(text_muted)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(reason_short),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "{id_prefix}-unavail-primary-{u_idx}"
+                                            )))
+                                            .cursor_pointer()
+                                            .h(px(22.0))
+                                            .px(px(8.0))
+                                            .rounded(px(5.0))
+                                            .bg(if is_reauthing { bg_active } else { radio_checked_bg })
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if is_reauthing {
+                                                text_pri
+                                            } else {
+                                                radio_checked_fg
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    let act = if is_reauthing {
+                                                        OpenBotModelPickerAction::CancelReauthenticate
+                                                    } else if recovery.supports_browser_relogin
+                                                        && !recovery.prefer_open_editor
+                                                    {
+                                                        OpenBotModelPickerAction::ReauthenticateProvider {
+                                                            provider_id: pid_primary.clone(),
+                                                            kind_hint: kind_hint.clone(),
+                                                        }
+                                                    } else if recovery.prefer_open_editor {
+                                                        OpenBotModelPickerAction::InspectProviderSettings(
+                                                            pid_primary.clone(),
+                                                        )
+                                                    } else {
+                                                        OpenBotModelPickerAction::RefreshAndActivateProvider(
+                                                            pid_primary.clone(),
+                                                        )
+                                                    };
+                                                    on_primary(this, act, cx);
+                                                }),
+                                            )
+                                            .child(if is_reauthing {
+                                                tr_str(lang, "登录中 · 取消", "Cancel")
+                                            } else {
+                                                tr_str(
+                                                    lang,
+                                                    recovery.primary_cta_zh,
+                                                    recovery.primary_cta_en,
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "{id_prefix}-unavail-refresh-{u_idx}"
+                                            )))
+                                            .cursor_pointer()
+                                            .h(px(22.0))
+                                            .px(px(7.0))
+                                            .rounded(px(5.0))
+                                            .bg(bg_control)
+                                            .border_1()
+                                            .border_color(border_strong)
+                                            .hover(move |s| s.bg(hover_bg))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .text_color(text_sec)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    on_refresh(
+                                                        this,
+                                                        OpenBotModelPickerAction::RefreshAndActivateProvider(
+                                                            pid_refresh.clone(),
+                                                        ),
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .child(if is_refreshing {
+                                                tr_str(lang, "刷新中…", "Refreshing…")
+                                            } else {
+                                                tr_str(lang, "刷新激活", "Refresh")
+                                            }),
+                                    ),
+                            ),
+                    );
+                }
+                unavail_section = unavail_section.child(drawer);
+            }
+            right_panel = right_panel.child(unavail_section);
+        }
+    } else if !unavailable_providers.is_empty() {
+        // Every discovered/configured provider is currently unavailable — show clear non-selectable status
+        // with direct one-click Re-login / Refresh & Activate actions right inside the picker!
+        let on_open_settings = on_action.clone();
+        let on_refresh_all = on_action.clone();
+        let mut reason_list = div()
+            .id(SharedString::from(format!("{id_prefix}-empty-unavail-scroll")))
+            .w_full()
+            .max_h(px(210.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        for (u_idx, up) in unavailable_providers.iter().take(4).enumerate() {
+            let recovery = classify_provider_recovery(
+                &up.id,
+                Some(&up.kind),
+                up.is_subscription,
+                up.unavailable_code.as_deref(),
+                up.unavailable_reason.as_deref(),
+            );
+            let (card_bg, card_border, badge_fg) = match recovery.tone {
+                UnavailableBadgeTone::Expired => (
+                    gpui::hsla(0.09, 0.85, 0.50, 0.12),
+                    gpui::hsla(0.09, 0.85, 0.50, 0.36),
+                    gpui::rgb(0xF59E0B),
+                ),
+                UnavailableBadgeTone::Network => (
+                    gpui::hsla(0.58, 0.72, 0.52, 0.12),
+                    gpui::hsla(0.58, 0.72, 0.52, 0.36),
+                    gpui::rgb(0x38BDF8),
+                ),
+                _ => (
+                    gpui::hsla(0.0, 0.72, 0.50, 0.12),
+                    gpui::hsla(0.0, 0.72, 0.54, 0.35),
+                    ob.danger(),
+                ),
+            };
+            let reason_txt = up.unavailable_reason.clone().unwrap_or_else(|| {
+                tr_str(
+                    lang,
+                    "凭据已失效或无法连接，当前不可选",
+                    "Credentials invalid or unreachable",
+                )
+                .to_string()
+            });
+            let is_reauthing = state.is_provider_reauthing(&up.id);
+            let is_refreshing = state.is_provider_refreshing(&up.id);
+            let pid_primary = up.id.clone();
+            let pid_refresh = up.id.clone();
+            let kind_hint = recovery.subscription_kind.map(|k| k.as_str().to_string());
+            let on_primary = on_action.clone();
+            let on_refresh = on_action.clone();
+
+            reason_list = reason_list.child(
+                div()
+                    .w_full()
+                    .px(px(9.0))
+                    .py(px(7.0))
+                    .rounded(px(7.0))
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(card_border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .min_w(px(0.0))
+                                    .child(render_provider_icon(&up.icon_key, 14.0, text_pri, true))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(text_pri)
+                                            .child(up.display_name.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(badge_fg)
+                                    .child(tr_str(lang, recovery.badge_zh, recovery.badge_en)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(text_sec)
+                            .child(reason_txt),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .pt(px(2.0))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "{id_prefix}-empty-unavail-primary-{u_idx}"
+                                    )))
+                                    .cursor_pointer()
+                                    .h(px(24.0))
+                                    .px(px(9.0))
+                                    .rounded(px(6.0))
+                                    .bg(if is_reauthing { bg_active } else { radio_checked_bg })
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if is_reauthing {
+                                        text_pri
+                                    } else {
+                                        radio_checked_fg
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let act = if is_reauthing {
+                                                OpenBotModelPickerAction::CancelReauthenticate
+                                            } else if recovery.supports_browser_relogin
+                                                && !recovery.prefer_open_editor
+                                            {
+                                                OpenBotModelPickerAction::ReauthenticateProvider {
+                                                    provider_id: pid_primary.clone(),
+                                                    kind_hint: kind_hint.clone(),
+                                                }
+                                            } else if recovery.prefer_open_editor {
+                                                OpenBotModelPickerAction::InspectProviderSettings(
+                                                    pid_primary.clone(),
+                                                )
+                                            } else {
+                                                OpenBotModelPickerAction::RefreshAndActivateProvider(
+                                                    pid_primary.clone(),
+                                                )
+                                            };
+                                            on_primary(this, act, cx);
+                                        }),
+                                    )
+                                    .child(if is_reauthing {
+                                        tr_str(lang, "登录中 · 取消", "Signing in · Cancel")
+                                    } else {
+                                        tr_str(lang, recovery.primary_cta_zh, recovery.primary_cta_en)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "{id_prefix}-empty-unavail-refresh-{u_idx}"
+                                    )))
+                                    .cursor_pointer()
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .rounded(px(6.0))
+                                    .bg(bg_control)
+                                    .border_1()
+                                    .border_color(border_strong)
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(11.0))
+                                    .text_color(text_pri)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            on_refresh(
+                                                this,
+                                                OpenBotModelPickerAction::RefreshAndActivateProvider(
+                                                    pid_refresh.clone(),
+                                                ),
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child(if is_refreshing {
+                                        tr_str(lang, "校验中…", "Checking…")
+                                    } else {
+                                        tr_str(lang, "刷新激活", "Refresh")
+                                    }),
+                            ),
+                    ),
+            );
+        }
+        right_panel = right_panel.child(
+            div()
+                .flex_1()
+                .p(px(12.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(9.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.danger())
+                        .child(tr_str(lang, "暂无可用服务商", "No available providers")),
+                )
+                .child(reason_list)
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("{id_prefix}-empty-refresh-all")))
+                                .cursor_pointer()
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .rounded(px(7.0))
+                                .bg(bg_control)
+                                .border_1()
+                                .border_color(border_strong)
+                                .hover(move |s| s.bg(hover_bg))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text_pri)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        on_refresh_all(
+                                            this,
+                                            OpenBotModelPickerAction::RefreshAllProviders,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(tr_str(lang, "全部刷新", "Refresh All")),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("{id_prefix}-empty-open-providers")))
+                                .cursor_pointer()
+                                .h(px(28.0))
+                                .px(px(11.0))
+                                .rounded(px(7.0))
+                                .bg(radio_checked_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(radio_checked_fg)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        on_open_settings(
+                                            this,
+                                            OpenBotModelPickerAction::OpenProvidersSettings,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(tr_str(lang, "服务商设置", "Providers")),
+                        ),
+                ),
+        );
     } else {
         // Connected providers empty state (after live sync confirms 0 connected providers)
         let on_open_settings = on_action.clone();
@@ -1753,6 +2449,7 @@ mod tests {
                     "gpt-4o".to_string(),
                 ],
                 active: true,
+                ..Default::default()
             },
             SubscriptionAccountDto {
                 id: "claude:u1".to_string(),
@@ -1762,6 +2459,7 @@ mod tests {
                 plan: Some("max".to_string()),
                 models: vec!["claude-sonnet-4-6".to_string(), "claude-3-5-sonnet".to_string()],
                 active: false,
+                ..Default::default()
             },
         ];
 
@@ -1786,5 +2484,117 @@ mod tests {
             state.first_filtered_model(),
             Some(("deepseek".to_string(), "deepseek-reasoner".to_string()))
         );
+    }
+
+    #[std::prelude::v1::test]
+    fn unavailable_providers_are_excluded_from_selectable_picker_and_trigger() {
+        let mut state = OpenBotModelPickerState::default();
+        let magpie = MagpieStateDto {
+            active_provider: "deepseek".to_string(),
+            active_model: "deepseek-chat".to_string(),
+            needs_provider_selection: false,
+            subscriptions: vec![gpui_telegram_client::net::hermes_client::MagpieSubscriptionDto {
+                id: "google_vertex:dead@example.com".to_string(),
+                kind: "google_vertex".to_string(),
+                label: "Google Vertex AI (dead@example.com)".to_string(),
+                active: false,
+                default_model: Some("gemini-2.5-flash".to_string()),
+                usable: false,
+                unavailable_reason: Some(
+                    "Google Vertex AI OAuth 授权已失效 (invalid_grant)".to_string(),
+                ),
+                ..Default::default()
+            }],
+            providers: vec![gpui_telegram_client::net::hermes_client::MagpieProviderDto {
+                provider_id: "deepseek".to_string(),
+                preset_id: Some("deepseek".to_string()),
+                name: "DeepSeek".to_string(),
+                default_model: "deepseek-chat".to_string(),
+                models: vec!["deepseek-chat".to_string()],
+                is_active: true,
+                usable: true,
+                unavailable_reason: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        state.sync_from_magpie(&magpie, &[], &[], &[], Some("gemini-2.5-flash"));
+        let selectable = state.effective_providers();
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].id, "deepseek");
+        assert!(!state.is_provider_selectable("google_vertex:dead@example.com"));
+        assert!(state.is_provider_selectable("deepseek"));
+        assert_eq!(state.selected_provider_id, "deepseek");
+        assert_eq!(state.unavailable_providers().len(), 1);
+        assert_eq!(
+            state.unavailable_providers()[0].id,
+            "google_vertex:dead@example.com"
+        );
+        // Searching for gemini must NOT return the dead Vertex model
+        state.search_query = "gemini".to_string();
+        assert_eq!(state.first_filtered_model(), None);
+
+        // When ALL providers are unavailable, effective_providers() is empty and trigger falls back
+        let mut all_dead = magpie.clone();
+        all_dead.providers[0].usable = false;
+        all_dead.providers[0].unavailable_reason = Some("API Key 无效 (401)".to_string());
+        all_dead.needs_provider_selection = true;
+        state.sync_from_magpie(&all_dead, &[], &[], &[], Some("gemini-2.5-flash"));
+        assert!(state.effective_providers().is_empty());
+        assert_eq!(state.unavailable_providers().len(), 2);
+        assert_eq!(
+            state.resolve_trigger_display("gemini-2.5-flash", "请选择模型"),
+            ("generic", "请选择模型".to_string())
+        );
+    }
+
+    #[std::prelude::v1::test]
+    fn model_picker_preserves_unavailable_code_and_recovery_progress() {
+        let mut state = OpenBotModelPickerState::default();
+        let magpie = MagpieStateDto {
+            active_provider: "deepseek".to_string(),
+            active_model: "deepseek-chat".to_string(),
+            needs_provider_selection: false,
+            subscriptions: vec![gpui_telegram_client::net::hermes_client::MagpieSubscriptionDto {
+                id: "codex:expired@test.com".to_string(),
+                kind: "codex_chatgpt".to_string(),
+                label: "Codex (expired@test.com)".to_string(),
+                active: false,
+                default_model: Some("gpt-6-luna".to_string()),
+                usable: false,
+                unavailable_code: Some("oauth_invalid_grant".to_string()),
+                unavailable_reason: Some("Codex 登录已过期 (invalid_grant)".to_string()),
+                ..Default::default()
+            }],
+            providers: vec![gpui_telegram_client::net::hermes_client::MagpieProviderDto {
+                provider_id: "deepseek".to_string(),
+                preset_id: Some("deepseek".to_string()),
+                name: "DeepSeek".to_string(),
+                default_model: "deepseek-chat".to_string(),
+                models: vec!["deepseek-chat".to_string()],
+                is_active: true,
+                usable: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        state.sync_from_magpie(&magpie, &[], &[], &[], Some("deepseek-chat"));
+        let unavail = state.unavailable_providers();
+        assert_eq!(unavail.len(), 1);
+        assert_eq!(unavail[0].kind, "codex_chatgpt");
+        assert_eq!(
+            unavail[0].unavailable_code.as_deref(),
+            Some("oauth_invalid_grant")
+        );
+
+        state.sync_recovery_progress(
+            Some("codex:expired@test.com".to_string()),
+            vec!["codex:expired@test.com".to_string()],
+        );
+        assert!(state.is_provider_reauthing("codex:expired@test.com"));
+        assert!(state.is_provider_refreshing("codex:expired@test.com"));
+        assert!(!state.is_provider_selectable("codex:expired@test.com"));
     }
 }

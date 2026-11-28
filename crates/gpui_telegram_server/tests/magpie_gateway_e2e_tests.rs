@@ -1746,3 +1746,330 @@ async fn test_e2e_per_user_provider_isolation_encrypted_restart_and_cross_device
         assert!(bob_uid != alice_uid);
     }
 }
+
+#[tokio::test]
+async fn test_e2e_unavailable_vertex_invalid_grant_is_non_selectable_and_rejected_on_activate() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _env_read = ENV_RWLOCK.read().await;
+    let dir = tempfile::Builder::new()
+        .prefix("magpie_unusable_vertex_")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create tempdir");
+    let empty_home = tempfile::Builder::new()
+        .prefix("magpie_empty_home_")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create empty home");
+
+    // Spawn mock OAuth server returning 400 invalid_grant
+    let oauth_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind oauth");
+    let oauth_addr = oauth_listener.local_addr().expect("oauth addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = oauth_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":"invalid_grant","error_description":"Bad Request"}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    // Spawn mock 401 OpenAI-compatible server for invalid API key check
+    let bad_api_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind bad api");
+    let bad_api_addr = bad_api_listener.local_addr().expect("bad api addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = bad_api_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":{"message":"Incorrect API key provided"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let (openai_base, _anthropic_base, _mock_state) = spawn_mock_upstreams().await;
+    let (state, router) = boot_test_server_in(dir.path());
+    isolate_empty_providers(&state, empty_home.path());
+    let (_uid, tok) = register_user(&router, "vertex_unusable_user").await;
+
+    // 1. Sync a dead Vertex ADC subscription with auto_activate = true
+    let vertex_id = "google_vertex:revoked@example.com";
+    let (st_sync, sync_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/subscriptions/sync",
+        Some(&tok),
+        Some(json!({
+            "auto_activate": true,
+            "subscriptions": [
+                {
+                    "account": {
+                        "id": vertex_id,
+                        "kind": "google_vertex",
+                        "label": "Google Vertex AI (revoked@example.com)",
+                        "email": "revoked@example.com",
+                        "account_id": "proj-revoked",
+                        "plan": "vertex_adc",
+                        "active": true,
+                        "base_url": "https://aiplatform.googleapis.com/v1",
+                        "protocol": "gemini_generate_content",
+                        "default_model": "gemini-2.5-flash",
+                        "source_path": "",
+                        "headers": {
+                            "x-goog-user-project": "proj-revoked",
+                            "x-vertex-token-url": format!("http://{oauth_addr}/token")
+                        }
+                    },
+                    "raw_headers": {
+                        "x-goog-user-project": "proj-revoked",
+                        "x-vertex-token-url": format!("http://{oauth_addr}/token")
+                    },
+                    "vertex_adc": {
+                        "client_id": "cid-revoked",
+                        "client_secret": "csec-revoked",
+                        "refresh_token": "rt-revoked",
+                        "quota_project_id": "proj-revoked",
+                        "account": "revoked@example.com"
+                    },
+                    "region_id": "global",
+                    "available_models": ["gemini-2.5-flash", "gemini-2.5-pro"]
+                }
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(st_sync, StatusCode::OK, "sync should succeed and mark dead sub unusable: {sync_val}");
+    assert_eq!(
+        sync_val["needs_provider_selection"].as_bool(),
+        Some(true),
+        "dead Vertex ADC must NOT be auto-activated: {sync_val}"
+    );
+    assert_eq!(
+        sync_val["state"]["active_provider"].as_str(),
+        Some("local_hermes")
+    );
+    let synced_sub = sync_val["state"]["subscriptions"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|s| s["id"].as_str() == Some(vertex_id)))
+        .expect("vertex subscription present in state");
+    assert_eq!(synced_sub["usable"].as_bool(), Some(false));
+    assert_eq!(synced_sub["active"].as_bool(), Some(false));
+    assert!(
+        synced_sub["unavailable_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid_grant"),
+        "expected invalid_grant in unavailable_reason: {synced_sub}"
+    );
+
+    // 2. GET /subscriptions also reports usable=false, active=false
+    let (st_subs, subs_val) = http_json(
+        &router,
+        "GET",
+        "/api/v1/hermes/magpie/subscriptions",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st_subs, StatusCode::OK);
+    let sub_row = subs_val
+        .as_array()
+        .and_then(|arr| arr.iter().find(|s| s["id"].as_str() == Some(vertex_id)))
+        .expect("vertex sub in GET /subscriptions");
+    assert_eq!(sub_row["usable"].as_bool(), Some(false));
+    assert_eq!(sub_row["active"].as_bool(), Some(false));
+
+    // 3. POST /subscriptions/{id}/activate MUST reject with 400 provider_unavailable
+    let (st_act, act_val) = http_json(
+        &router,
+        "POST",
+        &format!("/api/v1/hermes/magpie/subscriptions/{vertex_id}/activate"),
+        Some(&tok),
+        Some(json!({ "model": "gemini-2.5-pro" })),
+    )
+    .await;
+    assert_eq!(
+        st_act,
+        StatusCode::BAD_REQUEST,
+        "activating dead Vertex must be rejected with 400: {act_val}"
+    );
+    assert_eq!(act_val["error"].as_str(), Some("provider_unavailable"));
+    assert!(
+        act_val["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid_grant"),
+        "expected invalid_grant message: {act_val}"
+    );
+
+    // 4. Add a healthy provider and verify /api/v1/magpie/v1/models excludes dead Vertex models
+    let (st_ok_prov, _) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/providers",
+        Some(&tok),
+        Some(json!({
+            "provider_id": "healthy_mock",
+            "name": "Healthy Mock",
+            "api_mode": "chat_completions",
+            "base_url": openai_base,
+            "api_key": "sk-healthy-1234",
+            "default_model": "healthy-model-1",
+            "activate": true,
+            "allow_local_fallback": false
+        })),
+    )
+    .await;
+    assert_eq!(st_ok_prov, StatusCode::OK);
+
+    let (st_models, models_val) = http_json(
+        &router,
+        "GET",
+        "/api/v1/magpie/v1/models",
+        Some(&tok),
+        None,
+    )
+    .await;
+    assert_eq!(st_models, StatusCode::OK);
+    let model_ids: Vec<&str> = models_val["data"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|m| m["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        model_ids.contains(&"healthy-model-1"),
+        "healthy provider model must appear: {model_ids:?}"
+    );
+    assert!(
+        !model_ids.iter().any(|m| m.contains("gemini-2.5")),
+        "dead Vertex models must be excluded from /v1/models: {model_ids:?}"
+    );
+
+    // 5. Saving a provider with an invalid API key (401) and activate=true MUST return 400 provider_unavailable
+    let (st_bad_prov, bad_prov_val) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/providers",
+        Some(&tok),
+        Some(json!({
+            "provider_id": "bad_api_provider",
+            "name": "Bad API Provider",
+            "api_mode": "chat_completions",
+            "base_url": format!("http://{bad_api_addr}/v1"),
+            "api_key": "sk-invalid-key",
+            "default_model": "bad-model-1",
+            "activate": true
+        })),
+    )
+    .await;
+    assert_eq!(
+        st_bad_prov,
+        StatusCode::BAD_REQUEST,
+        "activating a 401 provider must fail with 400: {bad_prov_val}"
+    );
+    assert_eq!(bad_prov_val["error"].as_str(), Some("provider_unavailable"));
+}
+
+#[tokio::test]
+async fn test_magpie_provider_refresh_endpoint_recovers_and_reactivates() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let is_healthy = Arc::new(AtomicBool::new(false));
+    let is_healthy_srv = Arc::clone(&is_healthy);
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = mock_listener.accept().await {
+            let ok = is_healthy_srv.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = if ok {
+                    let body = r#"{"data":[{"id":"deepseek-chat"}]}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = r#"{"error":{"message":"invalid_api_key"}}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let empty_home = tempfile::TempDir::new().expect("empty home");
+    let (state, router) = boot_test_server_in(dir.path());
+    isolate_empty_providers(&state, empty_home.path());
+    let (_uid, tok) = register_user(&router, "refresh_recovery_user").await;
+
+    // 1. Register provider without activating while upstream returns 401
+    let (st_save, _) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/providers",
+        Some(&tok),
+        Some(json!({
+            "provider_id": "refresh_target",
+            "name": "Refresh Target",
+            "api_mode": "chat_completions",
+            "base_url": format!("http://{mock_addr}/v1"),
+            "api_key": "sk-refresh-test",
+            "default_model": "deepseek-chat",
+            "activate": false
+        })),
+    )
+    .await;
+    assert_eq!(st_save, StatusCode::OK);
+
+    // 2. Refresh while upstream returns 401 -> usable=false, activated=false, unavailable_code="auth_401"
+    let (st_ref1, ref1) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/providers/refresh_target/refresh",
+        Some(&tok),
+        Some(json!({ "activate": true })),
+    )
+    .await;
+    assert_eq!(st_ref1, StatusCode::OK, "refresh response: {ref1}");
+    assert_eq!(ref1["usable"].as_bool(), Some(false));
+    assert_eq!(ref1["activated"].as_bool(), Some(false));
+    assert_eq!(ref1["unavailable_code"].as_str(), Some("auth_401"));
+
+    // 3. Flip upstream to 200 OK -> refresh recovers, clears unavailable_code, and activates!
+    is_healthy.store(true, Ordering::SeqCst);
+    let (st_ref2, ref2) = http_json(
+        &router,
+        "POST",
+        "/api/v1/hermes/magpie/providers/refresh_target/refresh",
+        Some(&tok),
+        Some(json!({ "activate": true, "model": "deepseek-chat" })),
+    )
+    .await;
+    assert_eq!(st_ref2, StatusCode::OK, "refresh recovery response: {ref2}");
+    assert_eq!(ref2["usable"].as_bool(), Some(true));
+    assert_eq!(ref2["activated"].as_bool(), Some(true));
+    assert!(ref2["unavailable_code"].is_null());
+    assert_eq!(ref2["state"]["active_provider"].as_str(), Some("refresh_target"));
+}

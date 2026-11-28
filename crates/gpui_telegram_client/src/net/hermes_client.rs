@@ -688,7 +688,7 @@ pub struct MagpiePresetDto {
     pub env_var_hints: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MagpieProviderDto {
     pub provider_id: String,
     #[serde(default)]
@@ -721,9 +721,54 @@ pub struct MagpieProviderDto {
     pub routing_strategy: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default = "default_magpie_true")]
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl Default for MagpieProviderDto {
+    fn default() -> Self {
+        Self {
+            provider_id: String::new(),
+            name: String::new(),
+            api_mode: String::new(),
+            base_url: None,
+            default_model: String::new(),
+            models: Vec::new(),
+            enabled: false,
+            has_api_key: false,
+            masked_key: None,
+            is_active: false,
+            preset_id: None,
+            region_id: None,
+            is_subscription: false,
+            no_key_required: false,
+            routing_strategy: None,
+            headers: HashMap::new(),
+            usable: true,
+            unavailable_code: None,
+            unavailable_reason: None,
+        }
+    }
+}
+
+impl MagpieProviderDto {
+    /// Returns `true` when this provider is verified usable and allowed to be selected.
+    pub fn is_selectable(&self) -> bool {
+        self.usable
+            && self
+                .unavailable_reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MagpieSubscriptionDto {
     pub id: String,
     pub kind: String,
@@ -748,6 +793,48 @@ pub struct MagpieSubscriptionDto {
     pub expires_at_ms: Option<i64>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(default = "default_magpie_true")]
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl Default for MagpieSubscriptionDto {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: String::new(),
+            label: String::new(),
+            email: None,
+            account_id: None,
+            plan: None,
+            active: false,
+            base_url: None,
+            protocol: String::new(),
+            default_model: None,
+            source_path: String::new(),
+            expires_at_ms: None,
+            headers: BTreeMap::new(),
+            usable: true,
+            unavailable_code: None,
+            unavailable_reason: None,
+        }
+    }
+}
+
+impl MagpieSubscriptionDto {
+    /// Returns `true` when this subscription is verified usable and allowed to be selected.
+    pub fn is_selectable(&self) -> bool {
+        self.usable
+            && self
+                .unavailable_reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -973,6 +1060,36 @@ pub struct MagpieProbeResponse {
     pub reply_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MagpieRefreshProviderRequest {
+    #[serde(default = "default_magpie_true")]
+    pub activate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MagpieRefreshProviderResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub usable: bool,
+    #[serde(default)]
+    pub activated: bool,
+    #[serde(default)]
+    pub active_provider_id: String,
+    #[serde(default)]
+    pub active_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub state: MagpieStateDto,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2261,6 +2378,21 @@ impl HermesClient {
     ) -> Result<MagpieProbeResponse, HttpClientError> {
         let path = format!(
             "/api/v1/hermes/magpie/providers/{}/probe",
+            percent_encode_rfc3986(provider_id)
+        );
+        self.http
+            .request_json(Method::POST, &path, Some(token), req)
+            .await
+    }
+
+    pub async fn magpie_refresh_provider(
+        &self,
+        token: &str,
+        provider_id: &str,
+        req: Option<&MagpieRefreshProviderRequest>,
+    ) -> Result<MagpieRefreshProviderResponse, HttpClientError> {
+        let path = format!(
+            "/api/v1/hermes/magpie/providers/{}/refresh",
             percent_encode_rfc3986(provider_id)
         );
         self.http
