@@ -17,6 +17,32 @@ pub struct HermesInlineButtonDto {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HermesProviderUsageDto {
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub daily_cost_usd: Vec<f64>,
+    #[serde(default)]
+    pub daily_tokens: Vec<u64>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HermesUsageSummaryDto {
     #[serde(default)]
     pub total_turns: u64,
@@ -25,13 +51,21 @@ pub struct HermesUsageSummaryDto {
     #[serde(default)]
     pub completion_tokens: u64,
     #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
     pub total_tokens: u64,
     #[serde(default)]
     pub estimated_cost_usd: f64,
     #[serde(default)]
     pub tool_calls: u64,
     #[serde(default)]
+    pub range_days: u32,
+    #[serde(default)]
+    pub dates: Vec<String>,
+    #[serde(default)]
     pub by_model: Vec<Value>,
+    #[serde(default)]
+    pub by_provider: Vec<HermesProviderUsageDto>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2003,6 +2037,20 @@ impl HermesClient {
         bot_id: Option<u64>,
     ) -> Result<HermesUsageSummaryDto, HttpClientError> {
         let path = with_bot_scope("/api/v1/hermes/usage", bot_id);
+        self.http
+            .request_json(Method::GET, &path, Some(token), None::<&()>)
+            .await
+    }
+
+    pub async fn usage_stats_for_range(
+        &self,
+        token: &str,
+        bot_id: Option<u64>,
+        days: u32,
+    ) -> Result<HermesUsageSummaryDto, HttpClientError> {
+        let clamped_days = days.clamp(1, 90);
+        let base = format!("/api/v1/hermes/usage?days={clamped_days}");
+        let path = with_bot_scope(&base, bot_id);
         self.http
             .request_json(Method::GET, &path, Some(token), None::<&()>)
             .await

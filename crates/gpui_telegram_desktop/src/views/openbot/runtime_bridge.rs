@@ -16,7 +16,8 @@ use openbot_contracts::crm::CrmPaymentState;
 use openbot_contracts::routines::RoutineSchedule;
 use openbot_runtime::OpenBotHostRuntime;
 use openbot_storage::{
-    AgentStore, ChannelStore, CrmCustomerPageInput, CrmPaymentPageInput, CrmStore, OpenBotDatabase,
+    AgentStore, ChannelStore, CrmCustomerPageInput, CrmPaymentPageInput, CrmStore, HostAnalytics,
+    HostAnalyticsInput, OpenBotDatabase,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -681,9 +682,55 @@ impl OpenBotRuntimeBridge {
             shell.crm_page.payments = live_payments;
         }
 
+        let range_days = shell.usage_credits.selected_range_days.clamp(1, 90);
+        if let Some(analytics) = self.read_host_usage_analytics(range_days) {
+            shell
+                .usage_credits
+                .apply_live_sources(None, Some(&analytics), range_days);
+        }
+
         Ok(TelegramBidirectionalProjection::from_agents_and_channels(
             &raw_agents,
             &raw_channels,
         ))
     }
+
+    /// Reads real local SQLite `AgentUsageStore` host analytics for the last `range_days` UTC days.
+    pub fn read_host_usage_analytics(&self, range_days: u32) -> Option<HostAnalytics> {
+        let dates = super::secondary_pages::UsageAndCreditsState::utc_date_window(range_days);
+        let start_date = dates.first()?.clone();
+        let end_date = dates.last()?.clone();
+        self.runtime
+            .database()
+            .usage_store()
+            .read_host_analytics(&HostAnalyticsInput {
+                agent_id: None,
+                start_date,
+                end_date,
+                time_zone: "UTC".to_string(),
+            })
+            .ok()
+    }
 }
+
+/// Reads real local SQLite `AgentUsageStore` host analytics directly from `<data_dir>/openbot.db`
+/// for the last `range_days` UTC days, returning `None` cleanly if `openbot.db` does not exist.
+pub fn load_openbot_host_analytics(data_dir: &Path, range_days: u32) -> Option<HostAnalytics> {
+    let db_path = data_dir.join("openbot.db");
+    if !db_path.is_file() {
+        return None;
+    }
+    let db = OpenBotDatabase::open(&db_path).ok()?;
+    let dates = super::secondary_pages::UsageAndCreditsState::utc_date_window(range_days);
+    let start_date = dates.first()?.clone();
+    let end_date = dates.last()?.clone();
+    db.usage_store()
+        .read_host_analytics(&HostAnalyticsInput {
+            agent_id: None,
+            start_date,
+            end_date,
+            time_zone: "UTC".to_string(),
+        })
+        .ok()
+}
+

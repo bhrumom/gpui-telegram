@@ -395,15 +395,15 @@ pub enum AppleSidebarEvent {
     OpenHelpAction(RailHelpAction),
 }
 
-fn default_usage_ring_metric() -> UsageRingMetric {
+pub(crate) fn default_usage_ring_metric() -> UsageRingMetric {
     UsageRingMetric {
         provider: AgentProviderId::Codex,
-        label: "Workspace".to_string(),
-        primary_ratio: Some(0.26),
-        secondary_ratio: Some(0.14),
+        label: "AI Usage".to_string(),
+        primary_ratio: Some(0.0),
+        secondary_ratio: None,
         unavailable: false,
         reset_label: None,
-        detail_summary: Some("Click to view usage & quotas".to_string()),
+        detail_summary: Some("No AI usage recorded yet".to_string()),
     }
 }
 

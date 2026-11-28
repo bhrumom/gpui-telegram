@@ -1663,3 +1663,119 @@ async fn test_local_hermes_computer_cloud_end_to_end_turn_loop() {
     assert_eq!(calls[0].1.op, "shell_exec");
     assert_eq!(calls[0].1.command.as_deref(), Some("uname -a"));
 }
+
+#[test]
+fn test_real_token_cost_estimation_and_usage_events_persistence() {
+    use gpui_telegram_agent::hermes::providers::{
+        estimate_token_cost_usd, ApiMode, TokenUsage,
+    };
+    use gpui_telegram_agent::hermes::state_db::{HermesStateStore, UsageEventRecord};
+
+    // 1. Local & unrecognized custom models honestly return $0.00 (never fabricated billing)
+    let local_cost = estimate_token_cost_usd(
+        "local_hermes",
+        "hermes-local-v1",
+        ApiMode::LocalHermes,
+        &TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(local_cost, 0.0);
+
+    let unknown_cost = estimate_token_cost_usd(
+        "custom_selfhost",
+        "my-private-weights-v1",
+        ApiMode::ChatCompletions,
+        &TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(unknown_cost, 0.0);
+
+    // 2. Anthropic Messages API: input_tokens is uncached; cached & cache_write are separate
+    let claude_cost = estimate_token_cost_usd(
+        "anthropic",
+        "claude-sonnet-4-20250514",
+        ApiMode::AnthropicMessages,
+        &TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            cache_read_tokens: 200_000,
+            cache_creation_tokens: 0,
+            total_tokens: 310_000,
+            estimated_cost_usd: 0.0,
+        },
+    );
+    // 0.1M * $3 + 0.2M * $0.30 + 0.01M * $15 = $0.30 + $0.06 + $0.15 = $0.51
+    assert!((claude_cost - 0.51).abs() < 1e-6, "got {claude_cost}");
+
+    // 3. OpenAI ChatCompletions API: input_tokens includes cache_read_tokens
+    let gpt_cost = estimate_token_cost_usd(
+        "openai",
+        "gpt-4o",
+        ApiMode::ChatCompletions,
+        &TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 20_000,
+            cache_read_tokens: 40_000,
+            cache_creation_tokens: 0,
+            total_tokens: 120_000,
+            estimated_cost_usd: 0.0,
+        },
+    );
+    // Uncached 0.06M * $2.50 ($0.15) + Cached 0.04M * $1.25 ($0.05) + Output 0.02M * $10 ($0.20) = $0.40
+    assert!((gpt_cost - 0.40).abs() < 1e-6, "got {gpt_cost}");
+
+    // 4. SQLite usage_events persistence and filtering
+    let store = HermesStateStore::open_in_memory().expect("in-memory store");
+    let now = chrono::Utc::now().timestamp_millis();
+    store
+        .record_usage_event(UsageEventRecord {
+            id: String::new(),
+            session_id: "sess_1".into(),
+            user_id: "u_100".into(),
+            bot_id: "bot_1".into(),
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            cached_tokens: 200_000,
+            cache_creation_tokens: 0,
+            cost_usd: claude_cost,
+            occurred_at_ms: now,
+        })
+        .expect("record event 1");
+    store
+        .record_usage_event(UsageEventRecord {
+            id: String::new(),
+            session_id: "sess_old".into(),
+            user_id: "u_100".into(),
+            bot_id: "bot_2".into(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 5_000,
+            output_tokens: 1_000,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: 0.0225,
+            occurred_at_ms: now - 15 * 86_400_000,
+        })
+        .expect("record old event");
+
+    let all = store.list_usage_events(None, None).unwrap();
+    assert_eq!(all.len(), 2);
+    let recent = store
+        .list_usage_events(Some(now - 7 * 86_400_000), None)
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].provider_id, "anthropic");
+    assert_eq!(recent[0].cached_tokens, 200_000);
+    let bot2_only = store.list_usage_events(None, Some("bot_2")).unwrap();
+    assert_eq!(bot2_only.len(), 1);
+    assert_eq!(bot2_only[0].model, "gpt-4o");
+}
+

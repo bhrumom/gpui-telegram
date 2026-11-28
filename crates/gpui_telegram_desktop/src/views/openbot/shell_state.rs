@@ -326,7 +326,7 @@ impl PageRailState {
             active_usage_hover_provider: None,
             usage_ring_spec: UsageRingSpec::DEFAULT,
             update_notice: false,
-            credits_balance_label: Some("100 cr".to_string()),
+            credits_balance_label: None,
             media_credits_label: None,
             show_server_slot: false,
             show_app_logo: true,

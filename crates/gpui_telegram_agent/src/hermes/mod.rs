@@ -64,7 +64,7 @@ use state_db::{
     AppendMessageRequest, ApprovalStatus as DbApprovalStatus, CreateApprovalRequest,
     CreateCronJobRequest, CreateKanbanCardRequest, CreateSessionRequest, CronJobPatch,
     CronJobRecord, HermesStateStore, KanbanCardPatch, MessageRecord, RecordCronRunRequest,
-    SessionListFilter, SessionPatch, SessionRecord,
+    SessionListFilter, SessionPatch, SessionRecord, UsageEventRecord,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -4887,6 +4887,59 @@ impl HermesEngine {
                     moa.total_usage.output_tokens as i64,
                     moa.total_usage.estimated_cost_usd,
                 );
+                let moa_user_id = caller_user_id.unwrap_or_default().to_string();
+                let moa_bot_id = self
+                    .inner
+                    .store
+                    .get_session(session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.bot_id)
+                    .unwrap_or_default();
+                let occurred_at_ms = Utc::now().timestamp_millis();
+                for cand in &moa.candidates {
+                    if cand.error.is_none()
+                        && (cand.usage.input_tokens > 0
+                            || cand.usage.output_tokens > 0
+                            || cand.usage.cache_read_tokens > 0
+                            || cand.usage.estimated_cost_usd > 0.0)
+                    {
+                        let _ = self.inner.store.record_usage_event(UsageEventRecord {
+                            id: String::new(),
+                            session_id: session_id.to_string(),
+                            user_id: moa_user_id.clone(),
+                            bot_id: moa_bot_id.clone(),
+                            provider_id: cand.provider_id.clone(),
+                            model: cand.model.clone(),
+                            input_tokens: cand.usage.input_tokens as i64,
+                            output_tokens: cand.usage.output_tokens as i64,
+                            cached_tokens: cand.usage.cache_read_tokens as i64,
+                            cache_creation_tokens: cand.usage.cache_creation_tokens as i64,
+                            cost_usd: cand.usage.estimated_cost_usd,
+                            occurred_at_ms,
+                        });
+                    }
+                }
+                if moa.synthesizer_usage.input_tokens > 0
+                    || moa.synthesizer_usage.output_tokens > 0
+                    || moa.synthesizer_usage.cache_read_tokens > 0
+                    || moa.synthesizer_usage.estimated_cost_usd > 0.0
+                {
+                    let _ = self.inner.store.record_usage_event(UsageEventRecord {
+                        id: String::new(),
+                        session_id: session_id.to_string(),
+                        user_id: moa_user_id,
+                        bot_id: moa_bot_id,
+                        provider_id: moa.synthesizer_provider_id.clone(),
+                        model: moa.synthesizer_model.clone(),
+                        input_tokens: moa.synthesizer_usage.input_tokens as i64,
+                        output_tokens: moa.synthesizer_usage.output_tokens as i64,
+                        cached_tokens: moa.synthesizer_usage.cache_read_tokens as i64,
+                        cache_creation_tokens: moa.synthesizer_usage.cache_creation_tokens as i64,
+                        cost_usd: moa.synthesizer_usage.estimated_cost_usd,
+                        occurred_at_ms,
+                    });
+                }
 
                 let done = HermesEvent::Done {
                     session_id: session_id.to_string(),
@@ -5395,6 +5448,24 @@ impl HermesEngine {
                 resp.usage.output_tokens as i64,
                 resp.usage.estimated_cost_usd,
             );
+            let _ = self.inner.store.record_usage_event(UsageEventRecord {
+                id: String::new(),
+                session_id: session_id.to_string(),
+                user_id: req.user_id.clone().unwrap_or_default(),
+                bot_id: req
+                    .bot_id
+                    .clone()
+                    .or_else(|| sess.bot_id.clone())
+                    .unwrap_or_default(),
+                provider_id: resp.provider_id.clone(),
+                model: resp.model.clone(),
+                input_tokens: resp.usage.input_tokens as i64,
+                output_tokens: resp.usage.output_tokens as i64,
+                cached_tokens: resp.usage.cache_read_tokens as i64,
+                cache_creation_tokens: resp.usage.cache_creation_tokens as i64,
+                cost_usd: resp.usage.estimated_cost_usd,
+                occurred_at_ms: Utc::now().timestamp_millis(),
+            });
 
             if let Some(ref r_text) = resp.reasoning {
                 combined_reasoning = Some(match combined_reasoning {
@@ -5765,6 +5836,24 @@ impl HermesEngine {
                             synth_resp.usage.output_tokens as i64,
                             synth_resp.usage.estimated_cost_usd,
                         );
+                        let _ = self.inner.store.record_usage_event(UsageEventRecord {
+                            id: String::new(),
+                            session_id: session_id.to_string(),
+                            user_id: req.user_id.clone().unwrap_or_default(),
+                            bot_id: req
+                                .bot_id
+                                .clone()
+                                .or_else(|| sess.bot_id.clone())
+                                .unwrap_or_default(),
+                            provider_id: synth_resp.provider_id.clone(),
+                            model: synth_resp.model.clone(),
+                            input_tokens: synth_resp.usage.input_tokens as i64,
+                            output_tokens: synth_resp.usage.output_tokens as i64,
+                            cached_tokens: synth_resp.usage.cache_read_tokens as i64,
+                            cache_creation_tokens: synth_resp.usage.cache_creation_tokens as i64,
+                            cost_usd: synth_resp.usage.estimated_cost_usd,
+                            occurred_at_ms: Utc::now().timestamp_millis(),
+                        });
                         if let Some(ref r_text) = synth_resp.reasoning {
                             combined_reasoning = Some(match combined_reasoning {
                                 Some(prev) => format!("{prev}\n{r_text}"),

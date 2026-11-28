@@ -199,6 +199,15 @@ pub(crate) fn apply_wallet_to_shell(
             is_outgoing: t.amount_stars < 0 || t.kind == "gift_sent",
         })
         .collect();
+    let ledger: Vec<crate::views::openbot::CreditLedgerEntry> = txs
+        .iter()
+        .map(|t| crate::views::openbot::CreditLedgerEntry {
+            id: t.tx_id.clone(),
+            label: t.description.clone(),
+            delta_credits: t.amount_stars,
+            created_at: format_ms_human(t.created_at_ms),
+        })
+        .collect();
     let ton = bal.ton_nano as f64 / 1_000_000_000.0;
     let stars = bal.stars_balance.max(0) as u64;
     shell.settings_router.update(cx, |sr, scx| {
@@ -208,6 +217,12 @@ pub(crate) fn apply_wallet_to_shell(
             sc_cx.notify();
         });
     });
+    if let Some(ws) = shell.openbot_workspace.clone() {
+        ws.update(cx, |w, wcx| {
+            w.sync_wallet_credits(bal.stars_balance.max(0), ton, 0, ledger);
+            wcx.notify();
+        });
+    }
 }
 
 impl AppShell {

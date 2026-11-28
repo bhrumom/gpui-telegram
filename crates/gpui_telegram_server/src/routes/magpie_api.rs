@@ -1814,7 +1814,35 @@ fn format_sse_error(format: GatewayResponseFormat, err_type: &str, message: &str
     }
 }
 
+fn record_gateway_usage_event(state: &AppState, uid: UserId, resp: &ProviderResponse) {
+    if resp.usage.input_tokens == 0
+        && resp.usage.output_tokens == 0
+        && resp.usage.cache_read_tokens == 0
+        && resp.usage.estimated_cost_usd <= 0.0
+    {
+        return;
+    }
+    let _ = state.fabushi_core().store().record_usage_event(
+        gpui_telegram_agent::hermes::state_db::UsageEventRecord {
+            id: String::new(),
+            session_id: format!("magpie_user_{}", uid.0),
+            user_id: uid.0.to_string(),
+            bot_id: String::new(),
+            provider_id: resp.provider_id.clone(),
+            model: resp.model.clone(),
+            input_tokens: resp.usage.input_tokens as i64,
+            output_tokens: resp.usage.output_tokens as i64,
+            cached_tokens: resp.usage.cache_read_tokens as i64,
+            cache_creation_tokens: resp.usage.cache_creation_tokens as i64,
+            cost_usd: resp.usage.estimated_cost_usd,
+            occurred_at_ms: Utc::now().timestamp_millis(),
+        },
+    );
+}
+
 fn stream_gateway_sse(
+    state: Arc<AppState>,
+    uid: UserId,
     router: ProviderRouter,
     prov_req: ProviderRequest,
     format: GatewayResponseFormat,
@@ -1831,8 +1859,17 @@ fn stream_gateway_sse(
     let task = tokio::spawn(async move { router.complete(prov_req, Some(tx)).await });
 
     let sse_stream = stream::unfold(
-        (rx, AbortTaskOnDrop(Some(task)), false, StreamSseState::new(), req_id, model_hint),
-        move |(mut rx, mut task_guard, finished, mut sse_st, id, mdl)| async move {
+        (
+            rx,
+            AbortTaskOnDrop(Some(task)),
+            false,
+            StreamSseState::new(),
+            req_id,
+            model_hint,
+            state,
+            uid,
+        ),
+        move |(mut rx, mut task_guard, finished, mut sse_st, id, mdl, state, uid)| async move {
             if finished {
                 return None;
             }
@@ -1840,7 +1877,7 @@ fn stream_gateway_sse(
                 if let Some(payload) = format_sse_event(format, &id, &mdl, ev, created, &mut sse_st) {
                     return Some((
                         Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(payload)),
-                        (rx, task_guard, false, sse_st, id, mdl),
+                        (rx, task_guard, false, sse_st, id, mdl, state, uid),
                     ));
                 }
             }
@@ -1848,6 +1885,7 @@ fn stream_gateway_sse(
             let out = if let Some(handle) = task_guard.0.take() {
                 match handle.await {
                     Ok(Ok(resp)) => {
+                        record_gateway_usage_event(&state, uid, &resp);
                         let u = provider_response_to_unified(resp);
                         format_sse_done(format, &id, &u.model, &u, &sse_st, created)
                     }
@@ -1870,7 +1908,7 @@ fn stream_gateway_sse(
 
             Some((
                 Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(out)),
-                (rx, task_guard, true, sse_st, id, mdl),
+                (rx, task_guard, true, sse_st, id, mdl, state, uid),
             ))
         },
     )
@@ -1920,11 +1958,12 @@ async fn handle_gateway_completion(
     let prov_req = unified_to_provider_request(unified);
 
     if stream_flag {
-        return stream_gateway_sse(router, prov_req, format);
+        return stream_gateway_sse(state, uid, router, prov_req, format);
     }
 
     match router.complete(prov_req, None).await {
         Ok(resp) => {
+            record_gateway_usage_event(&state, uid, &resp);
             let u = provider_response_to_unified(resp);
             let out = match format {
                 GatewayResponseFormat::ChatCompletions => unified_to_chat_completions_json(&u),

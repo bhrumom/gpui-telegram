@@ -251,10 +251,10 @@ impl Default for AppSettingsState {
             task_sound: true,
             dictation_model: "parakeet-tdt-0.6b-v3".to_string(),
             tts_speed: 1.0,
-            profile_email: "operator@openbot.local".to_string(),
-            billing_plan: "Pro".to_string(),
-            referral_code: "OPENBOT-2026".to_string(),
-            mobile_paired_devices: 1,
+            profile_email: String::new(),
+            billing_plan: "Standard".to_string(),
+            referral_code: String::new(),
+            mobile_paired_devices: 0,
             launch_at_login: true,
             quit_guard_enabled: true,
             keep_awake: false,
@@ -1059,11 +1059,11 @@ pub fn render_app_settings_modal(state: &AppSettingsState, palette: &OpenBotPale
             .child(render_setting_row("Configurable Commands", "11 rebindable commands with collision guard", "11 commands".into(), palette))
             .child(render_setting_row("Fixed Built-In Shortcuts", "openSettings, stopAllAgents, switchServer, zoom", "4 immutable".into(), palette)),
         AppSettingsTab::Profile => content
-            .child(render_setting_row("Operator Account", "Signed-in profile identity & sessions", state.profile_email.clone(), palette)),
+            .child(render_setting_row("Operator Account", "Signed-in profile identity & sessions", if state.profile_email.trim().is_empty() { "—".into() } else { state.profile_email.clone() }, palette)),
         AppSettingsTab::Billing => content
             .child(render_setting_row("Active Plan", "Subscription, credits & hosted servers (legacy alias)", state.billing_plan.clone(), palette)),
         AppSettingsTab::Referral => content
-            .child(render_setting_row("Referral Code", "Share invite code to earn compute credits", state.referral_code.clone(), palette)),
+            .child(render_setting_row("Referral Code", "Share invite code to earn compute credits", if state.referral_code.trim().is_empty() { "—".into() } else { state.referral_code.clone() }, palette)),
         AppSettingsTab::MobileConnect => content
             .child(render_setting_row("Paired Mobile Devices", "QR code pairing & encrypted remote relay", format!("{} device(s)", state.mobile_paired_devices), palette)),
         AppSettingsTab::AppBehavior => content

@@ -309,6 +309,7 @@ impl AppShell {
                     &shell.panel_state.mcp_servers,
                     &shell.panel_state.mcp_tools,
                 );
+                let usage_for_sidebar = usage_res.clone();
                 shell.tasks_workspace.update(cx, |w, w_cx| {
                     w.sync_tasks(acp);
                     w.sync_mcp_servers(mcp);
@@ -329,6 +330,16 @@ impl AppShell {
                     w.set_loading(false, None);
                     w_cx.notify();
                 });
+                if let Some(ref u) = usage_for_sidebar {
+                    let top = u.by_provider.first().map(|p| p.provider_id.as_str());
+                    shell.sync_apple_sidebar_usage_ring_from_live_data(
+                        u.estimated_cost_usd,
+                        u.total_tokens,
+                        u.cached_tokens,
+                        top,
+                        cx,
+                    );
+                }
                 if let Some(cmds) = cmds_res {
                     shell.composer.update(cx, |c, c_cx| {
                         c.set_hermes_commands(cmds);

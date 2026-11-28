@@ -475,6 +475,7 @@ fn test_global_tasks_workspace_6_hermes_studio_tabs_and_state_sync() {
         estimated_cost_usd: 0.02,
         tool_calls: 2,
         by_model: Vec::new(),
+        ..Default::default()
     });
     assert_eq!(ws.active_api_mode, "codex_responses");
     assert_eq!(ws.subagent_lineage.len(), 1);

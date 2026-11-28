@@ -47,11 +47,12 @@ pub use queue_and_voice::{QueuePanelState, VoicePillPhase, VoicePillState, Voice
 pub use runtime_bridge::{
     OPENBOT_SYNTHETIC_DIALOG_PREFIX, OpenBotRuntimeBridge, ProjectedTelegramAvatarProfile,
     ProjectedTelegramPeer, TelegramBidirectionalProjection, load_live_fusion_snapshot,
-    load_telegram_bidirectional_projection, synthetic_telegram_peer_id,
+    load_openbot_host_analytics, load_telegram_bidirectional_projection, synthetic_telegram_peer_id,
 };
 pub use secondary_pages::{
-    CalendarViewMode, CrmPageState, LibraryPanelState, MarketplacePageState, RoutineCalendarState,
-    TasksPanelState, UsageAndCreditsState,
+    CalendarViewMode, CreditLedgerEntry, CrmPageState, LibraryPanelState, MarketplacePageState,
+    ProviderUsageSeries, RoutineCalendarState, TasksPanelState, UsageAndCreditsState,
+    UsageAndCreditsUiAction,
 };
 pub use settings_and_shortcuts::{
     AppSettingsState, AppSettingsTab, ServerSettingsSection, ServerSettingsState, ShortcutChord,
@@ -70,9 +71,9 @@ pub use ui_probe::{
 pub use workflow_canvas::WorkflowCanvasState;
 pub use workspace_shell::{
     ActiveOpenBotTarget, DualSurfaceFusionSnapshot, LEGACY_GROK_AVATAR_SHAPES,
-    OpenBotShellSummarySnapshot, OpenBotWorkspaceShell, TELEGRAM_CMD_1_TO_9_DESTINATIONS,
-    TELEGRAM_TDESKTOP_THEME_CYCLE, TelegramBaselineInvariants, classify_unified_avatar_spec,
-    resolve_goutte_fallback_shape, resolve_workspace_shortcut,
+    OpenBotShellSummarySnapshot, OpenBotWorkspaceEvent, OpenBotWorkspaceShell,
+    TELEGRAM_CMD_1_TO_9_DESTINATIONS, TELEGRAM_TDESKTOP_THEME_CYCLE, TelegramBaselineInvariants,
+    classify_unified_avatar_spec, resolve_goutte_fallback_shape, resolve_workspace_shortcut,
 };
 
 /// Returns the canonical count of OpenBot Desktop OS surfaces (`7`: `Main`, `ChatWindow`,

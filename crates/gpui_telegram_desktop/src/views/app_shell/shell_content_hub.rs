@@ -625,6 +625,9 @@ impl AppShell {
                     w.select_page(page);
                     wcx.notify();
                 });
+                if section == AppleSidebarSection::Usage && !ws.read(cx).usage_credits.is_loading {
+                    self.refresh_openbot_usage_and_credits(cx);
+                }
                 self.sync_apple_sidebar_to_active_panel(cx);
                 cx.notify();
             }

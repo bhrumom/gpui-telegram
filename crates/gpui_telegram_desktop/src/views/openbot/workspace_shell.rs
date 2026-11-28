@@ -58,9 +58,10 @@ use super::os_surfaces::{
 use super::page_rail::render_page_rail;
 use super::queue_and_voice::{QueuePanelState, VoicePillState, render_queue_panel, render_voice_pill};
 use super::secondary_pages::{
-    CrmPageState, LibraryPanelState, MarketplacePageState, RoutineCalendarState, TasksPanelState,
-    UsageAndCreditsState, render_crm_page, render_library_panel, render_marketplace_page,
-    render_routine_calendar, render_tasks_panel, render_usage_and_credits,
+    CreditLedgerEntry, CrmPageState, LibraryPanelState, MarketplacePageState, RoutineCalendarState,
+    TasksPanelState, UsageAndCreditsState, UsageAndCreditsUiAction, render_crm_page,
+    render_library_panel, render_marketplace_page, render_routine_calendar, render_tasks_panel,
+    render_usage_and_credits, render_usage_and_credits_interactive,
 };
 use super::server_rail::render_server_rail;
 use super::settings_and_shortcuts::{
@@ -332,6 +333,14 @@ pub struct OpenBotWorkspaceShell {
     pub embedded_in_app_shell: bool,
     pending_page_select: Arc<Mutex<Option<OpenBotPage>>>,
 }
+
+/// Interactive events emitted by [`OpenBotWorkspaceShell`] to host [`crate::views::AppShell`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenBotWorkspaceEvent {
+    UsageAction(UsageAndCreditsUiAction),
+}
+
+impl EventEmitter<OpenBotWorkspaceEvent> for OpenBotWorkspaceShell {}
 
 impl Default for OpenBotWorkspaceShell {
     fn default() -> Self {
@@ -1210,6 +1219,41 @@ impl OpenBotWorkspaceShell {
         cx.notify();
     }
 
+    /// Synchronizes live wallet Stars/TON balance and ledger into `usage_credits` and `PageRail`.
+    pub fn sync_wallet_credits(
+        &mut self,
+        stars: i64,
+        ton_balance: f64,
+        pending_hold: i64,
+        ledger: Vec<CreditLedgerEntry>,
+    ) {
+        self.usage_credits
+            .apply_wallet(stars, ton_balance, pending_hold, ledger);
+        self.shell.page_rail.credits_balance_label = Some(format!("{} cr", stars.max(0)));
+    }
+
+    fn apply_usage_credits_action(
+        &mut self,
+        action: UsageAndCreditsUiAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            UsageAndCreditsUiAction::SelectRangeDays(days) => {
+                let clamped = days.clamp(1, 90);
+                self.usage_credits.selected_range_days = clamped;
+                self.usage_credits.is_loading = true;
+                self.usage_credits.sync_error = None;
+            }
+            UsageAndCreditsUiAction::Refresh => {
+                self.usage_credits.is_loading = true;
+                self.usage_credits.sync_error = None;
+            }
+            UsageAndCreditsUiAction::BuyCredits | UsageAndCreditsUiAction::MoveCredits => {}
+        }
+        cx.emit(OpenBotWorkspaceEvent::UsageAction(action));
+        cx.notify();
+    }
+
     fn render_main_surface(&self, cx: Option<&mut Context<Self>>) -> Div {
         match self.active_page {
             OpenBotPage::Agents => match &self.active_target {
@@ -1241,7 +1285,17 @@ impl OpenBotWorkspaceShell {
                 render_routine_calendar(&self.routine_calendar, &self.palette, self.now_sec)
             }
             OpenBotPage::Usage | OpenBotPage::Credits => {
-                render_usage_and_credits(&self.usage_credits, &self.palette)
+                if let Some(cx) = cx {
+                    render_usage_and_credits_interactive(
+                        &self.usage_credits,
+                        &self.palette,
+                        &self.lang_id,
+                        cx,
+                        |this, act, cx| this.apply_usage_credits_action(act, cx),
+                    )
+                } else {
+                    render_usage_and_credits(&self.usage_credits, &self.palette)
+                }
             }
             OpenBotPage::Library => render_library_panel(&self.library_panel, &self.palette),
             OpenBotPage::Providers => self.render_providers_surface(),

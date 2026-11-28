@@ -600,6 +600,142 @@ impl ModelProfile {
     }
 }
 
+/// Computes an estimated API cost in USD from actual token counts using published per-1M token
+/// list prices. Local/offline providers (`local_hermes`, `ollama`, `lmstudio`, `vllm`) and
+/// unrecognized custom models honestly return `0.0` instead of fabricated billing numbers.
+pub fn estimate_token_cost_usd(
+    provider_id: &str,
+    model: &str,
+    api_mode: ApiMode,
+    usage: &TokenUsage,
+) -> f64 {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_read_tokens == 0
+        && usage.cache_creation_tokens == 0
+    {
+        return 0.0;
+    }
+    let pid = provider_id.trim().to_ascii_lowercase();
+    if api_mode == ApiMode::LocalHermes
+        || matches!(
+            pid.as_str(),
+            "local_hermes" | "ollama" | "lmstudio" | "vllm" | "llama_cpp" | "llamacpp"
+        )
+    {
+        return 0.0;
+    }
+    let raw_model = model.trim().to_ascii_lowercase();
+    let m = raw_model
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&raw_model);
+    if m.is_empty() || m == "hermes-local-v1" {
+        return 0.0;
+    }
+
+    // (input_per_1m, cached_input_per_1m, cache_write_per_1m, output_per_1m)
+    let rates: Option<(f64, f64, f64, f64)> = if m.contains("claude-opus-4-5")
+        || m.contains("claude-opus-4.5")
+        || m.contains("claude-opus-4-6")
+        || m.contains("claude-opus-4.6")
+        || m.contains("claude-opus-4-7")
+        || m.contains("claude-opus-4-8")
+        || m.contains("claude-opus-5")
+    {
+        Some((5.0, 0.50, 6.25, 25.0))
+    } else if m.contains("claude-opus") || m.contains("claude-4-opus") {
+        Some((15.0, 1.50, 18.75, 75.0))
+    } else if m.contains("claude-sonnet") || m.contains("claude-3-7-sonnet") || m.contains("claude-3-5-sonnet") {
+        Some((3.0, 0.30, 3.75, 15.0))
+    } else if m.contains("claude-haiku-4-5") || m.contains("claude-haiku-4.5") {
+        Some((1.0, 0.10, 1.25, 5.0))
+    } else if m.contains("claude-3-5-haiku") {
+        Some((0.80, 0.08, 1.00, 4.0))
+    } else if m.contains("claude-haiku") {
+        Some((0.25, 0.03, 0.30, 1.25))
+    } else if m.contains("gpt-5-nano") {
+        Some((0.05, 0.005, 0.0, 0.40))
+    } else if m.contains("gpt-5-mini") {
+        Some((0.25, 0.025, 0.0, 2.00))
+    } else if m.contains("gpt-5.4") || m.contains("gpt-5.3") || m.contains("gpt-5.2") || m.contains("gpt-5-pro") {
+        Some((2.50, 0.25, 0.0, 15.0))
+    } else if m.contains("gpt-5") {
+        Some((1.25, 0.125, 0.0, 10.0))
+    } else if m.contains("gpt-4.1-nano") {
+        Some((0.10, 0.025, 0.0, 0.40))
+    } else if m.contains("gpt-4.1-mini") {
+        Some((0.40, 0.10, 0.0, 1.60))
+    } else if m.contains("gpt-4.1") {
+        Some((2.00, 0.50, 0.0, 8.00))
+    } else if m.contains("gpt-4o-mini") {
+        Some((0.15, 0.075, 0.0, 0.60))
+    } else if m.contains("gpt-4o") {
+        Some((2.50, 1.25, 0.0, 10.0))
+    } else if m.contains("codex-mini") {
+        Some((1.50, 0.375, 0.0, 6.00))
+    } else if m.contains("o3-mini") || m.contains("o4-mini") {
+        Some((1.10, 0.275, 0.0, 4.40))
+    } else if m.starts_with("o3") {
+        Some((2.00, 0.50, 0.0, 8.00))
+    } else if m.contains("o1-mini") {
+        Some((1.10, 0.55, 0.0, 4.40))
+    } else if m.starts_with("o1") {
+        Some((15.0, 7.50, 0.0, 60.0))
+    } else if m.contains("grok-3-mini") || m.contains("grok-4-fast") || m.contains("grok-code-fast") {
+        Some((0.30, 0.075, 0.0, 0.50))
+    } else if m.contains("grok") {
+        Some((3.00, 0.75, 0.0, 15.0))
+    } else if m.contains("gemini-2.5-pro") || m.contains("gemini-3-pro") || m.contains("gemini-3.1-pro") || m.contains("gemini-1.5-pro") {
+        Some((1.25, 0.3125, 0.0, 10.0))
+    } else if m.contains("gemini-2.5-flash-lite") || m.contains("gemini-2.0-flash-lite") {
+        Some((0.10, 0.025, 0.0, 0.40))
+    } else if m.contains("gemini-2.5-flash") || m.contains("gemini-3-flash") || m.contains("gemini-3.8-flash") {
+        Some((0.30, 0.075, 0.0, 2.50))
+    } else if m.contains("gemini") && m.contains("flash") {
+        Some((0.10, 0.025, 0.0, 0.40))
+    } else if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
+        Some((0.55, 0.14, 0.0, 2.19))
+    } else if m.contains("deepseek") {
+        Some((0.27, 0.07, 0.0, 1.10))
+    } else if m.contains("qwen3-coder") || m.contains("qwen-max") {
+        Some((1.20, 0.30, 0.0, 6.00))
+    } else if m.contains("qwen") {
+        Some((0.30, 0.08, 0.0, 1.20))
+    } else if m.contains("kimi") || m.contains("moonshot") {
+        Some((0.60, 0.15, 0.0, 2.50))
+    } else if m.contains("glm") {
+        Some((0.50, 0.12, 0.0, 2.00))
+    } else if m.contains("minimax") {
+        Some((0.30, 0.08, 0.0, 1.20))
+    } else if m.contains("mistral-large") {
+        Some((2.00, 0.50, 0.0, 6.00))
+    } else if m.contains("mistral") || m.contains("codestral") {
+        Some((0.30, 0.08, 0.0, 0.90))
+    } else {
+        None
+    };
+
+    let Some((in_rate, cached_rate, cache_write_rate, out_rate)) = rates else {
+        return 0.0;
+    };
+    let uncached_in = if api_mode == ApiMode::AnthropicMessages {
+        usage.input_tokens
+    } else {
+        usage.input_tokens.saturating_sub(usage.cache_read_tokens)
+    };
+    let cost = ((uncached_in as f64) * in_rate
+        + (usage.cache_read_tokens as f64) * cached_rate
+        + (usage.cache_creation_tokens as f64) * cache_write_rate
+        + (usage.output_tokens as f64) * out_rate)
+        / 1_000_000.0;
+    if cost.is_finite() && cost > 0.0 {
+        cost
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
@@ -3337,14 +3473,43 @@ impl ProviderRouter {
     }
 
     fn enrich_cost(&self, resp: &mut ProviderResponse) {
-        if resp.usage.estimated_cost_usd > 0.0 {
+        if resp.usage.estimated_cost_usd > 0.0 && resp.usage.estimated_cost_usd.is_finite() {
             return;
         }
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(profile) = guard.model_profiles.get(&resp.model) {
-            resp.usage.estimated_cost_usd =
-                profile.estimate_cost(resp.usage.input_tokens, resp.usage.output_tokens);
-        }
+        let profile_cost = {
+            let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.model_profiles.get(&resp.model).and_then(|profile| {
+                if profile.input_cost_per_1m > 0.0 || profile.output_cost_per_1m > 0.0 {
+                    let cached_discount = if resp.api_mode == ApiMode::AnthropicMessages {
+                        0.10
+                    } else {
+                        0.50
+                    };
+                    let uncached_in = if resp.api_mode == ApiMode::AnthropicMessages {
+                        resp.usage.input_tokens
+                    } else {
+                        resp.usage
+                            .input_tokens
+                            .saturating_sub(resp.usage.cache_read_tokens)
+                    };
+                    let in_cost = (uncached_in as f64 / 1_000_000.0) * profile.input_cost_per_1m;
+                    let cached_cost = (resp.usage.cache_read_tokens as f64 / 1_000_000.0)
+                        * profile.input_cost_per_1m
+                        * cached_discount;
+                    let cache_write_cost = (resp.usage.cache_creation_tokens as f64 / 1_000_000.0)
+                        * profile.input_cost_per_1m
+                        * 1.25;
+                    let out_cost =
+                        (resp.usage.output_tokens as f64 / 1_000_000.0) * profile.output_cost_per_1m;
+                    Some(in_cost + cached_cost + cache_write_cost + out_cost)
+                } else {
+                    None
+                }
+            })
+        };
+        resp.usage.estimated_cost_usd = profile_cost.unwrap_or_else(|| {
+            estimate_token_cost_usd(&resp.provider_id, &resp.model, resp.api_mode, &resp.usage)
+        });
     }
 
     async fn execute_single_provider(
@@ -8656,6 +8821,8 @@ pub struct MoaCandidateResponse {
     pub reasoning: Option<String>,
     pub duration_ms: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -8663,6 +8830,10 @@ pub struct MoaResult {
     pub synthesis: String,
     pub candidates: Vec<MoaCandidateResponse>,
     pub synthesizer_model: String,
+    #[serde(default)]
+    pub synthesizer_provider_id: String,
+    #[serde(default)]
+    pub synthesizer_usage: TokenUsage,
     pub total_usage: TokenUsage,
 }
 
@@ -8797,6 +8968,7 @@ impl MoaCoordinator {
                         reasoning: resp.reasoning,
                         duration_ms,
                         error: None,
+                        usage: resp.usage,
                     });
                 }
                 Err(err) => {
@@ -8808,6 +8980,7 @@ impl MoaCoordinator {
                         reasoning: None,
                         duration_ms,
                         error: Some(err.to_string()),
+                        usage: TokenUsage::default(),
                     });
                 }
             }
@@ -8872,6 +9045,9 @@ impl MoaCoordinator {
             metadata: base_request.metadata.clone(),
         };
 
+        let mut synthesizer_usage = TokenUsage::default();
+        let mut synthesizer_provider_id = synth_spec.provider_id.clone();
+        let mut synthesizer_model = synth_spec.model.clone();
         let synthesis = if synth_spec.provider_id == "local_hermes" {
             let mut parts = vec![format!(
                 "## Mixture-of-Agents Synthesis ({} perspectives)\nPrompt: \"{}\"",
@@ -8893,6 +9069,9 @@ impl MoaCoordinator {
             {
                 Ok(resp) => {
                     total_usage.accumulate(&resp.usage);
+                    synthesizer_provider_id = resp.provider_id;
+                    synthesizer_model = resp.model;
+                    synthesizer_usage = resp.usage;
                     resp.content
                 }
                 Err(_) => candidate_summary,
@@ -8903,7 +9082,9 @@ impl MoaCoordinator {
         Ok(MoaResult {
             synthesis,
             candidates,
-            synthesizer_model: synth_spec.model,
+            synthesizer_model,
+            synthesizer_provider_id,
+            synthesizer_usage,
             total_usage,
         })
     }

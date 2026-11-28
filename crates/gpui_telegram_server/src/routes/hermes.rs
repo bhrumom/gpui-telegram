@@ -9,12 +9,14 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use futures::stream::{self, StreamExt};
 use gpui_telegram_agent::fabushi_bot::{AgentAddress, AgentGroupAddress, FabushiBotHost, FabushiBotPatch};
 use gpui_telegram_agent::hermes::commands::{InlineActionButton, SlashCommandParser};
 use gpui_telegram_agent::hermes::memory::{MemoryTarget, ObservationCategory, SoulProfile};
-use gpui_telegram_agent::hermes::providers::{ApiMode, CredentialEntry, ProviderConfig};
+use gpui_telegram_agent::hermes::providers::{
+    estimate_token_cost_usd, ApiMode, CredentialEntry, ProviderConfig, TokenUsage,
+};
 use gpui_telegram_agent::hermes::security::{
     ApprovalDecisionAction, ApprovalMode, ApprovalStatus as SecurityApprovalStatus,
 };
@@ -22,7 +24,7 @@ use gpui_telegram_agent::hermes::skills::{CreateSkillRequest, SkillDocument, Ski
 use gpui_telegram_agent::hermes::state_db::{
     ApprovalRecord, ApprovalStatus, CreateCronJobRequest, CreateKanbanCardRequest, CronJobPatch,
     CronJobRecord, KanbanBoardRecord, KanbanCardPatch, KanbanCardRecord, SessionListFilter,
-    SessionPatch, SessionRecord,
+    SessionPatch, SessionRecord, UsageEventRecord,
 };
 use gpui_telegram_agent::hermes::toolsets::{all_builtin_tool_specs, ToolsetId, ToolsetPreset};
 use gpui_telegram_agent::hermes::trajectory::TrajectoryFormat;
@@ -36,7 +38,7 @@ use gpui_telegram_proto::message::{InlineKeyboardButton, MessageContent, Message
 use gpui_telegram_proto::sync::{TypingAction, TypingEvent, UpdateEvent};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6609,32 +6611,420 @@ pub async fn hermes_providers_put(
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct HermesUsageQuery {
+    pub bot_id: Option<u64>,
+    pub days: Option<u32>,
+}
+
+fn canonical_billing_provider(raw_provider: &str, model: &str) -> (String, String) {
+    let p = raw_provider.trim().to_ascii_lowercase();
+    let m = model.trim().to_ascii_lowercase();
+    let tail_model = m.rsplit_once('/').map(|(_, t)| t).unwrap_or(&m);
+
+    if p == "local_hermes"
+        || p == "ollama"
+        || p == "lmstudio"
+        || p == "vllm"
+        || tail_model == "hermes-local-v1"
+    {
+        return ("local".to_string(), "Local".to_string());
+    }
+    if p.contains("anthropic")
+        || p == "claude"
+        || p.starts_with("claude_")
+        || p.starts_with("claude:")
+        || tail_model.contains("claude")
+    {
+        return ("claude".to_string(), "Claude".to_string());
+    }
+    if p == "openai"
+        || p == "openai_responses"
+        || p == "codex"
+        || p.starts_with("codex_")
+        || p.starts_with("codex:")
+        || tail_model.starts_with("gpt-")
+        || tail_model.starts_with("codex")
+        || tail_model.starts_with("o1")
+        || tail_model.starts_with("o3")
+        || tail_model.starts_with("o4")
+    {
+        return ("codex".to_string(), "OpenAI / Codex".to_string());
+    }
+    if p == "grok" || p == "xai" || p.starts_with("xai") || tail_model.contains("grok") {
+        return ("grok".to_string(), "Grok".to_string());
+    }
+    if p.contains("gemini")
+        || p.contains("google")
+        || p == "antigravity"
+        || tail_model.contains("gemini")
+    {
+        return ("gemini".to_string(), "Gemini".to_string());
+    }
+    if p.contains("deepseek") || tail_model.contains("deepseek") {
+        return ("deepseek".to_string(), "DeepSeek".to_string());
+    }
+    if p.contains("openrouter") {
+        return ("openrouter".to_string(), "OpenRouter".to_string());
+    }
+    if p.contains("qwen")
+        || p.contains("dashscope")
+        || p.contains("alibaba")
+        || tail_model.contains("qwen")
+    {
+        return ("qwen".to_string(), "Qwen".to_string());
+    }
+    if p.contains("kimi")
+        || p.contains("moonshot")
+        || tail_model.contains("kimi")
+        || tail_model.contains("moonshot")
+    {
+        return ("kimi".to_string(), "Kimi".to_string());
+    }
+    if p.contains("glm") || p.contains("zhipu") || tail_model.contains("glm") {
+        return ("glm".to_string(), "GLM".to_string());
+    }
+    if p.contains("minimax") || tail_model.contains("minimax") {
+        return ("minimax".to_string(), "MiniMax".to_string());
+    }
+    if p.contains("mistral") || tail_model.contains("mistral") || tail_model.contains("codestral") {
+        return ("mistral".to_string(), "Mistral".to_string());
+    }
+    if !p.is_empty() && p != "chat_completions" && p != "codex_responses" && p != "anthropic_messages" {
+        let base = p.split(':').next().unwrap_or(&p).trim();
+        if !base.is_empty() {
+            let mut chars = base.chars();
+            let display = match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => "Other".to_string(),
+            };
+            return (base.to_string(), display);
+        }
+    }
+    ("other".to_string(), "Other".to_string())
+}
+
 pub async fn hermes_usage_get(
-    _auth: AuthBearer,
+    auth: AuthBearer,
     State(state): State<Arc<AppState>>,
-    Query(q): Query<OptionalBotScopeQuery>,
+    Query(q): Query<HermesUsageQuery>,
 ) -> Response {
-    let engine = resolve_hermes_for_bot(&state, q.bot_id);
-    let summary = match engine.store().usage_summary(None, None) {
-        Ok(s) => s,
-        Err(e) => return map_telegram_err(e),
-    };
-    let tool_calls: u64 = engine
-        .store()
-        .insights(None, None)
-        .map(|i| i.top_tools.iter().map(|t| t.call_count.max(0) as u64).sum())
+    let range_days = q.days.unwrap_or(7).clamp(1, 90);
+    let today_utc = Utc::now().date_naive();
+    let mut dates: Vec<String> = Vec::with_capacity(range_days as usize);
+    let mut date_index: HashMap<String, usize> = HashMap::with_capacity(range_days as usize);
+    for offset in (0..range_days).rev() {
+        let d = today_utc - ChronoDuration::days(i64::from(offset));
+        let label = d.format("%Y-%m-%d").to_string();
+        date_index.insert(label.clone(), dates.len());
+        dates.push(label);
+    }
+    let window_start_date = today_utc - ChronoDuration::days(i64::from(range_days - 1));
+    let window_start_ms = window_start_date
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp_millis())
         .unwrap_or(0);
+
+    let engines: Vec<Arc<HermesEngine>> = if q.bot_id.is_some() {
+        vec![resolve_hermes_for_bot(&state, q.bot_id)]
+    } else {
+        state
+            .fabushi_bots
+            .all_engines()
+            .into_iter()
+            .map(|(_, eng)| eng)
+            .collect()
+    };
+
+    let caller_uid_str = auth.user_id.0.to_string();
+    let is_admin = caller_is_admin(&state, auth.user_id);
+
+    let mut sessions_by_id: HashMap<String, SessionRecord> = HashMap::new();
+    let mut authorized_session_ids: HashSet<String> = HashSet::new();
+    let mut seen_events: HashSet<String> = HashSet::new();
+    let mut raw_events: Vec<UsageEventRecord> = Vec::new();
+    let mut tool_calls: u64 = 0;
+
+    for engine in &engines {
+        if let Ok(list) = engine.store().list_sessions(SessionListFilter::default()) {
+            for sess in list {
+                let authorized =
+                    authorize_hermes_session_access(&state, &auth, &sess, q.bot_id).is_ok();
+                if authorized {
+                    authorized_session_ids.insert(sess.id.clone());
+                }
+                sessions_by_id.entry(sess.id.clone()).or_insert(sess);
+            }
+        }
+        if let Ok(events) = engine.store().list_usage_events(None, None) {
+            for ev in events {
+                if seen_events.insert(ev.id.clone()) {
+                    raw_events.push(ev);
+                }
+            }
+        }
+        tool_calls = tool_calls.saturating_add(
+            engine
+                .store()
+                .insights(q.days, None)
+                .map(|i| i.top_tools.iter().map(|t| t.call_count.max(0) as u64).sum())
+                .unwrap_or(0),
+        );
+    }
+
+    let mut sessions_with_events: HashSet<String> = HashSet::new();
+    let mut authorized_events: Vec<UsageEventRecord> = Vec::new();
+    for ev in raw_events {
+        if !ev.session_id.is_empty() {
+            sessions_with_events.insert(ev.session_id.clone());
+        }
+        let allowed = if !ev.user_id.trim().is_empty() {
+            ev.user_id.trim() == caller_uid_str || is_admin
+        } else if !ev.session_id.is_empty() && sessions_by_id.contains_key(&ev.session_id) {
+            authorized_session_ids.contains(&ev.session_id)
+        } else {
+            is_admin
+        };
+        if allowed {
+            authorized_events.push(ev);
+        }
+    }
+
+    // Legacy fallback: include pre-existing authorized sessions that recorded totals before
+    // `usage_events` existed so historical real spend is preserved without double counting.
+    let mut authorized_session_messages: u64 = 0;
+    for (sid, sess) in &sessions_by_id {
+        if !authorized_session_ids.contains(sid) {
+            continue;
+        }
+        let ts_ms = sess.ended_at.unwrap_or(sess.started_at);
+        if q.days.is_none() || ts_ms >= window_start_ms {
+            authorized_session_messages =
+                authorized_session_messages.saturating_add(sess.message_count.max(0) as u64);
+        }
+        if sessions_with_events.contains(sid) {
+            continue;
+        }
+        if sess.input_tokens <= 0 && sess.output_tokens <= 0 && sess.total_cost_usd <= 0.0 {
+            continue;
+        }
+        let meta: Value = serde_json::from_str(&sess.metadata_json).unwrap_or_else(|_| json!({}));
+        let raw_provider = meta
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&sess.api_mode)
+            .to_string();
+        let cost = if sess.total_cost_usd > 0.0 && sess.total_cost_usd.is_finite() {
+            sess.total_cost_usd
+        } else {
+            let api_mode = match sess.api_mode.as_str() {
+                "anthropic_messages" => ApiMode::AnthropicMessages,
+                "codex_responses" => ApiMode::CodexResponses,
+                "local_hermes" => ApiMode::LocalHermes,
+                _ => ApiMode::ChatCompletions,
+            };
+            estimate_token_cost_usd(
+                &raw_provider,
+                &sess.model,
+                api_mode,
+                &TokenUsage {
+                    input_tokens: sess.input_tokens.max(0) as u64,
+                    output_tokens: sess.output_tokens.max(0) as u64,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: sess.input_tokens.max(0) as u64 + sess.output_tokens.max(0) as u64,
+                    estimated_cost_usd: 0.0,
+                },
+            )
+        };
+        authorized_events.push(UsageEventRecord {
+            id: format!("legacy_{sid}"),
+            session_id: sid.clone(),
+            user_id: caller_uid_str.clone(),
+            bot_id: sess.bot_id.clone().unwrap_or_default(),
+            provider_id: raw_provider,
+            model: sess.model.clone(),
+            input_tokens: sess.input_tokens.max(0),
+            output_tokens: sess.output_tokens.max(0),
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: cost,
+            occurred_at_ms: ts_ms,
+        });
+    }
+
+    let filter_to_window = q.days.is_some();
+
+    #[derive(Default)]
+    struct ModelAgg {
+        sessions: HashSet<String>,
+        turns: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        cost_usd: f64,
+    }
+
+    struct ProviderAgg {
+        provider_id: String,
+        display_name: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        cost_usd: f64,
+        turns: u64,
+        daily_cost_usd: Vec<f64>,
+        daily_tokens: Vec<u64>,
+        models: BTreeSet<String>,
+    }
+
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    let mut cached_tokens: u64 = 0;
+    let mut estimated_cost_usd: f64 = 0.0;
+    let mut event_turns: u64 = 0;
+    let mut by_model_map: BTreeMap<String, ModelAgg> = BTreeMap::new();
+    let mut by_provider_map: BTreeMap<String, ProviderAgg> = BTreeMap::new();
+
+    for ev in &authorized_events {
+        if filter_to_window && ev.occurred_at_ms < window_start_ms {
+            continue;
+        }
+        let in_tok = ev.input_tokens.max(0) as u64;
+        let out_tok = ev.output_tokens.max(0) as u64;
+        let cache_tok = ev.cached_tokens.max(0) as u64;
+        let cost = if ev.cost_usd.is_finite() && ev.cost_usd > 0.0 {
+            ev.cost_usd
+        } else {
+            0.0
+        };
+
+        event_turns = event_turns.saturating_add(1);
+        prompt_tokens = prompt_tokens.saturating_add(in_tok);
+        completion_tokens = completion_tokens.saturating_add(out_tok);
+        cached_tokens = cached_tokens.saturating_add(cache_tok);
+        estimated_cost_usd += cost;
+
+        let model_key = if ev.model.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            ev.model.trim().to_string()
+        };
+        let m_agg = by_model_map.entry(model_key.clone()).or_default();
+        if !ev.session_id.is_empty() {
+            m_agg.sessions.insert(ev.session_id.clone());
+        }
+        m_agg.turns = m_agg.turns.saturating_add(1);
+        m_agg.input_tokens = m_agg.input_tokens.saturating_add(in_tok);
+        m_agg.output_tokens = m_agg.output_tokens.saturating_add(out_tok);
+        m_agg.cached_tokens = m_agg.cached_tokens.saturating_add(cache_tok);
+        m_agg.cost_usd += cost;
+
+        let (prov_id, prov_name) = canonical_billing_provider(&ev.provider_id, &ev.model);
+        let p_agg = by_provider_map
+            .entry(prov_id.clone())
+            .or_insert_with(|| ProviderAgg {
+                provider_id: prov_id,
+                display_name: prov_name,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                cost_usd: 0.0,
+                turns: 0,
+                daily_cost_usd: vec![0.0; dates.len()],
+                daily_tokens: vec![0; dates.len()],
+                models: BTreeSet::new(),
+            });
+        p_agg.input_tokens = p_agg.input_tokens.saturating_add(in_tok);
+        p_agg.output_tokens = p_agg.output_tokens.saturating_add(out_tok);
+        p_agg.cached_tokens = p_agg.cached_tokens.saturating_add(cache_tok);
+        p_agg.cost_usd += cost;
+        p_agg.turns = p_agg.turns.saturating_add(1);
+        if !ev.model.trim().is_empty() {
+            p_agg.models.insert(ev.model.trim().to_string());
+        }
+        if let Some(dt) = Utc.timestamp_millis_opt(ev.occurred_at_ms).single() {
+            let day_key = dt.date_naive().format("%Y-%m-%d").to_string();
+            if let Some(&idx) = date_index.get(&day_key) {
+                p_agg.daily_cost_usd[idx] += cost;
+                p_agg.daily_tokens[idx] = p_agg.daily_tokens[idx]
+                    .saturating_add(in_tok.saturating_add(out_tok));
+            }
+        }
+    }
+
+    let mut by_model_vec: Vec<Value> = by_model_map
+        .into_iter()
+        .map(|(model, agg)| {
+            json!({
+                "model": model,
+                "session_count": agg.sessions.len() as i64,
+                "message_count": agg.turns as i64,
+                "input_tokens": agg.input_tokens as i64,
+                "output_tokens": agg.output_tokens as i64,
+                "cached_tokens": agg.cached_tokens as i64,
+                "total_cost_usd": agg.cost_usd,
+            })
+        })
+        .collect();
+    by_model_vec.sort_by(|a, b| {
+        let ta = a["input_tokens"].as_i64().unwrap_or(0) + a["output_tokens"].as_i64().unwrap_or(0);
+        let tb = b["input_tokens"].as_i64().unwrap_or(0) + b["output_tokens"].as_i64().unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    let mut by_provider_list: Vec<ProviderAgg> = by_provider_map.into_values().collect();
+    by_provider_list.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+            })
+            .then_with(|| a.provider_id.cmp(&b.provider_id))
+    });
+    let by_provider_json: Vec<Value> = by_provider_list
+        .into_iter()
+        .map(|p| {
+            let total = p.input_tokens.saturating_add(p.output_tokens);
+            json!({
+                "provider_id": p.provider_id,
+                "display_name": p.display_name,
+                "input_tokens": p.input_tokens,
+                "output_tokens": p.output_tokens,
+                "cached_tokens": p.cached_tokens,
+                "total_tokens": total,
+                "cost_usd": p.cost_usd,
+                "turns": p.turns,
+                "daily_cost_usd": p.daily_cost_usd,
+                "daily_tokens": p.daily_tokens,
+                "models": p.models.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+    let total_turns = if event_turns > 0 {
+        event_turns
+    } else {
+        authorized_session_messages
+    };
 
     (
         StatusCode::OK,
         Json(json!({
-            "total_turns": summary.total_messages.max(0) as u64,
-            "prompt_tokens": summary.total_input_tokens.max(0) as u64,
-            "completion_tokens": summary.total_output_tokens.max(0) as u64,
-            "total_tokens": summary.total_tokens.max(0) as u64,
-            "estimated_cost_usd": summary.total_cost_usd,
+            "total_turns": total_turns,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": estimated_cost_usd,
             "tool_calls": tool_calls,
-            "by_model": summary.by_model,
+            "range_days": range_days,
+            "dates": dates,
+            "by_model": by_model_vec,
+            "by_provider": by_provider_json,
         })),
     )
         .into_response()

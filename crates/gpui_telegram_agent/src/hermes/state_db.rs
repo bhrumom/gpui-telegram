@@ -148,6 +148,30 @@ CREATE TABLE IF NOT EXISTS kv_state (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (namespace, key)
 );
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    bot_id TEXT NOT NULL DEFAULT '',
+    provider_id TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0.0,
+    occurred_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_time
+    ON usage_events (occurred_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_user_time
+    ON usage_events (user_id, occurred_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_session
+    ON usage_events (session_id);
 "#;
 
 const FTS5_SCHEMA_SQL: &str = r#"
@@ -323,6 +347,23 @@ pub struct UsageSummary {
     pub total_tokens: i64,
     pub total_cost_usd: f64,
     pub by_model: Vec<ModelUsageBreakdown>,
+}
+
+/// Persisted per-call AI token & estimated cost event recorded from real provider responses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageEventRecord {
+    pub id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub bot_id: String,
+    pub provider_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cost_usd: f64,
+    pub occurred_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -889,6 +930,98 @@ impl HermesStateStore {
             )));
         }
         Ok(())
+    }
+
+    /// Persists an individual AI provider call's token & cost telemetry event.
+    pub fn record_usage_event(&self, mut event: UsageEventRecord) -> Result<()> {
+        if event.id.trim().is_empty() {
+            event.id = new_id("uev");
+        }
+        if event.occurred_at_ms <= 0 {
+            event.occurred_at_ms = now_ms();
+        }
+        let cost = if event.cost_usd.is_finite() && event.cost_usd > 0.0 {
+            event.cost_usd
+        } else {
+            0.0
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"
+            INSERT INTO usage_events (
+                id, session_id, user_id, bot_id, provider_id, model,
+                input_tokens, output_tokens, cached_tokens, cache_creation_tokens,
+                cost_usd, occurred_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                event.id,
+                event.session_id,
+                event.user_id,
+                event.bot_id,
+                event.provider_id,
+                event.model,
+                event.input_tokens.max(0),
+                event.output_tokens.max(0),
+                event.cached_tokens.max(0),
+                event.cache_creation_tokens.max(0),
+                cost,
+                event.occurred_at_ms,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Queries persisted per-call usage events filtered by optional lower timestamp bound and bot ID.
+    pub fn list_usage_events(
+        &self,
+        since_ms: Option<i64>,
+        bot_id: Option<&str>,
+    ) -> Result<Vec<UsageEventRecord>> {
+        let conn = self.conn.lock();
+        let mut sql = String::from(
+            r#"
+            SELECT id, session_id, user_id, bot_id, provider_id, model,
+                   input_tokens, output_tokens, cached_tokens, cache_creation_tokens,
+                   cost_usd, occurred_at_ms
+            FROM usage_events
+            WHERE 1=1
+            "#,
+        );
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(cutoff) = since_ms {
+            sql.push_str(" AND occurred_at_ms >= ?");
+            params_vec.push(cutoff.into());
+        }
+        if let Some(bid) = bot_id.map(str::trim).filter(|s| !s.is_empty()) {
+            sql.push_str(" AND bot_id = ?");
+            params_vec.push(bid.to_string().into());
+        }
+        sql.push_str(" ORDER BY occurred_at_ms ASC");
+
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(params_vec), |row| {
+                Ok(UsageEventRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    user_id: row.get(2)?,
+                    bot_id: row.get(3)?,
+                    provider_id: row.get(4)?,
+                    model: row.get(5)?,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    cached_tokens: row.get(8)?,
+                    cache_creation_tokens: row.get(9)?,
+                    cost_usd: row.get(10)?,
+                    occurred_at_ms: row.get(11)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
     }
 
     fn get_session_conn(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {

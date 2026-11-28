@@ -1254,3 +1254,145 @@ fn test_m6_t2_workflow_canvas_load_graph_json_structural_validation() {
     );
 }
 
+#[test]
+fn usage_and_credits_has_zero_fake_data_and_hydrates_from_live_sources() {
+    use gpui_telegram_client::net::{HermesProviderUsageDto, HermesUsageSummaryDto};
+    use gpui_telegram_desktop::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
+    use gpui_telegram_desktop::views::apple_sidebar::AppleAppSidebar;
+    use gpui_telegram_desktop::views::openbot::{
+        CreditLedgerEntry, PageRailState, UsageAndCreditsState,
+    };
+    use openbot_storage::{UsageSample, UsageTokens};
+
+    // 1. Fresh defaults MUST contain ZERO fabricated spend, tokens, credits, holds, or ring ratios.
+    let fresh = UsageAndCreditsState::default();
+    assert!(fresh.series.is_empty(), "default usage series must be empty, not fake Codex/Claude/Grok");
+    assert_eq!(fresh.total_tokens(), 0);
+    assert_eq!(fresh.total_cost_usd(), 0.0);
+    assert_eq!(fresh.wallet_balance_credits, 0);
+    assert_eq!(fresh.pending_hold_credits, 0);
+    assert!(fresh.ledger.is_empty());
+    assert_eq!(UsageAndCreditsState::format_rolling_price_digits(fresh.total_cost_usd()), vec!['$', '0', '.', '0', '0']);
+    assert_eq!(UsageAndCreditsState::format_cost_usd(0.0042), "$0.0042");
+    assert_eq!(UsageAndCreditsState::format_cost_usd(1.25), "$1.25");
+
+    let rail = PageRailState::new();
+    assert_eq!(rail.credits_balance_label, None);
+
+    let pal = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x3390ec, 14, 12);
+    let sidebar = AppleAppSidebar::new(pal, "en");
+    assert_eq!(sidebar.usage_ring_metric.primary_ratio, Some(0.0));
+    assert_eq!(sidebar.usage_ring_metric.secondary_ratio, None);
+
+    // 2. Hydrating from real local OpenBot SQLite AgentUsageStore populates exact real usage.
+    let tmp = TempDir::new().expect("tempdir");
+    let runtime = OpenBotHostRuntime::open(tmp.path()).expect("open runtime");
+    let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    runtime
+        .database()
+        .usage_store()
+        .record(&UsageSample {
+            agent_id: "agent-alpha".into(),
+            session_id: "sess-1".into(),
+            turn_id: "turn-1".into(),
+            provider: "claude".into(),
+            model: "claude-sonnet-4-6".into(),
+            counter_id: "c1".into(),
+            tokens: UsageTokens {
+                uncached_input: Some(10_000),
+                cached_input: Some(5_000),
+                cache_creation: Some(0),
+                output: Some(2_000),
+            },
+            baseline: false,
+            reported_cost: Some(0.0615),
+            occurred_at: Some(now_iso),
+            last_request_input_tokens: None,
+            smallest_request_input_tokens: None,
+            previous_tokens: None,
+            cost_counter_id: None,
+            zero_cost_unpriced: false,
+        })
+        .expect("record real openbot usage sample");
+
+    let bridge = OpenBotRuntimeBridge::from_runtime(Arc::clone(&runtime));
+    let mut ws = OpenBotWorkspaceShell::with_data_dir(tmp.path());
+    bridge.hydrate_workspace_shell(&mut ws).expect("hydrate");
+    assert_eq!(ws.usage_credits.series.len(), 1);
+    assert_eq!(ws.usage_credits.series[0].provider_id, "claude");
+    assert_eq!(ws.usage_credits.series[0].input_tokens, 15_000);
+    assert_eq!(ws.usage_credits.series[0].output_tokens, 2_000);
+    assert_eq!(ws.usage_credits.series[0].cached_tokens, 5_000);
+    assert!((ws.usage_credits.total_cost_usd() - 0.0615).abs() < 1e-6);
+    assert!(!ws.usage_credits.series[0].has_explicit_quota);
+
+    // 3. Merging real server HermesUsageSummaryDto + local OpenBot HostAnalytics + real Wallet works cleanly.
+    let dates = UsageAndCreditsState::utc_date_window(7);
+    assert_eq!(dates.last().map(String::as_str), Some(today.as_str()));
+    let mut daily_cost = vec![0.0; 7];
+    let mut daily_tokens = vec![0u64; 7];
+    daily_cost[6] = 0.20;
+    daily_tokens[6] = 25_000;
+    let hermes = HermesUsageSummaryDto {
+        total_turns: 3,
+        prompt_tokens: 20_000,
+        completion_tokens: 5_000,
+        cached_tokens: 2_000,
+        total_tokens: 25_000,
+        estimated_cost_usd: 0.20,
+        tool_calls: 1,
+        range_days: 7,
+        dates: dates.clone(),
+        by_model: Vec::new(),
+        by_provider: vec![HermesProviderUsageDto {
+            provider_id: "codex".into(),
+            display_name: "OpenAI / Codex".into(),
+            input_tokens: 20_000,
+            output_tokens: 5_000,
+            cached_tokens: 2_000,
+            total_tokens: 25_000,
+            cost_usd: 0.20,
+            turns: 3,
+            daily_cost_usd: daily_cost,
+            daily_tokens,
+            models: vec!["gpt-4o".into()],
+        }],
+    };
+    let ob_analytics = bridge.read_host_usage_analytics(7).expect("read analytics");
+    ws.usage_credits
+        .apply_live_sources(Some(&hermes), Some(&ob_analytics), 7);
+    assert_eq!(ws.usage_credits.series.len(), 2);
+    assert_eq!(ws.usage_credits.series[0].provider_id, "codex");
+    assert_eq!(ws.usage_credits.series[1].provider_id, "claude");
+    assert_eq!(ws.usage_credits.total_tokens(), 42_000);
+    assert!((ws.usage_credits.total_cost_usd() - 0.2615).abs() < 1e-6);
+    // Earlier zero days MUST stay at exact 0.0 (no fake stub bars)
+    assert_eq!(ws.usage_credits.series[0].daily_bars[0], 0.0);
+    assert!((ws.usage_credits.series[0].daily_bars[6] - 1.0).abs() < 1e-5);
+
+    ws.sync_wallet_credits(
+        350,
+        1.5,
+        0,
+        vec![CreditLedgerEntry {
+            id: "tx_1".into(),
+            label: "Stars Top-Up".into(),
+            delta_credits: 350,
+            created_at: "Today".into(),
+        }],
+    );
+    assert_eq!(ws.usage_credits.wallet_balance_credits, 350);
+    assert_eq!(ws.usage_credits.wallet_ton_balance, 1.5);
+    assert_eq!(ws.usage_credits.ledger.len(), 1);
+    assert_eq!(
+        ws.shell.page_rail.credits_balance_label.as_deref(),
+        Some("350 cr")
+    );
+
+    ws.usage_credits.reset();
+    assert!(ws.usage_credits.series.is_empty());
+    assert_eq!(ws.usage_credits.wallet_balance_credits, 0);
+}
+
+

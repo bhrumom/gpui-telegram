@@ -6,9 +6,12 @@
 //! - `CrmPageState` & `render_crm_page` (13 SQLite tables, `customers`/`payments` with overdue `data-late` badge, Stripe Connectors, `CrmCustomerPanel` redaction, `ReviewPanel` `crm_propose`)
 //! - `UsageAndCreditsState` & `render_usage_and_credits` (provider token/cost charts, quota bars, rolling metallic price display, credits wallet)
 
-use chrono::{Datelike, Days, NaiveDate, Weekday};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use chrono::{Datelike, Days, Duration as ChronoDuration, NaiveDate, Utc, Weekday};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_client::net::HermesUsageSummaryDto;
 use openbot_contracts::agents::{AgentTaskOutcome, AgentTaskState};
 use openbot_contracts::avatar::AvatarMood;
 use openbot_contracts::crm::{
@@ -17,11 +20,13 @@ use openbot_contracts::crm::{
 use openbot_contracts::routines::{
     ROUTINE_MINIMUM_INTERVAL_MINUTES, is_valid_timezone, routine_once_instant,
 };
+use openbot_storage::HostAnalytics;
 use serde::{Deserialize, Serialize};
 
 use crate::components::bloub_avatar::{
     AgentAvatarProps, MarketplaceNoMatchPlushState, render_agent_avatar,
 };
+use crate::i18n::tr_str;
 use crate::theme::openbot_palette::{
     OpenBotColorScheme, OpenBotPalette, file_reference_badge, file_reference_tone,
     parse_css_color_to_rgba,
@@ -1822,6 +1827,60 @@ pub const PROVIDER_COLOR_CODEX: u32 = 0xd6adf2;
 pub const PROVIDER_COLOR_CLAUDE: u32 = 0xd97757;
 pub const PROVIDER_COLOR_GROK: u32 = 0x6bc7d9;
 
+/// Resolves a deterministic visual accent color for any real AI provider ID.
+pub fn provider_usage_accent_hex(provider_id: &str) -> u32 {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "codex" | "openai" | "openai_responses" => PROVIDER_COLOR_CODEX,
+        "claude" | "anthropic" => PROVIDER_COLOR_CLAUDE,
+        "grok" | "xai" => PROVIDER_COLOR_GROK,
+        "gemini" | "google" | "antigravity" => 0x42a0ff,
+        "deepseek" => 0x4f7bff,
+        "openrouter" => 0x7c6ff7,
+        "qwen" | "dashscope" => 0x7259f0,
+        "kimi" | "moonshot" => 0x31cf76,
+        "glm" | "zhipu" => 0x3ba6ff,
+        "minimax" => 0xf06b8e,
+        "mistral" => 0xf08a24,
+        "local" | "local_hermes" | "ollama" | "lmstudio" => 0x8c96a4,
+        other => {
+            const FALLBACKS: [u32; 6] = [
+                0x42a0ff, 0x31cf76, 0xf08a24, 0xd6adf2, 0x6bc7d9, 0xd97757,
+            ];
+            let hash = other
+                .bytes()
+                .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+            FALLBACKS[hash % FALLBACKS.len()]
+        }
+    }
+}
+
+fn canonicalize_openbot_provider(raw: &str) -> (String, String) {
+    let p = raw.trim().to_ascii_lowercase();
+    match p.as_str() {
+        "codex" | "openai" | "openai_responses" => ("codex".into(), "OpenAI / Codex".into()),
+        "claude" | "anthropic" => ("claude".into(), "Claude".into()),
+        "grok" | "xai" => ("grok".into(), "Grok".into()),
+        "gemini" | "google" | "antigravity" => ("gemini".into(), "Gemini".into()),
+        "deepseek" => ("deepseek".into(), "DeepSeek".into()),
+        "openrouter" => ("openrouter".into(), "OpenRouter".into()),
+        "qwen" => ("qwen".into(), "Qwen".into()),
+        "kimi" => ("kimi".into(), "Kimi".into()),
+        "glm" => ("glm".into(), "GLM".into()),
+        "minimax" => ("minimax".into(), "MiniMax".into()),
+        "mistral" => ("mistral".into(), "Mistral".into()),
+        "local" | "local_hermes" | "ollama" | "lmstudio" => ("local".into(), "Local".into()),
+        "" => ("other".into(), "Other".into()),
+        other => {
+            let mut chars = other.chars();
+            let display = match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => "Other".into(),
+            };
+            (other.to_string(), display)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsageSeries {
@@ -1834,6 +1893,12 @@ pub struct ProviderUsageSeries {
     pub cost_usd: f64,
     pub quota_used_ratio: f32,
     pub daily_bars: Vec<f32>,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub has_explicit_quota: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1845,6 +1910,14 @@ pub struct CreditLedgerEntry {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageAndCreditsUiAction {
+    SelectRangeDays(u32),
+    Refresh,
+    BuyCredits,
+    MoveCredits,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAndCreditsState {
@@ -1853,55 +1926,49 @@ pub struct UsageAndCreditsState {
     pub pending_hold_credits: i64,
     pub selected_range_days: u32,
     pub ledger: Vec<CreditLedgerEntry>,
+    #[serde(default)]
+    pub date_labels: Vec<String>,
+    #[serde(default)]
+    pub wallet_ton_balance: f64,
+    #[serde(default)]
+    pub total_turns: u64,
+    #[serde(default)]
+    pub is_loading: bool,
+    #[serde(default)]
+    pub has_synced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
 }
 
 impl Default for UsageAndCreditsState {
     fn default() -> Self {
         Self {
-            series: vec![
-                ProviderUsageSeries {
-                    provider_id: "codex".into(),
-                    display_name: "Codex".into(),
-                    accent_hex: PROVIDER_COLOR_CODEX,
-                    input_tokens: 420_000,
-                    output_tokens: 118_000,
-                    cached_tokens: 210_000,
-                    cost_usd: 14.25,
-                    quota_used_ratio: 0.42,
-                    daily_bars: vec![0.3, 0.5, 0.45, 0.8, 0.65, 0.72, 0.58],
-                },
-                ProviderUsageSeries {
-                    provider_id: "claude".into(),
-                    display_name: "Claude".into(),
-                    accent_hex: PROVIDER_COLOR_CLAUDE,
-                    input_tokens: 310_000,
-                    output_tokens: 92_000,
-                    cached_tokens: 145_000,
-                    cost_usd: 11.60,
-                    quota_used_ratio: 0.36,
-                    daily_bars: vec![0.25, 0.4, 0.6, 0.52, 0.48, 0.62, 0.44],
-                },
-                ProviderUsageSeries {
-                    provider_id: "grok".into(),
-                    display_name: "Grok".into(),
-                    accent_hex: PROVIDER_COLOR_GROK,
-                    input_tokens: 195_000,
-                    output_tokens: 64_000,
-                    cached_tokens: 72_000,
-                    cost_usd: 5.40,
-                    quota_used_ratio: 0.21,
-                    daily_bars: vec![0.15, 0.2, 0.35, 0.28, 0.4, 0.32, 0.26],
-                },
-            ],
-            wallet_balance_credits: 2_500,
-            pending_hold_credits: 50,
+            series: Vec::new(),
+            wallet_balance_credits: 0,
+            pending_hold_credits: 0,
             selected_range_days: 7,
             ledger: Vec::new(),
+            date_labels: Self::utc_date_window(7),
+            wallet_ton_balance: 0.0,
+            total_turns: 0,
+            is_loading: false,
+            has_synced: false,
+            sync_error: None,
         }
     }
 }
 
 impl UsageAndCreditsState {
+    /// Returns the last `range_days` UTC calendar dates (`YYYY-MM-DD`) ending today inclusive.
+    pub fn utc_date_window(range_days: u32) -> Vec<String> {
+        let days = range_days.clamp(1, 90);
+        let today = Utc::now().date_naive();
+        (0..days)
+            .rev()
+            .map(|offset| (today - ChronoDuration::days(i64::from(offset))).format("%Y-%m-%d").to_string())
+            .collect()
+    }
+
     pub fn total_tokens(&self) -> u64 {
         self.series
             .iter()
@@ -1909,13 +1976,438 @@ impl UsageAndCreditsState {
             .fold(0u64, u64::saturating_add)
     }
 
+    pub fn total_cached_tokens(&self) -> u64 {
+        self.series
+            .iter()
+            .map(|s| s.cached_tokens)
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub fn total_cost_usd(&self) -> f64 {
-        self.series.iter().map(|s| s.cost_usd.max(0.0)).sum()
+        self.series
+            .iter()
+            .map(|s| if s.cost_usd.is_finite() { s.cost_usd.max(0.0) } else { 0.0 })
+            .sum()
     }
 
     /// Formats a USD figure into individual rolling-drum characters for metallic price rendering.
     pub fn format_rolling_price_digits(usd: f64) -> Vec<char> {
-        format!("${:.2}", usd.max(0.0)).chars().collect()
+        let safe = if usd.is_finite() { usd.max(0.0) } else { 0.0 };
+        format!("${:.2}", safe).chars().collect()
+    }
+
+    /// Formats a real USD cost without hiding small positive sub-cent API spend.
+    pub fn format_cost_usd(usd: f64) -> String {
+        let safe = if usd.is_finite() { usd.max(0.0) } else { 0.0 };
+        if safe > 0.0 && safe < 0.01 {
+            format!("${:.4}", safe)
+        } else {
+            format!("${:.2}", safe)
+        }
+    }
+
+    /// Formats a token count with thousands separators for crisp readability.
+    pub fn format_token_count(tokens: u64) -> String {
+        let s = tokens.to_string();
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len() + s.len() / 3);
+        for (idx, &b) in bytes.iter().enumerate() {
+            if idx > 0 && (bytes.len() - idx) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(b as char);
+        }
+        out
+    }
+
+    /// Resets usage and credits state back to clean empty zero values (used on logout / account switch).
+    pub fn reset(&mut self) {
+        let range = self.selected_range_days.clamp(1, 90);
+        *self = Self {
+            selected_range_days: range,
+            date_labels: Self::utc_date_window(range),
+            ..Self::default()
+        };
+    }
+
+    /// Applies real server wallet balance and transaction ledger entries.
+    pub fn apply_wallet(
+        &mut self,
+        stars_balance: i64,
+        ton_balance: f64,
+        pending_hold: i64,
+        ledger: Vec<CreditLedgerEntry>,
+    ) {
+        self.wallet_balance_credits = stars_balance.max(0);
+        self.wallet_ton_balance = if ton_balance.is_finite() {
+            ton_balance.max(0.0)
+        } else {
+            0.0
+        };
+        self.pending_hold_credits = pending_hold.max(0);
+        self.ledger = ledger;
+    }
+
+    /// Recomputes `series`, `date_labels`, and `total_turns` strictly from real Hermes/Magpie
+    /// server telemetry and/or real local OpenBot SQLite `AgentUsageStore` host analytics.
+    pub fn apply_live_sources(
+        &mut self,
+        hermes: Option<&HermesUsageSummaryDto>,
+        openbot: Option<&HostAnalytics>,
+        range_days: u32,
+    ) {
+        let clamped_days = range_days.clamp(1, 90);
+        self.selected_range_days = clamped_days;
+
+        let dates: Vec<String> = hermes
+            .filter(|h| !h.dates.is_empty())
+            .map(|h| h.dates.clone())
+            .or_else(|| {
+                openbot
+                    .filter(|o| !o.daily.is_empty())
+                    .map(|o| o.daily.iter().map(|d| d.date.clone()).collect())
+            })
+            .unwrap_or_else(|| Self::utc_date_window(clamped_days));
+
+        let date_index: HashMap<&str, usize> = dates
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.as_str(), i))
+            .collect();
+
+        struct Acc {
+            provider_id: String,
+            display_name: String,
+            input_tokens: u64,
+            output_tokens: u64,
+            cached_tokens: u64,
+            cost_usd: f64,
+            turns: u64,
+            daily_cost: Vec<f64>,
+            daily_tokens: Vec<u64>,
+            models: BTreeSet<String>,
+        }
+
+        let mut merged: BTreeMap<String, Acc> = BTreeMap::new();
+        let mut total_turns: u64 = 0;
+
+        if let Some(h) = hermes {
+            total_turns = total_turns.saturating_add(h.total_turns);
+            if !h.by_provider.is_empty() {
+                for p in &h.by_provider {
+                    let (pid, default_name) = canonicalize_openbot_provider(&p.provider_id);
+                    let display_name = if p.display_name.trim().is_empty() {
+                        default_name
+                    } else {
+                        p.display_name.clone()
+                    };
+                    let entry = merged.entry(pid.clone()).or_insert_with(|| Acc {
+                        provider_id: pid,
+                        display_name,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_tokens: 0,
+                        cost_usd: 0.0,
+                        turns: 0,
+                        daily_cost: vec![0.0; dates.len()],
+                        daily_tokens: vec![0; dates.len()],
+                        models: BTreeSet::new(),
+                    });
+                    entry.input_tokens = entry.input_tokens.saturating_add(p.input_tokens);
+                    entry.output_tokens = entry.output_tokens.saturating_add(p.output_tokens);
+                    entry.cached_tokens = entry.cached_tokens.saturating_add(p.cached_tokens);
+                    if p.cost_usd.is_finite() && p.cost_usd > 0.0 {
+                        entry.cost_usd += p.cost_usd;
+                    }
+                    entry.turns = entry.turns.saturating_add(p.turns);
+                    for m in &p.models {
+                        if !m.trim().is_empty() {
+                            entry.models.insert(m.trim().to_string());
+                        }
+                    }
+                    for (idx, &c) in p.daily_cost_usd.iter().enumerate() {
+                        if idx < entry.daily_cost.len() && c.is_finite() && c > 0.0 {
+                            entry.daily_cost[idx] += c;
+                        }
+                    }
+                    for (idx, &t) in p.daily_tokens.iter().enumerate() {
+                        if idx < entry.daily_tokens.len() {
+                            entry.daily_tokens[idx] = entry.daily_tokens[idx].saturating_add(t);
+                        }
+                    }
+                }
+            } else if h.prompt_tokens > 0 || h.completion_tokens > 0 || h.estimated_cost_usd > 0.0 {
+                // Compatibility with older server responses that only returned flat totals / by_model.
+                if !h.by_model.is_empty() {
+                    for row in &h.by_model {
+                        let model = row
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let in_t = row
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let out_t = row
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_t = row
+                            .get("cached_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cost = row
+                            .get("total_cost_usd")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let turns = row
+                            .get("message_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let inferred = infer_provider_from_model(model);
+                        let (pid, display_name) = canonicalize_openbot_provider(inferred);
+                        let entry = merged.entry(pid.clone()).or_insert_with(|| Acc {
+                            provider_id: pid,
+                            display_name,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cached_tokens: 0,
+                            cost_usd: 0.0,
+                            turns: 0,
+                            daily_cost: vec![0.0; dates.len()],
+                            daily_tokens: vec![0; dates.len()],
+                            models: BTreeSet::new(),
+                        });
+                        entry.input_tokens = entry.input_tokens.saturating_add(in_t);
+                        entry.output_tokens = entry.output_tokens.saturating_add(out_t);
+                        entry.cached_tokens = entry.cached_tokens.saturating_add(cache_t);
+                        if cost.is_finite() && cost > 0.0 {
+                            entry.cost_usd += cost;
+                        }
+                        entry.turns = entry.turns.saturating_add(turns);
+                        entry.models.insert(model.to_string());
+                        if let Some(last) = entry.daily_cost.last_mut() {
+                            if cost.is_finite() && cost > 0.0 {
+                                *last += cost;
+                            }
+                        }
+                        if let Some(last) = entry.daily_tokens.last_mut() {
+                            *last = last.saturating_add(in_t.saturating_add(out_t));
+                        }
+                    }
+                } else {
+                    let entry = merged.entry("other".to_string()).or_insert_with(|| Acc {
+                        provider_id: "other".to_string(),
+                        display_name: "AI Usage".to_string(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_tokens: 0,
+                        cost_usd: 0.0,
+                        turns: 0,
+                        daily_cost: vec![0.0; dates.len()],
+                        daily_tokens: vec![0; dates.len()],
+                        models: BTreeSet::new(),
+                    });
+                    entry.input_tokens = entry.input_tokens.saturating_add(h.prompt_tokens);
+                    entry.output_tokens = entry.output_tokens.saturating_add(h.completion_tokens);
+                    entry.cached_tokens = entry.cached_tokens.saturating_add(h.cached_tokens);
+                    if h.estimated_cost_usd.is_finite() && h.estimated_cost_usd > 0.0 {
+                        entry.cost_usd += h.estimated_cost_usd;
+                    }
+                    entry.turns = entry.turns.saturating_add(h.total_turns);
+                    if let Some(last) = entry.daily_cost.last_mut() {
+                        if h.estimated_cost_usd.is_finite() && h.estimated_cost_usd > 0.0 {
+                            *last += h.estimated_cost_usd;
+                        }
+                    }
+                    if let Some(last) = entry.daily_tokens.last_mut() {
+                        *last = last.saturating_add(h.prompt_tokens.saturating_add(h.completion_tokens));
+                    }
+                }
+            }
+        }
+
+        if let Some(ob) = openbot {
+            total_turns = total_turns.saturating_add(ob.totals.turns as u64);
+            for m in &ob.models {
+                let (pid, display_name) = canonicalize_openbot_provider(&m.provider);
+                let entry = merged.entry(pid.clone()).or_insert_with(|| Acc {
+                    provider_id: pid,
+                    display_name,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    cost_usd: 0.0,
+                    turns: 0,
+                    daily_cost: vec![0.0; dates.len()],
+                    daily_tokens: vec![0; dates.len()],
+                    models: BTreeSet::new(),
+                });
+                let in_t = m
+                    .totals
+                    .uncached_input
+                    .unwrap_or(0)
+                    .saturating_add(m.totals.cached_input.unwrap_or(0))
+                    .saturating_add(m.totals.cache_creation.unwrap_or(0));
+                let out_t = m.totals.output.unwrap_or(0);
+                entry.input_tokens = entry.input_tokens.saturating_add(in_t);
+                entry.output_tokens = entry.output_tokens.saturating_add(out_t);
+                entry.cached_tokens = entry
+                    .cached_tokens
+                    .saturating_add(m.totals.cached_input.unwrap_or(0));
+                if let Some(c) = m.totals.estimated_cost_usd {
+                    if c.is_finite() && c > 0.0 {
+                        entry.cost_usd += c;
+                    }
+                }
+                entry.turns = entry.turns.saturating_add(m.totals.turns as u64);
+                if !m.model.trim().is_empty() {
+                    entry.models.insert(m.model.trim().to_string());
+                }
+            }
+            for pd in &ob.provider_daily {
+                let (pid, display_name) = canonicalize_openbot_provider(&pd.provider);
+                let entry = merged.entry(pid.clone()).or_insert_with(|| Acc {
+                    provider_id: pid,
+                    display_name,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    cost_usd: 0.0,
+                    turns: 0,
+                    daily_cost: vec![0.0; dates.len()],
+                    daily_tokens: vec![0; dates.len()],
+                    models: BTreeSet::new(),
+                });
+                if let Some(&idx) = date_index.get(pd.date.as_str()) {
+                    if let Some(c) = pd.estimated_cost_usd {
+                        if c.is_finite() && c > 0.0 {
+                            entry.daily_cost[idx] += c;
+                        }
+                    }
+                    entry.daily_tokens[idx] =
+                        entry.daily_tokens[idx].saturating_add(pd.processed_tokens);
+                }
+            }
+        }
+
+        let mut accs: Vec<Acc> = merged
+            .into_values()
+            .filter(|a| a.input_tokens > 0 || a.output_tokens > 0 || a.cost_usd > 0.0)
+            .collect();
+        accs.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+                })
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+
+        let total_cost: f64 = accs.iter().map(|a| a.cost_usd).sum();
+        let total_tok: u64 = accs
+            .iter()
+            .map(|a| a.input_tokens.saturating_add(a.output_tokens))
+            .sum();
+
+        let max_daily_cost = accs
+            .iter()
+            .flat_map(|a| a.daily_cost.iter().copied())
+            .fold(0.0_f64, f64::max);
+        let max_daily_tokens = accs
+            .iter()
+            .flat_map(|a| a.daily_tokens.iter().copied())
+            .max()
+            .unwrap_or(0);
+
+        self.series = accs
+            .into_iter()
+            .map(|a| {
+                let prov_tokens = a.input_tokens.saturating_add(a.output_tokens);
+                let share = if total_cost > 0.0 {
+                    (a.cost_usd / total_cost) as f32
+                } else if total_tok > 0 {
+                    (prov_tokens as f64 / total_tok as f64) as f32
+                } else {
+                    0.0
+                };
+                let daily_bars: Vec<f32> = if max_daily_cost > 0.0 {
+                    a.daily_cost
+                        .iter()
+                        .map(|&c| {
+                            if c > 0.0 {
+                                (c / max_daily_cost).clamp(0.0, 1.0) as f32
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                } else if max_daily_tokens > 0 {
+                    a.daily_tokens
+                        .iter()
+                        .map(|&t| {
+                            if t > 0 {
+                                (t as f64 / max_daily_tokens as f64).clamp(0.0, 1.0) as f32
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                } else {
+                    vec![0.0; dates.len()]
+                };
+                ProviderUsageSeries {
+                    accent_hex: provider_usage_accent_hex(&a.provider_id),
+                    provider_id: a.provider_id,
+                    display_name: a.display_name,
+                    input_tokens: a.input_tokens,
+                    output_tokens: a.output_tokens,
+                    cached_tokens: a.cached_tokens,
+                    cost_usd: a.cost_usd,
+                    quota_used_ratio: share.clamp(0.0, 1.0),
+                    daily_bars,
+                    turns: a.turns,
+                    models: a.models.into_iter().collect(),
+                    has_explicit_quota: false,
+                }
+            })
+            .collect();
+
+        self.date_labels = dates;
+        self.total_turns = total_turns;
+        self.is_loading = false;
+        self.has_synced = true;
+        self.sync_error = None;
+    }
+}
+
+fn infer_provider_from_model(model: &str) -> &'static str {
+    let m = model.trim().to_ascii_lowercase();
+    if m == "hermes-local-v1" {
+        "local"
+    } else if m.contains("claude") {
+        "claude"
+    } else if m.contains("gpt-") || m.contains("codex") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        "codex"
+    } else if m.contains("grok") {
+        "grok"
+    } else if m.contains("gemini") {
+        "gemini"
+    } else if m.contains("deepseek") {
+        "deepseek"
+    } else if m.contains("qwen") {
+        "qwen"
+    } else if m.contains("kimi") || m.contains("moonshot") {
+        "kimi"
+    } else if m.contains("glm") {
+        "glm"
+    } else if m.contains("minimax") {
+        "minimax"
+    } else if m.contains("mistral") || m.contains("codestral") {
+        "mistral"
+    } else {
+        "other"
     }
 }
 
@@ -1933,11 +2425,16 @@ fn paint_provider_usage_chart(
         return;
     }
     let group_w = bw / (day_count as f32);
-    let bar_w = ((group_w - 10.0) / (series.len() as f32)).clamp(4.0, 22.0);
+    let bar_w = ((group_w - 10.0) / (series.len() as f32)).clamp(3.0, 22.0);
     for (s_idx, s) in series.iter().enumerate() {
         let color: Hsla = rgb(s.accent_hex).into();
         let mut pb = PathBuilder::fill();
+        let mut drew_any = false;
         for (d_idx, &norm) in s.daily_bars.iter().enumerate() {
+            if !norm.is_finite() || norm <= 0.0 {
+                continue;
+            }
+            drew_any = true;
             let h = (norm.clamp(0.04, 1.0) * (bh - 12.0)).max(3.0);
             let x0 = ox + (d_idx as f32) * group_w + 5.0 + (s_idx as f32) * (bar_w + 2.0);
             let y0 = oy + bh - h;
@@ -1947,15 +2444,197 @@ fn paint_provider_usage_chart(
             pb.line_to(point(px(x0), px(oy + bh)));
             pb.close();
         }
-        if let Ok(path) = pb.build() {
-            window.paint_path(path, color.opacity(0.9));
+        if drew_any {
+            if let Ok(path) = pb.build() {
+                window.paint_path(path, color.opacity(0.9));
+            }
         }
     }
 }
 
-/// Renders the `Usage` and `Credits` dashboard with rolling metallic price display,
-/// wallet actions, provider token/cost canvas chart, and quota bars.
+fn short_month_day(iso_date: &str) -> String {
+    if iso_date.len() >= 10 {
+        iso_date[5..10].to_string()
+    } else {
+        iso_date.to_string()
+    }
+}
+
+/// Renders the `Usage` and `Credits` dashboard (non-interactive snapshot variant).
 pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotPalette) -> Div {
+    build_usage_and_credits_view(state, palette, "en", None, None, None, None)
+}
+
+/// Renders the interactive `Usage` and `Credits` dashboard wired to live range switching,
+/// manual refresh, and real Credits wallet navigation.
+pub fn render_usage_and_credits_interactive<V: 'static>(
+    state: &UsageAndCreditsState,
+    palette: &OpenBotPalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: fn(&mut V, UsageAndCreditsUiAction, &mut Context<V>),
+) -> Div {
+    let range_pills = build_range_pills(state, palette, lang_id, cx, on_action);
+    let refresh_btn = {
+        let bg_control = pal_rgba(palette, "--openbot-bg-control", 0x212121);
+        let bg_hover = pal_rgba(palette, "--openbot-bg-control-hover", 0x2a2a2a);
+        let border = pal_rgba(palette, "--openbot-border-grouped", 0x333335);
+        let text_primary = pal_rgba(palette, "--openbot-text-primary", 0xffffff);
+        let label = if state.is_loading {
+            tr_str(lang_id, "同步中…", "Syncing…")
+        } else {
+            tr_str(lang_id, "刷新", "Refresh")
+        };
+        div()
+            .id("openbot-usage-refresh-btn")
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(8.0))
+            .bg(bg_control)
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(move |s| s.bg(bg_hover))
+            .text_size(px(11.0))
+            .text_color(text_primary)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    on_action(this, UsageAndCreditsUiAction::Refresh, cx);
+                }),
+            )
+            .child(label)
+            .into_any_element()
+    };
+    let buy_btn = {
+        let accent = pal_rgba(palette, "--openbot-accent", 0x007cf7);
+        div()
+            .id("openbot-usage-buy-credits-btn")
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(10.0))
+            .bg(accent)
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(rgb(0xffffff))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    on_action(this, UsageAndCreditsUiAction::BuyCredits, cx);
+                }),
+            )
+            .child(tr_str(lang_id, "购买积分", "Buy Credits"))
+            .into_any_element()
+    };
+    let move_btn = {
+        let bg_control = pal_rgba(palette, "--openbot-bg-control", 0x212121);
+        let bg_hover = pal_rgba(palette, "--openbot-bg-control-hover", 0x2a2a2a);
+        let border = pal_rgba(palette, "--openbot-border-grouped", 0x333335);
+        let text_primary = pal_rgba(palette, "--openbot-text-primary", 0xffffff);
+        div()
+            .id("openbot-usage-move-credits-btn")
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(10.0))
+            .bg(bg_control)
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(move |s| s.bg(bg_hover))
+            .text_size(px(12.0))
+            .text_color(text_primary)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    on_action(this, UsageAndCreditsUiAction::MoveCredits, cx);
+                }),
+            )
+            .child(tr_str(lang_id, "管理钱包", "Manage Wallet"))
+            .into_any_element()
+    };
+
+    build_usage_and_credits_view(
+        state,
+        palette,
+        lang_id,
+        Some(range_pills),
+        Some(refresh_btn),
+        Some(buy_btn),
+        Some(move_btn),
+    )
+}
+
+fn build_range_pills<V: 'static>(
+    state: &UsageAndCreditsState,
+    palette: &OpenBotPalette,
+    lang_id: &str,
+    cx: &mut Context<V>,
+    on_action: fn(&mut V, UsageAndCreditsUiAction, &mut Context<V>),
+) -> AnyElement {
+    let bg_control = pal_rgba(palette, "--openbot-bg-control", 0x212121);
+    let border = pal_rgba(palette, "--openbot-border-grouped", 0x333335);
+    let text_primary = pal_rgba(palette, "--openbot-text-primary", 0xffffff);
+    let text_muted = pal_rgba(palette, "--openbot-text-muted", 0x979797);
+    let accent = pal_rgba(palette, "--openbot-accent", 0x007cf7);
+
+    let mut row = div().flex().items_center().gap(px(4.0));
+    for days in [7u32, 14, 30] {
+        let active = state.selected_range_days == days;
+        let label = if lang_id.starts_with("zh") {
+            format!("{days}天")
+        } else {
+            format!("{days}d")
+        };
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("openbot-usage-range-{days}d")))
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .bg(if active { accent } else { bg_control })
+                .border_1()
+                .border_color(if active { accent } else { border })
+                .text_size(px(11.0))
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    rgb(0xffffff)
+                } else {
+                    text_muted
+                })
+                .hover(move |s| {
+                    if active {
+                        s
+                    } else {
+                        s.text_color(text_primary)
+                    }
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        on_action(this, UsageAndCreditsUiAction::SelectRangeDays(days), cx);
+                    }),
+                )
+                .child(label),
+        );
+    }
+    row.into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_usage_and_credits_view(
+    state: &UsageAndCreditsState,
+    palette: &OpenBotPalette,
+    lang_id: &str,
+    range_pills: Option<AnyElement>,
+    refresh_btn: Option<AnyElement>,
+    buy_btn: Option<AnyElement>,
+    move_btn: Option<AnyElement>,
+) -> Div {
     let bg_canvas = pal_rgba(palette, "--openbot-bg-canvas", 0x1a1a1a);
     let bg_surface = pal_rgba(palette, "--openbot-bg-surface", 0x212121);
     let bg_control = pal_rgba(palette, "--openbot-bg-control", 0x212121);
@@ -1963,6 +2642,7 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
     let text_primary = pal_rgba(palette, "--openbot-text-primary", 0xffffff);
     let text_muted = pal_rgba(palette, "--openbot-text-muted", 0x979797);
     let accent = pal_rgba(palette, "--openbot-accent", 0x007cf7);
+    let danger = pal_rgba(palette, "--openbot-danger", 0xfd2f3b);
 
     let total_cost = state.total_cost_usd();
     let total_tokens = state.total_tokens();
@@ -1983,7 +2663,119 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
         );
     }
 
+    let chart_title = if lang_id.starts_with("zh") {
+        format!("模型服务商消耗（近 {} 天）", state.selected_range_days)
+    } else {
+        format!("Provider Spend ({}d)", state.selected_range_days)
+    };
+    let tokens_summary = {
+        let tok_str = UsageAndCreditsState::format_token_count(total_tokens);
+        let exact_sub = if total_cost > 0.0 && total_cost < 0.01 {
+            format!(" · {}", UsageAndCreditsState::format_cost_usd(total_cost))
+        } else {
+            String::new()
+        };
+        if state.total_turns > 0 {
+            if lang_id.starts_with("zh") {
+                format!("{tok_str} tokens · {} 次调用{exact_sub}", state.total_turns)
+            } else {
+                format!("{tok_str} tokens · {} calls{exact_sub}", state.total_turns)
+            }
+        } else {
+            format!("{tok_str} tokens{exact_sub}")
+        }
+    };
+
     let chart_series = state.series.clone();
+    let has_chart_bars = chart_series
+        .iter()
+        .any(|s| s.daily_bars.iter().any(|&v| v.is_finite() && v > 0.0));
+
+    let chart_body: AnyElement = if chart_series.is_empty() || !has_chart_bars {
+        div()
+            .h(px(136.0))
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(text_primary)
+                    .child(if state.is_loading {
+                        tr_str(lang_id, "正在同步真实 AI 计费数据…", "Syncing live AI usage data…")
+                            .to_string()
+                    } else if lang_id.starts_with("zh") {
+                        format!("近 {} 天暂无 AI 用量记录", state.selected_range_days)
+                    } else {
+                        format!(
+                            "No AI usage recorded in the last {} days",
+                            state.selected_range_days
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(text_muted)
+                    .child(tr_str(
+                        lang_id,
+                        "与 AI 机器人对话或运行智能体后，将在此显示真实的 Token 消耗与估算费用。",
+                        "Real token counts and estimated API costs appear here after you chat with an AI bot or agent.",
+                    )),
+            )
+            .into_any_element()
+    } else {
+        let dates = state.date_labels.clone();
+        let label_step = if dates.len() > 14 {
+            5
+        } else if dates.len() > 7 {
+            2
+        } else {
+            1
+        };
+        let mut axis_row = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pt(px(4.0));
+        for (idx, d) in dates.iter().enumerate() {
+            let show = idx % label_step == 0 || idx + 1 == dates.len();
+            axis_row = axis_row.child(
+                div()
+                    .flex_1()
+                    .text_size(px(9.5))
+                    .text_color(text_muted)
+                    .child(if show {
+                        short_month_day(d)
+                    } else {
+                        String::new()
+                    }),
+            );
+        }
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div().h(px(136.0)).w_full().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _cx| {
+                            paint_provider_usage_chart(bounds, &chart_series, window);
+                        },
+                    )
+                    .size_full(),
+                ),
+            )
+            .when(!dates.is_empty(), |el| el.child(axis_row))
+            .into_any_element()
+    };
+
     let chart_card = div()
         .p(px(14.0))
         .rounded(px(14.0))
@@ -1998,27 +2790,56 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
                 .flex()
                 .items_center()
                 .justify_between()
-                .child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).text_color(text_primary).child(format!("Provider Spend ({}d)", state.selected_range_days)))
-                .child(div().text_size(px(11.0)).text_color(text_muted).child(format!("{total_tokens} tokens"))),
-        )
-        .child(
-            div().h(px(136.0)).w_full().child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, _cx| {
-                        paint_provider_usage_chart(bounds, &chart_series, window);
-                    },
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(text_primary)
+                        .child(chart_title),
                 )
-                .size_full(),
-            ),
-        );
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(text_muted)
+                        .child(tokens_summary),
+                ),
+        )
+        .child(chart_body);
 
     let mut quotas = div().flex().flex_wrap().gap(px(10.0));
     for s in &state.series {
         let pct = (s.quota_used_ratio.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let bar_px = (2.16 * (pct as f32)).clamp(0.0, 216.0);
+        let ratio_label = if s.has_explicit_quota {
+            if lang_id.starts_with("zh") {
+                format!("配额 {pct}%")
+            } else {
+                format!("Quota {pct}%")
+            }
+        } else if lang_id.starts_with("zh") {
+            format!("占比 {pct}%")
+        } else {
+            format!("Share {pct}%")
+        };
+        let detail_line = format!(
+            "{ratio_label} · {} in / {} out · {} cached",
+            UsageAndCreditsState::format_token_count(s.input_tokens),
+            UsageAndCreditsState::format_token_count(s.output_tokens),
+            UsageAndCreditsState::format_token_count(s.cached_tokens),
+        );
+        let models_line = if s.models.is_empty() {
+            None
+        } else {
+            let joined = s.models.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            Some(if s.models.len() > 3 {
+                format!("{joined} +{}", s.models.len() - 3)
+            } else {
+                joined
+            })
+        };
         quotas = quotas.child(
             div()
-                .w(px(220.0))
+                .w(px(244.0))
                 .p(px(12.0))
                 .rounded(px(12.0))
                 .bg(bg_surface)
@@ -2032,19 +2853,89 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(s.accent_hex)).child(s.display_name.clone()))
-                        .child(div().text_size(px(11.0)).text_color(text_primary).child(format!("${:.2}", s.cost_usd))),
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(s.accent_hex))
+                                .child(s.display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(text_primary)
+                                .child(UsageAndCreditsState::format_cost_usd(s.cost_usd)),
+                        ),
                 )
                 .child(
                     div()
                         .h(px(6.0))
                         .rounded(px(999.0))
                         .bg(bg_control)
-                        .child(div().h_full().w(px(1.9 * (pct as f32))).rounded(px(999.0)).bg(rgb(s.accent_hex))),
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(bar_px))
+                                .rounded(px(999.0))
+                                .bg(rgb(s.accent_hex)),
+                        ),
                 )
-                .child(div().text_size(px(10.0)).text_color(text_muted).child(format!("Quota {pct}% · cached {}", s.cached_tokens))),
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(text_muted)
+                        .child(detail_line),
+                )
+                .when_some(models_line, |el, mline| {
+                    el.child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(text_muted)
+                            .truncate()
+                            .child(mline),
+                    )
+                }),
         );
     }
+
+    let wallet_subline = if state.pending_hold_credits > 0 {
+        if lang_id.starts_with("zh") {
+            format!("待结算冻结: {} 积分", state.pending_hold_credits)
+        } else {
+            format!("Pending hold: {} credits", state.pending_hold_credits)
+        }
+    } else if state.wallet_ton_balance > 0.0 {
+        format!("{:.2} TON", state.wallet_ton_balance)
+    } else {
+        tr_str(
+            lang_id,
+            "余额与交易实时同步自账户钱包",
+            "Live balance synced from account wallet",
+        )
+        .to_string()
+    };
+
+    let default_buy = div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(10.0))
+        .bg(accent)
+        .text_size(px(12.0))
+        .text_color(rgb(0xffffff))
+        .child(tr_str(lang_id, "购买积分", "Buy Credits"))
+        .into_any_element();
+    let default_move = div()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(10.0))
+        .bg(bg_control)
+        .border_1()
+        .border_color(border)
+        .text_size(px(12.0))
+        .text_color(text_primary)
+        .child(tr_str(lang_id, "管理钱包", "Manage Wallet"))
+        .into_any_element();
 
     let wallet_card = div()
         .p(px(14.0))
@@ -2060,17 +2951,37 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(div().text_size(px(12.0)).text_color(text_muted).child("Credits Wallet"))
-                .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).text_color(text_primary).child(format!("{} credits", state.wallet_balance_credits)))
-                .child(div().text_size(px(10.0)).text_color(text_muted).child(format!("Pending hold: {} credits", state.pending_hold_credits))),
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(text_muted)
+                        .child(tr_str(lang_id, "积分钱包", "Credits Wallet")),
+                )
+                .child(
+                    div()
+                        .text_size(px(18.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(text_primary)
+                        .child(if lang_id.starts_with("zh") {
+                            format!("{} 积分", state.wallet_balance_credits)
+                        } else {
+                            format!("{} credits", state.wallet_balance_credits)
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(text_muted)
+                        .child(wallet_subline),
+                ),
         )
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(div().px(px(10.0)).py(px(6.0)).rounded(px(10.0)).bg(accent).text_size(px(12.0)).text_color(rgb(0xffffff)).child("Buy Credits"))
-                .child(div().px(px(10.0)).py(px(6.0)).rounded(px(10.0)).bg(bg_control).border_1().border_color(border).text_size(px(12.0)).text_color(text_primary).child("Move Credits")),
+                .child(buy_btn.unwrap_or(default_buy))
+                .child(move_btn.unwrap_or(default_move)),
         );
 
     let ledger_card = if state.ledger.is_empty() {
@@ -2090,13 +3001,13 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
                     .text_size(px(12.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(text_primary)
-                    .child("Recent Credit Activity"),
+                    .child(tr_str(lang_id, "最近积分变动", "Recent Credit Activity")),
             );
-        for entry in &state.ledger {
+        for entry in state.ledger.iter().take(20) {
             let delta_color = if entry.delta_credits >= 0 {
                 pal_rgba(palette, "--openbot-success", 0x31cf76)
             } else {
-                pal_rgba(palette, "--openbot-danger", 0xfd2f3b)
+                danger
             };
             card = card.child(
                 div()
@@ -2119,26 +3030,59 @@ pub fn render_usage_and_credits(state: &UsageAndCreditsState, palette: &OpenBotP
         .size_full()
         .flex()
         .flex_col()
-        .gap(px(14.0))
-        .p(px(16.0))
         .bg(bg_canvas)
         .child(
             div()
+                .id("openbot-usage-credits-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .gap(px(14.0))
+                .p(px(16.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
-                        .child(tg_icon_rgba(IconName::WalletStars, 18.0, accent))
-                        .child(div().text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).text_color(text_primary).child("Usage & Credits")),
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .child(tg_icon_rgba(IconName::WalletStars, 18.0, accent))
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(text_primary)
+                                        .child(tr_str(lang_id, "AI 用量与计费", "Usage & Credits")),
+                                )
+                                .when_some(range_pills, |el, pills| el.child(pills))
+                                .when_some(refresh_btn, |el, btn| el.child(btn)),
+                        )
+                        .child(price_drums),
                 )
-                .child(price_drums),
+                .when_some(state.sync_error.clone(), |el, err| {
+                    el.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .rounded(px(10.0))
+                            .bg(bg_surface)
+                            .border_1()
+                            .border_color(danger)
+                            .text_size(px(11.0))
+                            .text_color(danger)
+                            .child(err),
+                    )
+                })
+                .child(wallet_card)
+                .child(chart_card)
+                .when(!state.series.is_empty(), |el| el.child(quotas))
+                .when_some(ledger_card, |el, card| el.child(card)),
         )
-        .child(wallet_card)
-        .child(chart_card)
-        .child(quotas)
-        .when_some(ledger_card, |el, card| el.child(card))
 }
+

@@ -44,7 +44,8 @@ use crate::views::app_shell::{
     ShellThemeTargets,
 };
 use crate::views::apple_sidebar::{
-    AppleSidebarEvent, PINNABLE_SECTIONS, RailHelpAction, load_page_rail_pins,
+    AppleSidebarEvent, PINNABLE_SECTIONS, RailHelpAction, default_usage_ring_metric,
+    load_page_rail_pins,
 };
 use crate::views::chat_sidebar::{
     BotGrokAvatarVisual, DialogDeliveryStatus, DialogItemModel, PendingCreateGroupRequest,
@@ -53,8 +54,10 @@ use crate::views::composer::field_autocomplete::MentionRow;
 use crate::views::composer::BotKeyboard;
 use crate::views::nav_rail::NavDestination;
 use crate::views::openbot::{
-    OPENBOT_SYNTHETIC_DIALOG_PREFIX, OpenBotRuntimeBridge, OpenBotWorkspaceShell,
-    TelegramBidirectionalProjection, load_telegram_bidirectional_projection,
+    CreditLedgerEntry, OPENBOT_SYNTHETIC_DIALOG_PREFIX, OpenBotRuntimeBridge,
+    OpenBotWorkspaceEvent, OpenBotWorkspaceShell, TelegramBidirectionalProjection,
+    UsageAndCreditsState, UsageAndCreditsUiAction, load_openbot_host_analytics,
+    load_telegram_bidirectional_projection,
 };
 use crate::views::openbot::agent_studio::{
     GlobalSearchResultItem, GlobalSearchSectionKind, GlobalSearchTab,
@@ -1077,6 +1080,9 @@ impl AppShell {
                 });
             }
             self.openbot_workspace = None;
+            self.apple_sidebar.update(cx, |sb, _| {
+                sb.set_usage_ring_metric(default_usage_ring_metric());
+            });
             self.community_workspace = None;
             self.orca_runtime = None;
             self.orca_bots_workspace = None;
@@ -1207,6 +1213,9 @@ impl AppShell {
             });
         }
         self.openbot_workspace = None;
+        self.apple_sidebar.update(cx, |sb, _| {
+            sb.set_usage_ring_metric(default_usage_ring_metric());
+        });
         self.global_search_modal = None;
         self.channel_create_dialog = None;
         self.chat_nav_history.clear();
@@ -1527,6 +1536,25 @@ impl AppShell {
         };
         let lang = self.active_lang_id().to_string();
         let width_px = self.overlays.last_viewport_width.round().max(960.0) as u32;
+        let cached_wallet = self
+            .settings_router
+            .read(cx)
+            .settings_credits
+            .as_ref()
+            .map(|sc_ent| {
+                let sc = sc_ent.read(cx);
+                let ledger: Vec<CreditLedgerEntry> = sc
+                    .transactions
+                    .iter()
+                    .map(|t| CreditLedgerEntry {
+                        id: t.id.clone(),
+                        label: t.title.clone(),
+                        delta_credits: t.amount,
+                        created_at: t.date.clone(),
+                    })
+                    .collect();
+                (sc.balance_stars as i64, sc.ton_balance, ledger)
+            });
         let created = cx.new(|_| {
             let mut ws = OpenBotWorkspaceShell::with_data_dir(&data_dir);
             ws.set_embedded_in_app_shell(true);
@@ -1538,10 +1566,237 @@ impl AppShell {
                     let _ = bridge.hydrate_workspace_shell(&mut ws);
                 }
             }
+            if let Some((stars, ton, ledger)) = cached_wallet {
+                ws.sync_wallet_credits(stars, ton, 0, ledger);
+            }
             ws
         });
+        cx.subscribe(
+            &created,
+            |this, _, event: &OpenBotWorkspaceEvent, cx| match *event {
+                OpenBotWorkspaceEvent::UsageAction(
+                    UsageAndCreditsUiAction::SelectRangeDays(_) | UsageAndCreditsUiAction::Refresh,
+                ) => {
+                    this.refresh_openbot_usage_and_credits(cx);
+                }
+                OpenBotWorkspaceEvent::UsageAction(
+                    UsageAndCreditsUiAction::BuyCredits | UsageAndCreditsUiAction::MoveCredits,
+                ) => {
+                    this.navigate_settings_to(SettingsSectionType::Credits, cx);
+                    this.refresh_wallet(cx);
+                }
+            },
+        )
+        .detach();
         self.openbot_workspace = Some(created.clone());
         created
+    }
+
+    /// Updates `AppleAppSidebar`'s usage ring hover summary from real live AI billing telemetry.
+    pub(crate) fn sync_apple_sidebar_usage_ring_from_live_data(
+        &mut self,
+        total_cost_usd: f64,
+        total_tokens: u64,
+        total_cached_tokens: u64,
+        primary_provider_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = self.active_lang_id().to_string();
+        let ctx_ratio = self.bot_fusion.context_usage_ratio;
+        let provider = match primary_provider_id
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "claude" | "anthropic" => openbot_contracts::providers::AgentProviderId::Claude,
+            "grok" | "xai" => openbot_contracts::providers::AgentProviderId::Grok,
+            "deepseek" => openbot_contracts::providers::AgentProviderId::DeepSeek,
+            "openrouter" => openbot_contracts::providers::AgentProviderId::OpenRouter,
+            "kimi" => openbot_contracts::providers::AgentProviderId::Kimi,
+            "mistral" => openbot_contracts::providers::AgentProviderId::Mistral,
+            "gemini" | "google" | "antigravity" => {
+                openbot_contracts::providers::AgentProviderId::Antigravity
+            }
+            _ => openbot_contracts::providers::AgentProviderId::Codex,
+        };
+        let cache_ratio = if total_tokens > 0 && total_cached_tokens > 0 {
+            Some((total_cached_tokens as f32 / total_tokens as f32).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        let detail = if total_tokens == 0 && total_cost_usd <= 0.0 {
+            tr_str(&lang, "暂无 AI 用量记录", "No AI usage recorded yet").to_string()
+        } else {
+            format!(
+                "{} · {} tokens",
+                UsageAndCreditsState::format_cost_usd(total_cost_usd),
+                UsageAndCreditsState::format_token_count(total_tokens),
+            )
+        };
+        self.apple_sidebar.update(cx, |sb, scx| {
+            let mut metric = sb.usage_ring_metric.clone();
+            metric.provider = provider;
+            metric.label = tr_str(&lang, "AI 用量", "AI Usage").to_string();
+            metric.primary_ratio = Some(ctx_ratio.unwrap_or(0.0).clamp(0.0, 1.0));
+            metric.secondary_ratio = cache_ratio;
+            metric.unavailable = false;
+            metric.detail_summary = Some(detail);
+            sb.set_usage_ring_metric(metric);
+            scx.notify();
+        });
+    }
+
+    /// Fetches real server AI billing telemetry (`GET /api/v1/hermes/usage?days=N`), real server
+    /// Stars/TON wallet balance + ledger, and real local `openbot.db` `AgentUsageStore` analytics,
+    /// replacing all placeholder values in `OpenBotWorkspaceShell.usage_credits` and `AppleAppSidebar`.
+    pub fn refresh_openbot_usage_and_credits(&mut self, cx: &mut Context<Self>) {
+        let range_days = self
+            .openbot_workspace
+            .as_ref()
+            .map(|ws| ws.read(cx).usage_credits.selected_range_days.clamp(1, 90))
+            .unwrap_or(7);
+        let data_dir = self.openbot_data_dir();
+        let Some(fence) = self.capture_client_fence() else {
+            let local_analytics = load_openbot_host_analytics(&data_dir, range_days);
+            if let Some(ws) = self.openbot_workspace.clone() {
+                let (cost, toks, cached, top_prov) = ws.update(cx, |w, wcx| {
+                    w.usage_credits
+                        .apply_live_sources(None, local_analytics.as_ref(), range_days);
+                    let top = w
+                        .usage_credits
+                        .series
+                        .first()
+                        .map(|s| s.provider_id.clone());
+                    let res = (
+                        w.usage_credits.total_cost_usd(),
+                        w.usage_credits.total_tokens(),
+                        w.usage_credits.total_cached_tokens(),
+                        top,
+                    );
+                    wcx.notify();
+                    res
+                });
+                self.sync_apple_sidebar_usage_ring_from_live_data(
+                    cost,
+                    toks,
+                    cached,
+                    top_prov.as_deref(),
+                    cx,
+                );
+            }
+            return;
+        };
+
+        if let Some(ws) = self.openbot_workspace.clone() {
+            ws.update(cx, |w, wcx| {
+                w.usage_credits.is_loading = true;
+                w.usage_credits.sync_error = None;
+                wcx.notify();
+            });
+        }
+
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let usage_res = fence
+                .client
+                .hermes
+                .usage_stats_for_range(&fence.token, None, range_days)
+                .await;
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let bal_res = fence
+                .client
+                .wallet_balance_with_token(&fence.token, fence.client_epoch)
+                .await
+                .ok();
+            let txs_res = if fence.preflight_ui(&weak, app).await {
+                fence
+                    .client
+                    .wallet_transactions_with_token(&fence.token, fence.client_epoch)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                return;
+            };
+            let local_analytics = load_openbot_host_analytics(&data_dir, range_days);
+            let _ = weak.update(app, |shell, cx| {
+                if !fence.is_valid(shell) {
+                    return;
+                }
+                if let Some(ref b) = bal_res {
+                    crate::views::app_shell::shell_settings_sync::apply_wallet_to_shell(
+                        shell,
+                        b,
+                        &txs_res,
+                        cx,
+                    );
+                }
+                let (hermes_opt, err_opt) = match usage_res {
+                    Ok(u) => (Some(u), None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                if let Some(ws) = shell.openbot_workspace.clone() {
+                    let applied = ws.update(cx, |w, wcx| {
+                        let active_range = w.usage_credits.selected_range_days.clamp(1, 90);
+                        // Ignore stale responses if the user switched ranges while in flight.
+                        if active_range != range_days {
+                            return None;
+                        }
+                        w.usage_credits.apply_live_sources(
+                            hermes_opt.as_ref(),
+                            local_analytics.as_ref(),
+                            range_days,
+                        );
+                        if hermes_opt.is_none() && local_analytics.is_none() {
+                            w.usage_credits.sync_error = err_opt.map(|msg| {
+                                if w.lang_id.starts_with("zh") {
+                                    format!("无法加载服务器计费数据: {msg}")
+                                } else {
+                                    format!("Failed to load live billing data: {msg}")
+                                }
+                            });
+                        }
+                        let top = w
+                            .usage_credits
+                            .series
+                            .first()
+                            .map(|s| s.provider_id.clone());
+                        let summary = (
+                            w.usage_credits.total_cost_usd(),
+                            w.usage_credits.total_tokens(),
+                            w.usage_credits.total_cached_tokens(),
+                            top,
+                        );
+                        wcx.notify();
+                        Some(summary)
+                    });
+                    if let Some((cost, toks, cached, top_prov)) = applied {
+                        shell.sync_apple_sidebar_usage_ring_from_live_data(
+                            cost,
+                            toks,
+                            cached,
+                            top_prov.as_deref(),
+                            cx,
+                        );
+                    }
+                } else if let Some(ref h) = hermes_opt {
+                    let top = h.by_provider.first().map(|p| p.provider_id.as_str());
+                    shell.sync_apple_sidebar_usage_ring_from_live_data(
+                        h.estimated_cost_usd,
+                        h.total_tokens,
+                        h.cached_tokens,
+                        top,
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Switches `AppShell` into the 1:1 OpenBot Workspace surface (`ActiveWorkspacePanel::OpenBot`),
@@ -1560,6 +1815,12 @@ impl AppShell {
             r.set_active_destination(NavDestination::OpenBot);
             r_cx.notify();
         });
+        if matches!(
+            ws.read(cx).active_page,
+            crate::views::openbot::OpenBotPage::Usage | crate::views::openbot::OpenBotPage::Credits
+        ) {
+            self.refresh_openbot_usage_and_credits(cx);
+        }
         self.sync_apple_sidebar_to_active_panel(cx);
         cx.notify();
         ws

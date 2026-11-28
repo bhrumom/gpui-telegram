@@ -1099,3 +1099,107 @@ async fn test_webmcp_call_tool_failure_surfaces_registered_tools_and_webview_ope
 
     let _ = responder.await;
 }
+
+#[tokio::test]
+async fn test_hermes_usage_endpoint_real_billing_user_isolation_and_date_windows() {
+    use gpui_telegram_agent::hermes::state_db::UsageEventRecord;
+
+    let dir = TempDirGuard::new("hermes_real_billing");
+    let (state, app) = open_durable(&dir);
+
+    // Register two distinct users: Alice (owner/admin) and Bob (regular user).
+    let (alice_id, alice_tok) = reg(&app, "alice_bill").await;
+    let (bob_id, bob_tok) = reg(&app, "bob_bill").await;
+
+    // 1. Fresh user starts at exact zero with empty by_provider (zero fake data).
+    let (st, bob_empty) = api(&app, Method::GET, "/api/v1/hermes/usage?days=7", Some(&bob_tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bob_empty["total_tokens"], 0);
+    assert_eq!(bob_empty["estimated_cost_usd"], 0.0);
+    assert_eq!(bob_empty["range_days"], 7);
+    assert_eq!(bob_empty["dates"].as_array().unwrap().len(), 7);
+    assert!(bob_empty["by_provider"].as_array().unwrap().is_empty());
+
+    // 2. Record real usage events for Bob (today & 12 days ago) and for Alice (today).
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let core = state.fabushi_core();
+    let store = core.store();
+    store
+        .record_usage_event(UsageEventRecord {
+            id: "ev_bob_claude_today".into(),
+            session_id: "sess_bob_1".into(),
+            user_id: bob_id.to_string(),
+            bot_id: String::new(),
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            cached_tokens: 4_000,
+            cache_creation_tokens: 0,
+            cost_usd: 0.0612,
+            occurred_at_ms: now_ms,
+        })
+        .unwrap();
+    store
+        .record_usage_event(UsageEventRecord {
+            id: "ev_bob_openai_12d".into(),
+            session_id: "sess_bob_old".into(),
+            user_id: bob_id.to_string(),
+            bot_id: String::new(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 20_000,
+            output_tokens: 5_000,
+            cached_tokens: 1_000,
+            cache_creation_tokens: 0,
+            cost_usd: 0.10,
+            occurred_at_ms: now_ms - 12 * 86_400_000,
+        })
+        .unwrap();
+    store
+        .record_usage_event(UsageEventRecord {
+            id: "ev_alice_grok_today".into(),
+            session_id: "sess_alice_1".into(),
+            user_id: alice_id.to_string(),
+            bot_id: String::new(),
+            provider_id: "xai".into(),
+            model: "grok-3".into(),
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: 0.30,
+            occurred_at_ms: now_ms,
+        })
+        .unwrap();
+
+    // 3. Bob querying ?days=7 sees ONLY Bob's 7-day Claude event (isolated from Alice & >7d event).
+    let (st, bob_7d) = api(&app, Method::GET, "/api/v1/hermes/usage?days=7", Some(&bob_tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bob_7d["prompt_tokens"], 10_000);
+    assert_eq!(bob_7d["completion_tokens"], 2_000);
+    assert_eq!(bob_7d["cached_tokens"], 4_000);
+    assert_eq!(bob_7d["total_tokens"], 12_000);
+    let cost_7d = bob_7d["estimated_cost_usd"].as_f64().unwrap();
+    assert!((cost_7d - 0.0612).abs() < 1e-6, "got {cost_7d}");
+    let provs_7d = bob_7d["by_provider"].as_array().unwrap();
+    assert_eq!(provs_7d.len(), 1);
+    assert_eq!(provs_7d[0]["provider_id"], "claude");
+    assert_eq!(provs_7d[0]["display_name"], "Claude");
+    let daily_costs = provs_7d[0]["daily_cost_usd"].as_array().unwrap();
+    assert_eq!(daily_costs.len(), 7);
+    assert!((daily_costs[6].as_f64().unwrap() - 0.0612).abs() < 1e-6);
+    assert_eq!(daily_costs[0].as_f64().unwrap(), 0.0);
+
+    // 4. Bob querying ?days=30 sees both Bob's Claude and OpenAI events, still isolated from Alice.
+    let (st, bob_30d) = api(&app, Method::GET, "/api/v1/hermes/usage?days=30", Some(&bob_tok), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bob_30d["total_tokens"], 37_000);
+    let cost_30d = bob_30d["estimated_cost_usd"].as_f64().unwrap();
+    assert!((cost_30d - 0.1612).abs() < 1e-6, "got {cost_30d}");
+    let provs_30d = bob_30d["by_provider"].as_array().unwrap();
+    assert_eq!(provs_30d.len(), 2);
+    assert!(provs_30d.iter().all(|p| p["provider_id"] != "grok"));
+    let _ = alice_tok;
+}
+

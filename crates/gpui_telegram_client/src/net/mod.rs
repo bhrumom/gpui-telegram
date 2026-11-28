@@ -106,7 +106,7 @@ pub use hermes_client::{
     HermesCronJobDto, HermesHeartbeatConfigDto, HermesHonchoRequest, HermesHonchoStateDto,
     HermesInlineButtonDto, HermesKanbanBoardDto, HermesKanbanCardDto, HermesMemoryEntryDto,
     HermesMemoryMutationRequest, HermesMemoryStateDto, HermesMoveKanbanCardRequest,
-    HermesProviderConfigDto, HermesRichChatDto, HermesRichMessageDto, HermesRollbackRequest,
+    HermesProviderConfigDto, HermesProviderUsageDto, HermesRichChatDto, HermesRichMessageDto, HermesRollbackRequest,
     HermesRollbackResponse, HermesSaveCronRequest, HermesSaveProviderRequest,
     HermesSaveSkillRequest, HermesSessionBranchRequest, HermesSessionDetailDto,
     HermesSessionDto, HermesSessionExportResponse, HermesSessionSearchRequest, HermesSkillDto,
