@@ -239,7 +239,7 @@ pub struct AppState {
     pub pairing_requests: Arc<RwLock<HashMap<String, (UserId, i64)>>>,
     pub passkey_challenges: Arc<RwLock<HashMap<String, i64>>>,
     pub alipay_upstream_attempts: Arc<RwLock<HashMap<String, String>>>,
-    pub mcp_registry: Arc<RwLock<gpui_telegram_agent::McpRegistry>>,
+    pub mcp_registry: Arc<std::sync::RwLock<gpui_telegram_agent::McpRegistry>>,
     pub permission_dock: Arc<gpui_telegram_agent::ToolPermissionDock>,
     pub computer_lease_broker: Arc<RwLock<gpui_telegram_agent::ComputerLeaseBroker>>,
     pub talk_coordinator: Arc<RwLock<gpui_telegram_agent::TalkCoordinator>>,
@@ -502,6 +502,19 @@ impl AppState {
         }
         let _ = db.purge_legacy_builtin_sticker_gif_catalog();
         let _ = db.seed_botfather_and_flagship_apps();
+        match db.publish_openbot_marketplace_catalog() {
+            Ok((apps, agents, skills)) => {
+                tracing::info!(
+                    apps,
+                    agents,
+                    skills,
+                    "Published authentic OpenBot Marketplace catalog into SQLite"
+                );
+            }
+            Err(err) => {
+                tracing::warn!("publish_openbot_marketplace_catalog failed: {}", err);
+            }
+        }
         let _ = ensure_default_ai_bot(&db);
         let _ = ensure_creator_studio_bot(&db);
 
@@ -676,8 +689,21 @@ impl AppState {
             Arc::clone(&pts_engine),
             Arc::downgrade(&gateway_hub),
         ));
+        let mcp_registry = Arc::new(std::sync::RwLock::new(hydrated_mcp));
+        let hydrated_live_conns =
+            crate::routes::marketplace::hydrate_marketplace_connections_into_mcp_registry(
+                &db,
+                &mcp_registry,
+            );
+        if hydrated_live_conns > 0 {
+            tracing::info!(
+                connections = hydrated_live_conns,
+                "Hydrated live Marketplace connector & MCP handlers into shared McpRegistry"
+            );
+        }
         fabushi_bots.set_group_workspace_bridge(group_workspace_bridge);
         fabushi_bots.set_permission_dock(Arc::clone(&permission_dock));
+        fabushi_bots.set_mcp_registry(Arc::clone(&mcp_registry));
 
         let teammate_bridge = Arc::new(ServerFabushiTeammateBridge {
             db: db.clone(),
@@ -912,7 +938,7 @@ impl AppState {
             pairing_requests: Arc::new(RwLock::new(HashMap::new())),
             passkey_challenges: Arc::new(RwLock::new(HashMap::new())),
             alipay_upstream_attempts: Arc::new(RwLock::new(HashMap::new())),
-            mcp_registry: Arc::new(RwLock::new(hydrated_mcp)),
+            mcp_registry,
             permission_dock,
             computer_lease_broker: Arc::new(RwLock::new(gpui_telegram_agent::ComputerLeaseBroker::new())),
             talk_coordinator: Arc::new(RwLock::new(gpui_telegram_agent::TalkCoordinator::new())),
@@ -1553,6 +1579,7 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/tasks", get(routes::acp::tasks_list).post(routes::acp::tasks_create))
         .route("/api/v1/tasks/{task_id}/approve", post(routes::acp::tasks_approve))
         .route("/api/v1/mcp/servers", get(routes::acp::mcp_servers_list).post(routes::acp::mcp_servers_register))
+        .route("/api/v1/mcp/servers/{server_id}", delete(routes::acp::mcp_servers_delete))
         .route("/api/v1/mcp/tools", get(mcp_tools_list))
         .route("/api/v1/mcp/call", post(mcp_tool_call))
         .route("/api/v1/mcp/permission/approve", post(mcp_permission_approve))
@@ -1911,6 +1938,44 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/catalog/{id}/leaderboard",
             get(routes::creations::catalog_leaderboard),
+        )
+        // --- Live Server-Published OpenBot Marketplace (266+ Connectors/Plugins, Agents, Skills) ---
+        .route(
+            "/api/v1/marketplace/catalog",
+            get(routes::marketplace::marketplace_catalog_get),
+        )
+        .route(
+            "/api/v1/marketplace/apps",
+            get(routes::marketplace::marketplace_apps_list)
+                .post(routes::marketplace::marketplace_apps_publish),
+        )
+        .route(
+            "/api/v1/marketplace/connections",
+            get(routes::marketplace::marketplace_connections_list),
+        )
+        .route(
+            "/api/v1/marketplace/connections/connect",
+            post(routes::marketplace::marketplace_connections_connect),
+        )
+        .route(
+            "/api/v1/marketplace/connections/{app_id}/probe",
+            post(routes::marketplace::marketplace_connection_probe),
+        )
+        .route(
+            "/api/v1/marketplace/connections/{app_id}/call",
+            post(routes::marketplace::marketplace_connection_call),
+        )
+        .route(
+            "/api/v1/marketplace/connections/{app_id}",
+            delete(routes::marketplace::marketplace_connection_disconnect),
+        )
+        .route(
+            "/api/v1/marketplace/agents/{slug}/install",
+            post(routes::marketplace::marketplace_agent_install),
+        )
+        .route(
+            "/api/v1/marketplace/skills/{slug}/install",
+            post(routes::marketplace::marketplace_skill_install),
         )
         // --- WebSocket Upgrade Route ---
         .route("/api/v1/ws", get(ws_upgrade_handler))
@@ -7221,8 +7286,11 @@ async fn mcp_tools_list(
     _auth: AuthBearer,
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
-    let registry = state.mcp_registry.read();
-    let tools = registry.list_tools();
+    let tools = state
+        .mcp_registry
+        .read()
+        .map(|r| r.list_tools())
+        .unwrap_or_default();
     Json(json!({
         "tools": tools,
         "count": tools.len()
@@ -7251,15 +7319,19 @@ async fn mcp_tool_call(
     let args = payload.get("arguments").cloned().unwrap_or(Value::Null);
 
     let tool_def = {
-        let registry = state.mcp_registry.read();
-        registry.get(tool_name).cloned().unwrap_or_else(|| {
-            gpui_telegram_agent::McpToolDefinition::new(
-                tool_name,
-                "",
-                "{}",
-                gpui_telegram_agent::ToolRiskLevel::Low,
-            )
-        })
+        state
+            .mcp_registry
+            .read()
+            .ok()
+            .and_then(|registry| registry.get(tool_name).cloned())
+            .unwrap_or_else(|| {
+                gpui_telegram_agent::McpToolDefinition::new(
+                    tool_name,
+                    "",
+                    "{}",
+                    gpui_telegram_agent::ToolRiskLevel::Low,
+                )
+            })
     };
 
     let (assessed_risk, auto_verdict) = state.permission_dock.evaluate_auto_review(&tool_def, &args);
@@ -7301,15 +7373,31 @@ async fn mcp_tool_call(
         gpui_telegram_agent::AutoReviewVerdict::Allow => {}
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "executed",
-            "tool_name": tool_name,
-            "result": format!("Tool {} executed successfully", tool_name)
-        })),
-    )
-        .into_response()
+    let exec_res = match state.mcp_registry.read() {
+        Ok(reg) => reg.execute_tool(tool_name, args),
+        Err(_) => Err("McpRegistry lock poisoned".to_string()),
+    };
+
+    match exec_res {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "executed",
+                "tool_name": tool_name,
+                "result": result
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "status": "error",
+                "tool_name": tool_name,
+                "error": err
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn mcp_permission_approve(

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::marketplace::{MarketplaceAppListingDto, MarketplaceToolSchemaDto};
 use openbot_contracts::avatar::{AvatarHue, AvatarMood};
 use openbot_runtime::platform::marketplace::{
     OpenBotAgentCatalogItem, OpenBotConnectorCatalogItem, OpenBotPluginCatalogItem,
@@ -102,6 +103,16 @@ fn render_app_logo_tile(app: &MarketplaceAppEntry, size_px: f32) -> Div {
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(0xFFFFFF))
                     .child(monogram_for_name(&p.name))
+            }
+        }
+        MarketplaceAppEntry::Published(a) => {
+            if let Some(ic) = connector_brand_icon(&a.slug) {
+                tile.child(tg_icon_rgba(ic, icon_px, rgba(0xFFFFFFFF)))
+            } else {
+                tile.text_size(px(font_px))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xFFFFFF))
+                    .child(monogram_for_name(&a.name))
             }
         }
         MarketplaceAppEntry::Custom(_) => {
@@ -389,6 +400,7 @@ fn render_no_match_plush_state(
 fn render_app_row(
     app: &MarketplaceAppEntry,
     connected: bool,
+    connecting: bool,
     pal: TdesktopThemePalette,
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
@@ -402,12 +414,23 @@ fn render_app_row(
     let app_id_btn = app_id.clone();
     let tagline = app.localized_tagline(lang);
     let is_open_plugin = matches!(app, MarketplaceAppEntry::Plugin(p) if p.auth_kind == "open");
+    let is_open_published =
+        matches!(app, MarketplaceAppEntry::Published(a) if a.auth_kind == "open");
     let open_plugin_slug = match app {
         MarketplaceAppEntry::Plugin(p) => Some(p.slug.clone()),
         _ => None,
     };
 
-    let action_el: AnyElement = if connected {
+    let action_el: AnyElement = if connecting {
+        div()
+            .flex_shrink_0()
+            .px(px(10.0))
+            .py(px(5.0))
+            .text_size(px(12.0))
+            .text_color(ob.text_muted())
+            .child(tr_str(lang, "验证中…", "Verifying…"))
+            .into_any_element()
+    } else if connected {
         div()
             .flex_shrink_0()
             .px(px(10.0))
@@ -448,6 +471,14 @@ fn render_app_row(
                             });
                             return;
                         }
+                    }
+                    if is_open_published {
+                        cx.emit(ContentHubEvent::MarketplaceConnectPublished {
+                            app_id: app_id_btn.clone(),
+                            auth_values: BTreeMap::new(),
+                            override_url: None,
+                        });
+                        return;
                     }
                     this.marketplace.open_setup_for_app(&app_id_btn);
                     this.marketplace.push_route(MarketplaceRoute::AppDetail {
@@ -542,13 +573,35 @@ fn render_apps_browse(
     let search_field = ws.marketplace.search.clone();
     let agents_count = ws.marketplace.filtered_agents().len();
     let skills_count = ws.marketplace.filtered_skills().len();
+    let connecting_id = ws.marketplace.connecting_app_id.clone();
+    let server_synced = ws.marketplace.server_synced;
+    let server_loading = ws.marketplace.server_sync_loading;
+    let total_published_apps = if ws.marketplace.server_total_apps > 0 {
+        ws.marketplace.server_total_apps
+    } else {
+        ws.marketplace.all_apps().len()
+    };
+
+    let sync_pill_text = if server_loading {
+        tr_str(lang, "正在同步云端市场…", "Syncing live marketplace…").to_string()
+    } else if server_synced {
+        if lang.starts_with("zh") {
+            format!("云端市场已上架 · {total_published_apps} 个真实连接器")
+        } else {
+            format!("Live Marketplace · {total_published_apps} connectors")
+        }
+    } else if lang.starts_with("zh") {
+        format!("{total_published_apps} 个连接器")
+    } else {
+        format!("{total_published_apps} connectors")
+    };
 
     let mut content = div()
         .w_full()
         .flex()
         .flex_col()
         .gap(px(22.0))
-        // Header: Title + Subtitle + Toolbar (Search + "+ 添加自定义项")
+        // Header: Title + Live Sync Pill + Subtitle + Toolbar (Search + "+ 添加自定义项")
         .child(
             div()
                 .w_full()
@@ -562,10 +615,40 @@ fn render_apps_browse(
                         .gap(px(4.0))
                         .child(
                             div()
-                                .text_size(px(24.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(ob.text_primary())
-                                .child(tr_str(lang, "应用", "Apps")),
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .child(
+                                    div()
+                                        .text_size(px(24.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
+                                        .child(tr_str(lang, "应用", "Apps")),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(8.0))
+                                        .py(px(2.5))
+                                        .rounded(px(999.0))
+                                        .bg(if server_synced {
+                                            rgba(0x31CF761C)
+                                        } else {
+                                            ob.bg_control()
+                                        })
+                                        .border_1()
+                                        .border_color(if server_synced {
+                                            rgba(0x31CF7644)
+                                        } else {
+                                            ob.border_hairline()
+                                        })
+                                        .text_size(px(11.0))
+                                        .text_color(if server_synced {
+                                            ob.success()
+                                        } else {
+                                            ob.text_muted()
+                                        })
+                                        .child(sync_pill_text),
+                                ),
                         )
                         .child(
                             div()
@@ -573,8 +656,8 @@ fn render_apps_browse(
                                 .text_color(ob.text_muted())
                                 .child(tr_str(
                                     lang,
-                                    "连接你的助手使用的工具和服务。",
-                                    "Connect the tools and services your agents use.",
+                                    "连接你的助手使用的工具和服务，所有连接均经实时握手/凭据验证。",
+                                    "Connect verified tools and MCP services for your agents.",
                                 )),
                         ),
                 )
@@ -652,8 +735,10 @@ fn render_apps_browse(
                 .iter()
                 .take(APP_GROUP_LIMIT)
                 .map(|app| {
-                    let connected = ws.marketplace.is_app_connected(&app.id());
-                    render_app_row(app, connected, pal, lang, cx).into_any_element()
+                    let aid = app.id();
+                    let connected = ws.marketplace.is_app_connected(&aid);
+                    let connecting = connecting_id.as_deref() == Some(aid.as_str());
+                    render_app_row(app, connected, connecting, pal, lang, cx).into_any_element()
                 })
                 .collect();
 
@@ -699,6 +784,7 @@ fn render_app_group_page(
     let search_focused = ws.active_input == ContentHubInputTarget::MarketplaceSearch;
     let search_field = ws.marketplace.search.clone();
     let cat_label = category_localized_label(category, lang);
+    let connecting_id = ws.marketplace.connecting_app_id.clone();
 
     let items: Vec<MarketplaceAppEntry> = ws
         .marketplace
@@ -710,8 +796,10 @@ fn render_app_group_page(
     let rows: Vec<AnyElement> = items
         .iter()
         .map(|app| {
-            let connected = ws.marketplace.is_app_connected(&app.id());
-            render_app_row(app, connected, pal, lang, cx).into_any_element()
+            let aid = app.id();
+            let connected = ws.marketplace.is_app_connected(&aid);
+            let connecting = connecting_id.as_deref() == Some(aid.as_str());
+            render_app_row(app, connected, connecting, pal, lang, cx).into_any_element()
         })
         .collect();
 
@@ -797,43 +885,85 @@ fn render_app_detail_page(
     }
 
     let connected = ws.marketplace.is_app_connected(app_id);
-    let connected_rec = ws.marketplace.connected_record(app_id).cloned();
+    let conn_status = ws.marketplace.connection_status(app_id).map(str::to_string);
+    let last_error = ws
+        .marketplace
+        .connection_last_error(app_id)
+        .map(str::to_string);
+    let account_label = ws
+        .marketplace
+        .connection_account_label(app_id)
+        .map(str::to_string);
+    let discovered_tools = ws.marketplace.discovered_tools_for_app(app_id);
+    let is_connecting = ws.marketplace.connecting_app_id.as_deref() == Some(app_id);
+    let is_probing = ws.marketplace.probing_app_id.as_deref() == Some(app_id);
+    let install_count = ws.marketplace.app_install_count(app_id);
     let linked_server_id = ws.marketplace.linked_mcp_server_id(app_id);
     let tagline = app.localized_tagline(lang);
     let description = app.localized_description(lang);
     let app_name = app.name().to_string();
 
+    let (pill_bg, pill_border, pill_color, pill_text) = if is_connecting {
+        (
+            rgba(0x0A84FF1E),
+            rgba(0x0A84FF44),
+            ob.accent_text(),
+            tr_str(lang, "正在验证连接…", "Verifying…").to_string(),
+        )
+    } else if connected {
+        let lbl = if !discovered_tools.is_empty() {
+            if lang.starts_with("zh") {
+                format!("已连接 · {} 个实时工具", discovered_tools.len())
+            } else {
+                format!("Connected · {} live tools", discovered_tools.len())
+            }
+        } else {
+            tr_str(lang, "已连接", "Connected").to_string()
+        };
+        (rgba(0x31CF7624), rgba(0x31CF7655), ob.success(), lbl)
+    } else if conn_status.as_deref() == Some("needs_sign_in") {
+        (
+            rgba(0xF59E0B22),
+            rgba(0xF59E0B55),
+            ob.warning(),
+            tr_str(lang, "需要 OAuth 授权", "Needs OAuth sign-in").to_string(),
+        )
+    } else if matches!(conn_status.as_deref(), Some("error") | Some("needs_key")) {
+        (
+            rgba(0xE5393522),
+            rgba(0xE5393555),
+            ob.danger(),
+            tr_str(lang, "验证未通过", "Verification failed").to_string(),
+        )
+    } else {
+        (
+            ob.bg_control(),
+            ob.border_hairline(),
+            ob.text_muted(),
+            tr_str(lang, "未连接", "Not connected").to_string(),
+        )
+    };
+
     let status_pill = div()
         .px(px(8.0))
         .py(px(2.5))
         .rounded(px(999.0))
-        .bg(if connected {
-            rgba(0x31CF7624)
-        } else {
-            ob.bg_control()
-        })
+        .bg(pill_bg)
         .border_1()
-        .border_color(if connected {
-            rgba(0x31CF7655)
-        } else {
-            ob.border_hairline()
-        })
+        .border_color(pill_border)
         .text_size(px(11.5))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(if connected {
-            ob.success()
-        } else {
-            ob.text_muted()
-        })
-        .child(if connected {
-            tr_str(lang, "已连接", "Connected")
-        } else {
-            tr_str(lang, "未连接", "Not connected")
-        });
+        .text_color(pill_color)
+        .child(pill_text);
 
     let share_url = match &app {
         MarketplaceAppEntry::Connector(c) => format!("https://openbot.app/apps/{}", c.slug),
         MarketplaceAppEntry::Plugin(p) => format!("https://openbot.app/apps/{}", p.slug),
+        MarketplaceAppEntry::Published(a) => a
+            .website_url
+            .clone()
+            .or_else(|| a.url.clone())
+            .unwrap_or_else(|| format!("openbot://marketplace/{}", a.slug)),
         MarketplaceAppEntry::Custom(s) => format!("openbot://mcp/{}", s.id),
     };
 
@@ -924,14 +1054,16 @@ fn render_app_detail_page(
                 .child(header_actions),
         );
 
-    // Setup / Connection Card tailored to Connector, Plugin, or Custom Server
+    // Setup / Connection Card tailored to Connector, Plugin, Published Connector, or Custom Server
     match &app {
         MarketplaceAppEntry::Connector(conn) => {
             page = page.child(render_native_connector_setup_card(
                 ws,
                 conn,
                 connected,
-                connected_rec.as_ref().and_then(|r| r.account_label.as_deref()),
+                is_connecting,
+                account_label.as_deref(),
+                last_error.as_deref(),
                 pal,
                 lang,
                 cx,
@@ -1005,7 +1137,19 @@ fn render_app_detail_page(
                 ws,
                 plugin,
                 connected,
-                connected_rec.as_ref().and_then(|r| r.account_label.as_deref()),
+                account_label.as_deref(),
+                pal,
+                lang,
+                cx,
+            ));
+        }
+        MarketplaceAppEntry::Published(listing) => {
+            page = page.child(render_published_app_setup_card(
+                ws,
+                listing,
+                connected,
+                is_connecting,
+                account_label.as_deref(),
                 pal,
                 lang,
                 cx,
@@ -1014,6 +1158,18 @@ fn render_app_detail_page(
         MarketplaceAppEntry::Custom(srv) => {
             page = page.child(render_custom_server_info_card(srv, pal, lang));
         }
+    }
+
+    // Live Discovered Tools Card (real tools returned from upstream MCP `tools/list` or verified native API)
+    if connected || !discovered_tools.is_empty() || matches!(app, MarketplaceAppEntry::Custom(_)) {
+        page = page.child(render_discovered_tools_card(
+            app_id,
+            &discovered_tools,
+            is_probing,
+            pal,
+            lang,
+            cx,
+        ));
     }
 
     // Agent access control section (when connected & backed by an MCP server)
@@ -1128,6 +1284,17 @@ fn render_app_detail_page(
             }
             (p.creator_name.clone(), Some(p.version.clone()), l)
         }
+        MarketplaceAppEntry::Published(a) => {
+            let mut l = Vec::new();
+            if let Some(ref u) = a.website_url {
+                l.push((tr_str(lang, "网站", "Website"), u.clone()));
+            }
+            (
+                a.creator_name.clone(),
+                (!a.version.is_empty()).then(|| a.version.clone()),
+                l,
+            )
+        }
         MarketplaceAppEntry::Custom(_) => (
             tr_str(lang, "自定义", "Custom").to_string(),
             None,
@@ -1172,6 +1339,13 @@ fn render_app_detail_page(
                     category_localized_label(app.category(), lang).to_string(),
                     pal,
                 ))
+                .when(!matches!(app, MarketplaceAppEntry::Custom(_)), |el| {
+                    el.child(info_fact_row(
+                        tr_str(lang, "真实连接次数", "Verified installs"),
+                        format!("{install_count}"),
+                        pal,
+                    ))
+                })
                 .when_some(version, |el, v| {
                     el.child(info_fact_row(tr_str(lang, "版本", "Version"), v, pal))
                 })
@@ -1256,8 +1430,8 @@ fn render_app_detail_page(
                                 } else {
                                     tr_str(
                                         lang,
-                                        "从这台电脑移除该连接及其凭证，之后可随时重新连接。",
-                                        "Remove this connection and its saved credentials from this computer.",
+                                        "移除本机与云端加密凭据并注销实时工具，之后可随时重新连接。",
+                                        "Remove local & cloud encrypted credentials and unregister live tools.",
                                     )
                                 }),
                         ),
@@ -1305,11 +1479,289 @@ fn render_app_detail_page(
     page.into_any_element()
 }
 
+fn render_discovered_tools_card(
+    app_id: &str,
+    tools: &[MarketplaceToolSchemaDto],
+    is_probing: bool,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> Div {
+    let ob = pal.openbot_palette();
+    let app_id_probe = app_id.to_string();
+    let title = if lang.starts_with("zh") {
+        format!("已发现的实时工具 ({})", tools.len())
+    } else {
+        format!("Live discovered tools ({})", tools.len())
+    };
+
+    let mut card = apple_grouped_card(pal)
+        .p(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
+                        .child(title),
+                )
+                .child(
+                    openbot_secondary_btn(
+                        "mkt-app-reprobe-tools-btn",
+                        if is_probing {
+                            tr_str(lang, "探测中…", "Probing…")
+                        } else {
+                            tr_str(lang, "重新探测工具", "Re-probe tools")
+                        },
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_this, _, _, cx| {
+                            cx.emit(ContentHubEvent::MarketplaceProbeApp {
+                                app_id: app_id_probe.clone(),
+                            });
+                        }),
+                    ),
+                ),
+        );
+
+    if tools.is_empty() {
+        card = card.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(ob.text_muted())
+                .child(tr_str(
+                    lang,
+                    "暂未探测到工具列表，点击「重新探测工具」发起实时 MCP tools/list 握手。",
+                    "No tools discovered yet. Click \"Re-probe tools\" to run live MCP tools/list.",
+                )),
+        );
+    } else {
+        for tool in tools.iter().take(24) {
+            card = card.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
+                    .bg(ob.bg_canvas())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_primary())
+                            .child(tool.name.clone()),
+                    )
+                    .when(!tool.description.trim().is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(ob.text_muted())
+                                .child(tool.description.clone()),
+                        )
+                    }),
+            );
+        }
+        if tools.len() > 24 {
+            card = card.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(ob.text_muted())
+                    .child(if lang.starts_with("zh") {
+                        format!("还有 {} 个工具已注册可供助手调用。", tools.len() - 24)
+                    } else {
+                        format!("+{} more live tools registered for agents.", tools.len() - 24)
+                    }),
+            );
+        }
+    }
+
+    card
+}
+
+fn render_published_app_setup_card(
+    ws: &mut ContentHubWorkspace,
+    listing: &MarketplaceAppListingDto,
+    connected: bool,
+    is_connecting: bool,
+    current_label: Option<&str>,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> Div {
+    let ob = pal.openbot_palette();
+    let draft = ws.marketplace.setup_draft.clone().unwrap_or_default();
+    let pri_focused = ws.active_input == ContentHubInputTarget::MarketplaceSetupPrimary;
+    let app_id = listing.app_id.clone();
+    let auth_kind = listing.auth_kind.clone();
+    let endpoint_display = listing
+        .url
+        .clone()
+        .or_else(|| listing.command.clone())
+        .unwrap_or_else(|| listing.server_name.clone());
+
+    let mut card = apple_grouped_card(pal)
+        .p(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
+                                .child(tr_str(lang, "已上架连接器", "Published Connector")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(ob.text_muted())
+                                .child(format!(
+                                    "MCP ({}) · {}",
+                                    listing.transport.to_uppercase(),
+                                    endpoint_display
+                                )),
+                        ),
+                )
+                .when_some(current_label, |el, lbl| {
+                    el.child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(ob.success())
+                            .child(format!("✓ {lbl}")),
+                    )
+                }),
+        );
+
+    if auth_kind != "open" {
+        let placeholder = if auth_kind == "local" {
+            "http://127.0.0.1:8080/mcp"
+        } else {
+            tr_str(lang, "输入访问令牌 / API Key…", "Enter access token / API key…")
+        };
+        card = card.child(
+            render_editable_field_box(
+                "mkt-published-primary-input",
+                &draft.primary,
+                placeholder,
+                pri_focused,
+                false,
+                pal,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus_input(ContentHubInputTarget::MarketplaceSetupPrimary, cx);
+                }),
+            ),
+        );
+    }
+
+    if let Some(ref err) = draft.error {
+        card = card.child(
+            div()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(8.0))
+                .bg(rgba(0xE539351E))
+                .border_1()
+                .border_color(rgba(0xE5393555))
+                .text_size(px(12.0))
+                .text_color(ob.danger())
+                .child(err.clone()),
+        );
+    }
+
+    let is_local = auth_kind == "local";
+    card.child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(ob.text_muted())
+                    .child(tr_str(
+                        lang,
+                        "连接时将实时执行 MCP initialize + tools/list 握手校验。",
+                        "Live MCP initialize + tools/list verification runs on connect.",
+                    )),
+            )
+            .child(
+                openbot_primary_cta_btn(
+                    "mkt-published-connect-btn",
+                    if is_connecting {
+                        tr_str(lang, "验证中…", "Verifying…")
+                    } else if connected {
+                        tr_str(lang, "重新验证并连接", "Reconnect & verify")
+                    } else {
+                        tr_str(lang, "验证并连接", "Verify & Connect")
+                    },
+                    pal,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        let raw = this
+                            .marketplace
+                            .setup_draft
+                            .as_ref()
+                            .map(|d| d.primary.text.trim().to_string())
+                            .unwrap_or_default();
+                        let mut auth_values = BTreeMap::new();
+                        let override_url = if is_local && !raw.is_empty() {
+                            Some(raw)
+                        } else {
+                            if !raw.is_empty() {
+                                auth_values.insert("oauth_token".to_string(), raw);
+                            }
+                            None
+                        };
+                        cx.emit(ContentHubEvent::MarketplaceConnectPublished {
+                            app_id: app_id.clone(),
+                            auth_values,
+                            override_url,
+                        });
+                    }),
+                ),
+            ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_native_connector_setup_card(
     ws: &mut ContentHubWorkspace,
     conn: &'static OpenBotConnectorCatalogItem,
     connected: bool,
+    is_connecting: bool,
     current_label: Option<&str>,
+    last_error: Option<&str>,
     pal: TdesktopThemePalette,
     lang: &str,
     cx: &mut Context<ContentHubWorkspace>,
@@ -1322,50 +1774,74 @@ fn render_native_connector_setup_card(
 
     let (pri_label, pri_placeholder, sec_label, sec_placeholder) = match conn.connector_id.as_str() {
         "slack" => (
-            tr_str(lang, "Slack 工作区名称", "Slack Workspace Name"),
-            tr_str(lang, "例如：Acme Engineering", "e.g. Acme Engineering"),
-            tr_str(lang, "Bot Token / Signing Secret (可选)", "Bot Token (xoxb-..., optional)"),
+            tr_str(lang, "Slack 工作区名称 (可选)", "Slack Workspace Name (optional)"),
+            tr_str(lang, "例如：Acme Engineering（验证后自动读取）", "e.g. Acme Engineering (auto-detected)"),
+            tr_str(lang, "Bot User OAuth Token * (实时调用 auth.test 验证)", "Bot User OAuth Token * (verified via auth.test)"),
             "xoxb-...",
         ),
         "discord" => (
-            tr_str(lang, "Discord 服务器名称", "Discord Server Name"),
+            tr_str(lang, "Discord 服务器名称 (可选)", "Discord Server Name (optional)"),
             tr_str(lang, "例如：OpenBot Community", "e.g. OpenBot Community"),
-            tr_str(lang, "Discord Bot Token (可选)", "Discord Bot Token (optional)"),
+            tr_str(lang, "Discord Bot Token * (实时调用 /users/@me 验证)", "Discord Bot Token * (verified via /users/@me)"),
             "MT...",
         ),
         "telegram" => (
-            tr_str(lang, "Telegram 机器人或群组名称", "Telegram Bot / Group Label"),
-            tr_str(lang, "例如：@my_openbot", "e.g. @my_openbot"),
-            tr_str(lang, "BotFather Token (可选)", "BotFather Token (optional)"),
+            tr_str(lang, "备注名称 (可选)", "Display Label (optional)"),
+            tr_str(lang, "验证后自动填入 Bot @username", "Auto-filled from getMe @username"),
+            tr_str(lang, "BotFather Token * (实时调用 getMe 验证)", "BotFather Token * (verified via getMe)"),
             "123456:ABC...",
         ),
         "whatsapp" => (
-            tr_str(lang, "WhatsApp 账号或手机号", "WhatsApp Account / Phone"),
-            tr_str(lang, "例如：+86 138 0000 0000", "e.g. +1 415 555 0100"),
-            tr_str(lang, "配对码或允许列表备注 (可选)", "Pairing Note / Allowlist (optional)"),
-            tr_str(lang, "仅限自己和允许的联系人", "Self-chat & allowlist"),
+            tr_str(lang, "WhatsApp Phone Number ID *", "WhatsApp Phone Number ID *"),
+            "109876543210123",
+            tr_str(lang, "Meta Cloud API Access Token * (实时调用 Graph API 验证)", "Meta Cloud API Access Token * (verified via Graph API)"),
+            "EAAG...",
         ),
         "github" => (
-            tr_str(lang, "GitHub 账号或组织", "GitHub Account / Org"),
-            tr_str(lang, "例如：octocat", "e.g. octocat"),
-            tr_str(lang, "Personal Access Token (ghp_...)", "Personal Access Token (ghp_...)"),
-            "ghp_...",
+            tr_str(lang, "GitHub 账号或组织 (可选)", "GitHub Account / Org (optional)"),
+            tr_str(lang, "验证后自动填入登录账号", "Auto-filled from /user login"),
+            tr_str(lang, "Personal Access Token * (实时调用 api.github.com/user 验证)", "Personal Access Token * (verified via api.github.com/user)"),
+            "ghp_... / github_pat_...",
         ),
-        "onepassword" | "bitwarden" | "protonpass" => (
-            tr_str(lang, "共享保管库 / 文件夹名称", "Shared Vault / Folder Name"),
+        "onepassword" => (
+            tr_str(lang, "共享保管库名称 (可选)", "Shared Vault Name (optional)"),
             tr_str(lang, "例如：OpenBot Shared", "e.g. OpenBot Shared"),
-            tr_str(lang, "服务账号令牌 / API Key (可选)", "Service Account Token (optional)"),
+            tr_str(lang, "Service Account Token (可选，或使用本机 `op` CLI 登录态)", "Service Account Token (optional, or local `op` CLI)"),
             "ops_...",
+        ),
+        "bitwarden" => (
+            tr_str(lang, "文件夹名称 (可选)", "Folder Name (optional)"),
+            tr_str(lang, "例如：OpenBot", "e.g. OpenBot"),
+            tr_str(lang, "BW_SESSION 令牌 (可选，或使用本机 `bw` CLI 解锁态)", "BW_SESSION key (optional, or local `bw` CLI)"),
+            "bw_session...",
+        ),
+        "protonpass" => (
+            tr_str(lang, "共享保管库名称 (可选)", "Shared Vault Name (optional)"),
+            tr_str(lang, "例如：OpenBot Vault", "e.g. OpenBot Vault"),
+            tr_str(lang, "CLI 访问令牌 (可选，需本机已安装 `pass-cli`)", "CLI Token (optional, requires local `pass-cli`)"),
+            "",
+        ),
+        "x" => (
+            tr_str(lang, "X 账号 Handle (可选)", "X Handle (optional)"),
+            tr_str(lang, "例如：@openbot_", "e.g. @openbot_"),
+            tr_str(lang, "X API v2 Bearer Token * (实时调用 api.x.com/2 验证)", "X API v2 Bearer Token * (verified via api.x.com/2)"),
+            "AAAA...",
         ),
         _ => (
             tr_str(lang, "账号标识", "Account / Handle"),
             tr_str(lang, "例如：@openbot_", "e.g. @openbot_"),
-            tr_str(lang, "扩展授权令牌 (可选)", "Extension Token (optional)"),
+            tr_str(lang, "API Token *", "API Token *"),
             "",
         ),
     };
 
-    apple_grouped_card(pal)
+    let inline_err = draft
+        .error
+        .as_deref()
+        .or(last_error)
+        .map(str::to_string);
+
+    let mut card = apple_grouped_card(pal)
         .p(px(16.0))
         .flex()
         .flex_col()
@@ -1380,7 +1856,7 @@ fn render_native_connector_setup_card(
                         .text_size(px(13.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(ob.text_primary())
-                        .child(tr_str(lang, "连接配置", "Connection Setup")),
+                        .child(tr_str(lang, "实时凭据验证与连接", "Live Credential Verification")),
                 )
                 .when_some(current_label, |el, lbl| {
                     el.child(
@@ -1448,59 +1924,88 @@ fn render_native_connector_setup_card(
                         }),
                     ),
                 ),
-        )
-        .child(
+        );
+
+    if let Some(err) = inline_err {
+        card = card.child(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(ob.text_muted())
-                        .child(tr_str(
-                            lang,
-                            "连接凭据仅保存在本机安全存储中，不会上传到第三方。",
-                            "Credentials are stored locally on this computer.",
-                        )),
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(8.0))
+                .bg(rgba(0xE539351E))
+                .border_1()
+                .border_color(rgba(0xE5393555))
+                .text_size(px(12.0))
+                .text_color(ob.danger())
+                .child(err),
+        );
+    }
+
+    card.child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(11.5))
+                    .text_color(ob.text_muted())
+                    .child(tr_str(
+                        lang,
+                        "将实时请求官方 API/CLI 验证有效凭据，通过后加密保存并立即注入助手可用工具。",
+                        "Verifies live against the official API/CLI, encrypts credentials at rest, and registers live bot tools.",
+                    )),
+            )
+            .child(
+                openbot_primary_cta_btn(
+                    "mkt-native-connect-submit",
+                    if is_connecting {
+                        tr_str(lang, "正在验证…", "Verifying…").to_string()
+                    } else if connected {
+                        tr_str(lang, "重新验证并更新", "Re-verify & Update").to_string()
+                    } else if lang.starts_with("zh") {
+                        format!("验证并连接 {}", conn.name)
+                    } else {
+                        format!("Verify & Connect {}", conn.name)
+                    },
+                    pal,
                 )
-                .child(
-                    openbot_primary_cta_btn(
-                        "mkt-native-connect-submit",
-                        if connected {
-                            tr_str(lang, "更新连接", "Update connection").to_string()
-                        } else if lang.starts_with("zh") {
-                            format!("连接 {}", conn.name)
-                        } else {
-                            format!("Connect {}", conn.name)
-                        },
-                        pal,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            let (acct, cred) = this
-                                .marketplace
-                                .setup_draft
-                                .as_ref()
-                                .map(|d| (d.primary.text.trim().to_string(), d.secondary.text.trim().to_string()))
-                                .unwrap_or_default();
-                            let mut meta = BTreeMap::new();
-                            if !acct.is_empty() {
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        let (acct, cred) = this
+                            .marketplace
+                            .setup_draft
+                            .as_ref()
+                            .map(|d| (d.primary.text.trim().to_string(), d.secondary.text.trim().to_string()))
+                            .unwrap_or_default();
+                        let mut meta = BTreeMap::new();
+                        if !acct.is_empty() {
+                            if conn_id == "whatsapp" {
+                                meta.insert("phone_number_id".to_string(), acct.clone());
+                            } else if matches!(
+                                conn_id.as_str(),
+                                "onepassword" | "bitwarden" | "protonpass"
+                            ) {
+                                meta.insert("vault".to_string(), acct.clone());
+                            } else {
                                 meta.insert("workspace".to_string(), acct.clone());
                             }
-                            cx.emit(ContentHubEvent::MarketplaceConnectNative {
-                                connector_id: conn_id.clone(),
-                                account_label: (!acct.is_empty()).then_some(acct),
-                                credential: (!cred.is_empty()).then_some(cred),
-                                metadata: meta,
-                            });
-                            cx.notify();
-                        }),
-                    ),
+                        }
+                        cx.emit(ContentHubEvent::MarketplaceConnectNative {
+                            connector_id: conn_id.clone(),
+                            account_label: (!acct.is_empty()).then_some(acct),
+                            credential: (!cred.is_empty()).then_some(cred),
+                            metadata: meta,
+                        });
+                        cx.notify();
+                    }),
                 ),
-        )
+            ),
+    )
 }
 
 fn render_plugin_setup_card(
@@ -1828,8 +2333,10 @@ fn render_plugin_setup_card(
                 );
         }
         _ => {
-            // OAuth / Browser sign-in (`link`)
-            let sign_in_url = plugin.url.clone().or_else(|| plugin.website_url.clone());
+            // Real OAuth 2.0 RFC 9728 + RFC 8414 + RFC 7591 DCR + PKCE S256 loopback (`link`)
+            let slug_oauth = slug.clone();
+            let slug_token = slug.clone();
+            let has_http_endpoint = plugin.url.is_some();
             card = card
                 .child(
                     div()
@@ -1837,12 +2344,12 @@ fn render_plugin_setup_card(
                         .text_color(ob.text_secondary())
                         .child(if lang.starts_with("zh") {
                             format!(
-                                "在浏览器中使用你的 {} 账号登录，或直接粘贴访问令牌以立即连接 MCP 服务器。",
+                                "通过真实 OAuth 2.0 (PKCE) 在浏览器登录 {}，或粘贴 Bearer 访问令牌并实时探测工具。",
                                 plugin.name
                             )
                         } else {
                             format!(
-                                "Sign in with your {} account in the browser, or paste an optional access token to connect the MCP server.",
+                                "Sign in with {} via live OAuth 2.0 (PKCE) in your browser, or paste a Bearer token to verify and discover tools.",
                                 plugin.name
                             )
                         }),
@@ -1851,7 +2358,11 @@ fn render_plugin_setup_card(
                     render_editable_field_box(
                         "mkt-plugin-oauth-token",
                         &draft.primary,
-                        tr_str(lang, "可选：直接粘贴 OAuth / Bearer Token…", "Optional: paste OAuth / Bearer token…"),
+                        tr_str(
+                            lang,
+                            "可选：粘贴 OAuth / Bearer Token 直接连接…",
+                            "Optional: paste OAuth / Bearer token…",
+                        ),
                         pri_focused,
                         false,
                         pal,
@@ -1869,30 +2380,35 @@ fn render_plugin_setup_card(
                         .items_center()
                         .justify_end()
                         .gap(px(8.0))
-                        .when_some(sign_in_url, |el, u| {
+                        .when(has_http_endpoint, |el| {
                             el.child(
-                                openbot_secondary_btn(
+                                openbot_primary_cta_btn(
                                     "mkt-plugin-open-browser-auth",
-                                    tr_str(lang, "打开浏览器授权 ↗", "Open sign-in page ↗"),
+                                    tr_str(
+                                        lang,
+                                        "浏览器 OAuth 登录",
+                                        "Sign in with Browser (OAuth)",
+                                    ),
                                     pal,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |_this, _, _, cx| {
-                                        cx.emit(ContentHubEvent::MarketplaceOpenExternalUrl {
-                                            url: u.clone(),
+                                        cx.emit(ContentHubEvent::MarketplaceStartOAuth {
+                                            slug: slug_oauth.clone(),
+                                            override_url: None,
                                         });
                                     }),
                                 ),
                             )
                         })
                         .child(
-                            openbot_primary_cta_btn(
+                            openbot_secondary_btn(
                                 "mkt-plugin-link-connect-btn",
                                 if connected {
-                                    tr_str(lang, "重新连接", "Reconnect")
+                                    tr_str(lang, "重新验证令牌", "Re-verify token")
                                 } else {
-                                    tr_str(lang, "连接", "Connect")
+                                    tr_str(lang, "使用令牌验证连接", "Verify & Connect")
                                 },
                                 pal,
                             )
@@ -1907,7 +2423,7 @@ fn render_plugin_setup_card(
                                         }
                                     }
                                     cx.emit(ContentHubEvent::MarketplaceConnectPlugin {
-                                        slug: slug.clone(),
+                                        slug: slug_token.clone(),
                                         auth_values: vals,
                                         override_url: None,
                                     });
@@ -1916,6 +2432,34 @@ fn render_plugin_setup_card(
                         ),
                 );
         }
+    }
+
+    if let Some(ref err) = draft.error {
+        card = card.child(
+            div()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(8.0))
+                .bg(rgba(0xE539351E))
+                .border_1()
+                .border_color(rgba(0xE5393555))
+                .text_size(px(12.0))
+                .text_color(ob.danger())
+                .child(err.clone()),
+        );
+    } else if let Some(ref note) = draft.notice {
+        card = card.child(
+            div()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(8.0))
+                .bg(rgba(0x31CF761A))
+                .border_1()
+                .border_color(rgba(0x31CF7644))
+                .text_size(px(12.0))
+                .text_color(ob.success())
+                .child(note.clone()),
+        );
     }
 
     card
@@ -2137,6 +2681,46 @@ fn render_custom_server_form_page(
                                 cx.listener(|this, _, _, cx| {
                                     this.focus_input(
                                         ContentHubInputTarget::MarketplaceCustomName,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_secondary())
+                                .child(tr_str(
+                                    lang,
+                                    "简介（上架到市场时展示，可选）",
+                                    "Tagline (shown when publishing to Marketplace, optional)",
+                                )),
+                        )
+                        .child(
+                            render_editable_field_box(
+                                "mkt-custom-tagline-input",
+                                &form.tagline,
+                                tr_str(
+                                    lang,
+                                    "例如：查询内部工单系统与发布状态",
+                                    "e.g. Query internal tickets and deploy status",
+                                ),
+                                ws.active_input == ContentHubInputTarget::MarketplaceCustomTagline,
+                                false,
+                                pal,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.focus_input(
+                                        ContentHubInputTarget::MarketplaceCustomTagline,
                                         cx,
                                     );
                                 }),
@@ -2452,6 +3036,30 @@ fn render_custom_server_form_page(
                             cx.listener(|this, _, _, cx| {
                                 this.marketplace.pop_route();
                                 cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        openbot_secondary_btn(
+                            "mkt-custom-publish-btn",
+                            tr_str(lang, "发布上架到市场", "Publish to Marketplace"),
+                            pal,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                let f = &this.marketplace.custom_form;
+                                cx.emit(ContentHubEvent::MarketplacePublishCustomApp {
+                                    name: f.name.text.trim().to_string(),
+                                    tagline: f.tagline.text.trim().to_string(),
+                                    category: "other".to_string(),
+                                    transport: f.transport,
+                                    command: f.command.text.trim().to_string(),
+                                    args: f.parsed_args(),
+                                    env: f.parsed_env(),
+                                    url: f.url.text.trim().to_string(),
+                                    headers: f.parsed_headers(),
+                                });
                             }),
                         ),
                     )

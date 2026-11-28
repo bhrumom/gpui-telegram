@@ -1208,6 +1208,17 @@ pub struct McpToolCallOutcome {
     pub structured_content: Option<JsonValue>,
 }
 
+/// Full schema of a real tool discovered via live MCP `tools/list` or native connector verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpDiscoveredTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: JsonValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpProbeOutcome {
@@ -1216,8 +1227,41 @@ pub struct McpProbeOutcome {
     pub status: String,
     pub tool_count: usize,
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub tool_defs: Vec<McpDiscoveredTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub www_authenticate: Option<String>,
+}
+
+/// RFC 9728 + RFC 8414 OAuth 2.0 discovery metadata resolved from a live MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthDiscovery {
+    pub resource_url: String,
+    pub authorization_server: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+}
+
+/// OAuth 2.0 token response returned from a live MCP authorization server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthTokenResponse {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2112,7 +2156,7 @@ impl McpGateway {
         })
     }
 
-    /// Probes an MCP server via JSON-RPC 2.0 `tools/list` and classifies auth/key failures.
+    /// Probes an MCP server via JSON-RPC 2.0 `initialize` + `tools/list` and classifies auth/key failures.
     pub async fn probe_server(&self, server_id_or_name: &str) -> RuntimeResult<McpProbeOutcome> {
         let server = self
             .get_server(server_id_or_name)?
@@ -2121,52 +2165,212 @@ impl McpGateway {
                     "MCP server '{server_id_or_name}' not found."
                 ))
             })?;
+        let mut www_auth: Option<String> = None;
         let res = match server.transport {
             McpTransport::Stdio => self.call_stdio_jsonrpc(&server, "tools/list", json!({})).await,
-            McpTransport::Http => self.call_http_jsonrpc(&server, "tools/list", json!({})).await,
+            McpTransport::Http => {
+                match self
+                    .call_http_jsonrpc_with_challenge(&server, "tools/list", json!({}))
+                    .await
+                {
+                    Ok(v) => Ok(v),
+                    Err((err, challenge)) => {
+                        www_auth = challenge;
+                        Err(err)
+                    }
+                }
+            }
         };
         match res {
             Ok(val) => {
-                let tools: Vec<String> = val
-                    .get("tools")
-                    .and_then(JsonValue::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| t.get("name").and_then(JsonValue::as_str))
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let tool_defs = parse_discovered_tools(&val);
+                let tools: Vec<String> = tool_defs.iter().map(|t| t.name.clone()).collect();
                 Ok(McpProbeOutcome {
                     server_id: server.id,
                     name: server.name,
                     status: "ready".to_string(),
                     tool_count: tools.len(),
                     tools,
+                    tool_defs,
                     error: None,
+                    www_authenticate: None,
                 })
             }
-            Err(OpenBotRuntimeError::Unauthorized(msg)) => Ok(McpProbeOutcome {
-                server_id: server.id,
-                name: server.name,
-                status: if server.headers.is_empty() {
-                    "needs_sign_in".to_string()
-                } else {
-                    "needs_key".to_string()
-                },
-                tool_count: 0,
-                tools: Vec::new(),
-                error: Some(self.redact_secrets(&msg)),
-            }),
+            Err(OpenBotRuntimeError::Unauthorized(msg)) => {
+                let status =
+                    if server.headers.is_empty() && self.oauth_access_token(&server.id).is_none() {
+                        "needs_sign_in".to_string()
+                    } else {
+                        "needs_key".to_string()
+                    };
+                Ok(McpProbeOutcome {
+                    server_id: server.id,
+                    name: server.name,
+                    status,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    tool_defs: Vec::new(),
+                    error: Some(self.redact_secrets(&msg)),
+                    www_authenticate: www_auth,
+                })
+            }
             Err(err) => Ok(McpProbeOutcome {
                 server_id: server.id,
                 name: server.name,
                 status: "error".to_string(),
                 tool_count: 0,
                 tools: Vec::new(),
+                tool_defs: Vec::new(),
                 error: Some(self.redact_secrets(&err.to_string())),
+                www_authenticate: www_auth,
             }),
         }
+    }
+
+    /// Starts a live RFC 9728 / RFC 8414 / RFC 7591 + PKCE S256 OAuth 2.0 flow with an ephemeral
+    /// loopback callback listener on `127.0.0.1`. Returns the real vendor `authorize_url` to open
+    /// in the user's browser and a join handle that resolves once the callback exchanges the token.
+    pub async fn start_loopback_oauth_flow(
+        self: &Arc<Self>,
+        server_id: &str,
+        mcp_url: &str,
+        www_authenticate: Option<&str>,
+    ) -> RuntimeResult<(String, tokio::task::JoinHandle<RuntimeResult<McpOAuthTokenResponse>>)> {
+        let discovery = discover_mcp_oauth(&self.http_client, mcp_url, www_authenticate).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| OpenBotRuntimeError::Execution(format!("OAuth loopback bind failed: {e}")))?;
+        let local_port = listener
+            .local_addr()
+            .map_err(|e| OpenBotRuntimeError::Execution(format!("OAuth local_addr failed: {e}")))?
+            .port();
+        let redirect_uri = format!("http://127.0.0.1:{local_port}/callback");
+
+        let client_id = if let Some(reg_ep) = discovery.registration_endpoint.as_deref() {
+            register_mcp_oauth_client(&self.http_client, reg_ep, &redirect_uri).await?
+        } else {
+            "fabushi-openbot-desktop".to_string()
+        };
+
+        let scope = if discovery.scopes_supported.is_empty() {
+            None
+        } else {
+            Some(discovery.scopes_supported.join(" "))
+        };
+        let (authorize_url, pkce) = self.build_oauth_authorize_url(
+            server_id,
+            &discovery.authorization_endpoint,
+            &client_id,
+            &redirect_uri,
+            scope.as_deref(),
+        )?;
+
+        let gw = Arc::clone(self);
+        let server_id_owned = server_id.to_string();
+        let token_endpoint = discovery.token_endpoint.clone();
+        let expected_state = pkce.state;
+
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let accept_res = tokio::time::timeout(Duration::from_secs(180), listener.accept())
+                .await
+                .map_err(|_| {
+                    OpenBotRuntimeError::Execution(
+                        "OAuth sign-in timed out after 180 seconds.".to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    OpenBotRuntimeError::Execution(format!("OAuth loopback accept failed: {e}"))
+                })?;
+
+            let (mut stream, _) = accept_res;
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req_text = String::from_utf8_lossy(&buf[..n]);
+            let req_line = req_text.lines().next().unwrap_or("");
+            let req_path = req_line.split_whitespace().nth(1).unwrap_or("/");
+            let parsed = Url::parse(&format!("http://127.0.0.1{req_path}")).map_err(|e| {
+                OpenBotRuntimeError::Execution(format!("Invalid OAuth callback URL: {e}"))
+            })?;
+
+            let mut code: Option<String> = None;
+            let mut state: Option<String> = None;
+            let mut oauth_err: Option<String> = None;
+            for (k, v) in parsed.query_pairs() {
+                match k.as_ref() {
+                    "code" => code = Some(v.into_owned()),
+                    "state" => state = Some(v.into_owned()),
+                    "error" => oauth_err = Some(v.into_owned()),
+                    _ => {}
+                }
+            }
+
+            if let Some(err_code) = oauth_err {
+                let html = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:32px\"><h2>Authorization failed</h2><p>{err_code}</p></body></html>"
+                );
+                let _ = stream.write_all(html.as_bytes()).await;
+                return Err(OpenBotRuntimeError::Unauthorized(format!(
+                    "OAuth authorization rejected: {err_code}"
+                )));
+            }
+
+            let Some(code_val) = code.filter(|s| !s.trim().is_empty()) else {
+                let html = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:32px\"><h2>Missing authorization code</h2></body></html>";
+                let _ = stream.write_all(html.as_bytes()).await;
+                return Err(OpenBotRuntimeError::Unauthorized(
+                    "OAuth callback did not include an authorization code.".to_string(),
+                ));
+            };
+            let state_val = state.unwrap_or_default();
+            if state_val != expected_state {
+                let html = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:32px\"><h2>State mismatch</h2></body></html>";
+                let _ = stream.write_all(html.as_bytes()).await;
+                return Err(OpenBotRuntimeError::Unauthorized(
+                    "OAuth callback state mismatch.".to_string(),
+                ));
+            }
+
+            let verifier = gw.verify_oauth_callback(&server_id_owned, &state_val)?;
+            let tok = exchange_mcp_oauth_code(
+                &gw.http_client,
+                &token_endpoint,
+                &client_id,
+                &code_val,
+                &verifier,
+                &redirect_uri,
+            )
+            .await;
+
+            match tok {
+                Ok(resp) => {
+                    let expires_at_ms = resp.expires_in.map(|secs| {
+                        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                        now_ms.saturating_add(secs.saturating_mul(1000))
+                    });
+                    gw.store_oauth_token(
+                        &server_id_owned,
+                        &resp.access_token,
+                        resp.refresh_token.as_deref(),
+                        expires_at_ms,
+                    )?;
+                    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:32px;text-align:center\"><h2>Connected to Fabushi</h2><p>Authorization succeeded. You may close this tab and return to Fabushi.</p></body></html>";
+                    let _ = stream.write_all(html.as_bytes()).await;
+                    Ok(resp)
+                }
+                Err(err) => {
+                    let html = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style=\"font-family:system-ui;padding:32px\"><h2>Token exchange failed</h2><p>{}</p></body></html>",
+                        gw.redact_secrets(&err.to_string())
+                    );
+                    let _ = stream.write_all(html.as_bytes()).await;
+                    Err(err)
+                }
+            }
+        });
+
+        Ok((authorize_url, handle))
     }
 
     async fn call_stdio_jsonrpc(
@@ -2177,72 +2381,89 @@ impl McpGateway {
     ) -> RuntimeResult<JsonValue> {
         let cfg = server.clone();
         let method_owned = method.to_string();
-        let raw_out = tokio::task::spawn_blocking(move || -> RuntimeResult<String> {
-            let mut cmd = Command::new(&cfg.command);
-            cmd.args(&cfg.args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            if !cfg.working_directory.trim().is_empty() {
-                cmd.current_dir(&cfg.working_directory);
-            }
-            for pair in &cfg.env {
-                cmd.env(&pair.key, &pair.value);
-            }
-            for key in &cfg.env_passthrough {
-                if let Ok(val) = std::env::var(key) {
-                    cmd.env(key, val);
+        let raw_out = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || -> RuntimeResult<String> {
+                let resolved_cmd = expand_leading_tilde(&cfg.command);
+                let mut cmd = Command::new(&resolved_cmd);
+                cmd.args(&cfg.args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if !cfg.working_directory.trim().is_empty() {
+                    cmd.current_dir(expand_leading_tilde(&cfg.working_directory));
                 }
-            }
-            let mut child = cmd.spawn().map_err(|e| {
-                OpenBotRuntimeError::Execution(format!(
-                    "Failed to launch stdio MCP server '{}': {e}",
-                    cfg.name
-                ))
-            })?;
+                for pair in &cfg.env {
+                    cmd.env(&pair.key, &pair.value);
+                }
+                for key in &cfg.env_passthrough {
+                    if let Ok(val) = std::env::var(key) {
+                        cmd.env(key, val);
+                    }
+                }
+                let mut child = cmd.spawn().map_err(|e| {
+                    OpenBotRuntimeError::Execution(format!(
+                        "Failed to launch stdio MCP server '{}' (`{}`): {e}",
+                        cfg.name, resolved_cmd
+                    ))
+                })?;
 
-            let init_req = frame_jsonrpc_request(
-                1,
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": { "name": "openbot", "version": "1.0.0" }
-                }),
-            );
-            let call_req = frame_jsonrpc_request(2, &method_owned, params);
-            if let Some(mut stdin) = child.stdin.take() {
-                let payload = format!(
-                    "{}\n{}\n",
-                    serde_json::to_string(&init_req)?,
-                    serde_json::to_string(&call_req)?
+                let init_req = frame_jsonrpc_request(
+                    1,
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": { "name": "fabushi-openbot", "version": env!("CARGO_PKG_VERSION") }
+                    }),
                 );
-                let _ = stdin.write_all(payload.as_bytes());
-                let _ = stdin.flush();
-            }
+                let initialized_notif = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                });
+                let call_req = frame_jsonrpc_request(2, &method_owned, params);
+                if let Some(mut stdin) = child.stdin.take() {
+                    let payload = format!(
+                        "{}\n{}\n{}\n",
+                        serde_json::to_string(&init_req)?,
+                        serde_json::to_string(&initialized_notif)?,
+                        serde_json::to_string(&call_req)?
+                    );
+                    let _ = stdin.write_all(payload.as_bytes());
+                    let _ = stdin.flush();
+                }
 
-            let output = child.wait_with_output().map_err(|e| {
-                OpenBotRuntimeError::Execution(format!(
-                    "Stdio MCP server '{}' I/O failure: {e}",
-                    cfg.name
-                ))
-            })?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if stdout.trim().is_empty() && !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(OpenBotRuntimeError::Execution(format!(
-                    "Stdio MCP server '{}' exited with status {}: {}",
-                    cfg.name,
-                    output.status,
-                    stderr.trim()
-                )));
-            }
-            Ok(stdout)
-        })
+                let output = child.wait_with_output().map_err(|e| {
+                    OpenBotRuntimeError::Execution(format!(
+                        "Stdio MCP server '{}' I/O failure: {e}",
+                        cfg.name
+                    ))
+                })?;
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if stdout.trim().is_empty() && !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(OpenBotRuntimeError::Execution(format!(
+                        "Stdio MCP server '{}' exited with status {}: {}",
+                        cfg.name,
+                        output.status,
+                        stderr.trim()
+                    )));
+                }
+                Ok(stdout)
+            }),
+        )
         .await
+        .map_err(|_| {
+            OpenBotRuntimeError::Execution(format!(
+                "Stdio MCP server '{}' timed out after 20s.",
+                server.name
+            ))
+        })?
         .map_err(|e| OpenBotRuntimeError::Execution(format!("MCP stdio task panicked: {e}")))??;
 
-        parse_jsonrpc_response(&raw_out)
+        parse_jsonrpc_response_for_id(&raw_out, Some(2))
+            .or_else(|_| parse_jsonrpc_response(&raw_out))
             .map_err(|e| OpenBotRuntimeError::Execution(self.redact_secrets(&e.to_string())))
     }
 
@@ -2252,56 +2473,548 @@ impl McpGateway {
         method: &str,
         params: JsonValue,
     ) -> RuntimeResult<JsonValue> {
-        let req_body = frame_jsonrpc_request(1, method, params);
-        let mut req = self
-            .http_client
-            .post(&server.url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
+        self.call_http_jsonrpc_with_challenge(server, method, params)
+            .await
+            .map_err(|(err, _)| err)
+    }
 
-        let mut has_auth_header = false;
-        for pair in &server.headers {
-            if pair.key.eq_ignore_ascii_case("authorization") {
-                has_auth_header = true;
-            }
-            req = req.header(&pair.key, &pair.value);
-        }
+    async fn call_http_jsonrpc_with_challenge(
+        &self,
+        server: &McpServerConfig,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<JsonValue, (OpenBotRuntimeError, Option<String>)> {
+        let mut headers = server.headers.clone();
+        let has_auth_header = headers
+            .iter()
+            .any(|p| p.key.eq_ignore_ascii_case("authorization"));
         if !has_auth_header {
             if let Some(token) = self.oauth_access_token(&server.id) {
-                req = req.bearer_auth(token);
+                headers.push(McpKeyValue {
+                    key: "Authorization".to_string(),
+                    value: if token.to_ascii_lowercase().starts_with("bearer ") {
+                        token
+                    } else {
+                        format!("Bearer {token}")
+                    },
+                });
             }
         }
-
-        let resp = req
-            .json(&req_body)
-            .send()
-            .await
-            .map_err(|e| OpenBotRuntimeError::Http(self.redact_secrets(&e.to_string())))?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| OpenBotRuntimeError::Http(self.redact_secrets(&e.to_string())))?;
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(OpenBotRuntimeError::Unauthorized(self.redact_secrets(&format!(
-                "MCP HTTP server '{}' rejected authorization ({}): {}",
-                server.name,
-                status.as_u16(),
-                text.trim()
-            ))));
-        }
-        if !status.is_success() {
-            return Err(OpenBotRuntimeError::Http(self.redact_secrets(&format!(
-                "MCP HTTP server '{}' returned HTTP {}: {}",
-                server.name,
-                status.as_u16(),
-                text.trim()
-            ))));
-        }
-        parse_jsonrpc_response(&text)
-            .map_err(|e| OpenBotRuntimeError::Execution(self.redact_secrets(&e.to_string())))
+        call_http_mcp_endpoint_jsonrpc(
+            &self.http_client,
+            &server.name,
+            &server.url,
+            &headers,
+            method,
+            params,
+        )
+        .await
+        .map_err(|(err, challenge)| {
+            let redacted = match err {
+                OpenBotRuntimeError::Unauthorized(m) => {
+                    OpenBotRuntimeError::Unauthorized(self.redact_secrets(&m))
+                }
+                OpenBotRuntimeError::Http(m) => OpenBotRuntimeError::Http(self.redact_secrets(&m)),
+                OpenBotRuntimeError::Execution(m) => {
+                    OpenBotRuntimeError::Execution(self.redact_secrets(&m))
+                }
+                other => other,
+            };
+            (redacted, challenge)
+        })
     }
+}
+
+/// Parses MCP `tools/list` response JSON into full [`McpDiscoveredTool`] definitions.
+pub fn parse_discovered_tools(val: &JsonValue) -> Vec<McpDiscoveredTool> {
+    val.get("tools")
+        .and_then(JsonValue::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let name = t.get("name").and_then(JsonValue::as_str)?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let description = t
+                        .get("description")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let input_schema = t
+                        .get("inputSchema")
+                        .or_else(|| t.get("input_schema"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                    Some(McpDiscoveredTool {
+                        name: name.to_string(),
+                        description,
+                        input_schema,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn expand_leading_tilde(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_jsonrpc_response_for_id(raw: &str, target_id: Option<i64>) -> RuntimeResult<JsonValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OpenBotRuntimeError::Execution(
+            "Empty JSON-RPC 2.0 response from MCP server.".to_string(),
+        ));
+    }
+    if let Ok(val) = serde_json::from_str::<JsonValue>(trimmed) {
+        if target_id.is_none() || val.get("id").and_then(JsonValue::as_i64) == target_id {
+            return unwrap_jsonrpc_envelope(val);
+        }
+    }
+    let mut matched: Option<JsonValue> = None;
+    for line in trimmed.lines() {
+        let l = line.trim();
+        let candidate = l.strip_prefix("data:").map(str::trim).unwrap_or(l);
+        if candidate.starts_with('{') {
+            if let Ok(val) = serde_json::from_str::<JsonValue>(candidate) {
+                if val.get("jsonrpc").and_then(JsonValue::as_str) == Some("2.0")
+                    && (val.get("result").is_some() || val.get("error").is_some())
+                    && (target_id.is_none()
+                        || val.get("id").and_then(JsonValue::as_i64) == target_id)
+                {
+                    matched = Some(val);
+                }
+            }
+        }
+    }
+    if let Some(found) = matched {
+        return unwrap_jsonrpc_envelope(found);
+    }
+    Err(OpenBotRuntimeError::Execution(
+        "No matching JSON-RPC 2.0 response found from MCP server.".to_string(),
+    ))
+}
+
+/// Performs a complete Streamable HTTP MCP JSON-RPC exchange (`initialize` -> `Mcp-Session-Id` ->
+/// `notifications/initialized` -> `method`) against a real upstream MCP endpoint, handling both
+/// JSON and SSE (`text/event-stream`) responses and surfacing `WWW-Authenticate` on HTTP 401/403.
+pub async fn call_http_mcp_endpoint_jsonrpc(
+    http_client: &reqwest::Client,
+    server_name: &str,
+    url: &str,
+    headers: &[McpKeyValue],
+    method: &str,
+    params: JsonValue,
+) -> Result<JsonValue, (OpenBotRuntimeError, Option<String>)> {
+    let build_post = |session_id: Option<&str>| {
+        let mut req = http_client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(sid) = session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for pair in headers {
+            if !pair.key.trim().is_empty() {
+                req = req.header(pair.key.trim(), pair.value.as_str());
+            }
+        }
+        req
+    };
+
+    // Step 1: MCP `initialize` handshake to negotiate session ID (falls back if server is stateless).
+    let init_body = frame_jsonrpc_request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "fabushi-openbot",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    );
+
+    let init_resp = build_post(None)
+        .json(&init_body)
+        .send()
+        .await
+        .map_err(|e| (OpenBotRuntimeError::Http(e.to_string()), None))?;
+
+    let init_status = init_resp.status();
+    let init_www_auth = init_resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let init_text = init_resp
+        .text()
+        .await
+        .map_err(|e| (OpenBotRuntimeError::Http(e.to_string()), init_www_auth.clone()))?;
+
+    if init_status.as_u16() == 401 || init_status.as_u16() == 403 {
+        return Err((
+            OpenBotRuntimeError::Unauthorized(format!(
+                "MCP HTTP server '{}' rejected authorization ({}): {}",
+                server_name,
+                init_status.as_u16(),
+                init_text.trim()
+            )),
+            init_www_auth,
+        ));
+    }
+
+    if init_status.is_success() {
+        // Send best-effort `notifications/initialized` notification if session was established.
+        let notif_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        let _ = build_post(session_id.as_deref()).json(&notif_body).send().await;
+    }
+
+    // Step 2: Execute the actual JSON-RPC method (`tools/list` or `tools/call`).
+    let req_body = frame_jsonrpc_request(2, method, params);
+    let resp = build_post(session_id.as_deref())
+        .json(&req_body)
+        .send()
+        .await
+        .map_err(|e| (OpenBotRuntimeError::Http(e.to_string()), None))?;
+
+    let status = resp.status();
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or(init_www_auth);
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| (OpenBotRuntimeError::Http(e.to_string()), www_auth.clone()))?;
+
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err((
+            OpenBotRuntimeError::Unauthorized(format!(
+                "MCP HTTP server '{}' rejected authorization ({}): {}",
+                server_name,
+                status.as_u16(),
+                text.trim()
+            )),
+            www_auth,
+        ));
+    }
+    if !status.is_success() {
+        return Err((
+            OpenBotRuntimeError::Http(format!(
+                "MCP HTTP server '{}' returned HTTP {}: {}",
+                server_name,
+                status.as_u16(),
+                text.trim()
+            )),
+            www_auth,
+        ));
+    }
+
+    parse_jsonrpc_response_for_id(&text, Some(2))
+        .or_else(|_| parse_jsonrpc_response(&text))
+        .map_err(|e| (OpenBotRuntimeError::Execution(e.to_string()), www_auth))
+}
+
+/// Probes any live Streamable HTTP MCP endpoint (`initialize` + `tools/list`) without needing a
+/// local `McpServerStore` row (shared by both desktop and cloud backend server).
+pub async fn probe_http_mcp_endpoint(
+    http_client: &reqwest::Client,
+    server_id: &str,
+    server_name: &str,
+    url: &str,
+    headers: &[McpKeyValue],
+) -> McpProbeOutcome {
+    match call_http_mcp_endpoint_jsonrpc(
+        http_client,
+        server_name,
+        url,
+        headers,
+        "tools/list",
+        json!({}),
+    )
+    .await
+    {
+        Ok(val) => {
+            let tool_defs = parse_discovered_tools(&val);
+            let tools = tool_defs.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+            McpProbeOutcome {
+                server_id: server_id.to_string(),
+                name: server_name.to_string(),
+                status: "ready".to_string(),
+                tool_count: tools.len(),
+                tools,
+                tool_defs,
+                error: None,
+                www_authenticate: None,
+            }
+        }
+        Err((OpenBotRuntimeError::Unauthorized(msg), www_auth)) => McpProbeOutcome {
+            server_id: server_id.to_string(),
+            name: server_name.to_string(),
+            status: if headers.is_empty() {
+                "needs_sign_in".to_string()
+            } else {
+                "needs_key".to_string()
+            },
+            tool_count: 0,
+            tools: Vec::new(),
+            tool_defs: Vec::new(),
+            error: Some(redact_secrets(&msg)),
+            www_authenticate: www_auth,
+        },
+        Err((err, www_auth)) => McpProbeOutcome {
+            server_id: server_id.to_string(),
+            name: server_name.to_string(),
+            status: "error".to_string(),
+            tool_count: 0,
+            tools: Vec::new(),
+            tool_defs: Vec::new(),
+            error: Some(redact_secrets(&err.to_string())),
+            www_authenticate: www_auth,
+        },
+    }
+}
+
+fn parse_www_authenticate_resource_metadata(header: &str) -> Option<String> {
+    let lower = header.to_ascii_lowercase();
+    let idx = lower.find("resource_metadata=")?;
+    let rest = &header[idx + "resource_metadata=".len()..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        Some(quoted[..end].to_string())
+    } else {
+        let end = rest.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(rest.len());
+        let val = rest[..end].trim();
+        (!val.is_empty()).then(|| val.to_string())
+    }
+}
+
+/// Discovers OAuth 2.0 endpoints for a live MCP server using RFC 9728 (`oauth-protected-resource`)
+/// and RFC 8414 (`oauth-authorization-server` / `openid-configuration`).
+pub async fn discover_mcp_oauth(
+    http_client: &reqwest::Client,
+    mcp_url: &str,
+    www_authenticate: Option<&str>,
+) -> RuntimeResult<McpOAuthDiscovery> {
+    let parsed = Url::parse(mcp_url).map_err(|e| {
+        OpenBotRuntimeError::Validation(format!("Invalid MCP URL '{mcp_url}': {e}"))
+    })?;
+    let origin = parsed.origin().ascii_serialization();
+
+    // 1. Try RFC 9728 Protected Resource Metadata
+    let mut prm_candidates: Vec<String> = Vec::new();
+    if let Some(hdr) = www_authenticate {
+        if let Some(rm) = parse_www_authenticate_resource_metadata(hdr) {
+            prm_candidates.push(rm);
+        }
+    }
+    let path_suffix = parsed.path().trim_matches('/');
+    if !path_suffix.is_empty() {
+        prm_candidates.push(format!("{origin}/.well-known/oauth-protected-resource/{path_suffix}"));
+    }
+    prm_candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
+
+    let mut auth_server_origin = origin.clone();
+    let mut scopes_supported: Vec<String> = Vec::new();
+    for prm_url in prm_candidates {
+        if let Ok(resp) = http_client.get(&prm_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<JsonValue>().await {
+                    if let Some(first_as) = val
+                        .get("authorization_servers")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(JsonValue::as_str)
+                    {
+                        auth_server_origin = first_as.trim_end_matches('/').to_string();
+                    }
+                    if let Some(scopes) = val.get("scopes_supported").and_then(JsonValue::as_array) {
+                        scopes_supported = scopes
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(str::to_string)
+                            .collect();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Try RFC 8414 Authorization Server Metadata (and OpenID Configuration fallback)
+    let as_candidates = [
+        format!("{auth_server_origin}/.well-known/oauth-authorization-server"),
+        format!("{auth_server_origin}/.well-known/openid-configuration"),
+    ];
+    for as_url in as_candidates {
+        if let Ok(resp) = http_client.get(&as_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<JsonValue>().await {
+                    let auth_ep = val
+                        .get("authorization_endpoint")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string);
+                    let token_ep = val
+                        .get("token_endpoint")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string);
+                    if let (Some(authorization_endpoint), Some(token_endpoint)) = (auth_ep, token_ep)
+                    {
+                        let registration_endpoint = val
+                            .get("registration_endpoint")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string);
+                        if scopes_supported.is_empty() {
+                            if let Some(sc) = val.get("scopes_supported").and_then(JsonValue::as_array)
+                            {
+                                scopes_supported = sc
+                                    .iter()
+                                    .filter_map(JsonValue::as_str)
+                                    .map(str::to_string)
+                                    .collect();
+                            }
+                        }
+                        return Ok(McpOAuthDiscovery {
+                            resource_url: mcp_url.to_string(),
+                            authorization_server: auth_server_origin,
+                            authorization_endpoint,
+                            token_endpoint,
+                            registration_endpoint,
+                            scopes_supported,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Err(OpenBotRuntimeError::Unauthorized(format!(
+        "Could not discover OAuth 2.0 metadata for '{mcp_url}'. You may paste a Bearer token directly."
+    )))
+}
+
+/// Performs RFC 7591 OAuth 2.0 Dynamic Client Registration against an MCP authorization server.
+pub async fn register_mcp_oauth_client(
+    http_client: &reqwest::Client,
+    registration_endpoint: &str,
+    redirect_uri: &str,
+) -> RuntimeResult<String> {
+    let body = json!({
+        "client_name": "Fabushi OpenBot",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    });
+    let resp = http_client
+        .post(registration_endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| OpenBotRuntimeError::Http(format!("OAuth client registration failed: {e}")))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(OpenBotRuntimeError::Unauthorized(format!(
+            "OAuth dynamic registration returned HTTP {}: {}",
+            status.as_u16(),
+            text.trim()
+        )));
+    }
+    let val: JsonValue = serde_json::from_str(&text).map_err(|e| {
+        OpenBotRuntimeError::Execution(format!("Invalid OAuth registration JSON: {e}"))
+    })?;
+    val.get("client_id")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            OpenBotRuntimeError::Execution(
+                "OAuth registration response missing client_id.".to_string(),
+            )
+        })
+}
+
+/// Exchanges an OAuth 2.0 authorization code + PKCE `code_verifier` for a live access token.
+pub async fn exchange_mcp_oauth_code(
+    http_client: &reqwest::Client,
+    token_endpoint: &str,
+    client_id: &str,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> RuntimeResult<McpOAuthTokenResponse> {
+    let resp = http_client
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|e| OpenBotRuntimeError::Http(format!("OAuth token exchange failed: {e}")))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(OpenBotRuntimeError::Unauthorized(format!(
+            "OAuth token exchange returned HTTP {}: {}",
+            status.as_u16(),
+            redact_secrets(text.trim())
+        )));
+    }
+    let val: JsonValue = serde_json::from_str(&text).map_err(|e| {
+        OpenBotRuntimeError::Execution(format!("Invalid OAuth token JSON: {e}"))
+    })?;
+    let access_token = val
+        .get("access_token")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            OpenBotRuntimeError::Unauthorized(
+                "OAuth token response did not include access_token.".to_string(),
+            )
+        })?;
+    Ok(McpOAuthTokenResponse {
+        access_token,
+        refresh_token: val
+            .get("refresh_token")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        expires_in: val.get("expires_in").and_then(JsonValue::as_u64),
+        token_type: val
+            .get("token_type")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        scope: val.get("scope").and_then(JsonValue::as_str).map(str::to_string),
+    })
 }
 
 fn strip_url_query(raw: &str) -> String {

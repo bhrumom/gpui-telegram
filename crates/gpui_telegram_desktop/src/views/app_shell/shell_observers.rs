@@ -218,6 +218,7 @@ impl AppShell {
                     | ContentHubInputTarget::MarketplaceSetupPrimary
                     | ContentHubInputTarget::MarketplaceSetupSecondary
                     | ContentHubInputTarget::MarketplaceCustomName
+                    | ContentHubInputTarget::MarketplaceCustomTagline
                     | ContentHubInputTarget::MarketplaceCustomCommand
                     | ContentHubInputTarget::MarketplaceCustomArgs
                     | ContentHubInputTarget::MarketplaceCustomEnv

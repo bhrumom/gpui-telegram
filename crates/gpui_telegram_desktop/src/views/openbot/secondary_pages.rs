@@ -1251,7 +1251,7 @@ impl MarketplacePageState {
                 summary: conn.tagline.clone(),
                 category: conn.category.clone(),
                 verified: true,
-                installs: 25_000,
+                installs: conn.installs,
                 gradient_hex: parse_hex(&conn.brand_hex, 0x007cf7),
             });
         }

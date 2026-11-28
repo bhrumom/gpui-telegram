@@ -7,6 +7,7 @@ pub mod chat_extras;
 pub mod computer_store;
 pub mod creations_store;
 pub mod e2ee_store;
+pub mod marketplace_store;
 pub mod mcp_oauth_store;
 pub mod migrations;
 pub mod miniapp_store;

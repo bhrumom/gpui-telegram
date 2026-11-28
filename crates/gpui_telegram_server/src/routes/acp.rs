@@ -222,7 +222,11 @@ pub async fn tasks_approve(_auth: AuthBearer, State(state): State<Arc<AppState>>
 }
 
 pub async fn mcp_servers_list(_auth: AuthBearer, State(state): State<Arc<AppState>>) -> Json<Value> {
-    let tools = state.mcp_registry.read().list_tools();
+    let tools = state
+        .mcp_registry
+        .read()
+        .map(|r| r.list_tools())
+        .unwrap_or_default();
     let servers: Vec<Value> = state.db.load_mcp_servers().unwrap_or_default().into_iter().map(|(id, name, ep, st, ts)| json!({
         "server_id": id, "name": name, "endpoint": ep, "status": st, "tools": ts,
     })).collect();
@@ -239,10 +243,34 @@ pub async fn mcp_servers_register(_auth: AuthBearer, State(state): State<Arc<App
         let schema = payload.get("schema").and_then(|v| v.as_str()).unwrap_or("{}");
         let def = gpui_telegram_agent::McpToolDefinition::new(tool_name, desc, schema, gpui_telegram_agent::ToolRiskLevel::Low).with_server_id(server_id);
         reg_tools.push(serde_json::to_value(&def).unwrap_or(Value::Null));
-        state.mcp_registry.write().register(def);
+        if let Ok(mut reg) = state.mcp_registry.write() {
+            reg.register(def);
+        }
     }
     let _ = state.db.upsert_mcp_server(server_id, name, endpoint, "connected", &Value::Array(reg_tools));
     (StatusCode::CREATED, Json(json!({ "status": "registered", "server_id": server_id }))).into_response()
+}
+
+pub async fn mcp_servers_delete(
+    _auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    Path(server_id): Path<String>,
+) -> Response {
+    let removed = state.db.delete_mcp_server(&server_id).unwrap_or(false);
+    let removed_tools = state
+        .mcp_registry
+        .write()
+        .map(|mut reg| reg.remove_by_server_id(&server_id))
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "deleted": removed,
+            "server_id": server_id,
+            "removed_tools": removed_tools
+        })),
+    )
+        .into_response()
 }
 
 pub async fn computer_lease_acquire(auth: AuthBearer, State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {

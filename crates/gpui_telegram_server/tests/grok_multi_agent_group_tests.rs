@@ -612,7 +612,7 @@ async fn server_group_workspace_bridge_and_unified_permission_dock_roundtrip() {
     assert!(Arc::ptr_eq(&state.permission_dock, &core_dock));
 
     // Register a high-risk MCP tool and verify POST /api/v1/mcp/call -> pending -> approve flow
-    state.mcp_registry.write().register(McpToolDefinition::new(
+    state.mcp_registry.write().unwrap().register(McpToolDefinition::new(
         "deploy_prod_release",
         "Deploys production release",
         "{}",

@@ -3,6 +3,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use gpui_telegram_proto::marketplace::{
+    MarketplaceAppListingDto, MarketplaceConnectionDto, MarketplaceToolSchemaDto,
+};
 use openbot_runtime::platform::marketplace::{
     ConnectedAppRecord, OpenBotAgentCatalogItem, OpenBotCatalog, OpenBotConnectorCatalogItem,
     OpenBotPluginCatalogItem, OpenBotSkillCatalogItem, SKILL_CATEGORIES,
@@ -100,11 +103,12 @@ pub struct MarketplaceBotSummary {
     pub installed_skill_slugs: Vec<String>,
 }
 
-/// Unified connector/plugin/custom app item shown in the Marketplace `应用` tab.
+/// Unified connector/plugin/published/custom app item shown in the Marketplace `应用` tab.
 #[derive(Debug, Clone)]
 pub enum MarketplaceAppEntry {
     Connector(&'static OpenBotConnectorCatalogItem),
     Plugin(&'static OpenBotPluginCatalogItem),
+    Published(MarketplaceAppListingDto),
     Custom(McpServerConfig),
 }
 
@@ -113,6 +117,7 @@ impl MarketplaceAppEntry {
         match self {
             Self::Connector(c) => c.id.clone(),
             Self::Plugin(p) => p.id.clone(),
+            Self::Published(a) => a.app_id.clone(),
             Self::Custom(s) => format!("custom:{}", s.id),
         }
     }
@@ -121,6 +126,7 @@ impl MarketplaceAppEntry {
         match self {
             Self::Connector(c) => &c.name,
             Self::Plugin(p) => &p.name,
+            Self::Published(a) => &a.name,
             Self::Custom(s) => &s.name,
         }
     }
@@ -129,6 +135,7 @@ impl MarketplaceAppEntry {
         match self {
             Self::Connector(c) => &c.category,
             Self::Plugin(p) => &p.category,
+            Self::Published(a) => &a.category,
             Self::Custom(_) => "other",
         }
     }
@@ -152,6 +159,24 @@ impl MarketplaceAppEntry {
                         .to_string()
                 } else {
                     p.tagline.clone()
+                }
+            }
+            Self::Published(a) => {
+                if is_zh {
+                    if let Some(zh) = a.zh_tagline.as_deref().filter(|s| !s.is_empty()) {
+                        return zh.to_string();
+                    }
+                }
+                if !a.tagline.is_empty() {
+                    a.tagline.clone()
+                } else {
+                    a.url
+                        .clone()
+                        .or_else(|| a.command.clone())
+                        .unwrap_or_else(|| {
+                            tr_str(lang, "已上架的 MCP 连接器", "Published MCP connector")
+                                .to_string()
+                        })
                 }
             }
             Self::Custom(s) => match s.transport {
@@ -194,6 +219,18 @@ impl MarketplaceAppEntry {
                     p.description.clone()
                 }
             }
+            Self::Published(a) => {
+                if is_zh {
+                    if let Some(zh) = a.zh_description.as_deref().filter(|s| !s.is_empty()) {
+                        return zh.to_string();
+                    }
+                }
+                if !a.description.is_empty() {
+                    a.description.clone()
+                } else {
+                    a.tagline.clone()
+                }
+            }
             Self::Custom(_) => tr_str(
                 lang,
                 "通过自定义 STDIO 或 Streamable HTTP 接入的 MCP 工具服务器。",
@@ -207,6 +244,13 @@ impl MarketplaceAppEntry {
         match self {
             Self::Connector(c) => &c.brand_hex,
             Self::Plugin(p) => &p.brand_hex,
+            Self::Published(a) => {
+                if a.brand_hex.is_empty() {
+                    "#0A84FF"
+                } else {
+                    &a.brand_hex
+                }
+            }
             Self::Custom(_) => "#3F3F46",
         }
     }
@@ -229,6 +273,7 @@ pub struct CustomServerFormDraft {
     pub edit_server_id: Option<String>,
     pub transport: McpTransport,
     pub name: EditableFieldState,
+    pub tagline: EditableFieldState,
     pub command: EditableFieldState,
     pub args: EditableFieldState,
     pub env_lines: EditableFieldState,
@@ -245,6 +290,7 @@ impl Default for CustomServerFormDraft {
             edit_server_id: None,
             transport: McpTransport::Http,
             name: EditableFieldState::default(),
+            tagline: EditableFieldState::default(),
             command: EditableFieldState::default(),
             args: EditableFieldState::default(),
             env_lines: EditableFieldState::default(),
@@ -266,6 +312,7 @@ impl CustomServerFormDraft {
         self.edit_server_id = Some(srv.id.clone());
         self.transport = srv.transport;
         self.name = EditableFieldState::with_text(&srv.name);
+        self.tagline = EditableFieldState::default();
         self.command = EditableFieldState::with_text(&srv.command);
         self.args = EditableFieldState::with_text(srv.args.join(" "));
         let env_str = srv
@@ -308,6 +355,7 @@ impl CustomServerFormDraft {
 
     pub fn clear_all_preedits(&mut self) {
         self.name.set_ime_preedit(None);
+        self.tagline.set_ime_preedit(None);
         self.command.set_ime_preedit(None);
         self.args.set_ime_preedit(None);
         self.env_lines.set_ime_preedit(None);
@@ -354,6 +402,16 @@ pub struct MarketplaceHubState {
     pub skill_picker_slug: Option<String>,
     pub setup_draft: Option<ConnectorSetupDraft>,
     pub custom_form: CustomServerFormDraft,
+    pub published_custom_apps: Vec<MarketplaceAppListingDto>,
+    pub server_connections: BTreeMap<String, MarketplaceConnectionDto>,
+    pub live_app_install_counts: BTreeMap<String, u64>,
+    pub live_agent_install_counts: BTreeMap<String, u64>,
+    pub live_skill_install_counts: BTreeMap<String, u64>,
+    pub server_synced: bool,
+    pub server_sync_loading: bool,
+    pub server_total_apps: usize,
+    pub connecting_app_id: Option<String>,
+    pub probing_app_id: Option<String>,
     pub notice_banner: Option<String>,
     pub error_banner: Option<String>,
 }
@@ -381,6 +439,16 @@ impl MarketplaceHubState {
             skill_picker_slug: None,
             setup_draft: None,
             custom_form: CustomServerFormDraft::default(),
+            published_custom_apps: Vec::new(),
+            server_connections: BTreeMap::new(),
+            live_app_install_counts: BTreeMap::new(),
+            live_agent_install_counts: BTreeMap::new(),
+            live_skill_install_counts: BTreeMap::new(),
+            server_synced: false,
+            server_sync_loading: false,
+            server_total_apps: 0,
+            connecting_app_id: None,
+            probing_app_id: None,
             notice_banner: None,
             error_banner: None,
         }
@@ -434,6 +502,7 @@ impl MarketplaceHubState {
                     || d.extra.iter().any(|(_, f)| f.ime_preedit.is_some())
             })
             || self.custom_form.name.ime_preedit.is_some()
+            || self.custom_form.tagline.ime_preedit.is_some()
             || self.custom_form.command.ime_preedit.is_some()
             || self.custom_form.args.ime_preedit.is_some()
             || self.custom_form.env_lines.ime_preedit.is_some()
@@ -454,11 +523,86 @@ impl MarketplaceHubState {
         self.custom_form.clear_all_preedits();
     }
 
+    /// Strict real verification check: returns `true` ONLY when an app has an active verified
+    /// `"connected"` status locally or on the cloud backend (never for `needs_sign_in` or `error`).
     pub fn is_app_connected(&self, app_id: &str) -> bool {
         if let Some(custom_id) = app_id.strip_prefix("custom:") {
             return self.mcp_servers.iter().any(|s| s.id == custom_id && s.enabled);
         }
-        self.connected_apps.iter().any(|r| r.app_id == app_id)
+        let local_connected = self
+            .connected_apps
+            .iter()
+            .any(|r| r.app_id == app_id && r.status == "connected");
+        let server_connected = self
+            .server_connections
+            .get(app_id)
+            .is_some_and(|c| c.status == "connected");
+        local_connected || server_connected
+    }
+
+    pub fn connection_status(&self, app_id: &str) -> Option<&str> {
+        if let Some(rec) = self.connected_record(app_id) {
+            return Some(rec.status.as_str());
+        }
+        self.server_connections
+            .get(app_id)
+            .map(|c| c.status.as_str())
+    }
+
+    pub fn connection_last_error(&self, app_id: &str) -> Option<&str> {
+        self.connected_record(app_id)
+            .and_then(|r| r.last_error.as_deref())
+            .or_else(|| {
+                self.server_connections
+                    .get(app_id)
+                    .and_then(|c| c.last_error.as_deref())
+            })
+    }
+
+    pub fn connection_account_label(&self, app_id: &str) -> Option<&str> {
+        self.connected_record(app_id)
+            .and_then(|r| r.account_label.as_deref())
+            .or_else(|| {
+                self.server_connections
+                    .get(app_id)
+                    .and_then(|c| c.account_label.as_deref())
+            })
+    }
+
+    pub fn discovered_tools_for_app(&self, app_id: &str) -> Vec<MarketplaceToolSchemaDto> {
+        if let Some(sc) = self.server_connections.get(app_id) {
+            if !sc.discovered_tools.is_empty() {
+                return sc.discovered_tools.clone();
+            }
+        }
+        if let Some(rec) = self.connected_record(app_id) {
+            if !rec.discovered_tools.is_empty() {
+                return rec
+                    .discovered_tools
+                    .iter()
+                    .map(|t| MarketplaceToolSchemaDto {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        input_schema: t.input_schema.clone(),
+                    })
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn app_install_count(&self, app_id: &str) -> u64 {
+        self.live_app_install_counts
+            .get(app_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn skill_install_count(&self, slug: &str) -> u64 {
+        self.live_skill_install_counts
+            .get(slug)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn connected_record(&self, app_id: &str) -> Option<&ConnectedAppRecord> {
@@ -473,8 +617,9 @@ impl MarketplaceHubState {
             .and_then(|r| r.mcp_server_id.clone())
     }
 
-    /// Returns all apps across native connectors (9), OpenBot plugins (257), and user-added custom
-    /// MCP servers (excluding servers already owned by a connected connector or plugin).
+    /// Returns all apps across native connectors (9), OpenBot plugins (257), real server-published
+    /// team/community connectors, and local custom MCP servers (excluding servers already owned by
+    /// a connected connector or plugin).
     pub fn all_apps(&self) -> Vec<MarketplaceAppEntry> {
         let cat = self.catalog();
         let managed_server_ids: HashSet<&str> = self
@@ -482,14 +627,28 @@ impl MarketplaceHubState {
             .iter()
             .filter_map(|r| r.mcp_server_id.as_deref())
             .collect();
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(
+            cat.connectors.len() + cat.plugins.len() + self.published_custom_apps.len(),
+        );
 
-        let mut out =
-            Vec::with_capacity(cat.connectors.len() + cat.plugins.len() + self.mcp_servers.len());
+        let mut out = Vec::with_capacity(
+            cat.connectors.len()
+                + cat.plugins.len()
+                + self.published_custom_apps.len()
+                + self.mcp_servers.len(),
+        );
         for c in &cat.connectors {
+            seen_ids.insert(c.id.clone());
             out.push(MarketplaceAppEntry::Connector(c));
         }
         for p in &cat.plugins {
+            seen_ids.insert(p.id.clone());
             out.push(MarketplaceAppEntry::Plugin(p));
+        }
+        for published in &self.published_custom_apps {
+            if seen_ids.insert(published.app_id.clone()) {
+                out.push(MarketplaceAppEntry::Published(published.clone()));
+            }
         }
         for srv in &self.mcp_servers {
             if !managed_server_ids.contains(srv.id.as_str()) {
@@ -601,10 +760,19 @@ impl MarketplaceHubState {
             .collect();
         match self.skill_sort {
             MarketplaceSkillSortMode::Installs => {
-                list.sort_by(|a, b| b.installs.cmp(&a.installs).then_with(|| a.name.cmp(&b.name)));
+                list.sort_by(|a, b| {
+                    self.skill_install_count(&b.slug)
+                        .cmp(&self.skill_install_count(&a.slug))
+                        .then_with(|| a.name.cmp(&b.name))
+                });
             }
             MarketplaceSkillSortMode::Updated => {
-                list.sort_by(|a, b| b.version.cmp(&a.version).then_with(|| b.installs.cmp(&a.installs)));
+                list.sort_by(|a, b| {
+                    b.version.cmp(&a.version).then_with(|| {
+                        self.skill_install_count(&b.slug)
+                            .cmp(&self.skill_install_count(&a.slug))
+                    })
+                });
             }
             MarketplaceSkillSortMode::Name => {
                 list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -654,7 +822,7 @@ impl MarketplaceHubState {
                 if p.auth_kind == "local" {
                     let default_url = existing
                         .as_ref()
-                        .and_then(|r| r.account_label.clone())
+                        .and_then(|r| r.endpoint.clone().or_else(|| r.account_label.clone()))
                         .or_else(|| p.url.clone())
                         .unwrap_or_default();
                     draft.primary = EditableFieldState::with_text(default_url);
@@ -665,9 +833,23 @@ impl MarketplaceHubState {
                         } else if idx == 1 {
                             draft.secondary = EditableFieldState::default();
                         } else {
-                            draft.extra.push((field.id.clone(), EditableFieldState::default()));
+                            draft
+                                .extra
+                                .push((field.id.clone(), EditableFieldState::default()));
                         }
                     }
+                }
+            }
+            MarketplaceAppEntry::Published(a) => {
+                if a.auth_kind == "local" {
+                    let default_url = existing
+                        .as_ref()
+                        .and_then(|r| r.endpoint.clone().or_else(|| r.account_label.clone()))
+                        .or_else(|| a.url.clone())
+                        .unwrap_or_default();
+                    draft.primary = EditableFieldState::with_text(default_url);
+                } else {
+                    draft.primary = EditableFieldState::default();
                 }
             }
             MarketplaceAppEntry::Custom(_) => {}

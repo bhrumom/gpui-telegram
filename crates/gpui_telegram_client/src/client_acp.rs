@@ -118,6 +118,106 @@ impl TelegramClient {
         self.http_client.list_mcp_tools(token).await
     }
 
+    pub async fn get_marketplace_catalog_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+    ) -> std::result::Result<gpui_telegram_proto::MarketplaceCatalogResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.get_marketplace_catalog(token).await
+    }
+
+    pub async fn publish_marketplace_app_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        req: &gpui_telegram_proto::PublishMarketplaceAppRequest,
+    ) -> std::result::Result<gpui_telegram_proto::MarketplaceAppListingDto, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.publish_marketplace_app(token, req).await
+    }
+
+    pub async fn connect_marketplace_app_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        req: &gpui_telegram_proto::ConnectMarketplaceAppRequest,
+    ) -> std::result::Result<gpui_telegram_proto::ConnectMarketplaceAppResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.connect_marketplace_app(token, req).await
+    }
+
+    pub async fn probe_marketplace_connection_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        app_id: &str,
+    ) -> std::result::Result<gpui_telegram_proto::ConnectMarketplaceAppResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .probe_marketplace_connection(token, app_id)
+            .await
+    }
+
+    pub async fn call_marketplace_tool_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        app_id: &str,
+        req: &gpui_telegram_proto::CallMarketplaceToolRequest,
+    ) -> std::result::Result<gpui_telegram_proto::CallMarketplaceToolResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .call_marketplace_tool(token, app_id, req)
+            .await
+    }
+
+    pub async fn disconnect_marketplace_app_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        app_id: &str,
+    ) -> std::result::Result<serde_json::Value, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .disconnect_marketplace_app(token, app_id)
+            .await
+    }
+
+    pub async fn record_marketplace_agent_install_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        slug: &str,
+    ) -> std::result::Result<gpui_telegram_proto::MarketplaceInstallResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .record_marketplace_agent_install(token, slug)
+            .await
+    }
+
+    pub async fn record_marketplace_skill_install_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        slug: &str,
+    ) -> std::result::Result<gpui_telegram_proto::MarketplaceInstallResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .record_marketplace_skill_install(token, slug)
+            .await
+    }
+
+    pub async fn delete_mcp_server_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        server_id: &str,
+    ) -> std::result::Result<serde_json::Value, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.delete_mcp_server(token, server_id).await
+    }
+
     pub fn list_mcp_tools(
         &self,
     ) -> impl std::future::Future<Output = std::result::Result<Vec<serde_json::Value>, HttpClientError>>

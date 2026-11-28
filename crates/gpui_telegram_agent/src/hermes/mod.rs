@@ -2141,9 +2141,8 @@ impl CommandHost for EngineCommandHost<'_> {
         self.ensure_bot_config_allowed()?;
         match action {
             "list" | "tools" => {
-                let reg = self
-                    .engine
-                    .mcp_registry()
+                let reg_arc = self.engine.effective_mcp_registry();
+                let reg = reg_arc
                     .read()
                     .map_err(|_| "MCP registry lock poisoned".to_string())?;
                 let tools = reg.list_tools();
@@ -2165,9 +2164,8 @@ impl CommandHost for EngineCommandHost<'_> {
                     .unwrap_or((raw.trim(), "{}"));
                 let parsed: Value = serde_json::from_str(args_json)
                     .unwrap_or_else(|_| json!({ "input": args_json }));
-                let reg = self
-                    .engine
-                    .mcp_registry()
+                let reg_arc = self.engine.effective_mcp_registry();
+                let reg = reg_arc
                     .read()
                     .map_err(|_| "MCP registry lock poisoned".to_string())?;
                 let out = reg.execute_tool(name, parsed)?;
@@ -2175,9 +2173,8 @@ impl CommandHost for EngineCommandHost<'_> {
             }
             "remove" => {
                 let name = arg.ok_or_else(|| "Usage: `/mcp remove <tool_name>`".to_string())?;
-                let mut reg = self
-                    .engine
-                    .mcp_registry()
+                let reg_arc = self.engine.effective_mcp_registry();
+                let mut reg = reg_arc
                     .write()
                     .map_err(|_| "MCP registry lock poisoned".to_string())?;
                 if reg.remove(name.trim()).is_some() {
@@ -2627,7 +2624,7 @@ impl CommandHost for EngineCommandHost<'_> {
         let skills_count = self.engine.skills().skills_list_index().len();
         let mcp_count = self
             .engine
-            .mcp_registry()
+            .effective_mcp_registry()
             .read()
             .map(|m| m.list_tools().len())
             .unwrap_or(0);
@@ -3246,6 +3243,7 @@ struct HermesEngineInner {
     checkpoints: Arc<Mutex<FileCheckpointManager>>,
     processes: Arc<ProcessRegistry>,
     mcp_registry: Arc<RwLock<McpRegistry>>,
+    shared_mcp_registry: RwLock<Option<Arc<RwLock<McpRegistry>>>>,
     talk_coordinator: Arc<Mutex<TalkCoordinator>>,
     computer_broker: Arc<Mutex<ComputerLeaseBroker>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
@@ -3416,6 +3414,7 @@ impl HermesEngine {
             checkpoints: Arc::new(Mutex::new(FileCheckpointManager::new())),
             processes: Arc::new(ProcessRegistry::new()),
             mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
+            shared_mcp_registry: RwLock::new(None),
             talk_coordinator: Arc::new(Mutex::new(TalkCoordinator::new())),
             computer_broker: Arc::new(Mutex::new(ComputerLeaseBroker::new())),
             computer_provider: RwLock::new(None),
@@ -3655,6 +3654,21 @@ impl HermesEngine {
 
     pub fn mcp_registry(&self) -> &Arc<RwLock<McpRegistry>> {
         &self.inner.mcp_registry
+    }
+
+    pub fn set_shared_mcp_registry(&self, registry: Arc<RwLock<McpRegistry>>) {
+        if let Ok(mut guard) = self.inner.shared_mcp_registry.write() {
+            *guard = Some(registry);
+        }
+    }
+
+    pub fn effective_mcp_registry(&self) -> Arc<RwLock<McpRegistry>> {
+        self.inner
+            .shared_mcp_registry
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| Arc::clone(&self.inner.mcp_registry))
     }
 
     pub fn talk_coordinator(&self) -> &Arc<Mutex<TalkCoordinator>> {
@@ -4103,7 +4117,7 @@ impl HermesEngine {
             .with_chat_and_bot(chat_id, bot_id_i64)
             .with_user_id(parsed_user_id)
             .with_state_bridge(bridge)
-            .with_mcp_registry(Arc::clone(&self.inner.mcp_registry));
+            .with_mcp_registry(self.effective_mcp_registry());
 
         ctx.security = Arc::clone(&self.inner.security);
         ctx.toolsets = toolsets_reg;

@@ -19,7 +19,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OpenBotRuntimeError, RuntimeResult};
-use crate::skill_mcp_service::{McpGateway, RegisterMcpServerInput};
+use crate::platform::connector_driver::{
+    native_connector_real_endpoint, native_connector_tools, verify_native_connector,
+};
+use crate::skill_mcp_service::{
+    McpDiscoveredTool, McpGateway, McpProbeOutcome, RegisterMcpServerInput,
+};
 
 pub const MARKETPLACE_TABS: [&str; 3] = ["apps", "agents", "skills"];
 pub const SKILL_CATEGORIES: [&str; 8] = [
@@ -241,6 +246,14 @@ pub struct ConnectedAppRecord {
     pub mcp_server_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_tools: Vec<McpDiscoveredTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
 }
@@ -572,6 +585,10 @@ impl MarketplaceService {
             connected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             mcp_server_id: Some(saved_server.id.clone()),
             account_label,
+            endpoint: effective_url.or_else(|| plugin.command.clone()),
+            discovered_tools: Vec::new(),
+            last_error: None,
+            verified_at: None,
             metadata,
         };
         let saved_record = self.save_connected_app(record)?;
@@ -579,9 +596,57 @@ impl MarketplaceService {
         Ok((saved_record, saved_server))
     }
 
+    /// Connects an upstream OpenBot MCP plugin AND performs a real live MCP handshake
+    /// (`initialize` + `notifications/initialized` + `tools/list`) via [`McpGateway::probe_server`].
+    /// Never fakes `connected`: if the live server returns HTTP 401/403 or fails to launch/respond,
+    /// the error/auth status is surfaced truthfully and the broken connection is not marked connected.
+    pub async fn connect_plugin_via_mcp_verified(
+        &self,
+        mcp: &McpGateway,
+        slug: &str,
+        auth_values: &BTreeMap<String, String>,
+        override_url: Option<&str>,
+    ) -> RuntimeResult<(ConnectedAppRecord, McpServerConfig, McpProbeOutcome)> {
+        let (mut record, saved_server) =
+            self.connect_plugin_via_mcp(mcp, slug, auth_values, override_url)?;
+        let probe = mcp.probe_server(&saved_server.id).await?;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        if probe.status == "ready" {
+            record.status = "connected".to_string();
+            record.discovered_tools = probe.tool_defs.clone();
+            record.last_error = None;
+            record.verified_at = Some(now);
+            let saved_record = self.save_connected_app(record)?;
+            Ok((saved_record, saved_server, probe))
+        } else {
+            // Keep the registered MCP server config only when OAuth sign-in is pending (`needs_sign_in`),
+            // otherwise roll back the unverified connection so we never fabricate a connected app.
+            if probe.status == "needs_sign_in" {
+                record.status = "needs_sign_in".to_string();
+                record.discovered_tools = Vec::new();
+                record.last_error = probe.error.clone();
+                record.verified_at = None;
+                let saved_record = self.save_connected_app(record)?;
+                Ok((saved_record, saved_server, probe))
+            } else {
+                let _ = self.disconnect_app(&record.app_id);
+                let _ = mcp.remove_server(&saved_server.id);
+                let err_msg = probe
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("MCP handshake failed ({})", probe.status));
+                if probe.status == "needs_key" {
+                    Err(OpenBotRuntimeError::Unauthorized(err_msg))
+                } else {
+                    Err(OpenBotRuntimeError::Execution(err_msg))
+                }
+            }
+        }
+    }
+
     /// Connects one of the 9 native OpenBot connectors (`slack`, `discord`, `telegram`, `whatsapp`,
     /// `onepassword`, `bitwarden`, `protonpass`, `github`, `x`), persisting state and registering
-    /// its backing MCP server entry so assistants immediately see and use the live connector.
+    /// its authentic official API / CLI server entry in [`McpGateway`].
     pub fn connect_native_connector(
         &self,
         mcp: &McpGateway,
@@ -623,48 +688,137 @@ impl MarketplaceService {
                 if conn.connector_id == "github" {
                     Some(GITHUB_CONNECTOR_MCP_SERVER_ID.to_string())
                 } else {
-                    mcp.get_server(&conn.connector_id)
+                    mcp.get_server(&format!("connector-{}", conn.connector_id))
                         .ok()
                         .flatten()
+                        .or_else(|| mcp.get_server(&conn.connector_id).ok().flatten())
                         .map(|s| s.id)
                 }
             });
 
-        let (server_name, server_url) = if conn.connector_id == "github" {
-            (
-                GITHUB_CONNECTOR_MCP_SERVER_NAME.to_string(),
-                GITHUB_CONNECTOR_MCP_SERVER_URL.to_string(),
-            )
+        let server_name = if conn.connector_id == "github" {
+            GITHUB_CONNECTOR_MCP_SERVER_NAME.to_string()
         } else {
-            (
-                format!("connector-{}", conn.connector_id),
-                format!("https://connectors.openbot.local/{}/mcp", conn.connector_id),
-            )
+            format!("connector-{}", conn.connector_id)
         };
+        let real_endpoint = native_connector_real_endpoint(&conn.connector_id).to_string();
 
-        let mut headers = Vec::new();
-        if let Some(tok) = cred_trimmed {
-            headers.push(McpKeyValue {
-                key: "Authorization".to_string(),
-                value: if tok.to_ascii_lowercase().starts_with("bearer ") {
-                    tok.to_string()
-                } else {
-                    format!("Bearer {tok}")
-                },
-            });
+        let (transport, command, url, mut env_pairs, mut headers) =
+            match conn.connector_id.as_str() {
+                "onepassword" => {
+                    let mut env = Vec::new();
+                    if let Some(tok) = cred_trimmed {
+                        env.push(McpKeyValue {
+                            key: "OP_SERVICE_ACCOUNT_TOKEN".to_string(),
+                            value: tok.to_string(),
+                        });
+                    }
+                    (McpTransport::Stdio, Some("op".to_string()), None, env, Vec::new())
+                }
+                "bitwarden" => {
+                    let mut env = Vec::new();
+                    if let Some(tok) = cred_trimmed {
+                        env.push(McpKeyValue {
+                            key: "BW_SESSION".to_string(),
+                            value: tok.to_string(),
+                        });
+                    }
+                    (McpTransport::Stdio, Some("bw".to_string()), None, env, Vec::new())
+                }
+                "protonpass" => (
+                    McpTransport::Stdio,
+                    Some("pass-cli".to_string()),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                "github" => {
+                    let mut hdrs = Vec::new();
+                    if let Some(tok) = cred_trimmed {
+                        hdrs.push(McpKeyValue {
+                            key: "Authorization".to_string(),
+                            value: if tok.to_ascii_lowercase().starts_with("bearer ") {
+                                tok.to_string()
+                            } else {
+                                format!("Bearer {tok}")
+                            },
+                        });
+                    }
+                    (
+                        McpTransport::Http,
+                        None,
+                        Some(GITHUB_CONNECTOR_MCP_SERVER_URL.to_string()),
+                        Vec::new(),
+                        hdrs,
+                    )
+                }
+                "discord" => {
+                    let mut hdrs = Vec::new();
+                    if let Some(tok) = cred_trimmed {
+                        hdrs.push(McpKeyValue {
+                            key: "Authorization".to_string(),
+                            value: if tok.starts_with("Bot ") || tok.starts_with("Bearer ") {
+                                tok.to_string()
+                            } else {
+                                format!("Bot {tok}")
+                            },
+                        });
+                    }
+                    (
+                        McpTransport::Http,
+                        None,
+                        Some(real_endpoint.clone()),
+                        Vec::new(),
+                        hdrs,
+                    )
+                }
+                _ => {
+                    let mut hdrs = Vec::new();
+                    if let Some(tok) = cred_trimmed {
+                        hdrs.push(McpKeyValue {
+                            key: "Authorization".to_string(),
+                            value: if tok.to_ascii_lowercase().starts_with("bearer ") {
+                                tok.to_string()
+                            } else {
+                                format!("Bearer {tok}")
+                            },
+                        });
+                    }
+                    (
+                        McpTransport::Http,
+                        None,
+                        Some(real_endpoint.clone()),
+                        Vec::new(),
+                        hdrs,
+                    )
+                }
+            };
+
+        if let Some(custom_base) = metadata
+            .get("api_base_url")
+            .map(|s| s.trim())
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        {
+            if transport == McpTransport::Http {
+                headers.push(McpKeyValue {
+                    key: "X-Fabushi-Api-Base".to_string(),
+                    value: custom_base.to_string(),
+                });
+            }
         }
+        let _ = &mut env_pairs;
 
         let saved_server = mcp.register_server(RegisterMcpServerInput {
             id: existing_server_id,
             name: server_name,
-            transport: McpTransport::Http,
+            transport,
             enabled: Some(true),
-            command: None,
+            command,
             args: Vec::new(),
-            env: Vec::new(),
+            env: env_pairs,
             env_passthrough: Vec::new(),
             working_directory: None,
-            url: Some(server_url),
+            url,
             headers,
         })?;
 
@@ -676,11 +830,65 @@ impl MarketplaceService {
             connected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             mcp_server_id: Some(saved_server.id),
             account_label: Some(clean_label),
+            endpoint: Some(real_endpoint),
+            discovered_tools: native_connector_tools(&conn.connector_id),
+            last_error: None,
+            verified_at: None,
             metadata,
         };
         let saved = self.save_connected_app(record)?;
         let _ = self.install_item(MarketplaceTab::Apps, &conn.slug);
         Ok(saved)
+    }
+
+    /// Live-verifies credentials for a native OpenBot connector against its real upstream API / CLI
+    /// (Slack `auth.test`, Discord `/users/@me`, Telegram `getMe`, GitHub `/user`, X `/2/users/me`,
+    /// WhatsApp Cloud API, `op`/`bw`/`pass-cli`) before persisting the connection.
+    pub async fn connect_native_connector_verified(
+        &self,
+        mcp: &McpGateway,
+        http: &reqwest::Client,
+        connector_id: &str,
+        account_label: &str,
+        credential: Option<&str>,
+        metadata: BTreeMap<String, String>,
+    ) -> RuntimeResult<ConnectedAppRecord> {
+        let verified =
+            verify_native_connector(http, connector_id, account_label, credential, &metadata)
+                .await?;
+        let mut rec = self.connect_native_connector(
+            mcp,
+            &verified.connector_id,
+            &verified.verified_account,
+            credential,
+            verified.metadata,
+        )?;
+        rec.status = verified.status;
+        rec.endpoint = Some(verified.endpoint);
+        rec.discovered_tools = verified.tools;
+        rec.last_error = None;
+        rec.verified_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
+        self.save_connected_app(rec)
+    }
+
+    /// Updates a connected app's live verification state and discovered tools after re-probing or OAuth.
+    pub fn update_connection_probe_state(
+        &self,
+        app_id: &str,
+        status: &str,
+        discovered_tools: Vec<McpDiscoveredTool>,
+        last_error: Option<String>,
+    ) -> RuntimeResult<Option<ConnectedAppRecord>> {
+        let Some(mut rec) = self.get_connected_app(app_id) else {
+            return Ok(None);
+        };
+        rec.status = status.to_string();
+        rec.discovered_tools = discovered_tools;
+        rec.last_error = last_error;
+        if status == "connected" {
+            rec.verified_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
+        }
+        Ok(Some(self.save_connected_app(rec)?))
     }
 
     /// Disconnects a native connector or plugin app and removes its linked `McpGateway` server.

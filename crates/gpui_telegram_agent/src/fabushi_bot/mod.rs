@@ -27,7 +27,7 @@ use bot_browser::script_app::{
     AutomationScriptApp, ScriptAppMetadata, ScriptReplayReport, VaultSecretResolver,
 };
 use bot_browser::types::BotBrowserError;
-use crate::mcp::ToolPermissionDock;
+use crate::mcp::{McpRegistry, ToolPermissionDock};
 use crate::multi_agent::GroupWorkspaceBridge;
 use chrono::Utc;
 use fabushi_messaging_core::actor::ActorId;
@@ -404,6 +404,7 @@ pub struct FabushiBotHost {
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
     group_workspace_bridge: RwLock<Option<Arc<dyn GroupWorkspaceBridge>>>,
     permission_dock: RwLock<Option<Arc<ToolPermissionDock>>>,
+    shared_mcp_registry: RwLock<Option<Arc<RwLock<McpRegistry>>>>,
     instances: RwLock<HashMap<i64, Arc<FabushiBotInstance>>>,
     agent_id_index: RwLock<HashMap<String, i64>>,
     username_index: RwLock<HashMap<String, i64>>,
@@ -453,6 +454,7 @@ impl FabushiBotHost {
             agentic_backend: RwLock::new(None),
             group_workspace_bridge: RwLock::new(None),
             permission_dock: RwLock::new(None),
+            shared_mcp_registry: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -495,6 +497,7 @@ impl FabushiBotHost {
             agentic_backend: RwLock::new(None),
             group_workspace_bridge: RwLock::new(None),
             permission_dock: RwLock::new(None),
+            shared_mcp_registry: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -525,6 +528,7 @@ impl FabushiBotHost {
             agentic_backend: RwLock::new(None),
             group_workspace_bridge: RwLock::new(None),
             permission_dock: RwLock::new(None),
+            shared_mcp_registry: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -554,6 +558,7 @@ impl FabushiBotHost {
             agentic_backend: RwLock::new(None),
             group_workspace_bridge: RwLock::new(None),
             permission_dock: RwLock::new(None),
+            shared_mcp_registry: RwLock::new(None),
             instances: RwLock::new(HashMap::new()),
             agent_id_index: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
@@ -817,6 +822,20 @@ impl FabushiBotHost {
             for inst in instances.values() {
                 if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
                     inst.hermes.set_permission_dock(Arc::clone(&dock));
+                }
+            }
+        }
+    }
+
+    pub fn set_mcp_registry(&self, registry: Arc<RwLock<McpRegistry>>) {
+        if let Ok(mut guard) = self.shared_mcp_registry.write() {
+            *guard = Some(Arc::clone(&registry));
+        }
+        self.core_engine.set_shared_mcp_registry(Arc::clone(&registry));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                if !Arc::ptr_eq(&inst.hermes, &self.core_engine) {
+                    inst.hermes.set_shared_mcp_registry(Arc::clone(&registry));
                 }
             }
         }
@@ -1445,6 +1464,16 @@ impl FabushiBotHost {
                 engine.set_permission_dock(dock);
             } else if let Some(dock) = self.core_engine.permission_dock() {
                 engine.set_permission_dock(dock);
+            }
+            if let Some(reg) = self
+                .shared_mcp_registry
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+            {
+                engine.set_shared_mcp_registry(reg);
+            } else {
+                engine.set_shared_mcp_registry(self.core_engine.effective_mcp_registry());
             }
             let runner = Arc::new(
                 AcpRunner::new(&runner_default_model).with_hermes_engine(Arc::clone(&engine)),

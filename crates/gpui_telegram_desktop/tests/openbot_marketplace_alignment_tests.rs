@@ -311,3 +311,95 @@ fn test_connector_and_custom_mcp_persistence_agent_access_and_skill_install_roun
         value: "V".into(),
     };
 }
+
+#[test]
+fn test_zero_fake_install_counts_zero_fake_endpoints_and_published_apps_surface() {
+    let catalog = openbot_marketplace_catalog();
+
+    // 1. Every single catalog item starts at 0 installs (zero fabricated counts).
+    assert!(
+        catalog.connectors.iter().all(|c| c.installs == 0),
+        "native connectors must not have hardcoded fake install counts"
+    );
+    assert!(
+        catalog.plugins.iter().all(|p| p.installs == 0),
+        "plugins must not have hardcoded fake install counts"
+    );
+    assert!(
+        catalog.agents.iter().all(|a| a.installs == 0),
+        "agents must not have hardcoded fake install counts"
+    );
+    assert!(
+        catalog.skills.iter().all(|s| s.installs == 0),
+        "skills must not have hardcoded fake install counts"
+    );
+
+    // 2. Native connector MCP registration uses authentic upstream HTTPS endpoints or real CLI commands,
+    //    never synthetic `connectors.openbot.local` placeholder URLs.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = OpenBotHostRuntime::open(tmp.path()).expect("open runtime");
+    let slack = rt
+        .marketplace()
+        .connect_native_connector(rt.mcp(), "slack", "Acme", Some("xoxb-test"), BTreeMap::new())
+        .expect("connect slack");
+    assert_eq!(slack.endpoint.as_deref(), Some("https://slack.com/api"));
+    let servers = rt.mcp().list_servers().expect("list servers");
+    assert!(
+        servers
+            .iter()
+            .all(|s| !s.url.contains("connectors.openbot.local")),
+        "must never register synthetic connectors.openbot.local URLs"
+    );
+
+    // 3. Unverified status (`needs_sign_in`, `error`) must NEVER report as connected.
+    let mut ui = MarketplaceHubState::new();
+    let mut unverified = slack.clone();
+    unverified.status = "needs_sign_in".to_string();
+    ui.connected_apps = vec![unverified];
+    assert!(
+        !ui.is_app_connected("connector:slack"),
+        "needs_sign_in record must NOT appear connected"
+    );
+
+    // 4. Server-published custom connectors appear seamlessly in `all_apps()` and `find_app()`.
+    let published_dto = gpui_telegram_proto::marketplace::MarketplaceAppListingDto {
+        app_id: "published:acme-billing".into(),
+        slug: "acme-billing".into(),
+        kind: "custom_published".into(),
+        name: "Acme Billing MCP".into(),
+        tagline: "Live billing & invoices".into(),
+        zh_tagline: Some("实时账单与发票查询".into()),
+        description: "Connect to Acme Billing Streamable HTTP MCP".into(),
+        zh_description: None,
+        category: "data-analytics".into(),
+        creator_name: "alice".into(),
+        version: "1.0.0".into(),
+        brand_hex: "#0A84FF".into(),
+        website_url: None,
+        privacy_policy_url: None,
+        terms_url: None,
+        server_name: "acme-billing".into(),
+        transport: "http".into(),
+        url: Some("https://billing.acme.example/mcp".into()),
+        command: None,
+        args: Vec::new(),
+        env: Vec::new(),
+        auth_kind: "open".into(),
+        auth_label: None,
+        auth_fields: Vec::new(),
+        auth_steps: Vec::new(),
+        auth_note: None,
+        auth_docs_url: None,
+        auth_docs_label: None,
+        prompts: Vec::new(),
+        setup_kind: None,
+        verified: false,
+        install_count: 0,
+        publisher_user_id: Some(1),
+        published_at_ms: 1_700_000_000_000,
+    };
+    ui.published_custom_apps.push(published_dto);
+    assert_eq!(ui.all_apps().len(), 267);
+    assert!(ui.find_app("published:acme-billing").is_some());
+}
+

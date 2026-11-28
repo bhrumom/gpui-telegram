@@ -20,6 +20,8 @@ gpui_telegram_webrtc = { workspace = true }
 gpui_telegram_agent = { workspace = true }
 bot-browser = { workspace = true }
 magpie_gateway = { workspace = true }
+openbot_runtime = { workspace = true }
+openbot_storage = { workspace = true }
 fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
 mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
 mahayana-host-runtime = { path = "../../inherited/host" }

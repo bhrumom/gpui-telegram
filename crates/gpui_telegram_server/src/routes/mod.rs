@@ -15,6 +15,7 @@ pub mod devices;
 pub mod e2ee;
 pub mod hermes;
 pub mod magpie_api;
+pub mod marketplace;
 pub mod mcp_oauth;
 pub mod media;
 pub mod messages;

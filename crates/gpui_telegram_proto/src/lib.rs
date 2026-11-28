@@ -56,3 +56,6 @@ pub use automation_apps::*;
 
 pub mod orca_contracts;
 pub use orca_contracts::*;
+
+pub mod marketplace;
+pub use marketplace::*;

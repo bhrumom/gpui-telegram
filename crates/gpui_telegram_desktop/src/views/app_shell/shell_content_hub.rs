@@ -1084,7 +1084,10 @@ impl AppShell {
         match ev {
             ContentHubEvent::RefreshMyCreations => self.refresh_my_creations(cx),
             ContentHubEvent::RefreshCatalog(sec) => self.refresh_content_hub_catalog(*sec, cx),
-            ContentHubEvent::RefreshMarketplaceState => self.sync_marketplace_runtime_state(cx),
+            ContentHubEvent::RefreshMarketplaceState => {
+                self.sync_marketplace_runtime_state(cx);
+                self.refresh_marketplace_from_server(cx);
+            }
             ContentHubEvent::RefreshReviewQueue => self.probe_reviewer_queue(cx, true),
             ContentHubEvent::OpenCreatorBot(kind_opt) => {
                 let cmd = kind_opt.map(|k| match k {
@@ -1254,6 +1257,24 @@ impl AppShell {
                     cx,
                 );
             }
+            ContentHubEvent::MarketplaceConnectPublished {
+                app_id,
+                auth_values,
+                override_url,
+            } => {
+                self.handle_marketplace_connect_published(
+                    app_id.clone(),
+                    auth_values.clone(),
+                    override_url.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceStartOAuth { slug, override_url } => {
+                self.handle_marketplace_start_oauth(slug.clone(), override_url.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceProbeApp { app_id } => {
+                self.handle_marketplace_probe_app(app_id.clone(), cx);
+            }
             ContentHubEvent::MarketplaceConnectNative {
                 connector_id,
                 account_label,
@@ -1290,6 +1311,30 @@ impl AppShell {
                     args.clone(),
                     env.clone(),
                     working_dir.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplacePublishCustomApp {
+                name,
+                tagline,
+                category,
+                transport,
+                command,
+                args,
+                env,
+                url,
+                headers,
+            } => {
+                self.handle_marketplace_publish_custom_app(
+                    name.clone(),
+                    tagline.clone(),
+                    category.clone(),
+                    *transport,
+                    command.clone(),
+                    args.clone(),
+                    env.clone(),
                     url.clone(),
                     headers.clone(),
                     cx,

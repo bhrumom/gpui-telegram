@@ -128,6 +128,7 @@ pub enum ContentHubInputTarget {
     MarketplaceSetupPrimary,
     MarketplaceSetupSecondary,
     MarketplaceCustomName,
+    MarketplaceCustomTagline,
     MarketplaceCustomCommand,
     MarketplaceCustomArgs,
     MarketplaceCustomEnv,
@@ -217,6 +218,18 @@ pub enum ContentHubEvent {
         auth_values: BTreeMap<String, String>,
         override_url: Option<String>,
     },
+    MarketplaceConnectPublished {
+        app_id: String,
+        auth_values: BTreeMap<String, String>,
+        override_url: Option<String>,
+    },
+    MarketplaceStartOAuth {
+        slug: String,
+        override_url: Option<String>,
+    },
+    MarketplaceProbeApp {
+        app_id: String,
+    },
     MarketplaceConnectNative {
         connector_id: String,
         account_label: Option<String>,
@@ -234,6 +247,17 @@ pub enum ContentHubEvent {
         args: Vec<String>,
         env: Vec<McpKeyValue>,
         working_dir: String,
+        url: String,
+        headers: Vec<McpKeyValue>,
+    },
+    MarketplacePublishCustomApp {
+        name: String,
+        tagline: String,
+        category: String,
+        transport: McpTransport,
+        command: String,
+        args: Vec<String>,
+        env: Vec<McpKeyValue>,
         url: String,
         headers: Vec<McpKeyValue>,
     },
@@ -486,6 +510,7 @@ impl ContentHubWorkspace {
             | ContentHubInputTarget::MarketplaceSetupPrimary
             | ContentHubInputTarget::MarketplaceSetupSecondary
             | ContentHubInputTarget::MarketplaceCustomName
+            | ContentHubInputTarget::MarketplaceCustomTagline
             | ContentHubInputTarget::MarketplaceCustomCommand
             | ContentHubInputTarget::MarketplaceCustomArgs
             | ContentHubInputTarget::MarketplaceCustomEnv
@@ -528,6 +553,9 @@ impl ContentHubWorkspace {
                 self.marketplace.setup_draft.as_ref().map(|d| &d.secondary)
             }
             ContentHubInputTarget::MarketplaceCustomName => Some(&self.marketplace.custom_form.name),
+            ContentHubInputTarget::MarketplaceCustomTagline => {
+                Some(&self.marketplace.custom_form.tagline)
+            }
             ContentHubInputTarget::MarketplaceCustomCommand => {
                 Some(&self.marketplace.custom_form.command)
             }
@@ -562,6 +590,9 @@ impl ContentHubWorkspace {
             }
             ContentHubInputTarget::MarketplaceCustomName => {
                 Some(&mut self.marketplace.custom_form.name)
+            }
+            ContentHubInputTarget::MarketplaceCustomTagline => {
+                Some(&mut self.marketplace.custom_form.tagline)
             }
             ContentHubInputTarget::MarketplaceCustomCommand => {
                 Some(&mut self.marketplace.custom_form.command)

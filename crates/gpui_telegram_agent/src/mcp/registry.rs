@@ -188,7 +188,24 @@ impl McpRegistry {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<McpToolDefinition> {
+        self.handlers.remove(name);
         self.tools.remove(name)
+    }
+
+    pub fn remove_by_server_id(&mut self, server_id: &str) -> usize {
+        let to_remove: Vec<String> = self
+            .tools
+            .iter()
+            .filter_map(|(name, def)| {
+                (def.server_id.as_deref() == Some(server_id)).then(|| name.clone())
+            })
+            .collect();
+        let count = to_remove.len();
+        for name in to_remove {
+            self.tools.remove(&name);
+            self.handlers.remove(&name);
+        }
+        count
     }
 
     pub fn bridge(&mut self) -> &mut RoutedMcpProtocolBridge {

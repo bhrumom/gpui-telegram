@@ -14,6 +14,7 @@ use crate::error::RuntimeResult;
 
 pub mod automation_http;
 pub mod bridges;
+pub mod connector_driver;
 pub mod crm;
 pub mod html_media;
 pub mod marketplace;
@@ -29,6 +30,10 @@ pub use bridges::{
     BridgeEvalOutcome, BridgeEvalRequest, ExternalBridgeOrchestrator, WhatsAppDecision,
     WhatsAppSenderFacts, WhatsAppSenderRules,
 };
+pub use connector_driver::{
+    NativeConnectorVerified, execute_native_connector_tool, native_connector_real_endpoint,
+    native_connector_tools, verify_native_connector,
+};
 pub use crm::{
     CrmProposeOutcome, CrmProposeRequest, CrmService, CrmSyncOutcome, CrmSyncRequest,
 };
@@ -37,8 +42,8 @@ pub use html_media::{
     HtmlRenderRequest, OpenBotPageRpcOutcome,
 };
 pub use marketplace::{
-    MarketplaceItem, MarketplaceSearchOutcome, MarketplaceSearchRequest, MarketplaceService,
-    MarketplaceTab,
+    ConnectedAppRecord, MarketplaceItem, MarketplaceSearchOutcome, MarketplaceSearchRequest,
+    MarketplaceService, MarketplaceTab,
 };
 pub use routines::{
     RoutineEngine, RoutineRunOutcome, RoutineRunRequest, RoutineSaveOutcome, RoutineSaveRequest,

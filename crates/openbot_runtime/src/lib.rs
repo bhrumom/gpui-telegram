@@ -79,19 +79,21 @@ pub use error::{FailoverCause, OpenBotRuntimeError, RuntimeResult, SoftRefusal};
 pub use host_runtime::OpenBotHostRuntime;
 pub use platform::{
     AutomationHttpServer, AutomationServerConfig, AutomationServerHandle, BridgeEvalOutcome,
-    BridgeEvalRequest, CreditMediaOutcome, CrmProposeOutcome, CrmProposeRequest, CrmService,
-    CrmSyncOutcome, CrmSyncRequest, ExternalBridgeOrchestrator, HtmlAndCreditMediaService,
-    HtmlRenderMode, HtmlRenderOutcome, HtmlRenderRequest, JoinedServerClient, MarketplaceItem,
-    MarketplaceSearchOutcome, MarketplaceSearchRequest, MarketplaceService, MarketplaceTab,
-    OpenBotPageRpcOutcome, OpenBotServeConfig, OpenBotServeHandle, PlatformServices,
-    PlatformToolDelegate, RoutineEngine, RoutineRunOutcome, RoutineRunRequest, RoutineSaveOutcome,
-    RoutineSaveRequest, RoutineTimer, StaticSiteDeleteOutcome, StaticSiteDeleteRequest,
-    StaticSitePublishRequest, StaticSiteRecord, StaticSiteService, TeamApiConfig, TeamApiHandle,
-    TeamApiServer, TeamProtocolEvalOutcome, TeamProtocolEvalRequest, VoiceEvalMode,
-    VoiceEvalOutcome, VoiceEvalRequest, VoiceService, WebhookPostOutcome, WebhookPostRequest,
-    WhatsAppDecision, WhatsAppSenderFacts, WhatsAppSenderRules, WorkflowEngine, WorkflowRunOutcome,
-    WorkflowRunRequest, WorkflowSaveOutcome, WorkflowSaveRequest, WorkflowStepReport, ct_eq,
-    generate_base64url_token_32,
+    BridgeEvalRequest, ConnectedAppRecord, CreditMediaOutcome, CrmProposeOutcome,
+    CrmProposeRequest, CrmService, CrmSyncOutcome, CrmSyncRequest, ExternalBridgeOrchestrator,
+    HtmlAndCreditMediaService, HtmlRenderMode, HtmlRenderOutcome, HtmlRenderRequest,
+    JoinedServerClient, MarketplaceItem, MarketplaceSearchOutcome, MarketplaceSearchRequest,
+    MarketplaceService, MarketplaceTab, NativeConnectorVerified, OpenBotPageRpcOutcome,
+    OpenBotServeConfig, OpenBotServeHandle, PlatformServices, PlatformToolDelegate, RoutineEngine,
+    RoutineRunOutcome, RoutineRunRequest, RoutineSaveOutcome, RoutineSaveRequest, RoutineTimer,
+    StaticSiteDeleteOutcome, StaticSiteDeleteRequest, StaticSitePublishRequest, StaticSiteRecord,
+    StaticSiteService, TeamApiConfig, TeamApiHandle, TeamApiServer, TeamProtocolEvalOutcome,
+    TeamProtocolEvalRequest, VoiceEvalMode, VoiceEvalOutcome, VoiceEvalRequest, VoiceService,
+    WebhookPostOutcome, WebhookPostRequest, WhatsAppDecision, WhatsAppSenderFacts,
+    WhatsAppSenderRules, WorkflowEngine, WorkflowRunOutcome, WorkflowRunRequest,
+    WorkflowSaveOutcome, WorkflowSaveRequest, WorkflowStepReport, ct_eq,
+    execute_native_connector_tool, generate_base64url_token_32, native_connector_real_endpoint,
+    native_connector_tools, verify_native_connector,
 };
 pub use providers::{
     HANDOFF_MAX_CHARS, HANDOFF_START, ProviderCliProbe, ProviderHarnessInfo,
@@ -99,10 +101,12 @@ pub use providers::{
     all_provider_harnesses, build_handoff_packet, provider_harness_info,
 };
 pub use skill_mcp_service::{
-    ComputerUseDescriptor, InstalledSkillEntry, InstalledSkillsManifest, McpGateway,
-    McpProbeOutcome, McpToolCallOutcome, PkceS256Challenge, RegisterMcpServerInput,
-    SaveSkillInput, SaveSkillOutcome, SkillFrontmatter, SkillService, generate_pkce_s256,
-    verify_pkce_s256,
+    ComputerUseDescriptor, InstalledSkillEntry, InstalledSkillsManifest, McpDiscoveredTool,
+    McpGateway, McpOAuthDiscovery, McpOAuthTokenResponse, McpProbeOutcome, McpToolCallOutcome,
+    PkceS256Challenge, RegisterMcpServerInput, SaveSkillInput, SaveSkillOutcome, SkillFrontmatter,
+    SkillService, call_http_mcp_endpoint_jsonrpc, discover_mcp_oauth, exchange_mcp_oauth_code,
+    generate_pkce_s256, parse_discovered_tools, probe_http_mcp_endpoint,
+    register_mcp_oauth_client, verify_pkce_s256,
 };
 pub use tool_catalog::{
     CHANNEL_TOOLS_COUNT, DIRECT_BROWSER_COUNT, DIRECT_OPENBOT_COUNT, DeveloperInstructionsInput,

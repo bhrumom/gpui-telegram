@@ -7,6 +7,7 @@ pub mod api_computers;
 pub mod api_creations;
 pub mod api_e2ee;
 pub mod api_features;
+pub mod api_marketplace;
 pub mod api_miniapps;
 pub mod api_user_vault;
 pub mod hermes_client;
