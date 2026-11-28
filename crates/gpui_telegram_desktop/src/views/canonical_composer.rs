@@ -897,6 +897,16 @@ impl Render for CanonicalComposer {
 
         let is_apple = self.palette.is_apple_style();
         let ob = self.palette.openbot_palette();
+        let cmp_strip_layout = crate::views::composer::composer_ui::compute_openbot_composer_strip_layout(
+            &text,
+            f32::from(self.calculate_content_height()),
+            self.editor.attachments.len(),
+            self.is_agent_busy,
+            self.compose_send_disabled,
+            is_recording,
+            self.is_input_focused,
+            &self.palette,
+        );
         let wrap_center = |child: AnyElement, align_end: bool| -> AnyElement {
             if is_apple {
                 div()
@@ -1007,9 +1017,13 @@ impl Render for CanonicalComposer {
                 ))
             })
             .when_some(banner, |el, b| el.child(b))
-            .when_some((!is_apple).then_some(context_ref_strip).flatten(), |el, strip| {
-                el.child(wrap_center(strip, false))
-            })
+            .when_some(
+                cmp_strip_layout
+                    .legacy_chip_strip_present
+                    .then_some(context_ref_strip)
+                    .flatten(),
+                |el, strip| el.child(wrap_center(strip, false)),
+            )
             .when_some(
                 (!self.is_compose_isolated)
                     .then(|| self.active_send_as_label().map(str::to_string))
@@ -1063,7 +1077,7 @@ impl Render for CanonicalComposer {
                     self.bot_menu_controls.refresh(label, should_be_small);
                 }
                 let show_web_menu = !self.is_compose_isolated && self.bot_menu_controls.is_active;
-                let show_slash_btn = !is_apple
+                let show_slash_btn = cmp_strip_layout.detached_slash_present
                     && !self.is_compose_isolated
                     && (!self.bot_slash_commands.is_empty() || self.hermes_slash_enabled);
                 let bot_menu_view = if show_web_menu && show_slash_btn {

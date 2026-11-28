@@ -166,6 +166,49 @@ enum MenuRowEntry {
     Divider,
 }
 
+/// Single-source-of-truth OpenBot `MainMenuDrawer` layout & color audit snapshot (`UI-F19`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MainMenuDrawerLayoutSnapshot {
+    pub open: bool,
+    pub left_px: f32,
+    pub top_px: f32,
+    pub width_px: f32,
+    pub radius_px: f32,
+    pub surface_bg_hex: String,
+    pub header_bg_hex: String,
+    pub uses_legacy_blue_header: bool,
+}
+
+/// Computes live `MainMenuDrawer` layout and derives `uses_legacy_blue_header` from actual
+/// `header_bg` RGB vs legacy Telegram/Apple blue (`#2b5278`, `#3390ec`, `#007aff`, `#2aabee`).
+pub fn compute_main_menu_drawer_layout(drawer: &MainMenuDrawer) -> MainMenuDrawerLayoutSnapshot {
+    use crate::views::content_hub::apple_primitives::{
+        is_legacy_blue_rgb, rgb24_to_hex, rgba_to_rgb24,
+    };
+    let ob = drawer.palette.openbot_palette();
+    let surface_rgb = if drawer.palette.is_apple_style() {
+        rgba_to_rgb24(ob.bg_surface())
+    } else {
+        drawer.palette.menu_bg
+    };
+    let header_rgb = if drawer.palette.is_apple_style() {
+        rgba_to_rgb24(ob.bg_surface_raised())
+    } else {
+        drawer.palette.accent
+    };
+    MainMenuDrawerLayoutSnapshot {
+        open: drawer.is_open,
+        left_px: 58.0,
+        top_px: 46.0,
+        width_px: 268.0,
+        radius_px: 14.0,
+        surface_bg_hex: rgb24_to_hex(surface_rgb),
+        header_bg_hex: rgb24_to_hex(header_rgb),
+        uses_legacy_blue_header: !drawer.palette.is_apple_style()
+            || is_legacy_blue_rgb(header_rgb),
+    }
+}
+
 impl Render for MainMenuDrawer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open {
@@ -177,6 +220,7 @@ impl Render for MainMenuDrawer {
                 .into_any_element();
         }
 
+        let drawer_layout = compute_main_menu_drawer_layout(self);
         let active = self.active_account();
         let accounts_list = self.accounts.clone();
         let expanded = self.accounts_expanded;
@@ -186,8 +230,14 @@ impl Render for MainMenuDrawer {
         let palette = self.palette;
         let ob = palette.openbot_palette();
 
-        let menu_surface = ob.bg_surface();
-        let header_bg = ob.bg_surface_raised();
+        let menu_surface = rgb(crate::views::content_hub::apple_primitives::parse_hex_color(
+            &drawer_layout.surface_bg_hex,
+            0x212121,
+        ));
+        let header_bg = rgb(crate::views::content_hub::apple_primitives::parse_hex_color(
+            &drawer_layout.header_bg_hex,
+            0x242424,
+        ));
         let row_hover = ob.bg_control_hover();
         let row_active = ob.bg_control_active();
         let fg_primary = ob.text_primary();
@@ -369,12 +419,12 @@ impl Render for MainMenuDrawer {
                 div()
                     .id("window-main-menu-panel")
                     .absolute()
-                    .left(px(58.0))
-                    .top(px(46.0))
-                    .w(px(268.0))
+                    .left(px(drawer_layout.left_px))
+                    .top(px(drawer_layout.top_px))
+                    .w(px(drawer_layout.width_px))
                     .max_h(px(640.0))
                     .p(px(6.0))
-                    .rounded(px(14.0))
+                    .rounded(px(drawer_layout.radius_px))
                     .bg(menu_surface)
                     .border_1()
                     .border_color(ring_col)

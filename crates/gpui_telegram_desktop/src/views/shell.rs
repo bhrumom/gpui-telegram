@@ -78,9 +78,8 @@ use crate::views::orca::{
 };
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
-    CommunityWorkspace, ComputerWorkbench, ContentHubSection, ContentHubWorkspace,
-    ContextInspector, ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer,
-    NavRail,
+    CommunityWorkspace, ContentHubSection, ContentHubWorkspace, ContextInspector,
+    ConversationStage, GlobalTasksWorkspace, MainMenuDrawer, MediaViewer, NavRail,
 };
 use crate::window::WindowSubsystemRuntime;
 
@@ -204,8 +203,7 @@ pub struct AppShell {
     pub global_search_modal: Option<Entity<GlobalSearchModal>>,
     /// Floating `440px` OpenBot `ChannelCreateDialog` modal (`UI-F11`).
     pub channel_create_dialog: Option<Entity<ChannelCreateDialogModal>>,
-    pub(crate) chat_nav_history: Vec<u64>,
-    pub(crate) chat_nav_cursor: Option<usize>,
+    pub(crate) chat_nav_history: crate::views::app_shell::openbot_shell_layout::ChatNavHistory,
     pub(crate) chat_nav_suppress_push: bool,
     pub(crate) last_nav_observed_selection_rev: u64,
 }
@@ -248,7 +246,12 @@ impl AppShell {
         let init_radius = preferences.appearance.bubble_radius;
         let (theme_mode, raw_init_palette) =
             compute_shell_palette(&preferences, None, None, init_radius, None);
-        let init_palette = raw_init_palette.with_openbot_chrome();
+        let wiring = crate::views::app_shell::openbot_shell_layout::default_openbot_shell_wiring();
+        let init_palette = if wiring.openbot_chrome_enabled {
+            raw_init_palette.with_openbot_chrome()
+        } else {
+            raw_init_palette
+        };
         let init_lang = if is_chinese_locale { "zh-CN" } else { "en" };
 
         composer.update(cx, |comp, _| {
@@ -262,8 +265,11 @@ impl AppShell {
         });
         sidebar.update(cx, |sb, sb_cx| {
             sb.attach_nav_rail(nav_rail.clone(), sb_cx);
-            sb.set_has_leading_app_sidebar(true);
+            crate::views::app_shell::openbot_shell_layout::configure_openbot_sidebar_for_shell(
+                sb, wiring,
+            );
             sb.set_collapsed(preferences.appearance.sidebar_collapsed);
+            let _ = sb.load_openbot_width_prefs(&app_dir);
             sb.folder_tags_enabled = preferences.folder_tags_enabled;
             sb.set_notification_badge_rules(
                 preferences.notifications.badge_count_messages,
@@ -347,8 +353,7 @@ impl AppShell {
             last_ime_modal_snapshot: None,
             global_search_modal: None,
             channel_create_dialog: None,
-            chat_nav_history: Vec::new(),
-            chat_nav_cursor: None,
+            chat_nav_history: crate::views::app_shell::openbot_shell_layout::ChatNavHistory::new(),
             chat_nav_suppress_push: false,
             last_nav_observed_selection_rev: 0,
         };
@@ -984,7 +989,6 @@ impl AppShell {
             self.global_search_modal = None;
             self.channel_create_dialog = None;
             self.chat_nav_history.clear();
-            self.chat_nav_cursor = None;
             self.last_nav_observed_selection_rev = 0;
         }
         let srv_url = self.client.config.server_url.clone();
@@ -1204,7 +1208,6 @@ impl AppShell {
         self.global_search_modal = None;
         self.channel_create_dialog = None;
         self.chat_nav_history.clear();
-        self.chat_nav_cursor = None;
         self.last_nav_observed_selection_rev = 0;
         self.community_workspace = None;
         self.orca_runtime = None;
@@ -1488,7 +1491,9 @@ impl AppShell {
         self.sync_apple_sidebar_to_active_panel(cx);
         let needs_router_close = {
             let r = self.settings_router.read(cx);
-            r.settings_section != SettingsSectionType::Main || !r.settings_stack.is_empty()
+            r.is_open
+                || r.settings_section != SettingsSectionType::Main
+                || !r.settings_stack.is_empty()
         };
         if needs_router_close {
             self.settings_router.update(cx, |r, rcx| r.close_silent(rcx));
@@ -2108,16 +2113,7 @@ impl AppShell {
     /// notifying `self.composer` iff `is_input_focused` or `ime_machine.is_composing()` changed.
     pub(crate) fn blur_composer_and_cancel_ime(&mut self, cx: &mut Context<Self>) -> bool {
         self.composer.update(cx, |c, ccx| {
-            let mut changed = false;
-            if c.ime_machine.is_composing() {
-                c.ime_machine.on_ime_cancel();
-                c.sync_autocomplete();
-                changed = true;
-            }
-            if c.is_input_focused {
-                c.is_input_focused = false;
-                changed = true;
-            }
+            let changed = c.on_focus_lost();
             if changed {
                 ccx.notify();
             }
@@ -2606,9 +2602,23 @@ impl AppShell {
         bottom_gap: f32,
         pal: TdesktopThemePalette,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
         let is_apple = pal.is_apple_style();
         let is_err = Self::is_error_toast_text(&text);
+        let mut toaster_state = crate::views::app_shell::modal_container::OpenBotToasterState::new(
+            self.stage.read(cx).reduced_motion,
+        );
+        toaster_state.push_toast(
+            if is_err {
+                crate::views::app_shell::modal_container::OpenBotToastTone::Error
+            } else {
+                crate::views::app_shell::modal_container::OpenBotToastTone::Info
+            },
+            text.clone(),
+            None,
+        );
+        let toaster_layout =
+            crate::views::app_shell::modal_container::compute_toaster_layout(&toaster_state);
         let border_col: Rgba = if is_err {
             TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.55)
         } else if is_apple {
@@ -2626,11 +2636,11 @@ impl AppShell {
             .id("window-toast-banner")
             .occlude()
             .cursor_pointer()
-            .max_w(px(pal.scaled_px(480.0)))
+            .max_w(px(pal.scaled_px(toaster_layout.max_width_px)))
             .min_w(px(0.0))
             .px(px(pal.scaled_px(14.0)))
             .py(px(pal.scaled_px(10.0)))
-            .rounded(px(pal.scaled_px(14.0)))
+            .rounded(px(pal.scaled_px(toaster_layout.radius_px)))
             .bg(card_bg)
             .border_1()
             .border_color(border_col)
@@ -2692,17 +2702,26 @@ impl AppShell {
                     .child(tg_icon(IconName::Close, pal.scaled_px(11.0), pal.text_secondary)),
             );
 
-        div()
-            .absolute()
-            .bottom(px(bottom_gap))
-            .left(px(pal.scaled_px(16.0)))
-            .right(px(pal.scaled_px(16.0)))
-            .flex()
-            .justify_end()
-            .child(card)
+        deferred(
+            div()
+                .absolute()
+                .bottom(px(bottom_gap))
+                .left(px(pal.scaled_px(16.0)))
+                .right(px(pal.scaled_px(16.0)))
+                .flex()
+                .justify_end()
+                .child(card),
+        )
+        .with_priority(toaster_layout.z_index)
+        .into_any_element()
     }
 
-    fn render_toast_banner(&self, text: String, pal: TdesktopThemePalette, cx: &mut Context<Self>) -> Div {
+    fn render_toast_banner(
+        &self,
+        text: String,
+        pal: TdesktopThemePalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.render_toast_banner_slot(text, pal.scaled_px(24.0), pal, cx)
     }
 
@@ -2888,13 +2907,22 @@ impl Render for AppShell {
         } else {
             self.overlays.last_viewport_width
         };
-        let is_narrow_viewport = effective_vp_w <= 720.0;
+        let is_narrow_viewport = effective_vp_w
+            <= crate::views::app_shell::openbot_shell_layout::OPENBOT_SHELL_NARROW_BREAKPOINT_PX;
         let has_update_notice = matches!(
             self.overlays.updater_state,
             DesktopUpdateState::Available { .. } | DesktopUpdateState::ReadyToRestart { .. }
         );
 
         self.ensure_openbot_chrome_palette(cx);
+
+        if self.sidebar.read(cx).pending_persist_openbot_width {
+            let pref_dir = self.preferences_dir.clone();
+            self.sidebar.update(cx, |sb, _| {
+                let _ = sb.save_openbot_width_prefs(&pref_dir);
+                sb.pending_persist_openbot_width = false;
+            });
+        }
 
         if self.is_authenticated {
             let (acc_name, acc_initials, is_conn) = {
@@ -2905,6 +2933,7 @@ impl Render for AppShell {
                     r.is_connected,
                 )
             };
+            let ctx_ratio = self.bot_fusion.context_usage_ratio;
             self.apple_sidebar.update(cx, |sb, _| {
                 if sb.account_name != acc_name
                     || sb.account_initials != acc_initials
@@ -2917,6 +2946,12 @@ impl Render for AppShell {
                 }
                 if sb.has_update_notice != has_update_notice {
                     sb.set_update_notice(has_update_notice);
+                }
+                if let Some(ratio) = ctx_ratio {
+                    let mut metric = sb.usage_ring_metric.clone();
+                    metric.primary_ratio = Some(ratio.clamp(0.0, 1.0));
+                    metric.unavailable = false;
+                    sb.set_usage_ring_metrics(vec![metric]);
                 }
                 rail_more_open = sb.more_menu_open;
                 rail_help_open = sb.help_menu_open;
@@ -3147,59 +3182,88 @@ impl Render for AppShell {
         } else {
             None
         };
-        let use_unified_openbot_side_panel =
-            show_chat_sidebar && !is_apple_compose_mode && pal.is_apple_style();
-        let rail_w_for_sp = if is_narrow_viewport {
-            0.0
-        } else {
-            self.apple_sidebar.read(cx).effective_width()
+        let wiring = crate::views::app_shell::openbot_shell_layout::default_openbot_shell_wiring();
+        let preliminary_use_unified = wiring.use_unified_openbot_side_panel
+            && show_chat_sidebar
+            && !is_apple_compose_mode
+            && pal.is_apple_style();
+        if preliminary_use_unified {
+            self.reconcile_unified_side_panel_sync(cx);
+        } else if self.inspector.read(cx).embedded_in_side_panel {
+            self.inspector.update(cx, |insp, _| {
+                insp.embedded_in_side_panel = false;
+            });
+        }
+        let settings_target = self.side_panel_settings_target(cx);
+        let stage_window_glass = self.stage.read(cx).window_glass;
+        let rail_w_for_frame = self.apple_sidebar.read(cx).effective_width();
+        let legacy_comp_open = self.bot_fusion.companion_open
+            && self.stage.read(cx).active_fabushi_bot.is_some();
+        let legacy_insp_open = self.inspector.read(cx).is_open;
+        let effective_vp_h = if vp_h > 0.0 { vp_h } else { 800.0 };
+        let frame_input = crate::views::app_shell::openbot_shell_layout::OpenBotShellFrameInput {
+            viewport_w: effective_vp_w,
+            viewport_h: effective_vp_h,
+            active_panel: self.active_panel,
+            palette: pal,
+            wiring,
+            rail_width_px: rail_w_for_frame,
+            sidebar_closed: sidebar_is_closed,
+            sidebar_width_px: sidebar_rendered_w,
+            is_apple_compose_mode,
+            unified_side_panel_open: self.is_unified_side_panel_open(),
+            unified_side_panel_maximized: self.bot_fusion.side_panel.state.maximized,
+            unified_side_panel_width_px: self.bot_fusion.side_panel.state.width_px,
+            unified_settings_visible: self.bot_fusion.side_panel.is_settings_visible(),
+            legacy_companion_open: legacy_comp_open,
+            legacy_inspector_open: legacy_insp_open,
+            settings_target,
+            window_glass: stage_window_glass,
+            composer_height_px: 64.0,
+            server_rail_width_px: 0.0,
         };
-        let sb_w_for_sp = if sidebar_is_closed {
-            0.0
-        } else {
-            sidebar_rendered_w
-        };
-        let workspace_avail_px = (effective_vp_w - rail_w_for_sp - sb_w_for_sp - 8.0).max(456.0);
-
-        let (unified_side_panel, unified_maximized, bot_companion_panel, right_panel_slot_w) =
-            if use_unified_openbot_side_panel {
-                self.reconcile_unified_side_panel_sync(cx);
-                let open = self.is_unified_side_panel_open();
-                let max_mode = open && self.bot_fusion.side_panel.state.maximized;
-                let panel = open.then(|| {
-                    self.render_unified_openbot_side_panel(&pal, workspace_avail_px, cx)
-                });
-                let slot_w = if open {
-                    self.bot_fusion.side_panel.state.width_px
-                } else {
-                    0.0
-                };
-                (panel, max_mode, None, slot_w)
-            } else {
-                if self.inspector.read(cx).embedded_in_side_panel {
-                    self.inspector.update(cx, |insp, _| {
-                        insp.embedded_in_side_panel = false;
-                    });
-                }
-                let comp = if show_chat_sidebar
-                    && !is_apple_compose_mode
-                    && self.bot_fusion.companion_open
-                    && self.stage.read(cx).active_fabushi_bot.is_some()
-                {
-                    Some(self.render_bot_companion_sidepanel(cx))
-                } else {
-                    None
-                };
-                let inspector_open = !is_apple_compose_mode && self.inspector.read(cx).is_open;
-                let slot_w: f32 = if comp.is_some() {
-                    380.0
-                } else if inspector_open {
-                    320.0
-                } else {
-                    0.0
-                };
-                (None, false, comp, slot_w)
-            };
+        let shell_frame =
+            crate::views::app_shell::openbot_shell_layout::compute_openbot_shell_frame_layout(
+                &frame_input,
+            );
+        let footer_audit =
+            crate::views::app_shell::openbot_shell_layout::compute_shell_account_footer_audit(
+                self.apple_sidebar.read(cx),
+                self.sidebar.read(cx),
+            );
+        if footer_audit.has_duplicate_account_footer && !shell_frame.narrow_viewport {
+            self.sidebar.update(cx, |sb, _| {
+                crate::views::app_shell::openbot_shell_layout::configure_openbot_sidebar_for_shell(
+                    sb, wiring,
+                );
+            });
+        }
+        let use_unified_openbot_side_panel = shell_frame.right_drawer.use_unified_side_panel;
+        let workspace_avail_px = shell_frame.workspace_avail_px.max(456.0);
+        let panel_height_px = shell_frame.canvas_card_rect.height.max(480.0);
+        let unified_maximized = shell_frame.right_drawer.unified_maximized;
+        let right_panel_slot_w = shell_frame.right_drawer.slot_width_px;
+        let active_side_panel_w = shell_frame.side_panel_rect.width;
+        if (self.stage.read(cx).active_side_panel_width_px - active_side_panel_w).abs() > 0.5 {
+            self.stage.update(cx, |st, _| {
+                st.active_side_panel_width_px = active_side_panel_w;
+            });
+        }
+        let unified_side_panel = shell_frame
+            .right_drawer
+            .mount_unified_side_panel
+            .then(|| {
+                self.render_unified_openbot_side_panel(
+                    &pal,
+                    workspace_avail_px,
+                    panel_height_px,
+                    cx,
+                )
+            });
+        let bot_companion_panel = shell_frame
+            .right_drawer
+            .mount_legacy_companion_panel
+            .then(|| self.render_bot_companion_sidepanel(cx));
         let right_panel_slot_open = want_external_stage_header && right_panel_slot_w > 0.0;
 
         let workspace_card = div()
@@ -3210,8 +3274,10 @@ impl Render for AppShell {
             .flex()
             .overflow_hidden()
             .bg(ob_canvas)
-            .when(!is_narrow_viewport, |el| {
-                el.rounded(px(14.0)).border_1().border_color(ob_border)
+            .when(!shell_frame.narrow_viewport, |el| {
+                el.rounded(px(shell_frame.workspace_card_radius_px))
+                    .border_1()
+                    .border_color(ob_border)
             })
             .when(in_content_hub, |el| {
                 el.child(
@@ -3377,11 +3443,13 @@ impl Render for AppShell {
                 if this.bot_fusion.side_panel.is_resizing_split {
                     if let Some(start_y) = this.bot_fusion.side_panel.split_drag_start_y {
                         let delta_y = f32::from(ev.position.y) - start_y;
-                        let next_share = (this.bot_fusion.side_panel.split_start_share
-                            - (delta_y as f64 / 520.0))
-                            .clamp(0.22, 0.72);
-                        this.bot_fusion.side_panel.state.lower_share = next_share;
-                        changed = true;
+                        let raw_share = this.bot_fusion.side_panel.split_start_share
+                            - (delta_y as f64 / 520.0);
+                        if raw_share.is_finite() {
+                            this.bot_fusion.side_panel.state.lower_share =
+                                raw_share.clamp(0.22, 0.72);
+                            changed = true;
+                        }
                     }
                 }
                 if changed {
@@ -3493,12 +3561,21 @@ impl Render for AppShell {
                         return;
                     }
                     if cmd && !mods.alt && !mods.shift && key.eq_ignore_ascii_case("b") {
-                        this.sidebar.update(cx, |sb, scx| {
-                            sb.toggle_closed_from_user();
-                            scx.notify();
+                        let active_panel = this.active_panel;
+                        let toggled = this.sidebar.update(cx, |sb, scx| {
+                            let changed = crate::views::app_shell::openbot_shell_layout::apply_cmd_b_sidebar_toggle(
+                                active_panel,
+                                sb,
+                            );
+                            if changed {
+                                scx.notify();
+                            }
+                            changed
                         });
-                        cx.stop_propagation();
-                        cx.notify();
+                        if toggled {
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
                         return;
                     }
                     if cmd && !mods.alt && !mods.shift && key == "[" {
@@ -3541,12 +3618,13 @@ impl Render for AppShell {
                             .flex()
                             .flex_col()
                             .bg(ob_frame)
-                            .when(!is_narrow_viewport, |el| {
-                                el.pr(px(4.0)).pb(px(4.0))
+                            .when(!shell_frame.narrow_viewport, |el| {
+                                el.pr(px(shell_frame.workspace_margin_px))
+                                    .pb(px(shell_frame.workspace_margin_px))
                             })
-                            .when(!is_narrow_viewport, |el| {
+                            .when(shell_frame.top_chrome_visible, |el| {
                                 let topbar_slot_w = if sidebar_is_closed {
-                                    44.0
+                                    shell_frame.top_row_tabs_start_px
                                 } else {
                                     sidebar_rendered_w.max(88.0)
                                 };
@@ -3554,7 +3632,7 @@ impl Render for AppShell {
                                     div()
                                         .id("app-shell-top-chrome-strip")
                                         .w_full()
-                                        .h(px(38.0))
+                                        .h(px(shell_frame.top_chrome_height_px))
                                         .flex_shrink_0()
                                         .bg(ob_frame)
                                         .flex()
@@ -3585,32 +3663,42 @@ impl Render for AppShell {
                                             )
                                         })
                                         .when(want_external_stage_header, |strip| {
-                                            let st_snap = {
+                                            let (st_snap, st_extra) = {
                                                 let st = self.stage.read(cx);
                                                 (
-                                                    st.active_chat_id,
-                                                    st.chat_title.clone(),
-                                                    st.chat_subtitle.clone(),
-                                                    st.chat_avatar_initials.clone(),
-                                                    st.chat_avatar_url.clone(),
-                                                    st.active_fabushi_bot.clone(),
-                                                    st.is_bot_chat,
-                                                    st.is_effective_group_chat(),
-                                                    st.group_member_tiles.clone(),
-                                                    st.group_member_briefs.clone(),
-                                                    st.bot_activity_state.clone(),
-                                                    st.active_thread_id.clone(),
-                                                    st.thread_tabs.clone(),
-                                                    st.active_model_label.clone(),
-                                                    st.active_thinking_effort.clone(),
-                                                    st.model_picker_open,
-                                                    st.pinned_popover_entries().len(),
-                                                    st.pinned_popover_open,
-                                                    st.search_open,
-                                                    st.more_menu_open,
-                                                    st.is_inspector_open || st.is_bot_companion_open,
-                                                    st.effective_stage_width(),
-                                                    st.message_ttl_seconds,
+                                                    (
+                                                        st.active_chat_id,
+                                                        st.chat_title.clone(),
+                                                        st.chat_subtitle.clone(),
+                                                        st.chat_avatar_initials.clone(),
+                                                        st.chat_avatar_url.clone(),
+                                                        st.active_fabushi_bot.clone(),
+                                                        st.is_bot_chat,
+                                                        st.is_effective_group_chat(),
+                                                        st.group_member_tiles.clone(),
+                                                        st.group_member_briefs.clone(),
+                                                        st.bot_activity_state.clone(),
+                                                        st.active_thread_id.clone(),
+                                                        st.thread_tabs.clone(),
+                                                        st.active_model_label.clone(),
+                                                        st.active_thinking_effort.clone(),
+                                                        st.model_picker_open,
+                                                        st.pinned_popover_entries().len(),
+                                                        st.pinned_popover_open,
+                                                        st.search_open,
+                                                        st.more_menu_open,
+                                                        st.is_inspector_open || st.is_bot_companion_open,
+                                                        st.effective_stage_width(),
+                                                        st.message_ttl_seconds,
+                                                    ),
+                                                    (
+                                                        st.is_channel_isolated,
+                                                        st.is_archived_chat,
+                                                        st.provider_connected,
+                                                        st.pending_model_badge.clone(),
+                                                        st.reduced_motion,
+                                                        st.window_glass,
+                                                    ),
                                                 )
                                             };
                                             let lang_hdr = self.active_lang_id().to_string();
@@ -3639,8 +3727,19 @@ impl Render for AppShell {
                                                 side_panel_open: st_snap.20,
                                                 right_panel_slot_open,
                                                 external_hosted: true,
-                                                available_width_px: st_snap.21,
-                                                is_isolated_lock: false,
+                                                available_width_px: if shell_frame.stage_column_rect.width > 0.0 {
+                                                    shell_frame.stage_column_rect.width
+                                                } else {
+                                                    st_snap.21
+                                                },
+                                                is_isolated_lock: st_snap.7 && st_extra.0,
+                                                is_archived: st_extra.1,
+                                                provider_connected: st_extra.2,
+                                                pending_model_badge: st_extra.3.as_deref(),
+                                                reduced_motion: st_extra.4,
+                                                window_glass: st_extra.5,
+                                                sidebar_closed: sidebar_is_closed,
+                                                topbar_controls_right_edge_px: topbar_slot_w,
                                                 message_ttl_seconds: st_snap.22,
                                             };
                                             strip
@@ -3832,23 +3931,13 @@ impl AppShell {
                 settings_router: &self.settings_router,
                 miniapp_overlay: self.miniapps.miniapp_overlay.as_ref(),
                 create_bot_box: self.miniapps.create_bot_box.as_ref(),
+                global_search_modal: self.global_search_modal.as_ref(),
+                channel_create_dialog: self.channel_create_dialog.as_ref(),
             },
             &ob_pal,
             &lang,
             cx,
         );
-        if let Some(ref gs) = self.global_search_modal {
-            gs.update(cx, |m, mcx| {
-                m.set_theme_and_locale(ob_pal, lang.clone());
-                mcx.notify();
-            });
-        }
-        if let Some(ref cc) = self.channel_create_dialog {
-            cc.update(cx, |m, mcx| {
-                m.set_theme_and_locale(ob_pal, lang.clone());
-                mcx.notify();
-            });
-        }
     }
 
     /// Processes OpenBot sidebar `+` menu / search / navigation callbacks and tracks chat history.
@@ -3879,23 +3968,7 @@ impl AppShell {
             self.last_nav_observed_selection_rev = sel_rev;
             if let Some(cid) = active_chat {
                 if !self.chat_nav_suppress_push {
-                    if let Some(cur) = self.chat_nav_cursor {
-                        if self.chat_nav_history.get(cur) != Some(&cid) {
-                            self.chat_nav_history.truncate(cur + 1);
-                            self.chat_nav_history.push(cid);
-                            self.chat_nav_cursor = Some(self.chat_nav_history.len() - 1);
-                        }
-                    } else {
-                        self.chat_nav_history.push(cid);
-                        self.chat_nav_cursor = Some(0);
-                    }
-                    if self.chat_nav_history.len() > 64 {
-                        let drop_n = self.chat_nav_history.len() - 64;
-                        self.chat_nav_history.drain(..drop_n);
-                        self.chat_nav_cursor = self
-                            .chat_nav_cursor
-                            .map(|c| c.saturating_sub(drop_n));
-                    }
+                    self.chat_nav_history.push(cid);
                 }
                 self.sync_sidebar_nav_flags(cx);
             }
@@ -4052,10 +4125,8 @@ impl AppShell {
     }
 
     fn sync_sidebar_nav_flags(&mut self, cx: &mut Context<Self>) {
-        let can_back = self.chat_nav_cursor.is_some_and(|c| c > 0);
-        let can_fwd = self
-            .chat_nav_cursor
-            .is_some_and(|c| c + 1 < self.chat_nav_history.len());
+        let can_back = self.chat_nav_history.can_back();
+        let can_fwd = self.chat_nav_history.can_forward();
         self.sidebar.update(cx, |sb, scx| {
             if sb.can_navigate_back != can_back || sb.can_navigate_forward != can_fwd {
                 sb.can_navigate_back = can_back;
@@ -4067,16 +4138,9 @@ impl AppShell {
 
     /// Steps backward (`delta = -1`, `Cmd+[`) or forward (`delta = 1`, `Cmd+]`) through visited chats.
     pub fn navigate_chat_history(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(cur) = self.chat_nav_cursor else {
+        let Some(target_chat_id) = self.chat_nav_history.step(delta) else {
             return;
         };
-        let next_i = cur as isize + delta;
-        if next_i < 0 || (next_i as usize) >= self.chat_nav_history.len() {
-            return;
-        }
-        let next_idx = next_i as usize;
-        let target_chat_id = self.chat_nav_history[next_idx];
-        self.chat_nav_cursor = Some(next_idx);
         self.chat_nav_suppress_push = true;
         self.active_panel = ActiveWorkspacePanel::Chats;
         self.sidebar.update(cx, |sb, scx| {
@@ -4247,6 +4311,14 @@ impl AppShell {
         initial_tab: Option<GlobalSearchTab>,
         cx: &mut Context<Self>,
     ) {
+        let modal_blocked = self.modal_container.read(cx).is_modal_active()
+            || self.channel_create_dialog.is_some()
+            || self.is_publish_review_modal_active(cx)
+            || self.miniapps.pending_miniapp_confirm.is_some();
+        let mut guard_state = crate::views::openbot::agent_studio::GlobalSearchState::new(false);
+        if !guard_state.try_open_palette(modal_blocked) {
+            return;
+        }
         self.occlude_browser_for_overlay(cx);
         self.ime.clear_preedit();
         self.sidebar.update(cx, |sb, scx| {
@@ -4274,14 +4346,23 @@ impl AppShell {
             m
         });
         cx.observe(&modal, |shell, ent, cx| {
-            let (act, close) = ent.update(cx, |m, _| {
-                (m.take_pending_activate(), m.take_pending_close())
+            let (act, close, remote_req) = ent.update(cx, |m, _| {
+                (
+                    m.take_pending_activate(),
+                    m.take_pending_close(),
+                    m.take_pending_remote_search(),
+                )
             });
             if close {
                 shell.global_search_modal = None;
             }
             if let Some(hit) = act {
                 shell.handle_global_search_activation(hit, cx);
+            }
+            if !close {
+                if let Some((seq, query)) = remote_req {
+                    shell.dispatch_global_search_remote(ent.clone(), seq, query, cx);
+                }
             }
             if close {
                 cx.notify();
@@ -4290,6 +4371,70 @@ impl AppShell {
         .detach();
         self.global_search_modal = Some(modal);
         cx.notify();
+    }
+
+    fn dispatch_global_search_remote(
+        &mut self,
+        modal: Entity<GlobalSearchModal>,
+        seq: u64,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let local_items = self.collect_global_search_items(cx);
+        let Some(fence) = self.capture_client_fence() else {
+            modal.update(cx, |m, mcx| {
+                m.apply_remote_results(seq, local_items, mcx);
+            });
+            return;
+        };
+        cx.spawn(async move |weak_shell: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak_shell, app).await {
+                return;
+            }
+            let res = fence
+                .client
+                .http_client
+                .search_global(&fence.token, &query, "all")
+                .await;
+            let _ = weak_shell.update(app, |shell, cx| {
+                if !fence.is_valid(shell) {
+                    return;
+                }
+                match res {
+                    Ok(hits) => {
+                        let mut merged = local_items;
+                        for hit in hits {
+                            let id = format!("msg:{}:{}", hit.chat_id, hit.message_id);
+                            if !merged.iter().any(|existing| existing.id == id) {
+                                let title = if hit.title.trim().is_empty() {
+                                    format!("Chat #{}", hit.chat_id)
+                                } else {
+                                    hit.title
+                                };
+                                merged.push(GlobalSearchResultItem {
+                                    id,
+                                    section: crate::views::openbot::agent_studio::GlobalSearchSectionKind::Messages,
+                                    title,
+                                    subtitle: hit.snippet,
+                                    badge: None,
+                                    avatar_seed: None,
+                                    shortcut_hint: None,
+                                });
+                            }
+                        }
+                        modal.update(cx, |m, mcx| {
+                            m.apply_remote_results(seq, merged, mcx);
+                        });
+                    }
+                    Err(err) => {
+                        modal.update(cx, |m, mcx| {
+                            m.fail_remote_search(seq, err.to_string(), mcx);
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Closes `GlobalSearchModal` cleanly.
@@ -4366,19 +4511,15 @@ impl AppShell {
                     });
                 }
                 "action:toggle_lang" => self.toggle_language(cx),
-                "setting:main" => self.navigate_settings_to(SettingsSectionType::Main, cx),
-                "setting:chat" => self.navigate_settings_to(SettingsSectionType::Chat, cx),
-                "setting:folders" => self.navigate_settings_to(SettingsSectionType::Folders, cx),
-                "setting:ai_providers" => {
-                    self.navigate_settings_to(SettingsSectionType::AiProviders, cx)
+                _ => {
+                    if let Some(sec) = SettingsRouter::resolve_global_search_settings_section(&item.id) {
+                        self.navigate_settings_to(sec, cx);
+                        self.settings_router.update(cx, |r, rcx| {
+                            let _ = r.open_from_global_search_hit(&item);
+                            rcx.notify();
+                        });
+                    }
                 }
-                "setting:privacy" => {
-                    self.navigate_settings_to(SettingsSectionType::PrivacySecurity, cx)
-                }
-                "setting:shortcuts" => {
-                    self.navigate_settings_to(SettingsSectionType::Shortcuts, cx)
-                }
-                _ => {}
             }
         }
     }
@@ -4388,12 +4529,13 @@ impl AppShell {
         let ob = self.theme_state.palette.openbot_palette();
         let lang = self.active_lang_id().to_string();
         let effective_vp_h = if vp_h > 0.0 { vp_h } else { 720.0 };
-        let (pinned, active_dest, hovered_row) = {
+        let (pinned, active_dest, hovered_row, rail_layout) = {
             let rail = self.apple_sidebar.read(cx);
             (
                 rail.pinned_sections.clone(),
                 rail.active_rail_destination(),
                 rail.hovered_more_row,
+                rail.compute_layout(effective_vp_h),
             )
         };
         let surface_bg = ob.bg_surface();
@@ -4406,7 +4548,7 @@ impl AppShell {
         let mut card = div()
             .id("rail-more-menu-card")
             .absolute()
-            .left(px(58.0))
+            .left(px(rail_layout.more_menu_left_px))
             .top(px(46.0))
             .w(px(232.0))
             .max_h(px((effective_vp_h - 62.0).max(200.0)))

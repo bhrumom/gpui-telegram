@@ -46,16 +46,18 @@ impl ConversationStage {
             };
             self.scroll_handle.set_offset(point(px(0.0), px(-y_top)));
             self.is_anchored_to_bottom = false;
-            self.highlight_manager.highlight(
-                SelectedQuote {
-                    message_id: msg_id,
-                    text_range: None,
-                    todo_list_id: None,
-                    poll_option: None,
-                    rich_page: None,
-                },
-                stage_now_ms(),
-            );
+            let quote = SelectedQuote {
+                message_id: msg_id,
+                text_range: None,
+                todo_list_id: None,
+                poll_option: None,
+                rich_page: None,
+            };
+            if self.palette.is_apple_style() {
+                self.highlight_manager.highlight_openbot(quote, stage_now_ms());
+            } else {
+                self.highlight_manager.highlight(quote, stage_now_ms());
+            }
         }
     }
 
@@ -897,6 +899,22 @@ impl ConversationStage {
                         user_id,
                         sender_name,
                     });
+            }
+            BubbleUiAction::RetryFailedMessage(msg_id) => {
+                if let Some(m) = self.messages.iter_mut().find(|m| m.id == msg_id) {
+                    if m.delivery_status == crate::views::stage::cards::models::DeliveryStatus::Failed
+                    {
+                        m.delivery_status =
+                            crate::views::stage::cards::models::DeliveryStatus::Sending;
+                        let toast = crate::i18n::tr_str(
+                            &self.lang_id,
+                            "正在重新发送消息…",
+                            "Retrying message...",
+                        )
+                        .to_string();
+                        self.show_toast_banner(toast, cx);
+                    }
+                }
             }
         }
         cx.notify();

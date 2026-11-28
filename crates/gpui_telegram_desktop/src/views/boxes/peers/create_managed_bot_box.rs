@@ -489,6 +489,8 @@ impl CreateManagedBotBoxPeers {
                     || !self.coding_executable_override.trim().is_empty())
         } else if self.is_fabushi_mode {
             !self.bot_name.trim().is_empty()
+                && self.description.chars().count()
+                    <= crate::views::openbot::agent_studio::FIRST_AGENT_PURPOSE_MAX_CHARS
                 && (self.bot_username.trim().is_empty()
                     || gpui_telegram_proto::miniapp_contracts::validate_bot_username(
                         &self.bot_username,
@@ -889,7 +891,7 @@ impl CreateManagedBotBoxPeers {
 
         let hero_visual: AnyElement = if self.use_dynamic_avatar {
             let mut props = AgentAvatarProps::new(&hero_seed)
-                .with_size(72.0)
+                .with_size(crate::views::openbot::agent_studio::FIRST_AGENT_HERO_SIZE_PX)
                 .with_mood(if self.hero_wink_toggle {
                     AvatarMood::Responded
                 } else {
@@ -1513,7 +1515,7 @@ impl CreateManagedBotBoxPeers {
                     Some(sug.shape),
                     None,
                     Some(sug.color_hex),
-                    42.0,
+                    crate::views::openbot::agent_studio::FIRST_AGENT_REC_CARD_AVATAR_PX,
                     AvatarMood::Idle,
                     None,
                 );
@@ -1524,8 +1526,8 @@ impl CreateManagedBotBoxPeers {
                     div()
                         .id(SharedString::from(format!("studio-starter-card-{idx}")))
                         .cursor_pointer()
-                        .w(px(256.0))
-                        .h(px(112.0))
+                        .w(px(crate::views::openbot::agent_studio::FIRST_AGENT_REC_CARD_WIDTH_PX))
+                        .h(px(crate::views::openbot::agent_studio::FIRST_AGENT_REC_CARD_HEIGHT_PX))
                         .flex_shrink_0()
                         .p(px(16.0))
                         .rounded(px(12.0))

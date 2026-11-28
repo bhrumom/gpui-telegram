@@ -163,6 +163,35 @@ pub fn openbot_vector_icon(kind: OpenBotChromeIcon, size_px: f32, color: Rgba) -
         .into_any_element()
 }
 
+/// Single-source-of-truth layout snapshot for `SidebarTopbar` (`38px`, `←`/`→` opacities, mac clearance).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenBotSidebarTopbarLayout {
+    pub height_px: f32,
+    pub toggle_visible: bool,
+    pub back_enabled: bool,
+    pub forward_enabled: bool,
+    pub back_opacity: f32,
+    pub forward_opacity: f32,
+    pub mac_clearance_px: f32,
+}
+
+pub fn compute_openbot_sidebar_topbar_layout(
+    can_go_back: bool,
+    can_go_forward: bool,
+    is_agents_page: bool,
+    has_page_rail: bool,
+) -> OpenBotSidebarTopbarLayout {
+    OpenBotSidebarTopbarLayout {
+        height_px: OPENBOT_TOPBAR_HEIGHT,
+        toggle_visible: is_agents_page,
+        back_enabled: can_go_back,
+        forward_enabled: can_go_forward,
+        back_opacity: if can_go_back { 1.0 } else { 0.4 },
+        forward_opacity: if can_go_forward { 1.0 } else { 0.4 },
+        mac_clearance_px: if has_page_rail { 24.0 } else { 78.0 },
+    }
+}
+
 /// Renders OpenBot's exact `38px` `SidebarTopbar` (`← →` history nav + right-aligned `PanelLeft`).
 /// Works both inside `#app-shell-top-chrome-strip` (`external_topbar_hosted == true`) and standalone.
 #[allow(clippy::too_many_arguments)]
@@ -177,6 +206,7 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
     on_forward: impl Fn(&mut V, &mut Context<V>) + 'static,
     on_toggle_panel: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
+    let layout = compute_openbot_sidebar_topbar_layout(can_go_back, can_go_forward, true, true);
     let ob = palette.openbot_palette();
     let hover_bg = ob.hover();
     let icon_muted = ob.text_muted();
@@ -209,7 +239,7 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
     if is_closed || is_compact {
         return div()
             .id("openbot-sidebar-topbar-compact")
-            .h(px(OPENBOT_TOPBAR_HEIGHT))
+            .h(px(layout.height_px))
             .w_full()
             .flex_shrink_0()
             .px(px(if is_closed { 8.0 } else { 12.0 }))
@@ -218,7 +248,7 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
             .flex()
             .items_center()
             .justify_center()
-            .child(panel_btn)
+            .when(layout.toggle_visible, |el| el.child(panel_btn))
             .into_any_element();
     }
 
@@ -228,10 +258,10 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
         .h(px(28.0))
         .flex_shrink_0()
         .rounded(px(6.0))
-        .when(can_go_back, |el| {
+        .when(layout.back_enabled, |el| {
             el.cursor_pointer().hover(move |s| s.bg(hover_bg))
         })
-        .when(!can_go_back, |el| el.opacity(0.4))
+        .opacity(layout.back_opacity)
         .flex()
         .items_center()
         .justify_center()
@@ -252,10 +282,10 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
         .h(px(28.0))
         .flex_shrink_0()
         .rounded(px(6.0))
-        .when(can_go_forward, |el| {
+        .when(layout.forward_enabled, |el| {
             el.cursor_pointer().hover(move |s| s.bg(hover_bg))
         })
-        .when(!can_go_forward, |el| el.opacity(0.4))
+        .opacity(layout.forward_opacity)
         .flex()
         .items_center()
         .justify_center()
@@ -270,13 +300,19 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
         )
         .child(openbot_vector_icon(OpenBotChromeIcon::ArrowRight, 15.0, icon_muted));
 
+    let pl_px = if cfg!(target_os = "macos") {
+        layout.mac_clearance_px
+    } else {
+        10.0
+    };
+
     div()
         .id("openbot-sidebar-topbar")
-        .h(px(OPENBOT_TOPBAR_HEIGHT))
+        .h(px(layout.height_px))
         .w_full()
         .flex_shrink_0()
         .pt(px(2.0))
-        .pl(px(10.0))
+        .pl(px(pl_px))
         .pr(px(3.0))
         .window_control_area(WindowControlArea::Drag)
         .flex()
@@ -285,8 +321,70 @@ pub fn render_openbot_sidebar_topbar<V: 'static>(
         .child(back_btn)
         .child(forward_btn)
         .child(div().flex_1().h_full())
-        .child(panel_btn)
+        .when(layout.toggle_visible, |el| el.child(panel_btn))
         .into_any_element()
+}
+
+/// Single-source-of-truth layout snapshot for `SidebarSearch` pill, inset funnel, and circular `+` button.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotSidebarSearchRowLayout {
+    pub height_px: f32,
+    pub radius_px: f32,
+    pub bg_hex: String,
+    pub funnel_size_px: f32,
+    pub filter_active: bool,
+    pub compact_search_visible: bool,
+    pub compact_search_size_px: f32,
+    pub filter_empty_visible: bool,
+    pub clear_filter_visible: bool,
+    pub add_button_size_px: f32,
+    pub add_button_bg_hex: String,
+    pub add_button_fg_hex: String,
+    pub add_menu_open: bool,
+    pub add_menu_items: [&'static str; 3],
+}
+
+pub fn compute_openbot_sidebar_search_row_layout(
+    is_compact: bool,
+    filter_active: bool,
+    filtered_count: usize,
+    is_new_menu_open: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+) -> OpenBotSidebarSearchRowLayout {
+    let ob = palette.openbot_palette();
+    let bg_hex = ob
+        .token("--openbot-bg-control")
+        .unwrap_or("#212121")
+        .to_string();
+    let add_button_bg_hex = ob
+        .token("--openbot-surface-light")
+        .unwrap_or("#f0f0f0")
+        .to_string();
+    let add_button_fg_hex = ob
+        .token("--openbot-text-on-light")
+        .unwrap_or("#141414")
+        .to_string();
+    OpenBotSidebarSearchRowLayout {
+        height_px: OPENBOT_SEARCH_HEIGHT,
+        radius_px: 9999.0,
+        bg_hex,
+        funnel_size_px: 28.0,
+        filter_active,
+        compact_search_visible: is_compact,
+        compact_search_size_px: OPENBOT_SEARCH_HEIGHT,
+        filter_empty_visible: filter_active && filtered_count == 0,
+        clear_filter_visible: filter_active,
+        add_button_size_px: 32.0,
+        add_button_bg_hex,
+        add_button_fg_hex,
+        add_menu_open: is_new_menu_open,
+        add_menu_items: [
+            tr_str(lang_id, "新建助手", "New Agent"),
+            tr_str(lang_id, "新建群聊", "New Group"),
+            tr_str(lang_id, "新建分组", "New Section"),
+        ],
+    }
 }
 
 /// Renders OpenBot's `SidebarSearch` pill trigger (`Q 搜索` -> `GlobalSearch`), inset `28x28`
@@ -302,6 +400,14 @@ pub fn render_openbot_sidebar_search_row<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let layout = compute_openbot_sidebar_search_row_layout(
+        false,
+        has_active_filter,
+        1,
+        is_new_menu_open,
+        palette,
+        lang_id,
+    );
     let ob = palette.openbot_palette();
     let pill_bg = ob.bg_control();
     let pill_hover = ob.bg_control_hover();
@@ -334,8 +440,8 @@ pub fn render_openbot_sidebar_search_row<V: 'static>(
                 .relative()
                 .flex_1()
                 .min_w(px(0.0))
-                .h(px(OPENBOT_SEARCH_HEIGHT))
-                .rounded_full()
+                .h(px(layout.height_px))
+                .rounded(px(layout.radius_px))
                 .bg(pill_bg)
                 .hover(move |s| s.bg(pill_hover))
                 .cursor_pointer()
@@ -368,11 +474,11 @@ pub fn render_openbot_sidebar_search_row<V: 'static>(
                         .absolute()
                         .right(px(2.0))
                         .top(px(2.0))
-                        .w(px(28.0))
-                        .h(px(28.0))
+                        .w(px(layout.funnel_size_px))
+                        .h(px(layout.funnel_size_px))
                         .rounded_full()
                         .cursor_pointer()
-                        .when(is_filter_open || has_active_filter, |el| el.bg(filter_active_bg))
+                        .when(is_filter_open || layout.filter_active, |el| el.bg(filter_active_bg))
                         .hover(move |s| s.bg(filter_hover_bg))
                         .flex()
                         .items_center()
@@ -387,9 +493,9 @@ pub fn render_openbot_sidebar_search_row<V: 'static>(
                         .child(openbot_vector_icon(
                             OpenBotChromeIcon::Filter,
                             13.5,
-                            if is_filter_open || has_active_filter { primary } else { muted },
+                            if is_filter_open || layout.filter_active { primary } else { muted },
                         ))
-                        .when(has_active_filter, |el| {
+                        .when(layout.filter_active, |el| {
                             el.child(
                                 div()
                                     .absolute()
@@ -406,12 +512,12 @@ pub fn render_openbot_sidebar_search_row<V: 'static>(
         .child(
             div()
                 .id("openbot-sidebar-plus-btn")
-                .w(px(32.0))
-                .h(px(32.0))
+                .w(px(layout.add_button_size_px))
+                .h(px(layout.add_button_size_px))
                 .flex_shrink_0()
                 .rounded_full()
                 .cursor_pointer()
-                .bg(if is_new_menu_open { plus_hover } else { plus_bg })
+                .bg(if layout.add_menu_open { plus_hover } else { plus_bg })
                 .hover(move |s| s.bg(plus_hover))
                 .flex()
                 .items_center()
@@ -436,6 +542,7 @@ pub fn render_openbot_new_menu_popover<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let layout = compute_openbot_sidebar_search_row_layout(false, false, 1, true, palette, lang_id);
     let ob = palette.openbot_palette();
     let surface = ob.bg_surface();
     let border = ob.border_strong_hairline();
@@ -444,23 +551,23 @@ pub fn render_openbot_new_menu_popover<V: 'static>(
     let icon_muted = ob.text_muted();
     let top_px = if external_topbar_hosted { 48.0 } else { 84.0 };
 
-    let entries: [(&'static str, IconName, &str, UnifiedSidebarAction); 3] = [
+    let entries: [(&'static str, IconName, &'static str, UnifiedSidebarAction); 3] = [
         (
             "openbot-new-menu-agent",
             IconName::BotRobot,
-            tr_str(lang_id, "新建助手", "New Agent"),
+            layout.add_menu_items[0],
             UnifiedSidebarAction::CreateNewAgent,
         ),
         (
             "openbot-new-menu-group",
             IconName::GroupUsers,
-            tr_str(lang_id, "新建群聊", "New Group"),
+            layout.add_menu_items[1],
             UnifiedSidebarAction::CreateNewGroup,
         ),
         (
             "openbot-new-menu-folder",
             IconName::FolderWork,
-            tr_str(lang_id, "新建分组", "New Section"),
+            layout.add_menu_items[2],
             UnifiedSidebarAction::CreateNewFolder,
         ),
     ];

@@ -2245,3 +2245,163 @@ For **N = 24** features (`F01`–`F24`), this suite targets **330 concrete opaqu
 2. **Zero Product Mocking**: `mock_servers.py` simulates **only** external third-party upstreams (remote MCP HTTP servers, external OAuth providers, outbound webhook receivers). All Orca routes, RPCs, CLI commands, Tool Relay security gates, SQLite schemas, and parsers are tested directly against the compiled product.
 3. **Traceable Markers**: Every Tier 1–4 test declares its tier (`@pytest.mark.tier1..4`), its feature(s) (`@pytest.mark.f01..24`), and (for upstream edge cases) `@pytest.mark.edge_case("SM1-XX" | "SM2-XX")`.
 4. **Hygiene & Teardown**: Every test cleans up child processes, sockets, and temp directories via RAII (`try/finally` + `TemporaryDirectory`), leaving `git status` clean and zero leaked processes. Any test invoking `cargo` runs `python3 scripts/clean_build_garbage.py` immediately afterward (`AGENTS.md`).
+
+---
+
+## 12. OpenBot 1:1 UI/UX Comprehensive Refactor — 4-Tier Opaque-Box E2E Test Infrastructure (`UI-F01`..`UI-F20`)
+
+- **Suite Location**:
+  - Phase A (pure Python 3.10+ stdlib, zero external packages): `scripts/run_openbot_uiux_e2e.py` + `tests/e2e_openbot_uiux/**` (`276` registered opaque-box tests).
+  - Phase B (pure deterministic Linux-headless Rust integration test & live probe emitter): `crates/gpui_telegram_desktop/tests/openbot_uiux_refactor_e2e.rs` (`29` pure `#[test]` functions, `0` ignored, ZERO `Application::headless().run(...)` calls — runs in `~5s` on headless Linux without display server).
+- **Authoritative Spec Anchors**:
+  - `.agents/teamwork/ORIGINAL_REQUEST.md` (`## Follow-up — 2026-11-27T08:37:18Z`: 1:1 OpenBot `383a35d2` UI/UX refactor, Bot Profile inside `打开 助手设置`, Group Chats aligned to OpenBot, other entries in `52px` left `PageRail`).
+  - `PROJECT.md` (`UI-F01`..`UI-F20` Feature Inventory, Interface Contracts §§1–4, Build Hygiene & Ledger Preservation Rules).
+  - Visual Ground Truth: `/home/antigravity/image.png` (Create-Agent Studio), `/home/antigravity/image_2.png` (Active Chat + Right `SidePanel` 4-Button Launcher), `/home/antigravity/image_3.png` (Current broken UI defects `D1`–`D12`).
+- **Append-Only Preservation Proof**:
+  - Bytes `0..224319` keep exact SHA-256 `543ac94ed88e4d1536f9e94a0e632463bb5de28300fb0f2c134196d7ccb370e9`.
+  - Bytes `0..152875` transitively keep exact SHA-256 `daa96e4165085964ccd552ca1d6213166e70d7a5bd43f4d3f37dc573711ce8ff` (preserving `scripts/run_openbot_e2e_suite.py --self-audit` zero-regression).
+
+### 12.1 Phase A / Phase B Execution Semantics & Zero-Cheat Fail-Closed Contract
+
+1. **Strict Zero-Cheat Fail-Closed Honesty**:
+   - Running `--tier`, `--feature`, `--filter`, or `--all` without a live runtime probe snapshot executes every selected test and fails closed with **exit code `1`** and explicit `AssertionError` diagnostics — **ZERO** skips, **ZERO** `xfail`, **ZERO** mock-pass fixtures, **ZERO** source-grep bypasses for `UI-F01`..`UI-F19`.
+   - In Phase B (`openbot_uiux_refactor_e2e.rs`), every emitted telemetry field is computed LIVE from real `gpui_telegram_desktop` / `openbot_contracts` / `gpui_telegram_proto` / `orca_core` APIs or physical workspace assets: **ZERO** hardcoded passing literals (`headless_gpui_render_ok`, `render_ok`, `.unwrap_or_else(|| json!(215))`, `selected_idx: 4`, `more_menu.open: true`), **ZERO** tautological `x = true; emit(!x)` echoes (`has_leading_app_sidebar`, `embedded_in_side_panel`), **ZERO** inline test-side oracle re-implementations (`overflow_pill_tone`, `220.0 > OPENBOT_HIDE_TIMESTAMP_WIDTH`, `.min(SIDEBAR_FOLDER_LEVELS - 1)` clamping), and `replay_deterministic` is computed strictly AFTER comparing two live payloads (`payload_a == payload_b`). Genuine `v2.0.0` bugs are emitted verbatim and unmeasured `Render`-only / `AppShell`-wired layout fields are omitted and cataloged under `unmeasured_render_only_gaps`.
+2. **Deterministic Phase B & Challenger Mutation Binding**:
+   - `UiUxRuntimeProbe` enforces strict envelope validation (`schema_version === 1` non-bool `int`, `suite == "openbot-uiux-refactor-v1"`, explicit required `panics === 0` non-bool `int`) directly inside `UiUxRuntimeProbe.resolve()` across all 3 priorities (so even disk-only tests fail with `probe_error` and exit `1` on a bad envelope), and resolves runtime telemetry in strict priority order:
+     1. `--probe-json <path>` or `OPENBOT_UIUX_PROBE_JSON` (JSON telemetry emitted by Phase B's binary or a Challenger mutation fixture; missing/empty/unreadable/malformed explicit path exits `2`).
+     2. `--probe-bin <path>` or `OPENBOT_UIUX_PROBE_BIN` (compiled Phase B `openbot_uiux_refactor_e2e` executed inside RAII `TempUiUxEnv` via `[bpath, "--exact", "emit_openbot_uiux_probe_json", "--nocapture", "--test-threads=1"]` with single fallback `[bpath]` if custom non-libtest executable rejects `--exact`, setting `OPENBOT_UIUX_EMIT_PROBE_JSON=<tmp>/probe_bin_out.json`, `GPUI_TELEGRAM_CONFIG_DIR=<tmp>/cfg`, `GPUI_OFFLINE_TEST=1`; catches `OSError`/`TimeoutExpired`/Rust panics `101,132,134,135,136,139`/`"panicked at"`/malformed JSON/bad envelope cleanly so `--json-out` is always written and runner exits `1`).
+     3. `--cli-bin <path>` or `GPUI_TELEGRAM_CLI_BIN` (invokes `openbot ui-probe --scenario openbot-uiux-live-shell --data-dir <tmp>/cli_data --json` with isolated `GPUI_TELEGRAM_CONFIG_DIR=<tmp>/cli_cfg` and `GPUI_OFFLINE_TEST=1`, automatically unwrapping `{"success": true, "data": {...}}` envelopes when present and catching execution/JSON/panic/envelope errors cleanly).
+     4. Unavailable -> fails closed (`AssertionError` on every `require_probe`/`probe_section`/`probe_scenario`/`probe_full` call -> exit `1`).
+   - `TempUiUxEnv.probe_scenario(scenario_id, section)` enforces strict section isolation (never bleeding sibling sections from `scenarios[scenario_id]` and rejecting non-dict overlays).
+3. **Closed-Form Upstream Oracles (`tests/e2e_openbot_uiux/oracles.py`)**:
+   - Every math/layout/color/text claim is cross-checked against pure-Python closed-form upstream `nightly-labs/openbot@383a35d2` oracles: OKLab `readableChatBackground` (dark `L <= 0.30, C <= 0.05`; light `L >= 0.95, C <= 0.02`, `[0,1]` sRGB clamp), WCAG `solidBubbleTakesDarkText` (`1.05 / (L + 0.05) < 3.0`), FNV-1a UTF-16 `bloubAvatarProfile` (`13` silhouettes, `goutte` remap, `18` colors), `256`-entry `plush_tint_ramp_lut`, `110/118px` sidebar hysteresis matching upstream `PanelResizer.tsx:L39-L42` (`< 110px` snaps compact `88px`; `< 118px` stays compact; `>= 118px` expands to `clamp(w, 128, 400)`), `SidePanel` `[360, 1600]` + `96px` conversation floor clamp, coupled `(visible_faces, overflow_count, overflow_pill_tone)` `ChannelAvatar` cluster `valid_tuples` conservation (`0, 1, 2, 3, 4, 5..12, 13+`), UTF-16 surrogate-safe `3000`-char preview truncation, upstream 12 camelCase `AppThemePalette` (`canvas..danger`, `name`, 6/8-digit hex), and upstream `validate_font_family` (`1..=128` trimmed, control-free, forbidding `"\;{}<>` while permitting `-apple-system` and CJK fonts).
+
+### 12.2 Runner CLI Contract (`scripts/run_openbot_uiux_e2e.py`), Exit Codes & JSON Output Schema
+
+- **Invocation Hygiene**: Always invoke with `PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/run_openbot_uiux_e2e.py ...` (`sys.dont_write_bytecode = True` is also enforced at module top so zero `__pycache__/` accumulates).
+- **CLI Flags**:
+  - `--self-audit` (7 strict AST/threshold/honesty gates `SA-1`..`SA-7`; optional `--self-audit-features UI-F01..UI-F10`).
+  - `--tier {1,2,3,4}` (repeatable & comma-separated, e.g. `--tier 1,2`).
+  - `--feature <UI-Fxx>` (repeatable, CSV, or ranges like `UI-F01..UI-F10`).
+  - `--filter <regex>` (case-insensitive regex across test ID, features, description, qualname).
+  - `--baseline` (read-only workspace baseline non-regression gate; optional `--strict-dist` requiring `dist/` binary staged; optional `--with-cargo` for Phase B/M6 serialized Cargo test execution under `flock /tmp/cargo_build.lock` + `clean_build_garbage.py`).
+  - `--all` (runs Tiers `1..4` + `--baseline`).
+  - `--probe-json <path>`, `--probe-bin <path>`, `--cli-bin <path>`.
+  - `--json-out <path>` (alias `--json-report <path>`), `-v` / `--verbose`.
+- **Exit Codes**:
+  - `0`: All requested gates (`--self-audit`, selected tests, and/or `--baseline`) passed cleanly.
+  - `1`: Any test failure (including honest Phase A fail-closed without runtime probe), `--self-audit` failure, or `--baseline` failure.
+  - `2`: Usage error (no action flag, invalid `--tier`, unknown `--feature`, invalid `--filter` regex, `0` matched tests, or explicit `--probe-json`/`--probe-bin`/`--cli-bin` missing/unreadable/malformed).
+- **JSON Report Schema**:
+  ```json
+  {
+    "ok": true,
+    "suite": "openbot-uiux-refactor-v1",
+    "schema_version": 1,
+    "timestamp": "2026-11-27T09:20:00Z",
+    "probe_source": "unavailable|probe_json:<path>|probe_bin:<path>|cli_bin:<path>",
+    "self_audit": { "passed": true, "gates": {"SA-1": true, "...": true}, "total_registered": 276, "tier_totals": {"1": 120, "2": 120, "3": 24, "4": 12}, "per_feature_counts": {}, "ast_audited_functions": 276, "errors": [] },
+    "e2e_execution": { "selected": 276, "passed": 0, "failed": 276, "probe_available": false, "results": [{"id": "...", "tier": 1, "features": ["UI-F01"], "status": "failed", "duration_sec": 0.001, "error": "..."}] },
+    "baseline": { "passed": true, "strict_dist": false, "dist_binary_staged": false, "steps": [] }
+  }
+  ```
+
+### 12.3 Unified Canonical Runtime UI Probe Telemetry Schema (`schema_version: 1`, `suite: "openbot-uiux-refactor-v1"`)
+
+Phase B's pure deterministic Linux-headless Rust E2E binary (`crates/gpui_telegram_desktop/tests/openbot_uiux_refactor_e2e.rs`, ZERO `Application::headless().run(...)` calls) invokes live `gpui_telegram_desktop`, `openbot_contracts`, `gpui_telegram_proto`, and `orca_core` APIs and emits a deterministic JSON telemetry object with:
+- **Header Metadata**: `"schema_version": 1`, `"suite": "openbot-uiux-refactor-v1"`, `"upstream_commit": "383a35d2"`, `"probe_kind": "pure_deterministic_rust_v2_0_0"`, `"panics": <live catch_unwind count>`, plus `"unmeasured_render_only_gaps"` cataloging all GPUI `Render`-only / `AppShell`-wired fields omitted in Phase B (`headless_gpui_render_ok`, `d2_duplicate_account_footer`, `total_account_footers_in_shell`, `has_duplicate_account_footer`, `context_inspector_live_reachable`/`mounted`, `overflow_pill_tone`, etc.) until M6 extracts pure layout helpers; `replay_deterministic` is computed strictly from live `payload_a == payload_b`.
+- **22 Canonical Top-Level Feature Namespaces**:
+  1. `tokens` (`UI-F01`): `scheme`, `appearance`, `fallback_applied`, `dark`, `light`, `tdesktop_sync`, `chat_color_presets` (11), `chat_bg_presets`, `oklab_samples`, `solid_bubble_samples`, `custom_palette`, `window_glass`, `font_validation`.
+  2. `plush` (`UI-F02`): `assets`, `default_bot_avatar`, `profile`, `supported_silhouettes` (13), `color_choices_count` (18), `tint_ramp`, `mood`, `activity`, `badges` (`working`/`unread`/`waiting`/`responded`/`error`), `runtime`.
+  3. `shell` (`UI-F03`): `window_width_px`, `window_height_px`, `platform`, `page_kind`, `outer_frame_bg_hex`, `canvas_card`, `top_strip_height_px`, `rail_visible`, `rail_width_px`, `server_rail`, `sidebar_visible`, `sidebar_width_px`, `conversation_min_width_px`, `conversation_rect`, `right_panel_count`, `window_glass_active`, `tab_shape_enabled`, `top_row_tabs_start_px`.
+  4. `page_rail` (`UI-F04`): `width_px` (`52`), `padding_top_px`, `padding_bottom_px`, `gap_px`, `button_size_px` (`36`), `button_radius_px` (`12`), `icon_size_px` (`20`), `icon_stroke_px` (`1.5`), `visible`, `top_items`, `pinned_items`, `more_menu`, `bottom_items`, `hidden_bottom_items`, `undo_toast_visible`, `persisted_pins`, `persisted_hidden`, `total_account_footers_in_shell` (`1`), `chats_unpinnable` (`false`).
+  5. `sidebar_chrome` (`UI-F05`): `width_px` (`280`), `default_width_px`, `compat_const_default_width_px` (`288`), `min_width_px` (`128`), `max_width_px` (`400`), `compact_width_px` (`88`), `collapse_threshold_px` (`110`), `expand_threshold_px` (`118`), `mode`, `persisted_width_px`, `topbar`, `search`, `add_button`.
+  6. `sidebar_list` (`UI-F06`): `tabs`, `pinned_grid`, `rows`, `group_order`, `folder_editor`, `empty_state`, `has_duplicate_account_footer` (`false`).
+  7. `global_search` (`UI-F07`): `open`, `width_px` (`640`), `top_px` (`112`), `bg_hex` (`#1e1e1e`), `ring_border`, `input_height_px` (`48`), `tabs` (6), `active_tab`, `row_height_px` (`36`), `section_header_height_px` (`28`), `results`, `highlighted_index`, `plush` (`56px`), `footer` (`36px`), `remote`, `blocked_by_active_dialog`.
+  8. `agent_studio` (`UI-F08`): `mode`, `form_width_px` (`420`), `canvas_bg_hex` (`#1a1a1a`), `header` (`38px`), `hero` (`72px`), `swatches` (`9x2 = 18`, `#42a0ff` ring), `shapes` (`12..13`), `fields`, `submit` (`#f0f0f0` CTA), `recommendations` (`>= 24` templates), `created_agent_id`, `navigated_to_chat`.
+  9. `conversation_header` (`UI-F09`): `height_px` (`38`), `position_mode` (`flex_flow`), `bg_strip_hex` (`#0d0d0d`), `header_rect`, `timeline_rect`, `overlaps_timeline` (`false`), `tab_shape`, `title_btn`, `new_thread_btn_visible`, `model_picker`, `pinned_popover`, `side_panel_toggle`, `shifted_start_px`, `wrapped_to_multiline`, `actions_clipped`, `isolation_lock_visible`.
+  10. `chat_stream` (`UI-F10`): `entry_gap_px`, `grouped_gap_px`, `bubbles`, `activity` (`32px` bubble-less shimmer), `steps` (collapsed `"Show error"` `<pre>`), `ui_block`, `empty_state`, `scroll_rail`, `chat_search` (`308x34px`), `direct_dm`, `row_boundary_caught_error`, `broken_image_fallback_visible`.
+  11. `channel_stage` (`UI-F11`): `channel_id`, `archived`, `read_only`, `avatar`, `author_gutter_px` (`36`), `author_avatar_px` (`32`), `show_author`, `bubble_style`, `author_avatar_clickable`, `author_name_clickable`, `author_name_color`, `reply_quote`, `action_markers`, `activity_indicator`, `create_dialog` (`440px`), `reactions_enabled`, `mark_unread_enabled`, `thread_branch_enabled`, `composer_hidden`, `sidebar_drag_disabled`, `context_menu_items`, `deleted_author_label`.
+  12. `composer` (`UI-F12`): `visible`, `compact`, `height_px` (`48`), `min_height_px`, `border_radius_px` (`24`/`14`), `surface_hex` (`#212121`), `placeholder`, `add_btn_px` (`28`), `add_trigger_disabled`, `add_menu_open`, `add_menu_items`, `leading_or_trailing_separator`, `action_circle_px` (`28`), `action_circle_bg_hex` (`#f0f0f0`), `action_circle_kind`, `dictation_active`, `dictation_width_px`, `dictation_bars`, `ime_composing`, `draft_text`, `sent_count`, `pasted_as_file`, `pasted_file_name`, `inline_text_length`, `attachments_count`, `attachment_accepted`, `image_model_warning`, `image_inputs_enabled`, `legacy_chip_strip_present`, `detached_slash_present`, `legacy_aa_emoji_row_present`, `focus_border_is_telegram_blue`, `send_btn_is_telegram_blue`.
+  13. `mention_picker` (`UI-F13`): `open`, `trigger`, `bg_hex` (`#121212`), `border_hex` (`#222222`), `radius_px` (`14`), `row_height_px` (`29`), `max_visible_rows` (`7`), `visible_rows`, `scroll_enabled`, `fade_top`, `fade_bottom`, `sections`, `everyone_shown`, `messages_debounce_ms` (`150`), `messages_min_query` (`3`), `thread_search_rows` (`5`), `skill_problems`, `results`, `highlighted_index`, `inserted_chips`, `rendered_chips`.
+  14. `composer_stack` (`UI-F14`): `visible`, `height_px` (`0` when idle), `radius_px` (`14`), `overlap_bottom_px` (`24`), `surface_hex`, `z_index` (`9`), `composer_z_index` (`11`), `queue`, `reply_preview`, `awaiting_replies`, `stopped_tasks`, `open_waits_count`, `notice`.
+  15. `side_panel` (`UI-F15`): `open`, `active_right_drawer_count` (`<= 1`), `legacy_standalone_inspector_mounted` (`false`), `competing_companion_panel_mounted` (`false`), `width_px` (`360`), `persisted_width_px`, `min_width_px` (`360`), `max_width_px` (`1600`), `conversation_min_px` (`96`), `conversation_width_px`, `header_height_px` (`38`), `maximized`, `effective_width_pct`, `launcher_visible`, `launcher_max_width_px`, `launcher_button_height_px`, `launcher_button_bg_hex`, `launcher_buttons`, `open_tabs`, `selected_tab`, `add_pane_menu_items`, `active_splits`, `max_splits` (`2`), `main_group_height_px`, `lower_split_height_px`, `split_share`, `split_accepted`, `overflow_chevron_visible`, `hidden_tabs_count`, `combined_actions_menu`, `unavailable_tab_flagged`, `side_question_turns`, `side_question_max_turns` (`20`), `main_msg_delta`, `side_question_draft_restored`.
+  16. `agent_settings_profile` (`UI-F16`): `mounted`, `host` (`side_panel_assistant_settings`), `avatar_px` (`62`), `avatar_popover_open`, `avatar_popover_width_px` (`284`), `avatar_shapes_count` (`13`), `avatar_eyes_count` (`16`), `avatar_colors_count` (`18`), `agent_id`, `name`, `title`, `handle`, `handle_copied`, `online`, `bio`, `autosave_debounce_ms` (`400`), `dirty_flushed_to_agent_id`, `other_agent_name`, `save_error_visible`, `rolled_back_name`, `avatar_upload_error_toast`, `avatar_unchanged`, `inset_card_style`, `groups_present`, `profile_fields`, `creations_counts`, `remote_computer_label`, `permission_level`, `permission_unchanged`, `new_chat_busy_toast`, `chat_reset`, `delete_history_disabled`, `context_inspector_live_reachable`, `active_subpage`.
+  17. `channel_settings` (`UI-F17`): `mounted`, `picture_trigger_px` (`62`), `picture_popover_width_px` (`284`), `icon_catalog_count` (`>= 20`), `canonical_icons_present`, `color_palette_count` (`>= 10`), `resolved_icon`, `resolved_hue`, `reset_visible`, `name`, `title`, `instructions`, `instructions_invalid`, `save_blocked`, `dirty_isolated_on_switch`, `serialized_save_order`, `browser_access`, `isolated`, `lead_agent_id`, `members`, `member_add_accepted`, `member_drag_reorder_supported` (`false`), `context_actions_visible`, `compact_disabled`, `read_only`, `subpages_present`, `subpage_counts`.
+  18. `contact_profile` (`UI-F17`): `mounted`, `host` (`side_panel_contact_profile`), `handle`, `online`, `online_dot_hex`, `bio`, `shared_media_visible`, `notifications_enabled`, `destructive_confirm_gated`.
+  19. `content_hub_pages` (`UI-F18`): `active_page`, `mounted_inside_inset_card`, `page_header_height_px` (`38`), `left_nav_width_px` (`280`), `content_max_width_px` (`880`), `canvas_hex`, `card_surface_hex` (`#212121`), `hairline_hex` (`#262626`), `primary_cta_bg_hex` (`#f0f0f0`), `primary_cta_fg_hex` (`#141414`), `legacy_blue_pill_count` (`0`), `horizontal_overflow_px` (`0`), `content_width_px`, `no_match_plush_asset`, `nav_depth`, `reader_page_index`, `music_playing`, `music_track_id`, `music_position_sec`, `game_runtime_active`, `game_score`, `publish_modal_open`, `publish_status`, `publish_submitted`, `publish_error_visible`, `community_interactions_ok`, `error_toast_visible`, `runtime_crashed`.
+  20. `settings_and_overlays` (`UI-F19`): `settings_page`, `confirm_dialog`, `action_menu`, `tooltip`, `toaster`, `main_menu_drawer`, `shortcuts`.
+  21. `compat_and_ledger` (`UI-F20`): `preserved_consts`, `allow_dead_code_count`, `plush_asset_count`, `ledger_targets_verified`, `ledger_closure_pass`, `context_inspector_capability_verified`, `headless_gpui_render_ok` *(omitted in Phase B pure-Rust probe while zero GPUI renders execute; required in M6)*, `replay_deterministic` *(computed dynamically after `payload_a == payload_b`)*.
+  22. `defects_audit` (`D1`–`D12` zero-regression audit): `d1_wide_apple_sidebar`..`d12_legacy_group_stage` (all strictly `false`).
+- **Per-Scenario Overlay Lookup (`scenarios["<scenario_id>"]`)**:
+  - `env.probe_scenario(scenario_id, section)` deep-merges `probe["scenarios"][scenario_id][section]` onto base `probe[section]` ONLY when keys exist in the telemetry snapshot (NEVER fabricating missing fields or passing defaults).
+
+### 12.4 7-Gate AST & Anti-Cheat `--self-audit` Specification (`SA-1`..`SA-7`)
+
+| Gate | Name | Enforcement Rule |
+|---|---|---|
+| **SA-1** | Syntax, Import & `TEST_INFRA.md` Append-Only Prefix | `py_compile` into RAII temp dir for runner + all `tests/e2e_openbot_uiux/*.py`; dynamic import of all `tier*.py`; verify `len(TEST_INFRA.md) > 224319`, `sha256(TEST_INFRA.md[:224319]) == 543ac94ed88e4d1536f9e94a0e632463bb5de28300fb0f2c134196d7ccb370e9`, `sha256(TEST_INFRA.md[:152875]) == daa96e4165085964ccd552ca1d6213166e70d7a5bd43f4d3f37dc573711ce8ff`, and appended tail matches `^## 12\.\s+OpenBot 1:1 UI/UX`. |
+| **SA-2** | Quantitative Tier & Feature Thresholds | Full mode enforces `Tier 1 >= 100` (`>= 5`/feature), `Tier 2 >= 100` (`>= 5`/feature), `Tier 3 >= 20` (`>= 2` distinct features/test), `Tier 4 >= 10`, total `>= 230` (registered target: `276` = `120 + 120 + 24 + 12`). |
+| **SA-3** | Unique IDs, Valid Metadata & Zero Skips | Unique `^TEST-UIUX-T[1-4]-` IDs, valid `tier in {1,2,3,4}`, valid `UI-F01`..`UI-F20` subset, `len(description) >= 10`; AST rejects unregistered `def test_*`, any `async def`, class-scoped `test_*`/`@uiux_e2e_test`, uncalled `raise SkipTest`/`unittest.SkipTest`, and any `skip`/`xfail`/`SkipTest`/`skipIf`/`skipUnless` calls or decorators. |
+| **SA-4** | AST Anti-Cheat (Assertions, Tautologies, Silent `except`) | Depth `<= 3` intra-module AST walk per `@uiux_e2e_test`: non-empty body, `>= 2` real non-trivial asserts/verifiers, recursive static-constant evaluator rejecting constant/container/chained-compare/bool-short-circuit/pure-builtin tautologies (`len([]) == 0`, `x or True`, `[x]`, `1 + 1 == 2`, `x == x`), and strict rejection of ANY broad `except`/`Exception`/`BaseException`/`AssertionError` handler lacking a `raise`. |
+| **SA-5** | Boundary Reachability & Zero Mock-Pass Fixtures | Depth `<= 3` call graph proves every test invokes a real opaque-box harness API (`UI-F01`..`UI-F19` MUST reach live runtime probe APIs — never source-grep alone); zero forbidden mock-pass symbols across runner/tests; zero hardcoded `/tmp` literals outside `harness.py`/runner. |
+| **SA-6** | Full 20-Feature Cross-Tier Representation Matrix | Every `UI-F01`..`UI-F20` appears across ALL 4 tiers (`tier1 >= 5`, `tier2 >= 5`, `tier3 >= 1`, `tier4 >= 1`; registered Tier 3 guarantees `>= 2` per feature). |
+| **SA-7** | Runner CLI Contract & Honesty Gate | AST confirms all required CLI flags and non-bool integer return exit codes `0`/`1`/`2`; rejects empty/comma-only `--tier`/`--feature`/`--self-audit-features`/`--filter` with exit `2`; while `crates/gpui_telegram_desktop/tests/openbot_uiux_refactor_e2e.rs` does not yet exist on disk, `TEST_READY.md` MUST NOT match `OPENBOT_UIUX_REFACTOR_E2E\s*[:=]\s*READY`. |
+
+### 12.5 `--baseline` Non-Regression Gate
+
+Strictly read-only in default mode (zero `cargo`/`rustc` invocations unless `--with-cargo` is explicitly supplied in Phase B/M6):
+1. **`cargo_toml_lean_profiles`**: Verifies root `Cargo.toml` enforces `debug = 0`, `strip = "debuginfo"`, `incremental = false` across `[profile.dev]`, `[profile.test]`, `[profile.ci]`, `[profile.release]` and zero sibling `.cargo-target-*` directories.
+2. **`openbot_plush_assets_73_webp`**: Verifies `crates/gpui_telegram_desktop/assets/openbot_plush/` holds exact `73` `.webp` files (`RIFF....WEBP` magic, non-zero size) + `1` `.webm` (`ui/fishing.webm`, `\x1a\x45\xdf\xa3` EBML magic) = `74` assets total.
+3. **`capability_coverage_integrity`**: Verifies `docs/verification/fusion-20261108/capability-coverage.json` (`schema_version == 2`, `58` capabilities, `127/127` `verified_entrypoints` physically present including `ContextInspector`, `18/18` UI evidence artifacts valid = `17` PNGs + `1` non-PNG artifact).
+4. **`preserved_pub_const_compat`**: Verifies backward-compatible symbols (`nav_rail::NAV_RAIL_WIDTH = 52.0`, `chat_sidebar::{DEFAULT_WIDTH = 288.0, COLLAPSED_WIDTH = 64.0, ROW_HEIGHT = 62.0}`, `context_inspector::DRAWER_WIDTH = 320.0`, `history_element::{MSG_MIN_WIDTH = 160.0, MSG_MAX_WIDTH = 430.0}`, `miniapp_contracts::default_fabushi_avatar_shape`).
+5. **`ledger_closure_gate`**: Runs `python3 -B scripts/verify_ledger_closure.py --ci-without-upstream --skip-cargo`, positively asserting ALL `14` core PASS markers (`PASS [Gate 1..5]:`, `[PASS] Gate 6.1..6.6`), zero unexpected core `[FAIL]` lines, and when `dist/` is unstaged in non-strict mode, verifying Gate `6.7` printed violations are solely the unstaged `dist/` binary AND reported count equals exact `2 * accepted_capabilities_count` (`96`). When `dist/GPUI Telegram.app/Contents/MacOS/gpui_telegram_desktop` is staged or `--strict-dist` is passed, exit code `0` plus `[PASS] Gate 6.7` and `PASS [Gate 6]:` are mandatory.
+6. **Optional `--with-cargo` (Phase B / M6 only)**: Detects whether `/tmp/cargo_build.lock` is already held (`OPENBOT_CARGO_LOCK_HELD=1` or matching `(st_dev, st_ino)` in `/proc/self/fd`) to avoid self-deadlock when invoked under an outer `flock /tmp/cargo_build.lock`, runs `CARGO_BUILD_JOBS=2 cargo test` targeting `openbot_uiux_refactor_e2e` (when present) with `-- --test-threads=2`, and executes `python3 -B scripts/clean_build_garbage.py` in `finally:`.
+
+### 12.6 Complete `UI-F01`..`UI-F20` 4-Tier Coverage Matrix (`276` Registered Tests) & `D1`–`D12` Defect Closure
+
+| Feature | Scope | T1 | T2 | T3 | T4 | Defects Closed |
+|---|---|---:|---:|---:|---:|---|
+| `UI-F01` | OpenBot `383a35d2` Dark/Light Tokens & OKLab Chat Colors | 6 | 6 | 2 | 3 | D5, D8, D10 |
+| `UI-F02` | 3D Felt `PlushBot` Default Avatars & Felt Status Badges | 6 | 6 | 2 | 3 | D7 |
+| `UI-F03` | OpenBot Inset Edge-Framed Root Shell (`#0d0d0d` + `14px` `#1a1a1a`) | 6 | 6 | 2 | 3 | D1 |
+| `UI-F04` | Unified `52px` Left Icon `PageRail` + `...` `RailMoreMenu` | 6 | 6 | 3 | 2 | D1, D2 |
+| `UI-F05` | OpenBot `SidebarTopbar`, Pill Search + Filter Funnel + White `+` | 6 | 6 | 3 | 3 | D5 |
+| `UI-F06` | Underline `SidebarTabs`, Compact Pinned Grid & Clean `62px` Rows | 6 | 6 | 3 | 3 | D2, D4, D5, D6 |
+| `UI-F07` | OpenBot `GlobalSearch` (`Cmd+K`) & `GlobalSearchPlush` | 6 | 6 | 2 | 1 | — |
+| `UI-F08` | OpenBot `FirstAgentSetup` Create-Agent Studio (`image.png`) | 6 | 6 | 2 | 1 | D7 |
+| `UI-F09` | Non-Overlapping `38px` `ConversationHeader` & Curved `TabShape` | 6 | 6 | 3 | 4 | D3 |
+| `UI-F10` | 1:1 Chat Stream, Neutral Bubbles, `AgentActivity` & `AgentSteps` | 6 | 6 | 3 | 4 | D8 |
+| `UI-F11` | Group Chat (`Channel`) Stage — `ChannelAvatar`, Gutter, Routing | 6 | 6 | 3 | 2 | D12 |
+| `UI-F12` | Sleek `48px` Morphing Pill Composer & `+` `ComposerAddMenu` | 6 | 6 | 3 | 2 | D9, D10 |
+| `UI-F13` | `@mention` / `@everyone` / `$` Skill Picker & `ReferenceChip` | 6 | 6 | 2 | 2 | D12 |
+| `UI-F14` | Tucked `.composer-stack` (`Queue`, `Reply`, `Awaiting`, `Stopped`) | 6 | 6 | 3 | 2 | D9, D12 |
+| `UI-F15` | Unified Dockable Right `SidePanel` & 4-Button `SidePanelLauncher` | 6 | 6 | 4 | 5 | D11 |
+| `UI-F16` | Bot Profile (`bot的资料页`) Inside `打开 助手设置` (`AgentSettingsPanel`) | 6 | 6 | 3 | 3 | D11 |
+| `UI-F17` | Group Settings (`ChannelSettingsPane`) & Human `ContactProfile` | 6 | 6 | 2 | 2 | D11, D12 |
+| `UI-F18` | OpenBot Visual Alignment of Secondary Hubs (`图书`/`音乐`/`游戏`/`App Store`/`云端创作`/`社区`) | 6 | 6 | 2 | 2 | D5 |
+| `UI-F19` | 2-Column `SettingsPage`, `ConfirmDialog`, Menus, Tooltips, Shortcuts | 6 | 6 | 2 | 4 | — |
+| `UI-F20` | Test Alignment, Headless GPUI E2E, Compat Consts & Ledger Closure | 6 | 6 | 2 | 1 | D1–D12 |
+| **TOTAL** | **Unique Registered Tests across `tests/e2e_openbot_uiux/tier*.py`** | **120** | **120** | **24** | **12** | **`276` Total (`D1`–`D12`)** |
+
+**`D1`–`D12` Defect Closure Table (`/home/antigravity/image_3.png` -> `image.png` / `image_2.png`)**:
+- **D1** (`204px` wide AppleSidebar) -> `52px` icon-only `PageRail` (`UI-F03`, `UI-F04`, `J01/J08/J09/J12`).
+- **D2** (Duplicate bottom account/settings footers) -> Single `24px` account plush tile in `PageRail`, `0` in `ChatSidebar` (`UI-F04`, `UI-F06`, `J01/J08/J12`).
+- **D3** (Translucent `.absolute().top_0()` header overlapping scrolling text) -> Solid `38px` flex-flow `ConversationHeader` (`UI-F09`, `J02/J07/J12`).
+- **D4** (Oversized unframed pink pinned circles) -> Compact `72x102px` 3-col pinned grid only when pinned (`UI-F06`, `J01/J09/J12`).
+- **D5** (Blue pill folder tabs & missing white `+`) -> Flat `32px` underline `SidebarTabs` + `32x32` `#f0f0f0` `+` circle (`UI-F01`, `UI-F05`, `UI-F06`, `UI-F18`, `J01/J08/J09/J10/J12`).
+- **D6** (Hard-clipped CJK preview & missing timestamp) -> `min_w_0` + `whitespace_nowrap` + ellipsis + right timestamp (`UI-F06`, `J09/J12`).
+- **D7** (Flat 2D GrokBot blobs) -> 3D fuzzy `PlushFeltRenderer` default (`UI-F02`, `UI-F08`, `J01/J12`).
+- **D8** (`#007AFF` blue outgoing bubble + raw JSON tool error wall + always-visible time) -> Neutral `#242424`/`#212121` bubbles + hover-only actions/timestamps + collapsed `AgentSteps` `"Show error"` `<pre>` (`UI-F01`, `UI-F10`, `J02/J10/J12`).
+- **D9** (2-row wrapped chip strip above composer) -> Deleted; `0px` idle tucked `.composer-stack` (`UI-F12`, `UI-F14`, `J02/J06/J12`).
+- **D10** (Telegram blue-bordered composer + detached `/`) -> `48px` `#212121` morphing pill (`+` / mic / `#f0f0f0` circle) (`UI-F01`, `UI-F12`, `J02/J06/J10/J12`).
+- **D11** (Double competing right drawers) -> Single unified `360px` right `SidePanel` hosting 4-button launcher + full Bot Profile inside `打开 助手设置` + live `ContextInspector` (`UI-F15`, `UI-F16`, `UI-F17`, `J03/J05/J07/J11/J12`).
+- **D12** (Legacy Telegram group chats) -> OpenBot `ChannelAvatar` cluster/row, `36px` author gutter, `ChatActionMarker`, `ChannelActivityIndicator`, `AwaitingReplies`, `ChannelStoppedTasks`, `ChannelSettingsPane` (`UI-F11`, `UI-F13`, `UI-F14`, `UI-F17`, `J04/J05/J12`).
+
+### 12.7 Phase B `TEST_READY.md` Publication & Honest M6 Gate Tracking
+
+`OPENBOT_UIUX_REFACTOR_E2E: READY` is published in `TEST_READY.md` (strictly appended after byte `29143`) now that Phase B's pure deterministic Rust integration harness (`crates/gpui_telegram_desktop/tests/openbot_uiux_refactor_e2e.rs`, `29` `#[test]` functions) compiles with `0` warnings, executes on headless Linux in `~5s` (`0` ignored, `0` `Application::headless().run` calls), emits verified `schema_version: 1` live `v2.0.0` probe JSON via `--exact emit_openbot_uiux_probe_json`, and drives `scripts/run_openbot_uiux_e2e.py --probe-bin "$PROBE_BIN"` end-to-end (locating `$PROBE_BIN` via `cargo test --no-run --message-format=json`, supporting both Cargo 1.100+ `target/debug/build/gpui_telegram_desktop/<hash>/out/openbot_uiux_refactor_e2e-*` and `target/debug/deps/`):
+1. **Harness & Baseline Certification**: `--self-audit` `7/7` PASS (`276` tests), prior `run_openbot_e2e_suite.py --self-audit` PASS (`276` tests), `--baseline` `5/5` PASS, `emit_openbot_uiux_probe_json` PASS (`exit 0`, byte-identical `77,354`-byte deterministic replay).
+2. **Zero-Fabrication Live `v2.0.0` Product Baseline (Pre-M6)**:
+   - Pure Rust E2E suite (`openbot_uiux_refactor_e2e`): **`21/29` PASS, `8/29` FAIL** (all `8` failures are verified `v2.0.0` defect regressions `C3`, `C5`, `C7`, `C8`-non-finite, `C9`, `C10`, `C11`, `C13/F12/F13` surfaced for Milestone `M6`; bogus `C4` and `C8-118` removed after upstream `383a35d2` verification).
+   - Live Python `--probe-bin` execution (`276` tests): **`48/276` PASS, `228/276` FAIL** (`T1: 22/120`, `T2: 26/120`, `T3: 0/24`, `T4: 0/12`, `0` Rust panics) — every failure traces transparently to genuine `v2.0.0` product defects or unextracted GPUI `Render`-only / `AppShell`-wired helpers (`21` `unmeasured_render_only_gaps`). Milestone `M6` closes these gaps until **`29/29` Rust PASS** and **`276/276` Python `--probe-bin` PASS** (`exit 0`).

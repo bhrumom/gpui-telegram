@@ -1358,6 +1358,7 @@ impl ChatSidebar {
         self.forum_topics.remove(&id);
         self.bot_grok_avatars.remove(&id);
         self.bot_fabushi_visuals.remove(&id);
+        self.group_member_briefs.remove(&id);
         if self.active_chat_id == Some(id) {
             self.clear_selection();
         } else if let Some(sel) = self.active_chat_id {
@@ -1370,9 +1371,14 @@ impl ChatSidebar {
     pub fn apply_context_action_local(&mut self, action: SidebarContextAction) {
         match action {
             SidebarContextAction::TogglePin(id) => self.toggle_pin_dialog(id),
+            SidebarContextAction::MoveToFolder(_) => {
+                self.pending_open_new_folder = true;
+            }
+            SidebarContextAction::ToggleHide(id) => self.toggle_archive_dialog(id),
             SidebarContextAction::ToggleMute(id) => self.toggle_mute_dialog(id),
             SidebarContextAction::ToggleArchive(id) => self.toggle_archive_dialog(id),
             SidebarContextAction::ToggleUnread(id) => self.toggle_unread_mark(id),
+            SidebarContextAction::OpenSettings(_) => {}
             SidebarContextAction::ClearHistory(id) => self.clear_history(id),
             SidebarContextAction::DeleteChat(id) => self.delete_dialog(id),
         }
@@ -1440,7 +1446,11 @@ impl ChatSidebar {
             is_premium: self.premium_ids.contains(&item.id),
             is_bot,
             is_group,
-            group_member_briefs: Vec::new(),
+            group_member_briefs: self
+                .group_member_briefs
+                .get(&item.id)
+                .cloned()
+                .unwrap_or_default(),
             fabushi_shape: fabushi_vis.as_ref().map(|(s, _)| s.clone()),
             fabushi_color: fabushi_vis.as_ref().map(|(_, c)| *c),
             grok_avatar,
@@ -1585,12 +1595,7 @@ impl ChatSidebar {
                 cx.notify();
             }
             UnifiedSidebarAction::OpenGlobalSearch => {
-                self.close_openbot_popovers();
-                if self.has_leading_app_sidebar && self.palette.is_apple_style() {
-                    self.pending_open_global_search = true;
-                } else {
-                    self.focus_search();
-                }
+                self.trigger_openbot_search_pill();
                 cx.notify();
             }
             UnifiedSidebarAction::ToggleFilterMenu => {
@@ -1600,20 +1605,15 @@ impl ChatSidebar {
                 cx.notify();
             }
             UnifiedSidebarAction::ToggleNewMenu => {
-                let next = !self.is_new_menu_open;
-                self.close_openbot_popovers();
-                self.is_new_menu_open = next;
+                self.toggle_new_menu();
                 cx.notify();
             }
             UnifiedSidebarAction::ToggleTabsEditMenu => {
-                let next = !self.is_tabs_edit_menu_open;
-                self.close_openbot_popovers();
-                self.is_tabs_edit_menu_open = next;
+                self.toggle_tabs_edit_menu();
                 cx.notify();
             }
             UnifiedSidebarAction::CreateNewAgent => {
-                self.close_openbot_popovers();
-                self.pending_open_create_agent_studio = true;
+                self.request_create_new_agent_from_plus_menu();
                 cx.notify();
             }
             UnifiedSidebarAction::CreateNewGroup => {

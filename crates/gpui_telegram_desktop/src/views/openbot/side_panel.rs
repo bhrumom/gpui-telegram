@@ -608,11 +608,22 @@ impl SidePanelState {
 
     /// Resizes width within `[360, 1600]` while keeping at least `CONVERSATION_PANEL_MIN = 96px`.
     pub fn resize_width(&mut self, requested_px: f32, viewport_width_px: Option<f32>) -> f32 {
-        let max_by_viewport = viewport_width_px
-            .map(|vw| (vw - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT))
-            .unwrap_or(SETTINGS_PANEL_MAX);
+        let max_by_viewport = match viewport_width_px {
+            Some(vw) if vw.is_finite() && vw > 0.0 => {
+                (vw - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT)
+            }
+            Some(_) => SETTINGS_PANEL_DEFAULT,
+            None => SETTINGS_PANEL_MAX,
+        };
         let upper = SETTINGS_PANEL_MAX.min(max_by_viewport);
-        self.width_px = requested_px.clamp(SETTINGS_PANEL_DEFAULT, upper);
+        let candidate = if requested_px.is_finite() {
+            requested_px
+        } else if self.width_px.is_finite() {
+            self.width_px
+        } else {
+            SETTINGS_PANEL_DEFAULT
+        };
+        self.width_px = candidate.clamp(SETTINGS_PANEL_DEFAULT, upper);
         self.width_px
     }
 
@@ -622,6 +633,14 @@ impl SidePanelState {
         share: f64,
         panel_height_px: Option<f32>,
     ) -> Result<f64, String> {
+        if !share.is_finite() {
+            return Err("Split share must be a finite number.".to_string());
+        }
+        if let Some(total_h) = panel_height_px {
+            if !total_h.is_finite() || total_h <= 0.0 {
+                return Err("Panel height must be finite and greater than zero.".to_string());
+            }
+        }
         let lower_height_px = panel_height_px.map(|h| (h as f64 * share).floor().max(0.0) as u32);
         validate_split_config(&self.active_splits, share, lower_height_px)?;
         if let Some(total_h) = panel_height_px {
@@ -1642,11 +1661,19 @@ mod tests {
         assert_eq!(st.resize_width(200.0, Some(1200.0)), SETTINGS_PANEL_DEFAULT);
         assert_eq!(st.resize_width(2400.0, Some(1200.0)), 1200.0 - CONVERSATION_PANEL_MIN);
         assert_eq!(st.resize_width(2400.0, Some(3000.0)), SETTINGS_PANEL_MAX);
+        assert_eq!(st.resize_width(f32::NAN, Some(3000.0)), SETTINGS_PANEL_MAX);
+        assert_eq!(st.resize_width(f32::INFINITY, Some(1200.0)), 1200.0 - CONVERSATION_PANEL_MIN);
+        assert_eq!(st.resize_width(600.0, Some(f32::NAN)), SETTINGS_PANEL_DEFAULT);
+        assert_eq!(st.resize_width(600.0, Some(-10.0)), SETTINGS_PANEL_DEFAULT);
 
         assert!(st.split_down(SidePanelPaneKind::Files).is_ok());
         assert_eq!(st.active_splits.len(), MAX_SIDE_SPLITS);
         assert!(st.split_down(SidePanelPaneKind::Browser).is_err());
         assert!(st.set_split_share(0.1, Some(500.0)).is_err());
+        assert!(st.set_split_share(f64::NAN, Some(500.0)).is_err());
+        assert!(st.set_split_share(0.4, Some(f32::NAN)).is_err());
+        assert!(st.set_split_share(0.4, Some(f32::INFINITY)).is_err());
+        assert!(st.set_split_share(0.4, Some(0.0)).is_err());
         assert!(st.set_split_share(0.4, Some(500.0)).is_ok());
 
         assert!(st.close_pane_keep_launcher(SidePanelPaneKind::Files));

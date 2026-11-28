@@ -9,7 +9,8 @@ use crate::views::chat_sidebar::{
     AddContactKind, DialogItemModel, SEARCH_HEADER_HEIGHT, SEARCH_HEIGHT, SEARCH_RADIUS,
 };
 use crate::views::sidebar::dialogs_row_view::{
-    render_openbot_dialog_avatar_with_badge, SidebarDialogMeta,
+    render_openbot_dialog_avatar_with_badge, resolve_dialog_felt_badge_state,
+    resolve_dialog_preview_priority, SidebarDialogMeta,
 };
 use crate::views::sidebar::ui::dialogs_stories_list::DialogsStoriesListUi;
 use crate::views::sidebar::ui::dialogs_suggestions::DialogsSuggestionsUi;
@@ -377,6 +378,85 @@ pub fn render_pinned_chats_grid<V: 'static>(
     )
 }
 
+/// Single-source-of-truth layout snapshot for OpenBot's compact `3-col 72x102px` pinned grid (D4 fix).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenBotPinnedGridLayout {
+    pub visible: bool,
+    pub legacy_oversized_circles: bool,
+    pub is_compact_grid: bool,
+    pub columns: usize,
+    pub max_width_px: f32,
+    pub tile_w_px: f32,
+    pub tile_h_px: f32,
+    pub avatar_px: f32,
+    pub gap_px: f32,
+}
+
+pub fn compute_openbot_pinned_grid_layout(
+    pinned_count: usize,
+    is_compact: bool,
+    palette: &TdesktopThemePalette,
+) -> OpenBotPinnedGridLayout {
+    let visible = pinned_count > 0;
+    let is_apple = palette.is_apple_style();
+    let (columns, max_width_px, tile_w_px, tile_h_px, avatar_px, gap_px) = if is_compact {
+        (1, 64.0, 60.0, 60.0, palette.scaled_px(48.0), 4.0)
+    } else {
+        (3, 236.0, 72.0, 102.0, palette.scaled_px(56.0), 8.0)
+    };
+    OpenBotPinnedGridLayout {
+        visible,
+        legacy_oversized_circles: !is_apple || avatar_px > 56.0,
+        is_compact_grid: is_apple && tile_w_px <= 72.0 && tile_h_px <= 102.0,
+        columns,
+        max_width_px,
+        tile_w_px,
+        tile_h_px,
+        avatar_px,
+        gap_px,
+    }
+}
+
+/// Single-source-of-truth layout snapshot for the empty sidebar workspace CTA (`UI-F06-04`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidebarEmptyStateLayout {
+    pub visible: bool,
+    pub title: &'static str,
+    pub subtitle: &'static str,
+    pub cta_label: &'static str,
+}
+
+pub fn compute_sidebar_empty_state_layout(
+    row_count: usize,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+) -> SidebarEmptyStateLayout {
+    let visible = row_count == 0;
+    if palette.is_apple_style() {
+        SidebarEmptyStateLayout {
+            visible,
+            title: tr_str(lang_id, "暂无助手或对话", "No agents or chats yet"),
+            subtitle: tr_str(
+                lang_id,
+                "创建你的第一个 AI 助手开始工作区对话",
+                "Create your first AI agent to start chatting",
+            ),
+            cta_label: tr_str(lang_id, "创建第一个助手", "Create First Agent"),
+        }
+    } else {
+        SidebarEmptyStateLayout {
+            visible,
+            title: tr_str(lang_id, "暂无对话", "No chats yet"),
+            subtitle: tr_str(
+                lang_id,
+                "点击右上角图标添加联系人或创建群组",
+                "Start a chat or connect your workspace",
+            ),
+            cta_label: tr_str(lang_id, "新建对话", "New Chat"),
+        }
+    }
+}
+
 /// Localized variant of [`render_pinned_chats_grid`] for OpenBot `SidebarPinnedGroup`.
 #[allow(clippy::too_many_arguments)]
 pub fn render_pinned_chats_grid_localized<V: 'static>(
@@ -388,13 +468,14 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
     on_select: impl Fn(&mut V, u64, &mut Context<V>) + Clone + 'static,
     on_context: impl Fn(&mut V, u64, Point<Pixels>, &mut Context<V>) + Clone + 'static,
 ) -> Option<AnyElement> {
-    if pinned_dialogs.is_empty() {
+    let grid = compute_openbot_pinned_grid_layout(pinned_dialogs.len(), false, palette);
+    if !grid.visible {
         return None;
     }
     let ob = palette.openbot_palette();
     let is_dark = palette.mode.is_dark();
     let shown = &pinned_dialogs[..pinned_dialogs.len().min(9)];
-    let avatar_size_px = palette.scaled_px(56.0);
+    let avatar_size_px = grid.avatar_px;
     let hover_bg = ob.hover();
     let active_bg = if is_dark { ob.bg_surface() } else { rgb(0xE8E8EB) };
     let text_pri = ob.text_primary();
@@ -413,6 +494,11 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
             } else {
                 0xF5F5F6
             };
+            let badge_state = resolve_dialog_felt_badge_state(
+                item,
+                meta,
+                &resolve_dialog_preview_priority(item, meta, lang_id),
+            );
             let avatar = render_openbot_dialog_avatar_with_badge(
                 item,
                 meta,
@@ -420,14 +506,14 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
                 avatar_size_px,
                 tile_surface_hex,
                 is_selected,
-                lang_id,
+                badge_state,
             );
 
             div()
                 .id(("sidebar-pinned-tile", did))
                 .cursor_pointer()
-                .w(px(72.0))
-                .h(px(102.0))
+                .w(px(grid.tile_w_px))
+                .h(px(grid.tile_h_px))
                 .flex_shrink_0()
                 .px(px(2.0))
                 .py(px(4.0))
@@ -491,14 +577,14 @@ pub fn render_pinned_chats_grid_localized<V: 'static>(
             .child(
                 div()
                     .w_full()
-                    .max_w(px(236.0))
+                    .max_w(px(grid.max_width_px))
                     .mx_auto()
                     .p(px(2.0))
                     .flex()
                     .flex_wrap()
                     .justify_center()
                     .content_start()
-                    .gap(px(8.0))
+                    .gap(px(grid.gap_px))
                     .children(tiles),
             )
             .into_any_element(),

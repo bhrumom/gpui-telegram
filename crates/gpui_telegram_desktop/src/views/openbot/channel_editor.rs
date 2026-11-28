@@ -60,18 +60,30 @@ pub const CHANNEL_FOLDERS_MAX: usize = CHANNEL_FOLDER_LIMIT;
 /// Members inside `ChannelEditor` stay strictly in insertion order (drag-reorder is unsupported).
 pub const MEMBER_DRAG_REORDER_SUPPORTED: bool = false;
 
+/// Normalizes an optional channel icon name and optional hue degree into
+/// `(Option<ChannelIconName>, AvatarHue)` in a single call (`UI-F11-02`).
+/// Unknown/blank icon names map to `None`; invalid/missing hues fall back to `AvatarHue::Blue` (`215`).
+pub fn normalize_channel_icon_and_hue(
+    icon: Option<&str>,
+    hue: Option<u16>,
+) -> (Option<ChannelIconName>, AvatarHue) {
+    let icon_name = icon
+        .map(|s| s.trim().to_ascii_lowercase())
+        .and_then(|norm| ChannelIconName::parse(&norm));
+    let resolved_hue = hue
+        .and_then(AvatarHue::from_degrees)
+        .unwrap_or(DEFAULT_CHANNEL_ICON_AVATAR_HUE);
+    (icon_name, resolved_hue)
+}
+
 /// Resolves a channel icon `(name, hue)` pair against the 20-icon catalog and 10-hue palette.
 ///
 /// - Unknown icon names (e.g. `"dragon"`) return `None`.
 /// - Known icon names with `None` or an out-of-palette hue (e.g. `Some(999)`) normalize hue to
 ///   `AvatarHue::Blue` (`215`).
 pub fn resolve_channel_icon(name: &str, hue: Option<u16>) -> Option<(ChannelIconName, AvatarHue)> {
-    let normalized_name = name.trim().to_ascii_lowercase();
-    let icon_name = ChannelIconName::parse(&normalized_name)?;
-    let resolved_hue = hue
-        .and_then(AvatarHue::from_degrees)
-        .unwrap_or(DEFAULT_CHANNEL_ICON_AVATAR_HUE);
-    Some((icon_name, resolved_hue))
+    let (icon_name, resolved_hue) = normalize_channel_icon_and_hue(Some(name), hue);
+    Some((icon_name?, resolved_hue))
 }
 
 /// Resolves an optional contract [`ChannelIcon`] using [`resolve_channel_icon`].
@@ -396,7 +408,12 @@ impl ChannelEditorState {
     }
 
     /// Removes a member preserving insertion order; removing the current lead falls back to `members[0]`.
+    /// Blocks removal of the last remaining channel member so a channel cannot become empty (`UI-F17-03`).
     pub fn remove_member(&mut self, agent_id: &str) -> bool {
+        if self.members.len() <= 1 && self.is_member(agent_id) {
+            self.validation_error = Some("Cannot remove the last channel member".to_string());
+            return false;
+        }
         let before = self.members.len();
         self.members.retain(|m| m != agent_id);
         let removed = self.members.len() != before;
@@ -412,8 +429,7 @@ impl ChannelEditorState {
     /// Toggles membership for `agent_id` in the searchable member checklist.
     pub fn toggle_member(&mut self, agent_id: &str) -> Result<bool, ChannelEditorValidationError> {
         if self.is_member(agent_id) {
-            self.remove_member(agent_id);
-            Ok(false)
+            Ok(!self.remove_member(agent_id))
         } else {
             self.add_member(agent_id.to_string())?;
             Ok(true)
@@ -613,6 +629,52 @@ impl ChannelEditorState {
     pub fn can_submit(&self) -> bool {
         !self.submitting && self.validate_draft().is_ok()
     }
+
+    pub fn create_dialog_layout(&self, palette: &OpenBotPalette) -> ChannelCreateDialogLayout {
+        ChannelCreateDialogLayout {
+            width_px: CHANNEL_CREATE_DIALOG_WIDTH_PX,
+            radius_px: CHANNEL_CREATE_DIALOG_RADIUS_PX,
+            surface_hex: palette
+                .token("--openbot-bg-surface")
+                .unwrap_or("#212121")
+                .to_string(),
+            selected_members: self.members.len(),
+            submit_disabled: !self.can_submit(),
+        }
+    }
+
+    /// Validates draft and constructs a live [`super::channel_view::ChannelConversationState`]
+    /// with auto-assigned lead agent (`UI-F11-06`).
+    pub fn create_channel_from_editor(
+        &self,
+    ) -> Result<super::channel_view::ChannelConversationState, ChannelEditorValidationError> {
+        let draft = self.validate_draft()?;
+        let id = self
+            .channel_id
+            .clone()
+            .unwrap_or_else(|| format!("chan-{}", draft.name.to_ascii_lowercase().replace(' ', "-")));
+        let members: Vec<String> = draft.members.iter().map(|m| m.agent_id.clone()).collect();
+        let lead = draft
+            .lead_agent_id
+            .clone()
+            .or_else(|| members.first().cloned());
+        let mut conv = super::channel_view::ChannelConversationState::new(id, draft.name, members, lead);
+        conv.title = draft.title;
+        conv.instructions = draft.instructions;
+        Ok(conv)
+    }
+}
+
+pub const CHANNEL_CREATE_DIALOG_WIDTH_PX: f32 = 440.0;
+pub const CHANNEL_CREATE_DIALOG_RADIUS_PX: f32 = 14.0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelCreateDialogLayout {
+    pub width_px: f32,
+    pub radius_px: f32,
+    pub surface_hex: String,
+    pub selected_members: usize,
+    pub submit_disabled: bool,
 }
 
 /// Complete right-pane `ChannelSettingsPane` controller embedding `ChannelEditorState` plus
@@ -2096,6 +2158,15 @@ mod tests {
         );
         assert_eq!(editor.members, vec!["agent-a", "agent-b"]);
         assert!(editor.validate_draft().is_ok());
+
+        // Removing down to 1 member succeeds; removing the final member is blocked.
+        assert!(editor.remove_member("agent-b"));
+        assert_eq!(editor.members, vec!["agent-a"]);
+        assert!(!editor.remove_member("agent-a"));
+        assert_eq!(editor.members, vec!["agent-a"]);
+        assert!(editor.validation_error.is_some());
+        assert_eq!(editor.toggle_member("agent-a"), Ok(true));
+        assert_eq!(editor.members, vec!["agent-a"]);
     }
 
     #[std::prelude::v1::test]
@@ -2251,7 +2322,10 @@ impl ChannelCreateDialogModal {
     }
 
     pub fn can_submit(&self) -> bool {
-        !self.name.trim().is_empty() && !self.selected_ids.is_empty()
+        let trimmed = self.name.trim();
+        !trimmed.is_empty()
+            && utf16_len(trimmed) <= CHANNEL_NAME_MAX_LEN
+            && !self.selected_ids.is_empty()
     }
 
     pub fn filtered_candidates(&self) -> Vec<&ChannelCreateMemberCandidate> {
@@ -2296,6 +2370,18 @@ impl ChannelCreateDialogModal {
             cx.notify();
             return;
         }
+        if utf16_len(trimmed) > CHANNEL_NAME_MAX_LEN {
+            self.validation_error = Some(
+                crate::i18n::tr_str(
+                    &self.language_id,
+                    "群聊名称不能超过 80 个字符",
+                    "Channel name cannot exceed 80 characters",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if self.selected_ids.is_empty() {
             self.validation_error = Some(
                 crate::i18n::tr_str(
@@ -2308,6 +2394,36 @@ impl ChannelCreateDialogModal {
             cx.notify();
             return;
         }
+        if self.selected_ids.len() > CHANNEL_MEMBERS_MAX {
+            self.validation_error = Some(
+                crate::i18n::tr_str(
+                    &self.language_id,
+                    "群聊成员最多支持 100 位",
+                    "Channel cannot exceed 100 members",
+                )
+                .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut editor_state = ChannelEditorState::new_create();
+        editor_state.name = trimmed.to_string();
+        for sid in &self.selected_ids {
+            if let Err(err) = editor_state.add_member(sid.clone()) {
+                self.validation_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        }
+        let created_preview = match editor_state.create_channel_from_editor() {
+            Ok(conv) => conv,
+            Err(err) => {
+                self.validation_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let resolved_name = created_preview.name;
         let mut member_user_ids = Vec::new();
         let mut member_usernames = Vec::new();
         let mut member_agent_ids = Vec::new();
@@ -2331,7 +2447,7 @@ impl ChannelCreateDialogModal {
         }
         self.ime.clear_ime_state();
         self.pending_submit = Some(ChannelCreateSubmission {
-            name: trimmed.to_string(),
+            name: resolved_name,
             member_user_ids,
             member_usernames,
             member_agent_ids,
@@ -2780,14 +2896,22 @@ impl Render for ChannelCreateDialogModal {
             }
         }
 
+        let mut editor_state = ChannelEditorState::new_create();
+        editor_state.name = self.name.clone();
+        editor_state.members = self.selected_ids.clone();
+        let dlg_layout = editor_state.create_dialog_layout(&ob);
+        let card_surface = rgb(crate::views::content_hub::apple_primitives::parse_hex_color(
+            &dlg_layout.surface_hex,
+            0x212121,
+        ));
         let card = div()
             .id("openbot-channel-create-dialog-card")
             .relative()
-            .w(px(440.0))
+            .w(px(dlg_layout.width_px))
             .max_w_full()
             .max_h(px((vp_h - 48.0).max(360.0)))
-            .rounded(px(14.0))
-            .bg(ob.bg_surface())
+            .rounded(px(dlg_layout.radius_px))
+            .bg(card_surface)
             .border_1()
             .border_color(ob.border_strong_hairline())
             .shadow(self.palette.popover_shadows())

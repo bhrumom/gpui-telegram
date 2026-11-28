@@ -76,11 +76,19 @@ pub fn build_mention_candidates(
     let mut seen_usernames: HashSet<String> = HashSet::new();
 
     if is_group {
-        seen_usernames.insert("everyone".to_string());
-        out.push((
-            MentionRow::new(0, "everyone", "所有人 / 全部 Bot", false),
-            Some("所有人".to_string()),
-        ));
+        let unique_members = members
+            .iter()
+            .filter(|m| m.user_id != 0)
+            .map(|m| m.user_id)
+            .collect::<HashSet<u64>>()
+            .len();
+        if unique_members > 1 || (members.is_empty() && fabushi_bots.len() > 1) {
+            seen_usernames.insert("everyone".to_string());
+            out.push((
+                MentionRow::new(0, "everyone", "所有人 / 全部 Bot", false),
+                Some("所有人".to_string()),
+            ));
+        }
 
         for m in members {
             if m.user_id == 0 || !seen_ids.insert(m.user_id) {
@@ -313,13 +321,20 @@ impl AppShell {
     /// Computes the active palette and propagates theme and locale to all mounted views and overlays.
     pub fn sync_theme_and_locale_to_views(&mut self, cx: &mut Context<Self>) {
         let lang = self.active_lang_id();
-        let (mode, pal) = compute_shell_palette(
+        let (mode, raw_pal) = compute_shell_palette(
             &self.preferences,
             Some(self.theme_state.theme_mode),
             self.theme_state.accent_color,
             self.theme_state.bubble_radius_px,
             self.theme_state.wallpaper_id.as_deref(),
         );
+        let pal = if crate::views::app_shell::openbot_shell_layout::default_openbot_shell_wiring()
+            .openbot_chrome_enabled
+        {
+            raw_pal.with_openbot_chrome()
+        } else {
+            raw_pal
+        };
         self.theme_state.theme_mode = mode;
         self.theme_state.palette = pal;
         let targets = ShellThemeTargets {
@@ -347,6 +362,8 @@ impl AppShell {
             settings_router: &self.settings_router,
             miniapp_overlay: self.miniapps.miniapp_overlay.as_ref(),
             create_bot_box: self.miniapps.create_bot_box.as_ref(),
+            global_search_modal: self.global_search_modal.as_ref(),
+            channel_create_dialog: self.channel_create_dialog.as_ref(),
         };
         propagate_theme_and_locale(targets, &pal, lang, cx);
         // Anti-spoofing invariant: propagate ONLY locale into top-Z SecuritySurfaceModal, NEVER theme palette!
@@ -740,55 +757,112 @@ impl AppShell {
             .map(|b| (b.bot_user_id as u64, b.avatar_color.clone()))
             .collect();
         let is_dark = self.theme_state.palette.mode.is_dark();
-        let member_tiles: Vec<(String, u32)> = if is_group && !effective_members.is_empty() {
-            effective_members
-                .iter()
-                .take(3)
-                .map(|m| {
-                    if let Some(fb) = self
-                        .miniapps
-                        .fabushi_bots
-                        .iter()
-                        .find(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == m.user_id)
-                    {
-                        let init = derive_initials(&fb.display_name);
-                        let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
-                            fb.avatar_color.as_str()
-                        } else {
-                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id)
-                        };
-                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, is_dark);
-                        (if init.is_empty() { "B".to_string() } else { init }, fill)
-                    } else if let Some(c) = self
-                        .session_sync
-                        .contacts_list
-                        .iter()
-                        .find(|c| c.user_id == m.user_id)
-                    {
-                        let name = contact_display_name(c);
-                        let init = derive_initials(&name);
-                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
-                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
-                            is_dark,
-                        );
-                        (if init.is_empty() { "U".to_string() } else { init }, fill)
+        let mut member_tiles: Vec<(String, u32)> = Vec::new();
+        let mut member_briefs: Vec<crate::components::avatar::ChannelAgentBrief> = Vec::new();
+        if is_group && !effective_members.is_empty() {
+            for m in effective_members {
+                if let Some(fb) = self
+                    .miniapps
+                    .fabushi_bots
+                    .iter()
+                    .find(|b| b.bot_user_id > 0 && b.bot_user_id as u64 == m.user_id)
+                {
+                    let init = derive_initials(&fb.display_name);
+                    let hue = if TdesktopThemePalette::is_tinted_bot_hue(&fb.avatar_color) {
+                        fb.avatar_color.as_str()
                     } else {
-                        let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
-                            TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
-                            is_dark,
-                        );
-                        ("M".to_string(), fill)
+                        TdesktopThemePalette::bot_hue_name_for_id(m.user_id)
+                    };
+                    let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(hue, is_dark);
+                    if member_tiles.len() < 3 {
+                        member_tiles.push((
+                            if init.is_empty() { "B".to_string() } else { init },
+                            fill,
+                        ));
                     }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                    let (shape_opt, ob_hue, ob_color) =
+                        crate::views::stage::openbot_stage_chrome::normalize_fabushi_plush_spec(
+                            &fb.avatar_shape,
+                            &fb.avatar_color,
+                        );
+                    let seed_opt = shape_opt
+                        .map(|s| format!("plush:{}", s.as_str()))
+                        .or_else(|| {
+                            let raw = fb.avatar_shape.trim();
+                            (!raw.is_empty()).then(|| raw.to_string())
+                        })
+                        .or_else(|| Some(format!("bot-{}", m.user_id)));
+                    member_briefs.push(crate::components::avatar::ChannelAgentBrief {
+                        id: if !fb.agent_id.trim().is_empty() {
+                            fb.agent_id.clone()
+                        } else {
+                            format!("bot-{}", m.user_id)
+                        },
+                        avatar_seed: seed_opt,
+                        avatar_hue: ob_hue,
+                        avatar_color: ob_color,
+                        avatar_url: None,
+                    });
+                } else if let Some(c) = self
+                    .session_sync
+                    .contacts_list
+                    .iter()
+                    .find(|c| c.user_id == m.user_id)
+                {
+                    let name = contact_display_name(c);
+                    let init = derive_initials(&name);
+                    let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
+                        TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
+                        is_dark,
+                    );
+                    if member_tiles.len() < 3 {
+                        member_tiles.push((
+                            if init.is_empty() { "U".to_string() } else { init },
+                            fill,
+                        ));
+                    }
+                    member_briefs.push(crate::components::avatar::ChannelAgentBrief {
+                        id: format!("user-{}", m.user_id),
+                        avatar_seed: Some(format!("user-{}", m.user_id)),
+                        avatar_hue: None,
+                        avatar_color: Some(format!("#{:06x}", fill & 0x00FF_FFFF)),
+                        avatar_url: None,
+                    });
+                } else {
+                    let (fill, _, _) = TdesktopThemePalette::bot_hue_colors(
+                        TdesktopThemePalette::bot_hue_name_for_id(m.user_id),
+                        is_dark,
+                    );
+                    if member_tiles.len() < 3 {
+                        member_tiles.push(("M".to_string(), fill));
+                    }
+                    member_briefs.push(crate::components::avatar::ChannelAgentBrief {
+                        id: format!("member-{}", m.user_id),
+                        avatar_seed: Some(format!("member-{}", m.user_id)),
+                        avatar_hue: None,
+                        avatar_color: Some(format!("#{:06x}", fill & 0x00FF_FFFF)),
+                        avatar_url: None,
+                    });
+                }
+            }
+        }
 
+        if !member_briefs.is_empty() {
+            let briefs_for_sb = member_briefs.clone();
+            self.sidebar.update(cx, |sb, sb_cx| {
+                sb.group_member_briefs.insert(chat_id, briefs_for_sb);
+                sb_cx.notify();
+            });
+        }
         self.stage.update(cx, |st, st_cx| {
             st.set_bot_hues_map(bot_hues);
-            if st.active_chat_id == Some(chat_id) && !member_tiles.is_empty() {
-                st.set_group_member_tiles(member_tiles);
+            if st.active_chat_id == Some(chat_id) {
+                if !member_tiles.is_empty() {
+                    st.set_group_member_tiles(member_tiles);
+                }
+                if !member_briefs.is_empty() {
+                    st.set_group_member_briefs(member_briefs);
+                }
             }
             st_cx.notify();
         });
@@ -1002,6 +1076,7 @@ impl AppShell {
             self.clear_compose_isolation_snapshot();
         }
         let mut selected = false;
+        let mut flushed_bot_patch = None;
         let mut max_msg_id = 0i64;
         let rich_meta_opt = self.session_sync.rich_chats_by_id.get(&chat_id).cloned();
         let self_uid = self.session_sync.user_id.unwrap_or(0);
@@ -1037,6 +1112,7 @@ impl AppShell {
                 self.inspector.update(st_cx, |insp, insp_cx| {
                     let had_insp_focus = insp.is_bot_input_active();
                     selected = select_authoritative_dialog(sb, st, insp, chat_id);
+                    flushed_bot_patch = insp.take_pending_flushed_bot_patch();
                     if selected {
                         if let Some((muted, pinned, _, _, _)) = dlg_info {
                             st.is_muted_chat = muted;
@@ -1049,6 +1125,8 @@ impl AppShell {
                             st.is_peer_blocked = rc.is_blocked;
                             st.is_bot_chat = rc.is_bot;
                             st.is_group_chat = rc.is_group || rc.is_channel || matches!(rc.chat_type, 1 | 2 | 3);
+                            insp.profile.is_bot = rc.is_bot;
+                            insp.members.is_group_or_channel = st.is_group_chat && !rc.is_bot;
                             st.is_saved_messages = rc.chat_type == 5
                                 || rc.kind.as_deref() == Some("saved")
                                 || (rc.chat_type == 0
@@ -1067,6 +1145,7 @@ impl AppShell {
                                 };
                             }
                         }
+                        insp.bot_chat_bubble_color = st.chat_bg_tint_hex.clone();
                         if st.messages.is_empty()
                             && !st.loaded_history_chats.contains(&chat_id)
                             && !st.show_bot_start_bar
@@ -1096,6 +1175,9 @@ impl AppShell {
                 }
             });
         });
+        if let Some(patch_act) = flushed_bot_patch {
+            self.handle_inspector_action(patch_act, cx);
+        }
         if !selected {
             return;
         }
@@ -2406,15 +2488,13 @@ impl AppShell {
                 }
                 StageAction::NewThread => {
                     let next_idx = self.stage.read(cx).thread_tabs.len() + 1;
-                    let tid = format!("thread-{next_idx}");
                     let label = if lang.starts_with("zh") {
                         format!("新对话 #{next_idx}")
                     } else {
                         format!("Thread #{next_idx}")
                     };
                     self.stage.update(cx, |st, scx| {
-                        st.thread_tabs.push((tid.clone(), label.clone()));
-                        st.active_thread_id = Some(tid);
+                        st.append_and_focus_thread_tab(label);
                         scx.notify();
                     });
                     self.composer.update(cx, |c, ccx| {

@@ -297,16 +297,28 @@ impl AgentAvatarProps {
     }
 
     pub fn optical_box_px(&self) -> f32 {
-        self.size_px * AVATAR_OPTICAL_BOX_RATIO
+        let sz = if self.size_px.is_finite() {
+            self.size_px.clamp(8.0, 512.0)
+        } else {
+            32.0
+        };
+        sz * AVATAR_OPTICAL_BOX_RATIO
     }
 
     pub fn optical_offset_px(&self) -> f32 {
-        if let Some(explicit) = self.optical_offset_override_px {
+        if let Some(explicit) = self.optical_offset_override_px.filter(|v| v.is_finite()) {
             explicit
-        } else if (self.size_px - CONVERSATION_TITLE_AVATAR_SIZE).abs() < 0.1 {
-            CONVERSATION_TITLE_OPTICAL_OFFSET_PX
         } else {
-            self.size_px * AVATAR_OPTICAL_OFFSET_RATIO
+            let sz = if self.size_px.is_finite() {
+                self.size_px.clamp(8.0, 512.0)
+            } else {
+                32.0
+            };
+            if (sz - CONVERSATION_TITLE_AVATAR_SIZE).abs() < 0.1 {
+                CONVERSATION_TITLE_OPTICAL_OFFSET_PX
+            } else {
+                sz * AVATAR_OPTICAL_OFFSET_RATIO
+            }
         }
     }
 }
@@ -558,11 +570,15 @@ impl AgentAvatarController {
             avatar_breathe_amount(props.mood, style)
         };
         let animated = !props.reduced_motion
-            && ((props.follow_pointer && props.document_focused && props.on_screen)
+            && props.on_screen
+            && props.document_focused
+            && (props.follow_pointer
                 || (plush_mood.busy && props.ambient_motion)
-                || (!props.motion.is_static() && props.document_focused)
+                || !props.motion.is_static()
                 || self.interacting);
-        let fps = if self.interacting || props.follow_pointer || !props.motion.is_static() {
+        let fps = if !animated {
+            0
+        } else if self.interacting || props.follow_pointer || !props.motion.is_static() {
             AVATAR_FPS
         } else {
             BACKGROUND_AVATAR_FPS
@@ -642,7 +658,7 @@ fn plush_asset_file(rel: &str) -> Option<PathBuf> {
 
 fn parse_hex_u32(hex: &str, fallback: u32) -> u32 {
     let clean = hex.trim().trim_start_matches('#');
-    if clean.len() >= 6 {
+    if clean.len() >= 6 && clean.as_bytes()[..6].iter().all(u8::is_ascii_hexdigit) {
         u32::from_str_radix(&clean[0..6], 16).unwrap_or(fallback)
     } else {
         fallback
@@ -695,9 +711,14 @@ pub fn render_agent_avatar(
 ) -> Div {
     let default_ctrl = AgentAvatarController::new(&props.seed);
     let resolved = controller.unwrap_or(&default_ctrl).resolve(props);
-    let base_size = props.size_px.max(8.0);
+    let base_size = if props.size_px.is_finite() {
+        props.size_px.clamp(8.0, 512.0)
+    } else {
+        32.0
+    };
+    let safe_now = if now_sec.is_finite() { now_sec } else { 0.0 };
     let breathe_scale = if resolved.breathe_amount > 0.0 && !props.reduced_motion {
-        let wave = ((std::f64::consts::TAU * now_sec) / AVATAR_BREATHE_PERIOD_SEC).cos();
+        let wave = ((std::f64::consts::TAU * safe_now) / AVATAR_BREATHE_PERIOD_SEC).cos();
         (1.0 - resolved.breathe_amount * wave) as f32
     } else {
         1.0
@@ -1197,17 +1218,78 @@ impl FeltStatusBadgeState {
     }
 }
 
+pub const WORKING_BADGE_WIDTH_PX: f32 = 30.0;
+pub const WORKING_BADGE_HEIGHT_PX: f32 = 16.0;
+pub const WORKING_BADGE_BALL_SIZE_PX: f32 = 7.0;
+pub const WORKING_BADGE_LOOP_MS: u64 = 960;
+pub const WORKING_BADGE_STAGGER_MS: [u64; 3] = [0, 130, 260];
+pub const WORKING_BADGE_BALL_SPECS: [(&str, u32); 3] = [
+    ("openbot_plush/ui/ball-lilac.webp", 0xC6A4E8),
+    ("openbot_plush/ui/ball-mint.webp", 0x7AD9B0),
+    ("openbot_plush/ui/ball-pink.webp", 0xF29BB8),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkingBadgeLayoutSnapshot {
+    pub width_px: f32,
+    pub height_px: f32,
+    pub bg_rgb: u32,
+    pub ball_count: usize,
+    pub ball_size_px: f32,
+    pub ball_asset_paths: [&'static str; 3],
+    pub ball_fallback_rgbs: [u32; 3],
+    pub stagger_ms: [u64; 3],
+    pub loop_ms: u64,
+    pub balls_paused: bool,
+    pub ball_hops: [(f32, f32, f32); 3],
+}
+
+/// Computes the single-source-of-truth geometry & animation snapshot for the `30x16px`
+/// OpenBot working badge (`render_sidebar_felt_badge_inner` renders directly from this).
+pub fn compute_working_badge_layout(
+    dark_scheme: bool,
+    reduced_motion: bool,
+    now_ms: u64,
+) -> WorkingBadgeLayoutSnapshot {
+    let sample_ms = if reduced_motion { 0 } else { now_ms };
+    WorkingBadgeLayoutSnapshot {
+        width_px: WORKING_BADGE_WIDTH_PX,
+        height_px: WORKING_BADGE_HEIGHT_PX,
+        bg_rgb: if dark_scheme { 0x212121 } else { 0xFFFFFF },
+        ball_count: WORKING_BADGE_BALL_SPECS.len(),
+        ball_size_px: WORKING_BADGE_BALL_SIZE_PX,
+        ball_asset_paths: [
+            WORKING_BADGE_BALL_SPECS[0].0,
+            WORKING_BADGE_BALL_SPECS[1].0,
+            WORKING_BADGE_BALL_SPECS[2].0,
+        ],
+        ball_fallback_rgbs: [
+            WORKING_BADGE_BALL_SPECS[0].1,
+            WORKING_BADGE_BALL_SPECS[1].1,
+            WORKING_BADGE_BALL_SPECS[2].1,
+        ],
+        stagger_ms: WORKING_BADGE_STAGGER_MS,
+        loop_ms: WORKING_BADGE_LOOP_MS,
+        balls_paused: reduced_motion || now_ms == 0,
+        ball_hops: [
+            working_ball_hop_sample(sample_ms, 0),
+            working_ball_hop_sample(sample_ms, 1),
+            working_ball_hop_sample(sample_ms, 2),
+        ],
+    }
+}
+
 /// Computes `(dy_px, width_px, height_px)` for ball `ball_idx` (`0..3`) in the `30x16px`
 /// OpenBot working pill (`960ms` cycle, `0/130/260ms` stagger, peak `-1.75px`, static at `now_ms == 0`).
 pub fn working_ball_hop_sample(now_ms: u64, ball_idx: usize) -> (f32, f32, f32) {
-    const BASE_PX: f32 = 7.0;
+    let base_px = WORKING_BADGE_BALL_SIZE_PX;
     if now_ms == 0 {
-        return (0.0, BASE_PX, BASE_PX);
+        return (0.0, base_px, base_px);
     }
-    const PERIOD_MS: u64 = 960;
-    const STAGGER_MS: u64 = 130;
-    let stagger = (ball_idx as u64) * STAGGER_MS;
-    let phase = ((now_ms + PERIOD_MS - (stagger % PERIOD_MS)) % PERIOD_MS) as f32 / (PERIOD_MS as f32);
+    let period_ms = WORKING_BADGE_LOOP_MS;
+    let stagger = WORKING_BADGE_STAGGER_MS[ball_idx.min(WORKING_BADGE_STAGGER_MS.len() - 1)];
+    let phase_ms = ((now_ms % period_ms) + period_ms - (stagger % period_ms)) % period_ms;
+    let phase = (phase_ms as f32) / (period_ms as f32);
     let (dy, sx, sy) = if phase < 0.08 {
         let u = phase / 0.08;
         (0.0, 1.0 + 0.10 * u, 1.0 - 0.10 * u)
@@ -1225,7 +1307,7 @@ pub fn working_ball_hop_sample(now_ms: u64, ball_idx: usize) -> (f32, f32, f32) 
     } else {
         (0.0, 1.0, 1.0)
     };
-    (dy, BASE_PX * sx, BASE_PX * sy)
+    (dy, base_px * sx, base_px * sy)
 }
 
 #[inline]
@@ -1246,35 +1328,31 @@ fn render_sidebar_felt_badge_inner(
     let tf = animator.map(|a| a.sample(now_ms));
 
     if badge == SidebarFeltBadge::Working {
-        const BALL_SPECS: [(&str, u32); 3] = [
-            ("openbot_plush/ui/ball-lilac.webp", 0xC6A4E8),
-            ("openbot_plush/ui/ball-mint.webp", 0x7AD9B0),
-            ("openbot_plush/ui/ball-pink.webp", 0xF29BB8),
-        ];
-        let pill_bg = if dark_scheme { 0x212121 } else { 0xFFFFFF };
+        let layout = compute_working_badge_layout(dark_scheme, false, now_ms);
         let mut pill = div()
             .relative()
-            .w(px(30.0))
-            .h(px(16.0))
+            .w(px(layout.width_px))
+            .h(px(layout.height_px))
             .px(px(3.5))
             .pb(px(3.0))
             .rounded_full()
-            .bg(rgb(pill_bg))
+            .bg(rgb(layout.bg_rgb))
             .opacity(tf.map_or(1.0, |t| t.opacity))
             .flex()
             .items_end()
             .justify_center()
             .gap(px(1.0));
-        for (idx, (asset_rel, fallback_rgb)) in BALL_SPECS.iter().enumerate() {
-            let (dy, bw, bh) = working_ball_hop_sample(now_ms, idx);
-            let ball_img = cached_ui_felt_webp(asset_rel);
+        for idx in 0..layout.ball_count {
+            let (dy, bw, bh) = layout.ball_hops[idx];
+            let ball_img = cached_ui_felt_webp(layout.ball_asset_paths[idx]);
+            let fallback_rgb = layout.ball_fallback_rgbs[idx];
             let ball_el = div()
                 .relative()
                 .w(px(bw))
                 .h(px(bh))
                 .mb(px((-dy).max(0.0)))
                 .rounded_full()
-                .when(ball_img.is_none(), |el| el.bg(rgb(*fallback_rgb)))
+                .when(ball_img.is_none(), |el| el.bg(rgb(fallback_rgb)))
                 .when_some(ball_img, |el, img_arc| {
                     el.child(
                         img(img_arc)
@@ -1520,6 +1598,24 @@ pub struct ChannelFaceCell {
     pub face_px: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelOverflowPillTone {
+    None,
+    Lilac,
+    Amber,
+}
+
+impl ChannelOverflowPillTone {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Lilac => "lilac",
+            Self::Amber => "amber",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelClusterEval {
     pub mode: ChannelClusterMode,
@@ -1532,6 +1628,7 @@ pub struct ChannelClusterEval {
     pub shown_faces: usize,
     pub hidden_count: usize,
     pub plus_pill: Option<String>,
+    pub overflow_pill_tone: ChannelOverflowPillTone,
     pub fallback_glyph: Option<&'static str>,
     pub size_px: f32,
     pub pitch_px: f32,
@@ -1605,7 +1702,11 @@ pub fn resolve_channel_cluster_sized(
     image_failed: bool,
     size_px: f32,
 ) -> ChannelClusterEval {
-    let size_px = size_px.max(16.0);
+    let size_px = if size_px.is_finite() {
+        size_px.clamp(16.0, 256.0)
+    } else {
+        CHANNEL_CLUSTER_DEFAULT_SIZE_PX
+    };
     let pitch_px = size_px * 0.38;
     let face_px = size_px * 0.54;
     let custom_face_px = size_px * 0.46;
@@ -1639,6 +1740,7 @@ pub fn resolve_channel_cluster_sized(
             shown_faces: 0,
             hidden_count: 0,
             plus_pill: None,
+            overflow_pill_tone: ChannelOverflowPillTone::None,
             fallback_glyph: None,
             size_px,
             pitch_px,
@@ -1662,6 +1764,7 @@ pub fn resolve_channel_cluster_sized(
             shown_faces: 0,
             hidden_count: 0,
             plus_pill: None,
+            overflow_pill_tone: ChannelOverflowPillTone::None,
             fallback_glyph: None,
             size_px,
             pitch_px,
@@ -1686,6 +1789,7 @@ pub fn resolve_channel_cluster_sized(
             shown_faces: 0,
             hidden_count: 0,
             plus_pill: None,
+            overflow_pill_tone: ChannelOverflowPillTone::None,
             fallback_glyph: Some("UsersRound"),
             size_px,
             pitch_px,
@@ -1728,6 +1832,7 @@ pub fn resolve_channel_cluster_sized(
                 shown_faces,
                 hidden_count: n.saturating_sub(shown_faces),
                 plus_pill: None,
+                overflow_pill_tone: ChannelOverflowPillTone::None,
                 fallback_glyph: None,
                 size_px,
                 pitch_px,
@@ -1751,6 +1856,13 @@ pub fn resolve_channel_cluster_sized(
             };
             let hidden_count = n.saturating_sub(shown_faces);
             let plus_pill = (hidden_count > 0).then(|| format!("+{hidden_count}"));
+            let overflow_pill_tone = if hidden_count == 0 {
+                ChannelOverflowPillTone::None
+            } else if hidden_count >= 10 {
+                ChannelOverflowPillTone::Amber
+            } else {
+                ChannelOverflowPillTone::Lilac
+            };
             let shown_member_ids: Vec<String> = unique_member_ids
                 .iter()
                 .take(shown_faces)
@@ -1769,6 +1881,7 @@ pub fn resolve_channel_cluster_sized(
                 shown_faces,
                 hidden_count,
                 plus_pill,
+                overflow_pill_tone,
                 fallback_glyph: None,
                 size_px,
                 pitch_px,
@@ -2084,7 +2197,7 @@ pub fn render_channel_avatar(
                     + (pill_text.len().saturating_sub(2) as f32) * 5.5
                     + 2.0 * ring_px)
                     .max(pill_h);
-                let use_amber = eval.hidden_count >= 10;
+                let use_amber = eval.overflow_pill_tone == ChannelOverflowPillTone::Amber;
                 let pill_bg = if use_amber {
                     linear_gradient(
                         180.0,
@@ -2168,6 +2281,15 @@ pub fn channel_activity_sentence(names: &[&str]) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelActivitySnapshot {
+    pub visible: bool,
+    pub worker_count: usize,
+    pub overlap_px: f32,
+    pub shimmer_animated: bool,
+    pub elapsed_text: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChannelActivityIndicatorState {
     pub face_ids: Vec<String>,
@@ -2175,6 +2297,8 @@ pub struct ChannelActivityIndicatorState {
     leaving_deadlines_ms: BTreeMap<String, u64>,
     last_seen: BTreeMap<String, ChannelWorkerBrief>,
     active_workers: Vec<ChannelWorkerBrief>,
+    started_at_ms: Option<u64>,
+    reduced_motion: bool,
 }
 
 impl ChannelActivityIndicatorState {
@@ -2191,6 +2315,10 @@ impl ChannelActivityIndicatorState {
         reduced_motion: bool,
     ) {
         self.tick(now_ms);
+        self.reduced_motion = reduced_motion;
+        if !workers.is_empty() && self.started_at_ms.is_none() {
+            self.started_at_ms = Some(now_ms);
+        }
         for w in workers {
             self.last_seen.insert(w.id.clone(), w.clone());
         }
@@ -2221,6 +2349,9 @@ impl ChannelActivityIndicatorState {
             self.face_ids.retain(|id| working_set.contains(id.as_str()));
             self.leaving_ids.clear();
             self.leaving_deadlines_ms.clear();
+            if self.face_ids.is_empty() {
+                self.started_at_ms = None;
+            }
             return;
         }
 
@@ -2228,6 +2359,9 @@ impl ChannelActivityIndicatorState {
         for id in gone {
             self.leaving_ids.insert(id.clone());
             self.leaving_deadlines_ms.insert(id, deadline);
+        }
+        if self.face_ids.is_empty() {
+            self.started_at_ms = None;
         }
     }
 
@@ -2245,6 +2379,22 @@ impl ChannelActivityIndicatorState {
             self.leaving_deadlines_ms.remove(id);
         }
         self.face_ids.retain(|id| !expired.contains(id));
+        if self.face_ids.is_empty() {
+            self.started_at_ms = None;
+        }
+    }
+
+    pub fn snapshot(&self, now_ms: u64) -> ChannelActivitySnapshot {
+        let secs = self
+            .started_at_ms
+            .map_or(0, |start| now_ms.saturating_sub(start) / 1_000);
+        ChannelActivitySnapshot {
+            visible: !self.active_workers.is_empty() || !self.face_ids.is_empty(),
+            worker_count: self.active_workers.len(),
+            overlap_px: CHANNEL_ACTIVITY_OVERLAP_PX,
+            shimmer_animated: !self.reduced_motion && !self.active_workers.is_empty(),
+            elapsed_text: format!("{}:{:02}", secs / 60, secs % 60),
+        }
     }
 
     pub fn worker_name_color(&self, worker_id: &str) -> String {
@@ -2264,6 +2414,7 @@ impl ChannelActivityIndicatorState {
     }
 
     pub fn render(&self, label_text: &str, dark_scheme: bool, now_sec: f64) -> Div {
+        let snap = self.snapshot((now_sec.max(0.0) * 1000.0) as u64);
         let mut faces_row = div().flex().items_center().flex_shrink_0();
         for (idx, id) in self.face_ids.iter().enumerate() {
             let brief = self
@@ -2286,10 +2437,11 @@ impl ChannelActivityIndicatorState {
             )
             .with_url(brief.and_then(|b| b.avatar_url.clone()));
             p.dark_scheme = dark_scheme;
+            p.reduced_motion = !snap.shimmer_animated;
 
             faces_row = faces_row.child(
                 div()
-                    .when(idx > 0, |el| el.ml(px(CHANNEL_ACTIVITY_OVERLAP_PX)))
+                    .when(idx > 0, |el| el.ml(px(snap.overlap_px)))
                     .when(is_leaving, |el| {
                         el.mr(px(CHANNEL_ACTIVITY_LEAVING_MARGIN_END_PX))
                             .mt(px(4.0))
@@ -2326,6 +2478,7 @@ impl ChannelActivityIndicatorState {
             );
         }
 
+        let show_elapsed = snap.visible && self.started_at_ms.is_some();
         div()
             .flex()
             .items_center()
@@ -2338,6 +2491,14 @@ impl ChannelActivityIndicatorState {
                     .text_color(rgb(muted_rgb))
                     .child(label_text.to_string()),
             )
+            .when(show_elapsed, |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(muted_rgb))
+                        .child(snap.elapsed_text.clone()),
+                )
+            })
     }
 }
 
@@ -3117,4 +3278,33 @@ fn render_editor_color_grid(
         grid = grid.child(row);
     }
     grid
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn parse_hex_u32_handles_non_ascii_without_utf8_panic() {
+        assert_eq!(parse_hex_u32("#a中文", 0x112233), 0x112233);
+        assert_eq!(parse_hex_u32("#🦀🦀", 0x445566), 0x445566);
+        assert_eq!(parse_hex_u32("#ff00aa", 0x000000), 0xFF00AA);
+        // Also reachable via public channel_icon_tile_colors -> oklab_mix_hex
+        let (bg, fg) = channel_icon_tile_colors(AvatarHue::Blue, "#a中文", "#🦀🦀");
+        assert!(bg.starts_with('#') && fg.starts_with('#'));
+    }
+
+    #[std::prelude::v1::test]
+    fn working_ball_hop_sample_and_cluster_size_guard_extremes() {
+        for idx in 0..3 {
+            let (dy, w, h) = working_ball_hop_sample(u64::MAX, idx);
+            assert!(dy.is_finite() && w.is_finite() && h.is_finite());
+            let (dy2, w2, h2) = working_ball_hop_sample(u64::MAX - 10, idx);
+            assert!(dy2.is_finite() && w2.is_finite() && h2.is_finite());
+        }
+        let c_nan = resolve_channel_cluster_sized(&[], ChannelAvatarLayout::Cluster, None, None, false, f32::NAN);
+        let c_inf = resolve_channel_cluster_sized(&[], ChannelAvatarLayout::Cluster, None, None, false, f32::INFINITY);
+        assert!(c_nan.size_px.is_finite() && c_nan.size_px >= 16.0);
+        assert!(c_inf.size_px.is_finite() && c_inf.size_px <= 256.0);
+    }
 }

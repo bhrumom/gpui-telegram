@@ -38,6 +38,123 @@ pub enum ComposerPopupAction {
     OpenBotAdd(ComposerOpenBotAddAction),
 }
 
+pub const OPENBOT_PICKER_DARK_BG_HEX: &str = "#121212";
+pub const OPENBOT_PICKER_DARK_BORDER_HEX: &str = "#222222";
+pub const OPENBOT_PICKER_LIGHT_BG_HEX: &str = "#f8f8fa";
+pub const OPENBOT_PICKER_LIGHT_BORDER_HEX: &str = "#e6e6ea";
+pub const OPENBOT_PICKER_RADIUS_PX: f32 = 14.0;
+pub const OPENBOT_PICKER_ROW_HEIGHT_PX: f32 = 29.0;
+pub const OPENBOT_PICKER_MAX_VISIBLE_ROWS: usize = 7;
+pub const OPENBOT_PICKER_MESSAGES_DEBOUNCE_MS: u64 = 150;
+pub const OPENBOT_PICKER_MESSAGES_MIN_QUERY: usize = 3;
+pub const OPENBOT_AT_PICKER_SECTIONS: [&str; 5] = [
+    "agents", "files", "tabs", "threads", "messages",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotPickerPopupLayout {
+    pub open: bool,
+    pub trigger: char,
+    pub bg_hex: &'static str,
+    pub border_hex: &'static str,
+    pub radius_px: f32,
+    pub row_height_px: f32,
+    pub max_visible_rows: usize,
+    pub visible_rows: usize,
+    pub scroll_enabled: bool,
+    pub fade_top: bool,
+    pub fade_bottom: bool,
+    pub sections: [&'static str; 5],
+    pub messages_debounce_ms: u64,
+    pub messages_min_query: usize,
+    pub messages_query_active: bool,
+}
+
+impl OpenBotPickerPopupLayout {
+    pub fn with_scroll_offset(mut self, total_rows: usize, scroll_offset: usize) -> Self {
+        let scroll_enabled = total_rows > self.visible_rows;
+        self.scroll_enabled = scroll_enabled;
+        self.fade_top = scroll_enabled && scroll_offset > 0;
+        self.fade_bottom = scroll_enabled && scroll_offset.saturating_add(self.visible_rows) < total_rows;
+        self
+    }
+}
+
+pub fn compute_openbot_picker_popup_layout(
+    open: bool,
+    trigger: char,
+    total_rows: usize,
+    query_len: usize,
+    palette: &TdesktopThemePalette,
+) -> OpenBotPickerPopupLayout {
+    let is_dark = palette.mode.is_dark();
+    let visible_rows = total_rows.min(OPENBOT_PICKER_MAX_VISIBLE_ROWS);
+    let scroll_enabled = total_rows > visible_rows;
+    OpenBotPickerPopupLayout {
+        open,
+        trigger,
+        bg_hex: if is_dark {
+            OPENBOT_PICKER_DARK_BG_HEX
+        } else {
+            OPENBOT_PICKER_LIGHT_BG_HEX
+        },
+        border_hex: if is_dark {
+            OPENBOT_PICKER_DARK_BORDER_HEX
+        } else {
+            OPENBOT_PICKER_LIGHT_BORDER_HEX
+        },
+        radius_px: OPENBOT_PICKER_RADIUS_PX,
+        row_height_px: OPENBOT_PICKER_ROW_HEIGHT_PX,
+        max_visible_rows: OPENBOT_PICKER_MAX_VISIBLE_ROWS,
+        visible_rows,
+        scroll_enabled,
+        fade_top: false,
+        fade_bottom: scroll_enabled,
+        sections: OPENBOT_AT_PICKER_SECTIONS,
+        messages_debounce_ms: OPENBOT_PICKER_MESSAGES_DEBOUNCE_MS,
+        messages_min_query: OPENBOT_PICKER_MESSAGES_MIN_QUERY,
+        messages_query_active: trigger == '@' && query_len >= OPENBOT_PICKER_MESSAGES_MIN_QUERY,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerAddMenuLayout {
+    pub items: Vec<crate::views::openbot::composer::ComposerAddMenuItem>,
+    pub separator_after_indices: Vec<usize>,
+    pub leading_or_trailing_separator: bool,
+}
+
+/// Computes the OpenBot `+` add-menu entries and separator layout for a peer (`UI-F12-06`).
+/// Consumed directly by `render_composer_add_menu`.
+pub fn compute_composer_add_menu_layout(is_bot: bool, is_group: bool) -> ComposerAddMenuLayout {
+    let items = crate::views::openbot::composer::ComposerAddMenuItem::items_for_peer(is_bot, is_group);
+    let mut separator_after_indices = Vec::new();
+    // Place an internal group separator between attachment/skill actions and voice/new-chat
+    // only when items exist strictly on both sides (never leading or trailing).
+    if items.len() > 2 {
+        if let Some(idx) = items.iter().position(|it| {
+            matches!(
+                it,
+                crate::views::openbot::composer::ComposerAddMenuItem::VoiceConversation
+                    | crate::views::openbot::composer::ComposerAddMenuItem::StartNewChat
+            )
+        }) {
+            if idx > 0 && idx < items.len() {
+                separator_after_indices.push(idx - 1);
+            }
+        }
+    }
+    let leading_or_trailing_separator = items.is_empty() && !separator_after_indices.is_empty()
+        || separator_after_indices
+            .iter()
+            .any(|&sep_after| sep_after + 1 >= items.len());
+    ComposerAddMenuLayout {
+        items,
+        separator_after_indices,
+        leading_or_trailing_separator,
+    }
+}
+
 const EMOJI_SHORTCODES: &[(&str, &str)] = &[
     (":thumbsup:", "👍"), (":+1:", "👍"), (":heart:", "❤️"), (":fire:", "🔥"),
     (":joy:", "😂"), (":smile:", "😄"), (":rocket:", "🚀"), (":party:", "🎉"),
@@ -61,7 +178,16 @@ pub fn render_autocomplete_popup<V: 'static>(
         && !ac.mention_rows.is_empty()
     {
         let sel_idx = ac.selected_index.max(0) as usize;
+        let scroll_top = sel_idx.saturating_sub(OPENBOT_PICKER_MAX_VISIBLE_ROWS.saturating_sub(1));
         let ob = palette.openbot_palette();
+        let picker_layout = compute_openbot_picker_popup_layout(
+            true,
+            '@',
+            ac.mention_rows.len(),
+            ac.filter.chars().count(),
+            palette,
+        )
+        .with_scroll_offset(ac.mention_rows.len(), scroll_top);
         let hbg = if is_apple { ob.hover() } else { palette.row_hover_rgba() };
         let active_bg = if is_apple {
             ob.bg_control_active()
@@ -80,18 +206,28 @@ pub fn render_autocomplete_popup<V: 'static>(
         };
         let mut box_el = div()
             .id("composer-autocomplete-popup")
-            .when(is_apple, |el| el.w_full().max_h(px(213.0)))
+            .when(is_apple, |el| {
+                el.w_full()
+                    .max_h(px(
+                        (picker_layout.max_visible_rows as f32) * picker_layout.row_height_px + 10.0,
+                    ))
+            })
             .when(!is_apple, |el| el.w(px(360.0)).max_h(px(320.0)))
-            .overflow_y_scroll()
+            .when(picker_layout.scroll_enabled || !is_apple, |el| {
+                el.overflow_y_scroll()
+            })
             .mb(px(if is_apple { 4.0 } else { 6.0 }))
             .p(px(5.0))
-            .rounded(px(14.0))
+            .rounded(px(picker_layout.radius_px))
             .bg(tucked_bg)
             .border_1()
             .border_color(tucked_border)
             .flex()
             .flex_col()
             .gap(px(1.0));
+        if picker_layout.fade_top {
+            box_el = box_el.child(div().h(px(1.0)).w_full().bg(ob.border_hairline()));
+        }
         if !is_apple {
             box_el = box_el.shadow_lg();
         }
@@ -99,11 +235,9 @@ pub fn render_autocomplete_popup<V: 'static>(
         for (idx, m) in ac.mention_rows.iter().take(12).enumerate() {
             let act = on_action.clone();
             let active = idx == sel_idx;
-            let insert = if !m.username.trim().is_empty() {
-                format!("@{} ", m.username.trim().trim_start_matches('@'))
-            } else {
-                format!("@{} ", m.name.trim())
-            };
+            let insert = crate::views::composer::composer_event_handlers::format_mention_insertion_token(
+                m, is_apple,
+            );
             let role_badge = ac.role_hint_for(m);
             let is_everyone = m.is_everyone();
             let hue = if is_everyone {
@@ -189,7 +323,11 @@ pub fn render_autocomplete_popup<V: 'static>(
             box_el = box_el.child(
                 div()
                     .id(SharedString::from(format!("ac-row-{}", idx)))
-                    .h(px(if is_apple { 29.0 } else { 32.0 }))
+                    .h(px(if is_apple {
+                        picker_layout.row_height_px
+                    } else {
+                        32.0
+                    }))
                     .px(px(8.0))
                     .rounded(px(7.0))
                     .when(active, |el| el.bg(active_bg))
@@ -286,6 +424,9 @@ pub fn render_autocomplete_popup<V: 'static>(
                             .child(role_badge),
                     ),
             );
+        }
+        if picker_layout.fade_bottom {
+            box_el = box_el.child(div().h(px(1.0)).w_full().bg(ob.border_hairline()));
         }
 
         return Some(box_el.into_any_element());
@@ -421,15 +562,52 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
     if is_apple {
         let ob = palette.openbot_palette();
         let hover_bg = ob.hover();
-        let ob_entries: [(ComposerOpenBotAddAction, OpenBotStageIcon, &str); 7] = [
-            (ComposerOpenBotAddAction::AttachFiles, OpenBotStageIcon::FileText, tr_str(lang_id, "附加文件或图片", "Attach files")),
-            (ComposerOpenBotAddAction::InsertSkillTrigger, OpenBotStageIcon::Puzzle, tr_str(lang_id, "使用技能 ($)", "Use skill ($)")),
-            (ComposerOpenBotAddAction::TeachTask, OpenBotStageIcon::Globe, tr_str(lang_id, "教任务（浏览器演示）", "Teach a task")),
-            (ComposerOpenBotAddAction::SideQuestion, OpenBotStageIcon::SideQuestion, tr_str(lang_id, "旁问 (Side Question)", "Side question")),
-            (ComposerOpenBotAddAction::LiveVoice, OpenBotStageIcon::AudioLines, tr_str(lang_id, "语音对话", "Voice conversation")),
-            (ComposerOpenBotAddAction::Workflows, OpenBotStageIcon::Workflow, tr_str(lang_id, "工作流", "Workflows")),
-            (ComposerOpenBotAddAction::NewChat, OpenBotStageIcon::NewChat, tr_str(lang_id, "新对话 (/new)", "New chat")),
-        ];
+        let is_group = (current_peer_type_mask
+            & (crate::components::bots::bot_attach_web_view::peer_types::GROUP
+                | crate::components::bots::bot_attach_web_view::peer_types::BROADCAST))
+            != 0;
+        let is_bot = current_peer_type_mask == 0
+            || (current_peer_type_mask
+                & (crate::components::bots::bot_attach_web_view::peer_types::BOT
+                    | crate::components::bots::bot_attach_web_view::peer_types::SAME_BOT))
+                != 0;
+        let add_menu_layout = compute_composer_add_menu_layout(is_bot, is_group);
+        let ob_entries: Vec<(ComposerOpenBotAddAction, OpenBotStageIcon, &str)> = add_menu_layout
+            .items
+            .into_iter()
+            .map(|item| match item {
+                crate::views::openbot::composer::ComposerAddMenuItem::AttachFiles => (
+                    ComposerOpenBotAddAction::AttachFiles,
+                    OpenBotStageIcon::FileText,
+                    tr_str(lang_id, "附加文件或图片", "Attach files"),
+                ),
+                crate::views::openbot::composer::ComposerAddMenuItem::PickSkill => (
+                    ComposerOpenBotAddAction::InsertSkillTrigger,
+                    OpenBotStageIcon::Puzzle,
+                    tr_str(lang_id, "使用技能 ($)", "Use skill ($)"),
+                ),
+                crate::views::openbot::composer::ComposerAddMenuItem::TeachBrowserTask => (
+                    ComposerOpenBotAddAction::TeachTask,
+                    OpenBotStageIcon::Globe,
+                    tr_str(lang_id, "教任务（浏览器演示）", "Teach a task"),
+                ),
+                crate::views::openbot::composer::ComposerAddMenuItem::AskSideQuestion => (
+                    ComposerOpenBotAddAction::SideQuestion,
+                    OpenBotStageIcon::SideQuestion,
+                    tr_str(lang_id, "旁问 (Side Question)", "Side question"),
+                ),
+                crate::views::openbot::composer::ComposerAddMenuItem::VoiceConversation => (
+                    ComposerOpenBotAddAction::LiveVoice,
+                    OpenBotStageIcon::AudioLines,
+                    tr_str(lang_id, "语音对话", "Voice conversation"),
+                ),
+                crate::views::openbot::composer::ComposerAddMenuItem::StartNewChat => (
+                    ComposerOpenBotAddAction::NewChat,
+                    OpenBotStageIcon::NewChat,
+                    tr_str(lang_id, "新对话 (/new)", "New chat"),
+                ),
+            })
+            .collect();
         let mut box_el = div()
             .id("composer-attachments-popup")
             .w(px(252.0))
@@ -445,6 +623,7 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
             .gap(px(1.0));
         for (idx, (act_kind, icon_kind, label)) in ob_entries.into_iter().enumerate() {
             let act = on_action.clone();
+            let add_sep_after = add_menu_layout.separator_after_indices.contains(&idx);
             box_el = box_el.child(
                 div()
                     .id(SharedString::from(format!("att-ob-opt-{}", idx)))
@@ -473,6 +652,9 @@ pub fn render_attachments_drawer_with_apps<V: 'static>(
                             .child(label.to_string()),
                     ),
             );
+            if add_sep_after {
+                box_el = box_el.child(div().w_full().h(px(1.0)).my(px(3.0)).bg(ob.border_hairline()));
+            }
         }
         box_el = box_el.child(div().w_full().h(px(1.0)).my(px(4.0)).bg(ob.border_hairline()));
         let extra_tools: [(ComposerPopupAction, &str, &str); 5] = [

@@ -13,8 +13,9 @@ use crate::views::sidebar::dialogs_overlays::{
     render_openbot_sidebar_tabs, render_openbot_tabs_edit_popover,
 };
 use crate::views::sidebar::dialogs_renderer::{
-    render_archived_header_row, render_pinned_chats_grid_localized, render_plus_dropdown,
-    render_stories_strip, render_suggestion_bar,
+    compute_sidebar_empty_state_layout, render_archived_header_row,
+    render_pinned_chats_grid_localized, render_plus_dropdown, render_stories_strip,
+    render_suggestion_bar,
 };
 use crate::views::sidebar::dialogs_row_view::{
     render_dialog_row_item_with_width, SidebarDialogMeta,
@@ -150,6 +151,7 @@ impl Render for ChatSidebar {
                         if this.is_resizing {
                             this.is_resizing = false;
                             this.resize_drag_start_x = None;
+                            this.pending_persist_openbot_width = true;
                             cx.notify();
                         }
                     }))
@@ -266,7 +268,7 @@ impl Render for ChatSidebar {
             )
         });
         // Defect D2 fix: suppress duplicate bottom account/settings footer when PageRail is active.
-        let footer = (!self.has_leading_app_sidebar).then(|| {
+        let footer = self.renders_embedded_account_footer().then(|| {
             render_expanded_gemini_footer(
                 &nav_snapshot,
                 self.has_leading_app_sidebar,
@@ -441,8 +443,17 @@ impl Render for ChatSidebar {
             )
         };
 
+        let openbot_tabs_layout =
+            crate::views::sidebar::dialogs_overlays::compute_openbot_sidebar_tabs_layout(
+                self.is_collapsed,
+                self.is_sidebar_closed,
+                use_inline_search,
+                &active_folder,
+                self.is_tabs_edit_menu_open,
+                &palette,
+            );
         let folder_tabs = if !use_inline_search {
-            if is_openbot {
+            if is_openbot && openbot_tabs_layout.visible {
                 let folders_list = self.folders.clone();
                 let hidden = self.hidden_tab_ids.clone();
                 Some(render_openbot_sidebar_tabs(
@@ -450,7 +461,7 @@ impl Render for ChatSidebar {
                     total_dialog_unread,
                     &active_folder,
                     &hidden,
-                    self.is_tabs_edit_menu_open,
+                    openbot_tabs_layout.sliders_menu_open,
                     &palette,
                     &lang_id,
                     cx,
@@ -874,37 +885,56 @@ impl Render for ChatSidebar {
                             .into_any_element(),
                     );
                 } else {
-                    list.push(
-                        div()
-                            .id("sidebar-empty-dialogs-state")
-                            .w_full()
-                            .py(px(40.0))
-                            .px(px(16.0))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(10.0))
-                            .child(tg_icon(IconName::FolderChat, 32.0, palette.text_secondary))
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(palette.text_primary))
-                                    .child(tr_str(&lang_id, "暂无对话", "No chats yet")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(palette.text_secondary))
-                                    .child(tr_str(
-                                        &lang_id,
-                                        "点击右上角图标添加联系人或创建群组",
-                                        "Start a chat or connect your workspace",
-                                    )),
-                            )
-                            .into_any_element(),
-                    );
+                    let empty = compute_sidebar_empty_state_layout(0, &palette, &lang_id);
+                    let ob = palette.openbot_palette();
+                    let mut empty_card = div()
+                        .id("sidebar-empty-dialogs-state")
+                        .w_full()
+                        .py(px(40.0))
+                        .px(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(10.0))
+                        .child(tg_icon(IconName::FolderChat, 32.0, palette.text_secondary))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(palette.text_primary))
+                                .child(empty.title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(palette.text_secondary))
+                                .child(empty.subtitle),
+                        );
+                    if is_apple && empty.visible {
+                        empty_card = empty_card.child(
+                            div()
+                                .id("sidebar-empty-create-first-agent")
+                                .mt(px(4.0))
+                                .px(px(14.0))
+                                .py(px(7.0))
+                                .rounded(px(8.0))
+                                .bg(ob.surface_light())
+                                .cursor_pointer()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_on_light())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.pending_open_create_agent_studio = true;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(empty.cta_label),
+                        );
+                    }
+                    list.push(empty_card.into_any_element());
                 }
             }
 
@@ -1016,6 +1046,7 @@ impl Render for ChatSidebar {
                 if this.is_resizing {
                     this.is_resizing = false;
                     this.resize_drag_start_x = None;
+                    this.pending_persist_openbot_width = true;
                     cx.notify();
                 }
             }))

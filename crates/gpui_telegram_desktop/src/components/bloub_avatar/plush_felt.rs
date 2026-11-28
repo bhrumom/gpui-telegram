@@ -536,9 +536,21 @@ pub fn rgba_to_gpui_render_image(mut rgba: image::RgbaImage) -> Arc<gpui::Render
 }
 
 pub fn plush_pixels(size_px: f32, scale_factor: f32) -> u32 {
-    let scaled = (f64::from(size_px.max(1.0)) * f64::from(scale_factor.max(1.0))).ceil() as u32;
-    let stepped = scaled.div_ceil(PIXEL_STEP) * PIXEL_STEP;
-    stepped.max(PIXEL_STEP)
+    let safe_size = if size_px.is_finite() {
+        size_px.clamp(1.0, 1024.0)
+    } else {
+        PIXEL_STEP as f32
+    };
+    let safe_scale = if scale_factor.is_finite() {
+        scale_factor.clamp(1.0, 4.0)
+    } else {
+        1.0
+    };
+    let scaled = (f64::from(safe_size) * f64::from(safe_scale))
+        .ceil()
+        .clamp(1.0, 1024.0) as u32;
+    let stepped = scaled.div_ceil(PIXEL_STEP).saturating_mul(PIXEL_STEP);
+    stepped.clamp(PIXEL_STEP, 1024)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2683,10 +2695,10 @@ pub fn composite_plush_rgba_with_assets(
     saturation: f64,
     assets: &BundledPlushAssets,
 ) -> image::RgbaImage {
-    let sz = pixel_size.max(8);
+    let sz = pixel_size.clamp(8, 1024);
     let px_per_vb = f64::from(sz) / VIEW_BOX;
     let half_px = f64::from(sz) * 0.5;
-    let mut buf = vec![[0.0_f64; 4]; (sz * sz) as usize];
+    let mut buf = vec![[0.0_f64; 4]; (sz as usize).saturating_mul(sz as usize)];
 
     let body_sx = sample.transition_sample.sx;
     let body_sy = sample.transition_sample.sy * sample.breath_sy;
@@ -2746,6 +2758,36 @@ pub fn composite_plush_rgba_with_assets(
                         *ch *= body_alpha;
                     }
                     buf[(py * sz + px) as usize] = p;
+                }
+            }
+        } else {
+            // Procedural felt-silhouette fallback when bundled `.webp` assets are absent on disk.
+            let radii = match sample.transition_sample.corps {
+                TransitionBodyStage::Avant => &sample.avant_radii,
+                TransitionBodyStage::Apres | TransitionBodyStage::Deux => &sample.apres_radii,
+            };
+            let lut = tint_ramp(&sample.ink_hex);
+            let aa_vb = (1.2 / px_per_vb).max(0.75);
+            for py in 0..sz {
+                let vb_y = ((f64::from(py) + 0.5 - half_px) / px_per_vb) / body_sy;
+                for px in 0..sz {
+                    let vb_x = ((f64::from(px) + 0.5 - half_px) / px_per_vb) / body_sx;
+                    let dist = vb_x.hypot(vb_y);
+                    let ang = vb_y.atan2(vb_x);
+                    let r_max = radius_at_angle(radii, ang).max(1.0);
+                    let cov = clamp01((r_max - dist) / aa_vb + 0.5) * body_alpha;
+                    if cov <= 1e-4 {
+                        continue;
+                    }
+                    let nx = vb_x / RAYON;
+                    let ny = vb_y / RAYON;
+                    let radial = (dist / r_max).clamp(0.0, 1.0);
+                    let light = clamp01(0.76 - 0.34 * radial - 0.14 * ny - 0.08 * nx);
+                    let shade = lut[(light * 255.0).round().clamp(0.0, 255.0) as usize];
+                    let cr = f64::from(shade[0]) / 255.0;
+                    let cg = f64::from(shade[1]) / 255.0;
+                    let cb = f64::from(shade[2]) / 255.0;
+                    buf[(py * sz + px) as usize] = [cr * cov, cg * cov, cb * cov, cov];
                 }
             }
         }
@@ -2905,6 +2947,50 @@ fn paint_plush_eye_layer(
                     }
                     if isolated[3] > 1e-5 {
                         blend_over_premul(&mut buf[(py * sz + px) as usize], isolated);
+                    }
+                }
+            }
+        } else if let Some(inv_pad) = invert_affine(&t_pad) {
+            // Procedural dark/paper eye oval fallback when eye `.webp` pads are missing.
+            let (ext_x, ext_y) = pad_extent(&eye.pieces);
+            let half_w = ext_x.max(10.0) * 0.52;
+            let half_h = ext_y.max(12.0) * 0.56;
+            let radius = half_w.min(half_h);
+            let corners = [
+                apply_affine(&t_pad, -half_w - 2.0, -half_h - 2.0),
+                apply_affine(&t_pad, half_w + 2.0, -half_h - 2.0),
+                apply_affine(&t_pad, -half_w - 2.0, half_h + 2.0),
+                apply_affine(&t_pad, half_w + 2.0, half_h + 2.0),
+            ];
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for (cx, cy) in corners {
+                min_x = min_x.min(cx - 1.0);
+                max_x = max_x.max(cx + 1.0);
+                min_y = min_y.min(cy - 1.0);
+                max_y = max_y.max(cy + 1.0);
+            }
+            let x0 = min_x.floor().max(0.0) as u32;
+            let x1 = max_x.ceil().min(f64::from(sz)) as u32;
+            let y0 = min_y.floor().max(0.0) as u32;
+            let y1 = max_y.ceil().min(f64::from(sz)) as u32;
+            let [er, eg, eb] = parse_hex_rgb(CLOSED_EYE_COLOR);
+            let cr = f64::from(er) / 255.0;
+            let cg = f64::from(eg) / 255.0;
+            let cb = f64::from(eb) / 255.0;
+            for py in y0..y1 {
+                let sy = f64::from(py) + 0.5;
+                for px in x0..x1 {
+                    let sx = f64::from(px) + 0.5;
+                    let (lx, ly) = apply_affine(&inv_pad, sx, sy);
+                    let cov = rrect_inside(lx, ly, half_w, half_h, radius) * pad_alpha;
+                    if cov > 1e-4 {
+                        blend_over_premul(
+                            &mut buf[(py * sz + px) as usize],
+                            [cr * cov, cg * cov, cb * cov, cov],
+                        );
                     }
                 }
             }

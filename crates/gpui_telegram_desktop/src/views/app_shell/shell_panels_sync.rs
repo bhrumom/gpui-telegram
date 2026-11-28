@@ -10,7 +10,7 @@ use crate::views::app_shell::shell_actions::{
     resolve_active_target_chat_id,
 };
 use crate::views::app_shell::shell_settings_sync::{apply_folders_to_shell, apply_wallet_to_shell};
-use crate::views::app_shell::shell_truth::{derive_initials, ClientCallFence};
+use crate::views::app_shell::shell_truth::derive_initials;
 use crate::views::boxes::modal_types::ModalDialogKind;
 use crate::views::context_inspector::build_add_member_candidates;
 use crate::views::drawer::inspector_tabs::InspectorAction;
@@ -1199,6 +1199,30 @@ impl AppShell {
                 }
             }
             SidebarContextAction::ToggleUnread(_) => {}
+            SidebarContextAction::MoveToFolder(_) => {
+                self.navigate_settings_to(
+                    crate::views::settings::settings_type::SettingsSectionType::Folders,
+                    cx,
+                );
+            }
+            SidebarContextAction::ToggleHide(id) => {
+                let arch = self.sidebar.read(cx).archived_ids.contains(&id);
+                if let Some(rc) = self.session_sync.rich_chats_by_id.get_mut(&id) {
+                    rc.is_archived = arch;
+                }
+            }
+            SidebarContextAction::OpenSettings(id) => {
+                if self.stage.read(cx).active_chat_id != Some(id) {
+                    self.sidebar.update(cx, |sb, scx| {
+                        sb.select_dialog_from_user(id);
+                        scx.notify();
+                    });
+                }
+                self.open_unified_side_panel_pane(
+                    crate::views::openbot::side_panel::SidePanelPaneKind::Settings,
+                    cx,
+                );
+            }
         }
         cx.notify();
     }

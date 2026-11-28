@@ -27,7 +27,7 @@ use crate::components::bloub_avatar::{AgentAvatarProps, render_agent_avatar};
 use crate::theme::openbot_palette::{
     ChatBackdropScene, OpenBotPalette, file_reference_badge, file_reference_tone,
     parse_css_color_to_rgba, readable_chat_background, render_chat_backdrop,
-    solid_bubble_takes_dark_text,
+    solid_bubble_text_rgb,
 };
 use crate::theme::{IconName, tg_icon_rgba};
 
@@ -405,9 +405,6 @@ impl ChatRowBoundary {
                 corrupt += 1;
                 isolated_ids.push(b.row_id);
             }
-            if healthy < 2 {
-                healthy = 2;
-            }
         }
         ChatRowRenderResult {
             rendered_rows: healthy + corrupt,
@@ -511,11 +508,16 @@ impl VoicePlayerState {
             let env = 0.22 + 0.72 * phase * (0.65 + 0.35 * ((i as f64) * 0.19).cos().abs());
             bars.push((env as f32).clamp(0.12, 1.0));
         }
+        let safe_duration = if duration_sec.is_finite() && duration_sec > 0.0 {
+            duration_sec.max(0.1)
+        } else {
+            0.1
+        };
         Self {
             track_id: id,
             title: None,
             waveform_bars: bars,
-            duration_sec: duration_sec.max(0.1),
+            duration_sec: safe_duration,
             position_sec: 0.0,
             seek_step_sec: VOICE_PLAYER_SEEK_STEP_SEC,
             speed: 1.0,
@@ -543,23 +545,53 @@ impl VoicePlayerState {
     }
 
     pub fn seek_forward(&mut self) {
-        self.position_sec = (self.position_sec + self.seek_step_sec).min(self.duration_sec);
+        let dur = if self.duration_sec.is_finite() {
+            self.duration_sec.max(0.1)
+        } else {
+            0.1
+        };
+        let pos = if self.position_sec.is_finite() {
+            self.position_sec
+        } else {
+            0.0
+        };
+        self.position_sec = (pos + self.seek_step_sec).min(dur);
     }
 
     pub fn seek_backward(&mut self) {
-        self.position_sec = (self.position_sec - self.seek_step_sec).max(0.0);
+        let pos = if self.position_sec.is_finite() {
+            self.position_sec
+        } else {
+            0.0
+        };
+        self.position_sec = (pos - self.seek_step_sec).max(0.0);
     }
 
     pub fn seek_to_fraction(&mut self, frac: f64) {
-        self.position_sec = (frac.clamp(0.0, 1.0)) * self.duration_sec;
+        if !frac.is_finite() {
+            return;
+        }
+        let dur = if self.duration_sec.is_finite() && self.duration_sec > 0.0 {
+            self.duration_sec
+        } else {
+            0.1
+        };
+        self.position_sec = (frac.clamp(0.0, 1.0)) * dur;
     }
 
     pub fn progress_fraction(&self) -> f32 {
+        if !self.position_sec.is_finite() || !self.duration_sec.is_finite() || self.duration_sec <= 0.0 {
+            return 0.0;
+        }
         ((self.position_sec / self.duration_sec.max(0.001)).clamp(0.0, 1.0)) as f32
     }
 
     fn format_clock(sec: f64) -> String {
-        let total = sec.max(0.0).round() as u64;
+        let total = if sec.is_finite() {
+            sec.max(0.0).round() as u64
+        } else {
+            0
+        };
         format!("{}:{:02}", total / 60, total % 60)
     }
 
@@ -2169,11 +2201,7 @@ pub fn render_conversation_view(
         let (bubble_bg, bubble_fg) = if is_user {
             if let Some(ref solid_hex) = state.user_bubble_solid_hex {
                 let bg = parse_css_color_to_rgba(solid_hex).unwrap_or(accent);
-                let fg = if solid_bubble_takes_dark_text(solid_hex) {
-                    rgb(0x141414)
-                } else {
-                    rgb(0xFFFFFF)
-                };
+                let fg = rgb(solid_bubble_text_rgb(solid_hex));
                 (bg, fg)
             } else {
                 (raised, text_primary)

@@ -376,14 +376,21 @@ fn test_ob_f15_conversation_streaming_preview_boundary_steps_trace_and_ask_ui() 
 
 #[test]
 fn test_ob_f16_composer_pickers_paste_attachments_pi_guard_queue_voice_and_side_panel() {
-    // @ picker: 5 sections; omits messages when 0 < query < 3; @everyone iff in_channel
-    let short_q = resolve_at_picker("au", true, &[], &[], &[], &[], &[]);
+    // @ picker: 5 sections; omits messages when 0 < query < 3; @everyone iff in_channel && >1 agents
+    let multi_agents = vec![
+        ("a1".to_string(), "Alpha".to_string()),
+        ("a2".to_string(), "Beta".to_string()),
+    ];
+    let solo_agent = vec![("a1".to_string(), "Alpha".to_string())];
+    let short_q = resolve_at_picker("au", true, &multi_agents, &[], &[], &[], &[]);
     assert!(!short_q.at_sections.iter().any(|s| s == "messages"));
     assert!(!short_q.everyone_shown);
-    let long_q = resolve_at_picker("every", true, &[], &[], &[], &[], &[]);
+    let long_q = resolve_at_picker("every", true, &multi_agents, &[], &[], &[], &[]);
     assert!(long_q.at_sections.iter().any(|s| s == "messages"));
     assert!(long_q.everyone_shown);
-    let dm_q = resolve_at_picker("every", false, &[], &[], &[], &[], &[]);
+    let solo_q = resolve_at_picker("every", true, &solo_agent, &[], &[], &[], &[]);
+    assert!(!solo_q.everyone_shown);
+    let dm_q = resolve_at_picker("every", false, &multi_agents, &[], &[], &[], &[]);
     assert!(!dm_q.everyone_shown);
 
     // $ picker: enabled skills & MCP + separate skill_problems

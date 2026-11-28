@@ -15,6 +15,7 @@ use crate::views::content_hub::apple_primitives::{
     empty_state_card_shell, filter_pill, hero_banner, openbot_marketplace_nav_item,
     openbot_marketplace_shell, openbot_page_header, openbot_primary_cta_btn, openbot_secondary_btn,
     rating_pill, render_editable_field_box, review_status_badge,
+    OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH,
 };
 use crate::views::content_hub::book_reader::BookReaderState;
 use crate::views::content_hub::{
@@ -828,7 +829,7 @@ pub fn render_books_hub_view(
     let body_scroll = div().id("apple-books-hub-scroll").child(
         div()
             .w_full()
-            .max_w(px(880.0))
+            .max_w(px(OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH))
             .mx_auto()
             .px(px(24.0))
             .py(px(20.0))

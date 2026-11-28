@@ -8,7 +8,9 @@ use crate::views::auth::AuthWizardView;
 use crate::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers;
 use crate::views::settings::SettingsRouter;
 use crate::views::tdesktop_theme::resolve_desktop_palette;
+use crate::views::openbot::channel_editor::ChannelCreateDialogModal;
 use crate::views::orca::{OrcaBotsWorkspace, OrcaIdeWorkspace, ScopedJumpPalette};
+use crate::views::sidebar::global_search_modal::GlobalSearchModal;
 use crate::views::{
     AppleAppSidebar, BrowserWorkspace, CallOverlay, CanonicalComposer, ChatSidebar,
     CommunityWorkspace, ComputerWorkbench, ContentHubWorkspace, ContextInspector,
@@ -132,6 +134,8 @@ pub struct ShellThemeTargets<'a> {
     pub settings_router: &'a Entity<SettingsRouter>,
     pub miniapp_overlay: Option<&'a Entity<BotAttachWebView>>,
     pub create_bot_box: Option<&'a Entity<CreateManagedBotBoxPeers>>,
+    pub global_search_modal: Option<&'a Entity<GlobalSearchModal>>,
+    pub channel_create_dialog: Option<&'a Entity<ChannelCreateDialogModal>>,
 }
 
 macro_rules! sync_palette_and_lang {
@@ -244,6 +248,20 @@ pub fn propagate_theme_and_locale<V: 'static>(
         overlay.update(cx, |o, ocx| {
             o.apply_theme(palette.clone(), lang_id);
             ocx.notify();
+        });
+    }
+    if let Some(gs) = targets.global_search_modal {
+        let lang_owned = lang_id.to_string();
+        gs.update(cx, |m, mcx| {
+            m.set_theme_and_locale(*palette, lang_owned);
+            mcx.notify();
+        });
+    }
+    if let Some(cc) = targets.channel_create_dialog {
+        let lang_owned = lang_id.to_string();
+        cc.update(cx, |m, mcx| {
+            m.set_theme_and_locale(*palette, lang_owned);
+            mcx.notify();
         });
     }
 }

@@ -8,7 +8,9 @@ use crate::components::avatar::{
     render_fabushi_shape_avatar, render_felt_status_badge, render_plush_bot_avatar,
     ChannelAgentBrief, ChannelAvatarLayout, FeltStatusBadgeState,
 };
-use crate::components::bloub_avatar::{PlushCharacterId, SidebarPlushRingKind};
+use crate::components::bloub_avatar::{
+    compute_working_badge_layout, PlushCharacterId, SidebarPlushRingKind,
+};
 use crate::components::grok_bot_avatar::{
     render_grok_bot_avatar, GrokBotAvatarProps, GrokPersonaState,
 };
@@ -32,11 +34,233 @@ use openbot_contracts::channels::ChannelMember;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarContextAction {
     TogglePin(u64),
+    MoveToFolder(u64),
+    ToggleHide(u64),
     ToggleMute(u64),
     ToggleArchive(u64),
     ToggleUnread(u64),
+    OpenSettings(u64),
     ClearHistory(u64),
     DeleteChat(u64),
+}
+
+pub const OPENBOT_ROW_RADIUS_PX: f32 = 8.0;
+pub const OPENBOT_WAIT_CHIP_ICON_ONLY_WIDTH: f32 = 300.0;
+
+pub const fn sidebar_context_action_key(action: SidebarContextAction) -> &'static str {
+    match action {
+        SidebarContextAction::TogglePin(_) => "pin",
+        SidebarContextAction::MoveToFolder(_) => "move_to_folder",
+        SidebarContextAction::ToggleHide(_) => "hide",
+        SidebarContextAction::ToggleMute(_) => "mute",
+        SidebarContextAction::ToggleArchive(_) => "archive",
+        SidebarContextAction::ToggleUnread(_) => "unread",
+        SidebarContextAction::OpenSettings(_) => "settings",
+        SidebarContextAction::ClearHistory(_) => "clear_history",
+        SidebarContextAction::DeleteChat(_) => "delete",
+    }
+}
+
+pub fn openbot_context_menu_actions(dialog_id: u64) -> [SidebarContextAction; 9] {
+    [
+        SidebarContextAction::TogglePin(dialog_id),
+        SidebarContextAction::MoveToFolder(dialog_id),
+        SidebarContextAction::ToggleHide(dialog_id),
+        SidebarContextAction::ToggleMute(dialog_id),
+        SidebarContextAction::ToggleUnread(dialog_id),
+        SidebarContextAction::OpenSettings(dialog_id),
+        SidebarContextAction::ToggleArchive(dialog_id),
+        SidebarContextAction::ClearHistory(dialog_id),
+        SidebarContextAction::DeleteChat(dialog_id),
+    ]
+}
+
+fn is_zero_width_cluster_extender(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200D}'
+            | '\u{FE0E}'
+            | '\u{FE0F}'
+            | '\u{20E3}'
+            | '\u{1F3FB}'..='\u{1F3FF}'
+            | '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch)
+}
+
+/// Splits `s` into atomic grapheme clusters `(cluster_slice, display_units)` so ZWJ emoji sequences
+/// (e.g. `👩‍👩‍👧‍👦`), variation selectors, skin-tone modifiers, and combining marks are never torn mid-cluster.
+fn grapheme_clusters_with_units(s: &str) -> Vec<(&str, usize)> {
+    let mut clusters = Vec::new();
+    let mut iter = s.char_indices().peekable();
+    while let Some((start, first)) = iter.next() {
+        let mut end = start + first.len_utf8();
+        let mut prev = first;
+        let units = if is_zero_width_cluster_extender(first) {
+            0
+        } else if first.is_ascii() {
+            1
+        } else {
+            2
+        };
+        let mut consumed_ri_pair = false;
+        while let Some(&(next_idx, next_ch)) = iter.peek() {
+            if prev == '\u{200D}' {
+                iter.next();
+                end = next_idx + next_ch.len_utf8();
+                prev = next_ch;
+            } else if is_zero_width_cluster_extender(next_ch) {
+                iter.next();
+                end = next_idx + next_ch.len_utf8();
+                prev = next_ch;
+            } else if !consumed_ri_pair && is_regional_indicator(first) && is_regional_indicator(next_ch) {
+                consumed_ri_pair = true;
+                iter.next();
+                end = next_idx + next_ch.len_utf8();
+                prev = next_ch;
+            } else {
+                break;
+            }
+        }
+        clusters.push((&s[start..end], units));
+    }
+    clusters
+}
+
+/// Unicode-grapheme-safe & CJK-aware single-line preview truncation (`D6` / `UI-F06-03` safe ellipsis).
+pub fn format_sidebar_row_preview(raw: &str, sidebar_width_px: f32) -> (String, bool) {
+    let single_line: String = raw
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch })
+        .collect();
+    let trimmed = single_line.trim();
+    if trimmed.is_empty() {
+        return (String::new(), false);
+    }
+    let safe_w = if sidebar_width_px.is_finite() {
+        sidebar_width_px
+    } else {
+        280.0
+    };
+    let text_budget_px = (safe_w - 76.0).max(52.0);
+    let max_units = ((text_budget_px / 7.5).floor() as usize).max(6);
+    let mut used = 0usize;
+    let mut out = String::new();
+    let mut truncated = false;
+    for (cluster, w) in grapheme_clusters_with_units(trimmed) {
+        if used + w > max_units {
+            truncated = true;
+            break;
+        }
+        out.push_str(cluster);
+        used += w;
+    }
+    if truncated {
+        while out.ends_with(' ') || out.ends_with('\u{200D}') {
+            out.pop();
+        }
+        out.push('…');
+        (out, true)
+    } else {
+        (trimmed.to_string(), false)
+    }
+}
+
+/// Single-source-of-truth layout snapshot for OpenBot's `62px` sidebar row (`D6`, thread sub-rows, archived dim).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotDialogRowLayout {
+    pub height_px: f32,
+    pub avatar_px: f32,
+    pub radius_px: f32,
+    pub min_w_0: bool,
+    pub whitespace_nowrap: bool,
+    pub time_visible: bool,
+    pub wait_chip_icon_only: bool,
+    pub archived_or_hidden: bool,
+    pub opacity: f32,
+    pub grayscale: bool,
+    pub thread_chevron_hover: bool,
+    pub thread_subrow_height_px: f32,
+    pub preview_displayed: String,
+    pub preview_truncated: bool,
+    pub avatar_is_plush_3d: bool,
+    pub felt_badge: Option<FeltStatusBadgeState>,
+    pub working_badge_width_px: Option<f32>,
+}
+
+pub fn compute_openbot_dialog_row_layout(
+    item: &DialogItemModel,
+    meta: &SidebarDialogMeta,
+    sidebar_width_px: f32,
+    lang_id: &str,
+) -> OpenBotDialogRowLayout {
+    let safe_w = if sidebar_width_px.is_finite() {
+        sidebar_width_px.max(0.0)
+    } else {
+        280.0
+    };
+    let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
+    let felt_badge = resolve_dialog_felt_badge_state(item, meta, &preview_priority);
+    let working_badge_width_px = if felt_badge == Some(FeltStatusBadgeState::Working3Balls) {
+        Some(compute_working_badge_layout(true, false, 240).width_px)
+    } else {
+        None
+    };
+    let default_pal = TdesktopThemePalette::default();
+    let avatar_is_plush_3d = match resolve_dialog_avatar_kind(item, meta, &default_pal) {
+        DialogAvatarKind::GrokBot { shape, .. } => {
+            !shape.trim().to_ascii_lowercase().starts_with("grok2d:")
+        }
+        DialogAvatarKind::FabushiShape { shape, .. } => {
+            let lower = shape.trim().to_ascii_lowercase();
+            !lower.eq("classic") && !lower.starts_with("bloub:") && !lower.starts_with("grok2d:")
+        }
+        _ => false,
+    };
+    let raw_preview = match preview_priority {
+        DialogPreviewPriority::BlockedApproval(s)
+        | DialogPreviewPriority::Draft(s)
+        | DialogPreviewPriority::LiveActivity(s)
+        | DialogPreviewPriority::Message(s) => {
+            if s.trim().is_empty() {
+                tr_str(lang_id, "暂无消息", "No messages yet").to_string()
+            } else {
+                s
+            }
+        }
+    };
+    let (preview_displayed, preview_truncated) = format_sidebar_row_preview(&raw_preview, safe_w);
+    let archived_or_hidden = meta.is_archived;
+    let has_topics = meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty());
+    OpenBotDialogRowLayout {
+        height_px: ROW_HEIGHT,
+        avatar_px: 46.0,
+        radius_px: OPENBOT_ROW_RADIUS_PX,
+        min_w_0: true,
+        whitespace_nowrap: true,
+        time_visible: !archived_or_hidden
+            && safe_w > OPENBOT_HIDE_TIMESTAMP_WIDTH
+            && !item.timestamp.is_empty(),
+        wait_chip_icon_only: safe_w <= OPENBOT_WAIT_CHIP_ICON_ONLY_WIDTH,
+        archived_or_hidden,
+        opacity: if archived_or_hidden { 0.5 } else { 1.0 },
+        grayscale: archived_or_hidden,
+        thread_chevron_hover: has_topics,
+        thread_subrow_height_px: crate::views::sidebar::dialogs_overlays::OPENBOT_THREAD_SUBROW_HEIGHT_PX,
+        preview_displayed,
+        preview_truncated,
+        avatar_is_plush_3d,
+        felt_badge,
+        working_badge_width_px,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -815,10 +1039,8 @@ pub(crate) fn render_openbot_dialog_avatar_with_badge(
     avatar_size_px: f32,
     surface_bg_hex: u32,
     is_selected: bool,
-    lang_id: &str,
+    badge_state: Option<FeltStatusBadgeState>,
 ) -> Div {
-    let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
-    let badge_state = resolve_dialog_felt_badge_state(item, meta, &preview_priority);
     let suppress_dot = badge_state.is_some() || meta.is_bot || meta.is_group;
     let base = render_dialog_avatar_with_options(
         item,
@@ -921,9 +1143,10 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
     if palette.is_apple_style() {
         // OpenBot `383a35d2` sidebar row rhythm: 62px height, 8px radius, 46px 3D plush/cluster
         // avatar + felt status badge, active #212121/#e8e8eb, hide timestamp <= 210px, D6-safe ellipsis.
+        let row_layout = compute_openbot_dialog_row_layout(item, meta, sidebar_width_px, lang_id);
         let ob = palette.openbot_palette();
         let is_dark = palette.mode.is_dark();
-        let row_height = palette.scaled_px(ROW_HEIGHT);
+        let row_height = palette.scaled_px(row_layout.height_px);
         let row_hover_bg = ob.hover();
         let row_active_bg = if is_dark { ob.bg_surface() } else { rgb(0xE8E8EB) };
         let row_surface_hex = if is_selected {
@@ -936,7 +1159,7 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
         let name_fg = ob.text_primary();
         let sub_fg = ob.text_muted();
         let time_fg = ob.text_readable();
-        let avatar_size_px = palette.scaled_px(46.0);
+        let avatar_size_px = palette.scaled_px(row_layout.avatar_px);
         let avatar = render_openbot_dialog_avatar_with_badge(
             item,
             meta,
@@ -944,12 +1167,11 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             avatar_size_px,
             row_surface_hex,
             is_selected,
-            lang_id,
+            row_layout.felt_badge,
         );
 
         let preview_priority = resolve_dialog_preview_priority(item, meta, lang_id);
         let has_unread = item.unread_count > 0 || meta.is_unread_marked;
-        let hide_timestamp = sidebar_width_px <= OPENBOT_HIDE_TIMESTAMP_WIDTH;
 
         let mut title_row = div()
             .flex_1()
@@ -1007,7 +1229,7 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             .justify_between()
             .gap(px(8.0))
             .child(title_row)
-            .when(!hide_timestamp && !item.timestamp.is_empty(), |el| {
+            .when(row_layout.time_visible, |el| {
                 el.child(
                     div()
                         .flex_shrink_0()
@@ -1092,12 +1314,8 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
                 .text_color(ob.text_secondary())
                 .child(activity)
                 .into_any_element(),
-            DialogPreviewPriority::Message(text) => {
-                let display_text = if text.trim().is_empty() {
-                    tr_str(lang_id, "暂无消息", "No messages yet").to_string()
-                } else {
-                    text
-                };
+            DialogPreviewPriority::Message(_) => {
+                let display_text = row_layout.preview_displayed.clone();
                 if let Some(icon) = media_badge_svg_rgba(preview_ui.media_badge, sub_fg) {
                     div()
                         .flex_1()
@@ -1170,7 +1388,7 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             );
         }
 
-        if meta.topics.as_ref().is_some_and(|t| !t.topics.is_empty()) {
+        if row_layout.thread_chevron_hover {
             has_aux = true;
             let chev = if meta.is_topics_expanded {
                 IconName::ChevronDown
@@ -1217,7 +1435,8 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
             .w_full()
             .p(px(palette.scaled_px(8.0)))
             .mb(px(2.0))
-            .rounded(px(8.0))
+            .rounded(px(row_layout.radius_px))
+            .opacity(row_layout.opacity)
             .when(is_selected, |el| el.bg(row_active_bg))
             .hover(move |s| if is_selected { s } else { s.bg(row_hover_bg) })
             .flex()
@@ -1616,4 +1835,31 @@ pub fn render_dialog_row_item_with_width<V: 'static>(
                 .child(bottom_row),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[std::prelude::v1::test]
+    fn preview_truncation_keeps_zwj_emoji_clusters_atomic_and_guards_nan() {
+        let sample = "法布施工作区智能助手👩‍👩‍👧‍👦 超长单行预览文本需要优雅省略且不能出现乱码";
+        for width in [260.0_f32, 240.0, 230.0, 225.0, 220.0, 180.0, f32::NAN, f32::INFINITY] {
+            let (out, trunc) = format_sidebar_row_preview(sample, width);
+            assert!(trunc, "expected truncation at width {width}");
+            assert!(out.ends_with('…'));
+            let without_ellipsis = out.trim_end_matches('…');
+            assert!(
+                !without_ellipsis.ends_with('\u{200D}'),
+                "orphaned ZWJ before ellipsis at width {width}: {out:?}"
+            );
+            // If any part of the family emoji appears, the complete atomic ZWJ sequence must be intact
+            if without_ellipsis.contains('👩') {
+                assert!(
+                    without_ellipsis.contains("👩‍👩‍👧‍👦"),
+                    "ZWJ cluster split at width {width}: {out:?}"
+                );
+            }
+        }
+    }
 }

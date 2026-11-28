@@ -3717,7 +3717,7 @@ pub(crate) fn ob_inset_group(
     let last_idx = rows.len().saturating_sub(1);
     let mut card = div()
         .w_full()
-        .rounded(px(8.0))
+        .rounded(px(BOT_SETTINGS_INSET_CARD_RADIUS_PX))
         .bg(ob.bg_surface())
         .border_1()
         .border_color(border)
@@ -3768,7 +3768,7 @@ pub(crate) fn ob_inset_row(
     div()
         .id(id)
         .w_full()
-        .min_h(px(40.0))
+        .min_h(px(BOT_SETTINGS_INSET_ROW_HEIGHT_PX))
         .px(px(12.0))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
@@ -3926,10 +3926,25 @@ pub(crate) fn ob_confirm_guard_card(
     on_confirm: impl Fn(&mut ContextInspector, &mut Context<ContextInspector>) + 'static,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
+    let pal = TdesktopThemePalette::build_openbot(
+        if ob.scheme.is_dark() {
+            crate::theme::TdesktopThemeMode::Night
+        } else {
+            crate::theme::TdesktopThemeMode::Day
+        },
+        0x0A84FF,
+        14,
+        16,
+    );
+    let dlg_state = crate::views::boxes::modal_theme::ConfirmDialogState::open_dialog(danger);
+    let dlg_layout =
+        crate::views::boxes::modal_theme::compute_confirm_dialog_layout(&dlg_state, &pal);
+    let cancel_focused = dlg_layout.initial_focus == "cancel";
     let btn_bg = if danger { ob.danger() } else { ob.accent() };
     div()
         .id(SharedString::from(format!("{id_prefix}-guard")))
         .w_full()
+        .max_w(px(dlg_layout.max_width_px))
         .p(px(12.0))
         .rounded(px(8.0))
         .bg(ob.bg_surface())
@@ -3965,6 +3980,9 @@ pub(crate) fn ob_confirm_guard_card(
                         .py(px(5.0))
                         .rounded(px(6.0))
                         .bg(ob.bg_control_hover())
+                        .when(cancel_focused, |btn| {
+                            btn.border_1().border_color(ob.text_primary())
+                        })
                         .text_size(px(12.0))
                         .text_color(ob.text_secondary())
                         .on_mouse_down(
@@ -4001,6 +4019,171 @@ pub(crate) fn ob_confirm_guard_card(
         .into_any_element()
 }
 
+pub const BOT_SETTINGS_HERO_AVATAR_PX: f32 = 62.0;
+pub const BOT_SETTINGS_SUBPAGE_HEADER_PX: f32 = 39.0;
+pub const BOT_SETTINGS_INSET_CARD_RADIUS_PX: f32 = 8.0;
+pub const BOT_SETTINGS_INSET_ROW_HEIGHT_PX: f32 = 40.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotCreationsCounts {
+    pub books: usize,
+    pub music: usize,
+    pub games: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotBotSettingsLayout {
+    pub mounted: bool,
+    pub host: &'static str,
+    pub hero_avatar_px: f32,
+    pub pencil_edit_visible: bool,
+    pub avatar_popover_open: bool,
+    pub avatar_editor_width_px: f32,
+    pub avatar_shapes_count: usize,
+    pub avatar_eyes_count: usize,
+    pub avatar_editor_cols: usize,
+    pub avatar_editor_rows: usize,
+    pub avatar_editor_total_cells: usize,
+    pub online: bool,
+    pub name: String,
+    pub bio: String,
+    pub display_handle: String,
+    pub handle_copied: bool,
+    pub autosave_debounce_ms: u64,
+    pub inset_card_bg_hex: String,
+    pub inset_card_radius_px: f32,
+    pub inset_row_height_px: f32,
+    pub profile_fields: [&'static str; 4],
+    pub creations_counts: BotCreationsCounts,
+    pub groups_present: [&'static str; 5],
+    pub active_subpage: Option<&'static str>,
+    pub subpage_header_px: f32,
+    pub subpages: [&'static str; 6],
+    pub permission_level: String,
+    pub permission_modes: [&'static str; 3],
+    pub destructive_confirm_dialogs: [&'static str; 3],
+    pub backup_models_count: usize,
+    pub backup_models_limit: usize,
+    pub folders_count: usize,
+    pub folders_limit: usize,
+    pub delete_history_disabled: bool,
+    pub context_inspector_live_reachable: bool,
+}
+
+pub fn compute_openbot_bot_settings_layout(
+    inspector: &ContextInspector,
+    pal: &TdesktopThemePalette,
+) -> OpenBotBotSettingsLayout {
+    let ob = pal.openbot_palette();
+    let clean_username = inspector
+        .profile
+        .username
+        .trim()
+        .trim_start_matches('@');
+    let display_handle = if clean_username.is_empty() {
+        String::new()
+    } else {
+        format!("@{clean_username}")
+    };
+    let name = if !inspector.bot_draft_name.trim().is_empty() {
+        inspector.bot_draft_name.clone()
+    } else {
+        inspector.profile.name.clone()
+    };
+    let bio = if !inspector.bot_draft_description.trim().is_empty() {
+        inspector.bot_draft_description.clone()
+    } else {
+        inspector.profile.bio.clone()
+    };
+    let books = inspector
+        .published_creations
+        .iter()
+        .filter(|c| c.kind_code == "book")
+        .count();
+    let music = inspector
+        .published_creations
+        .iter()
+        .filter(|c| c.kind_code == "music")
+        .count();
+    let games = inspector
+        .published_creations
+        .iter()
+        .filter(|c| c.kind_code == "game")
+        .count();
+    let permission_level = match inspector.bot_access_level.trim().to_ascii_lowercase().as_str() {
+        "full" | "autonomous" => "full".to_string(),
+        "workspace" | "strict" => "workspace".to_string(),
+        _ => "ask".to_string(),
+    };
+    let route = inspector.resolve_context_inspector_render_route();
+    let context_inspector_live_reachable = matches!(
+        route,
+        crate::views::context_inspector::ContextInspectorRenderRoute::OpenBotBotSettingsRoot
+            | crate::views::context_inspector::ContextInspectorRenderRoute::OpenBotBotSubpage(_)
+            | crate::views::context_inspector::ContextInspectorRenderRoute::OpenBotSharedMediaSubpage
+    );
+    let inset_bg_rgb = crate::views::content_hub::apple_primitives::rgba_to_rgb24(ob.bg_surface());
+
+    OpenBotBotSettingsLayout {
+        mounted: inspector.is_open && inspector.embedded_in_side_panel && inspector.profile.is_bot,
+        host: if inspector.embedded_in_side_panel {
+            "side_panel_assistant_settings"
+        } else {
+            "classic_drawer"
+        },
+        hero_avatar_px: BOT_SETTINGS_HERO_AVATAR_PX,
+        pencil_edit_visible: inspector.profile.is_viewer_owner && inspector.active_fabushi_bot.is_some(),
+        avatar_popover_open: inspector.avatar_editor_open,
+        avatar_editor_width_px: crate::components::bloub_avatar::EDITOR_MAX_WIDTH_PX,
+        avatar_shapes_count: openbot_contracts::avatar::SUPPORTED_AVATAR_SILHOUETTES.len(),
+        avatar_eyes_count: openbot_contracts::avatar::AVATAR_EXPRESSIONS.len(),
+        avatar_editor_cols: crate::components::bloub_avatar::EDITOR_COLOR_COLS,
+        avatar_editor_rows: crate::components::bloub_avatar::EDITOR_COLOR_ROWS,
+        avatar_editor_total_cells: crate::components::bloub_avatar::EDITOR_COLOR_TOTAL_CELLS,
+        online: inspector.profile.is_bot
+            && (inspector.active_fabushi_bot.is_some()
+                || inspector.profile.status.trim().eq_ignore_ascii_case("online")
+                || inspector.profile.status.trim() == "在线"
+                || inspector.profile.status.trim().is_empty()),
+        name,
+        bio,
+        display_handle,
+        handle_copied: inspector.copied_feedback.is_some(),
+        autosave_debounce_ms: inspector.bot_autosave.debounce_ms,
+        inset_card_bg_hex: crate::views::content_hub::apple_primitives::rgb24_to_hex(inset_bg_rgb),
+        inset_card_radius_px: BOT_SETTINGS_INSET_CARD_RADIUS_PX,
+        inset_row_height_px: BOT_SETTINGS_INSET_ROW_HEIGHT_PX,
+        profile_fields: [
+            "creations_books_music_games",
+            "add_to_group",
+            "shared_media",
+            "notify_me",
+        ],
+        creations_counts: BotCreationsCounts { books, music, games },
+        groups_present: ["profile", "brain", "knows", "does", "rules"],
+        active_subpage: inspector.openbot_subpage.map(|s| s.slug()),
+        subpage_header_px: BOT_SETTINGS_SUBPAGE_HEADER_PX,
+        subpages: [
+            "permissions",
+            "instructions",
+            "skills",
+            "memory",
+            "routines",
+            "workflows",
+        ],
+        permission_level,
+        permission_modes: ["workspace", "ask", "full"],
+        destructive_confirm_dialogs: ["new_chat", "delete_history", "delete_agent"],
+        backup_models_count: inspector.bot_backup_models.len(),
+        backup_models_limit: openbot_contracts::agents::AGENT_BACKUP_MODEL_LIMIT,
+        folders_count: inspector.bot_additional_folders.len()
+            + inspector.bot_excluded_folders.len(),
+        folders_limit: openbot_contracts::agents::AGENT_FOLDER_LIMIT,
+        delete_history_disabled: inspector.is_bot_busy(),
+        context_inspector_live_reachable,
+    }
+}
+
 /// Renders the embedded OpenBot `AgentSettingsPanel` root (`UI-F16`) inside `打开 助手设置`.
 pub fn render_openbot_bot_settings_root(
     inspector: &ContextInspector,
@@ -4008,21 +4191,17 @@ pub fn render_openbot_bot_settings_root(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
+    let layout = compute_openbot_bot_settings_layout(inspector, &pal);
     let ob = pal.openbot_palette();
     let is_dark = pal.mode.is_dark();
     let model = &inspector.profile;
     let bot_id = model.bot_id;
-    let is_owner_fabushi = model.is_viewer_owner && inspector.active_fabushi_bot.is_some();
+    let is_owner_fabushi = layout.pencil_edit_visible;
     let snap = &inspector.bot_fusion;
     let preedit = inspector.openbot_input_preedit(cx);
-    let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
 
     let clean_username = model.username.trim().trim_start_matches('@').to_string();
-    let display_handle = if clean_username.is_empty() {
-        String::new()
-    } else {
-        format!("@{clean_username}")
-    };
+    let display_handle = layout.display_handle.clone();
 
     // Centered 62x62px 3D plush avatar + 24x24px bottom-right Pencil badge
     let hero_avatar: AnyElement = if let Some(ref custom) = inspector
@@ -4031,8 +4210,8 @@ pub fn render_openbot_bot_settings_root(
         .or(model.avatar_path.as_ref())
     {
         div()
-            .w(px(62.0))
-            .h(px(62.0))
+            .w(px(layout.hero_avatar_px))
+            .h(px(layout.hero_avatar_px))
             .rounded_full()
             .overflow_hidden()
             .border_1()
@@ -4142,8 +4321,6 @@ pub fn render_openbot_bot_settings_root(
                 .justify_center()
                 .gap(px(8.0))
                 .when(!display_handle.is_empty(), |row| {
-                    let cp = display_handle.clone();
-                    let cp_fb = display_handle.clone();
                     row.child(
                         div()
                             .id("bot-copy-username")
@@ -4163,8 +4340,9 @@ pub fn render_openbot_bot_settings_root(
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
-                                    this.show_copied_feedback(format!("{copied_prefix}: {cp_fb}"), cx);
-                                    this.pending_action = Some(InspectorAction::CopyText(cp.clone()));
+                                    if let Some(msg) = this.trigger_copy_bot_handle() {
+                                        this.show_copied_feedback(msg, cx);
+                                    }
                                     cx.notify();
                                 }),
                             )
@@ -4584,7 +4762,7 @@ pub fn render_openbot_bot_settings_root(
             false,
             &ob,
             |this, _| {
-                this.openbot_subpage = Some(OpenBotSettingsSubpage::BackupModels);
+                let _ = this.open_bot_subpage(OpenBotSettingsSubpage::BackupModels);
             },
             cx,
         ),
@@ -4643,7 +4821,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Instructions);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Instructions);
                 },
                 cx,
             ),
@@ -4660,7 +4838,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Memories);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Memories);
                 },
                 cx,
             ),
@@ -4677,7 +4855,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Skills);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Skills);
                 },
                 cx,
             ),
@@ -4704,7 +4882,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::DataTables);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::DataTables);
                 },
                 cx,
             ),
@@ -4743,7 +4921,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Routines);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Routines);
                 },
                 cx,
             ),
@@ -4756,7 +4934,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Workflows);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Workflows);
                 },
                 cx,
             ),
@@ -4769,7 +4947,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Usage);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Usage);
                 },
                 cx,
             ),
@@ -4777,7 +4955,7 @@ pub fn render_openbot_bot_settings_root(
     );
 
     // Group 5: 规则 (Rules)
-    let access_summary = match inspector.bot_access_level.as_str() {
+    let access_summary = match layout.permission_level.as_str() {
         "full" => tr_str(lang, "完全访问", "Full access"),
         "workspace" => tr_str(lang, "工作区仅限", "Workspace only"),
         _ => tr_str(lang, "先询问", "Ask first"),
@@ -4795,7 +4973,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Permissions);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Permissions);
                 },
                 cx,
             ),
@@ -4812,7 +4990,7 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Folders);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Folders);
                 },
                 cx,
             ),
@@ -4829,12 +5007,23 @@ pub fn render_openbot_bot_settings_root(
                 false,
                 &ob,
                 |this, _| {
-                    this.openbot_subpage = Some(OpenBotSettingsSubpage::Advanced);
+                    let _ = this.open_bot_subpage(OpenBotSettingsSubpage::Advanced);
                 },
                 cx,
             ),
         ],
     );
+
+    let busy_banner = inspector.bot_busy_toast_message.clone().or_else(|| {
+        layout.delete_history_disabled.then(|| {
+            tr_str(
+                lang,
+                "助手正在执行任务，危险清理操作已暂时锁定",
+                "Agent is currently busy; destructive history actions are disabled.",
+            )
+            .to_string()
+        })
+    });
 
     div()
         .w_full()
@@ -4842,6 +5031,22 @@ pub fn render_openbot_bot_settings_root(
         .flex_col()
         .gap(px(16.0))
         .when_some(copied_feedback_banner(inspector, pal), |col, b| col.child(b))
+        .when_some(busy_banner, |col, msg| {
+            col.child(
+                div()
+                    .id("openbot-bot-busy-banner")
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(ob.bg_surface())
+                    .border_1()
+                    .border_color(ob.warning())
+                    .text_size(px(12.0))
+                    .text_color(ob.warning())
+                    .child(msg),
+            )
+        })
         .child(hero_block)
         .child(identity_section)
         .child(profile_group)
@@ -4924,8 +5129,6 @@ pub fn render_openbot_bot_subpage(
                     .iter()
                     .enumerate()
                     .map(|(idx, item)| {
-                        let cid = item.creation_id.clone();
-                        let kind = item.kind_code;
                         ob_inset_row(
                             SharedString::from(format!("openbot-bot-creation-{idx}")),
                             IconName::FolderAll,
@@ -4935,11 +5138,7 @@ pub fn render_openbot_bot_subpage(
                             false,
                             &ob,
                             move |this, _| {
-                                this.pending_openbot_action =
-                                    Some(OpenBotInspectorAction::OpenPublishedCreation {
-                                        creation_id: cid.clone(),
-                                        kind_code: kind,
-                                    });
+                                let _ = this.open_published_creation_at(idx);
                             },
                             cx,
                         )
@@ -5835,19 +6034,7 @@ pub fn render_openbot_bot_subpage(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
-                                if code_owned == "full" && this.bot_access_level != "full" {
-                                    this.pending_confirm_guard =
-                                        Some(OpenBotConfirmGuard::WidenPermissionsFull);
-                                } else {
-                                    this.bot_access_level = code_owned.clone();
-                                    this.pending_confirm_guard = None;
-                                    this.pending_openbot_action =
-                                        Some(OpenBotInspectorAction::SetBotPermissions {
-                                            access: code_owned.clone(),
-                                            computer_use: this.bot_computer_use,
-                                            allow_automation: this.bot_allow_automation,
-                                        });
-                                }
+                                this.request_bot_access_level_change(&code_owned);
                                 cx.notify();
                             }),
                         )
@@ -5856,6 +6043,15 @@ pub fn render_openbot_bot_subpage(
             }
             let cua = inspector.bot_computer_use;
             let auto = inspector.bot_allow_automation;
+            let pending_perm = inspector
+                .bot_pending_access_level
+                .as_deref()
+                .unwrap_or("full");
+            let confirm_title = if pending_perm == "ask" {
+                tr_str(lang, "确认扩大访问权限？", "Confirm Wider Access?")
+            } else {
+                tr_str(lang, "确认授予完全访问权限？", "Confirm Full Access?")
+            };
             div()
                 .w_full()
                 .flex()
@@ -5865,24 +6061,18 @@ pub fn render_openbot_bot_subpage(
                 .when(show_widen_guard, |col| {
                     col.child(ob_confirm_guard_card(
                         "openbot-perm-widen",
-                        tr_str(lang, "确认授予完全访问权限？", "Confirm Full Access?"),
+                        confirm_title,
                         tr_str(
                             lang,
-                            "完全访问允许助手自动执行工作区外文件读写和系统命令，请确认信任此助手。",
-                            "Full access allows commands and file access outside the workspace.",
+                            "提高权限级别允许助手执行更广泛的系统或工作区操作，请确认信任此助手。",
+                            "Widening permissions allows broader commands and file access. Confirm you trust this assistant.",
                         ),
-                        tr_str(lang, "确认开启完全访问", "Enable Full Access"),
+                        tr_str(lang, "确认授予权限", "Confirm Permission Change"),
                         true,
                         &ob,
                         lang,
                         |this, _| {
-                            this.bot_access_level = "full".to_string();
-                            this.pending_openbot_action =
-                                Some(OpenBotInspectorAction::SetBotPermissions {
-                                    access: "full".to_string(),
-                                    computer_use: this.bot_computer_use,
-                                    allow_automation: this.bot_allow_automation,
-                                });
+                            this.confirm_pending_access_level_change();
                         },
                         cx,
                     ))
@@ -6136,10 +6326,31 @@ pub fn render_openbot_bot_subpage(
                 .into_any_element()
         }
         OpenBotSettingsSubpage::Advanced => {
+            let layout = compute_openbot_bot_settings_layout(inspector, &pal);
             let steer_sel = inspector.bot_busy_mode != "queue";
             let ttl_val = inspector.settings.auto_delete_period.clone();
             let guard = inspector.pending_confirm_guard.clone();
             let bot_name = inspector.profile.name.clone();
+            let busy_toast = inspector.bot_busy_toast_message.clone();
+            let delete_disabled = layout.delete_history_disabled;
+            let delete_history_row = div()
+                .w_full()
+                .when(delete_disabled, |el| el.opacity(0.45))
+                .child(ob_inset_row(
+                    "openbot-bot-delete-history",
+                    IconName::DeleteTrash,
+                    tr_str(lang, "删除历史记录", "Delete History"),
+                    delete_disabled
+                        .then(|| tr_str(lang, "忙碌中", "Busy").to_string()),
+                    false,
+                    true,
+                    &ob,
+                    |this, _| {
+                        this.try_delete_bot_history_from_settings();
+                    },
+                    cx,
+                ))
+                .into_any_element();
             let mut danger_rows = vec![
                 ob_inset_row(
                     "bot-action-new-session",
@@ -6150,23 +6361,11 @@ pub fn render_openbot_bot_subpage(
                     false,
                     &ob,
                     |this, _| {
-                        this.pending_confirm_guard = Some(OpenBotConfirmGuard::BotNewSession);
+                        this.try_start_new_chat_from_settings();
                     },
                     cx,
                 ),
-                ob_inset_row(
-                    "openbot-bot-delete-history",
-                    IconName::DeleteTrash,
-                    tr_str(lang, "删除历史记录", "Delete History"),
-                    None,
-                    false,
-                    true,
-                    &ob,
-                    |this, _| {
-                        this.pending_confirm_guard = Some(OpenBotConfirmGuard::BotDeleteHistory);
-                    },
-                    cx,
-                ),
+                delete_history_row,
             ];
             if is_owner_fabushi {
                 danger_rows.push(ob_inset_row(
@@ -6220,6 +6419,22 @@ pub fn render_openbot_bot_subpage(
                 .flex()
                 .flex_col()
                 .gap(px(14.0))
+                .when_some(busy_toast, |col, msg| {
+                    col.child(
+                        div()
+                            .id("openbot-bot-advanced-busy-toast")
+                            .w_full()
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.warning())
+                            .text_size(px(12.0))
+                            .text_color(ob.warning())
+                            .child(msg),
+                    )
+                })
                 .child(ob_inset_group(
                     tr_str(lang, "忙碌时新消息策略", "Busy Message Mode"),
                     &ob,
@@ -6335,64 +6550,71 @@ pub fn render_openbot_bot_subpage(
                     ],
                 ))
                 .child(ob_inset_group(tr_str(lang, "会话与危险操作", "Danger Zone"), &ob, danger_rows))
-                .when_some(guard, |col, g| match g {
-                    OpenBotConfirmGuard::BotNewSession => col.child(ob_confirm_guard_card(
-                        "openbot-guard-bot-new",
-                        tr_str(lang, "确认开启新对话？", "Start New Session?"),
-                        tr_str(
+                .when_some(guard, |col, g| {
+                    let is_danger = inspector
+                        .active_confirm_dialog_state()
+                        .map(|s| s.destructive)
+                        .unwrap_or_else(|| g.is_destructive());
+                    match g {
+                        OpenBotConfirmGuard::BotNewSession => col.child(ob_confirm_guard_card(
+                            "openbot-guard-bot-new",
+                            tr_str(lang, "确认开启新对话？", "Start New Session?"),
+                            tr_str(
+                                lang,
+                                "将向助手发送 /new 重置当前上下文窗口。",
+                                "Sends /new to reset the current context window.",
+                            ),
+                            tr_str(lang, "确认开启", "Start New"),
+                            is_danger,
+                            &ob,
                             lang,
-                            "将向助手发送 /new 重置当前上下文窗口。",
-                            "Sends /new to reset the current context window.",
-                        ),
-                        tr_str(lang, "确认开启", "Start New"),
-                        false,
-                        &ob,
-                        lang,
-                        |this, _| {
-                            this.pending_action =
-                                Some(InspectorAction::RunBotCommand("/new".to_string()));
-                        },
-                        cx,
-                    )),
-                    OpenBotConfirmGuard::BotDeleteHistory => col.child(ob_confirm_guard_card(
-                        "openbot-guard-bot-delhist",
-                        tr_str(lang, "确认删除历史记录？", "Delete Chat History?"),
-                        tr_str(
+                            |this, _| {
+                                this.pending_action =
+                                    Some(InspectorAction::RunBotCommand("/new".to_string()));
+                            },
+                            cx,
+                        )),
+                        OpenBotConfirmGuard::BotDeleteHistory => col.child(ob_confirm_guard_card(
+                            "openbot-guard-bot-delhist",
+                            tr_str(lang, "确认删除历史记录？", "Delete Chat History?"),
+                            tr_str(
+                                lang,
+                                "此操作会清空当前与该助手的全部消息历史，无法撤销。",
+                                "Clears all messages in this conversation permanently.",
+                            ),
+                            tr_str(lang, "确认删除历史", "Delete History"),
+                            is_danger,
+                            &ob,
                             lang,
-                            "此操作会清空当前与该助手的全部消息历史，无法撤销。",
-                            "Clears all messages in this conversation permanently.",
-                        ),
-                        tr_str(lang, "确认删除历史", "Delete History"),
-                        true,
-                        &ob,
-                        lang,
-                        |this, _| {
-                            this.pending_openbot_action =
-                                Some(OpenBotInspectorAction::DeleteChatHistory);
-                        },
-                        cx,
-                    )),
-                    OpenBotConfirmGuard::BotDeleteAgent => col.child(ob_confirm_guard_card(
-                        "openbot-guard-bot-delete",
-                        tr_str(lang, "确认删除该助手？", "Delete Assistant?"),
-                        tr_str(
+                            |this, _| {
+                                this.pending_openbot_action =
+                                    Some(OpenBotInspectorAction::DeleteChatHistory);
+                            },
+                            cx,
+                        )),
+                        OpenBotConfirmGuard::BotDeleteAgent => col.child(ob_confirm_guard_card(
+                            "openbot-guard-bot-delete",
+                            tr_str(lang, "确认删除该助手？", "Delete Assistant?"),
+                            tr_str(
+                                lang,
+                                "删除后将移除该助手对话及其本地工作区状态，无法撤销。",
+                                "Removes this assistant and its local workspace state permanently.",
+                            ),
+                            tr_str(lang, "确认删除助手", "Delete Assistant"),
+                            is_danger,
+                            &ob,
                             lang,
-                            "删除后将移除该助手对话及其本地工作区状态，无法撤销。",
-                            "Removes this assistant and its local workspace state permanently.",
-                        ),
-                        tr_str(lang, "确认删除助手", "Delete Assistant"),
-                        true,
-                        &ob,
-                        lang,
-                        move |this, _| {
-                            this.pending_openbot_action = Some(OpenBotInspectorAction::DeleteBot {
-                                bot_id: target_bot_id,
-                                bot_name: bot_name.clone(),
-                            });
-                        },
-                        cx,
-                    )),
-                    _ => col,
+                            move |this, _| {
+                                this.pending_openbot_action =
+                                    Some(OpenBotInspectorAction::DeleteBot {
+                                        bot_id: target_bot_id,
+                                        bot_name: bot_name.clone(),
+                                    });
+                            },
+                            cx,
+                        )),
+                        _ => col,
+                    }
                 })
                 .into_any_element()
         }

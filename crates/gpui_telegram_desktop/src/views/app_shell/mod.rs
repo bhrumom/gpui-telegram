@@ -25,6 +25,7 @@ pub mod menu_ttl_validator;
 pub mod notifications_manager;
 pub mod notifications_manager_default;
 pub mod notifications_utilities;
+pub mod openbot_shell_layout;
 pub mod section_memento;
 pub mod section_widget;
 pub mod semantic_tree;

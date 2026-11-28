@@ -15,6 +15,8 @@ use gpui::*;
 pub const ACTIVE_FADE_IN_DURATION_MS: u64 = 200;
 pub const ACTIVE_FADE_OUT_DURATION_MS: u64 = 600;
 pub const FADE_WRAP_DURATION_MS: u64 = 300;
+/// OpenBot reply-quote jump flash duration (`1600ms`, additive so legacy 200/300/600ms invariants remain untouched).
+pub const OPENBOT_REPLY_FLASH_DURATION_MS: u64 = 1_600;
 
 /// Quote or snippet coordinate within a target message bubble.
 /// C++ citation: `HistoryView::SelectedQuote` (history_view_highlight_manager.h:L30).
@@ -54,6 +56,7 @@ pub struct HistoryViewHighlightManager {
     fading_out: bool,
     collapsing: bool,
     last_highlighted_id: Option<u64>,
+    active_duration_ms: u64,
 }
 
 impl HistoryViewHighlightManager {
@@ -66,6 +69,9 @@ impl HistoryViewHighlightManager {
             fading_out: false,
             collapsing: false,
             last_highlighted_id: None,
+            active_duration_ms: ACTIVE_FADE_IN_DURATION_MS
+                + FADE_WRAP_DURATION_MS
+                + ACTIVE_FADE_OUT_DURATION_MS,
         }
     }
 
@@ -84,6 +90,19 @@ impl HistoryViewHighlightManager {
         self.animation_start_ms = now_ms;
         self.fading_out = false;
         self.collapsing = false;
+        self.active_duration_ms = ACTIVE_FADE_IN_DURATION_MS
+            + FADE_WRAP_DURATION_MS
+            + ACTIVE_FADE_OUT_DURATION_MS;
+    }
+
+    /// Triggers OpenBot `1600ms` reply-quote jump highlight (`UI-F11-04`).
+    pub fn highlight_openbot(&mut self, quote: SelectedQuote, now_ms: u64) {
+        self.highlight(quote, now_ms);
+        self.active_duration_ms = OPENBOT_REPLY_FLASH_DURATION_MS;
+    }
+
+    pub const fn active_flash_duration_ms(&self) -> u64 {
+        self.active_duration_ms
     }
 
     /// Advances to next pending quote if current animation has finished.
@@ -103,7 +122,9 @@ impl HistoryViewHighlightManager {
         let quote = self.current_highlight.as_ref()?;
         let elapsed = now_ms.saturating_sub(self.animation_start_ms);
 
-        let total_cycle = ACTIVE_FADE_IN_DURATION_MS + FADE_WRAP_DURATION_MS + ACTIVE_FADE_OUT_DURATION_MS;
+        let total_cycle = self.active_duration_ms.max(
+            ACTIVE_FADE_IN_DURATION_MS + FADE_WRAP_DURATION_MS + ACTIVE_FADE_OUT_DURATION_MS,
+        );
         if elapsed >= total_cycle {
             let finished_id = quote.message_id;
             self.last_highlighted_id = Some(finished_id);

@@ -17,6 +17,7 @@ use crate::views::stage::stage_context_menu::{
 
 fn delivery_status_rank(status: DeliveryStatus) -> u8 {
     match status {
+        DeliveryStatus::Failed => 0,
         DeliveryStatus::Sending => 0,
         DeliveryStatus::Sent => 1,
         DeliveryStatus::Read => 2,

@@ -17,10 +17,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::components::bloub_avatar::{ServerPlushLogo, render_server_plush_logo};
 use crate::i18n::tr_str;
-use crate::theme::{IconName, TdesktopThemePalette, tg_icon_rgba};
+use crate::theme::{
+    IconName, OPENBOT_BADGE_NEW_DARK, OPENBOT_BADGE_NEW_LIGHT, OPENBOT_LAYER_TOOLTIP,
+    TdesktopThemePalette, tg_icon_rgba,
+};
 use crate::views::content_hub::ContentHubSection;
 use crate::views::openbot::page_rail::{paint_usage_rings_canvas, render_usage_hover_card};
-use crate::views::openbot::shell_state::{UsageRingMetric, UsageRingSpec, write_json_atomic};
+use crate::views::openbot::shell_state::{
+    PageRailHideableItem, UsageRingMetric, UsageRingSpec, write_json_atomic,
+};
 
 /// Canonical OpenBot `383a35d2` left `PageRail` width (`52px`).
 pub const OPENBOT_PAGE_RAIL_WIDTH: f32 = 52.0;
@@ -40,6 +45,23 @@ pub const RAIL_ICON_SIZE_PX: f32 = 20.0;
 pub const RAIL_GROUP_GAP_PX: f32 = 6.0;
 /// Bottom padding below the sole account switcher tile (`12px`).
 pub const RAIL_BOTTOM_PADDING_PX: f32 = 12.0;
+/// Rail Lucide-aligned icon stroke width (`1.5px`, `tokens.css:L321`).
+pub const RAIL_ICON_STROKE_PX: f32 = 1.5;
+/// `RailMoreMenu` popover placement (`PageRail.tsx:L538`).
+pub const RAIL_MORE_MENU_PLACEMENT: &str = "right-start";
+/// `RailMoreMenu` popover gutter offset (`10px`, `PageRail.tsx:L539`).
+pub const RAIL_MORE_MENU_GUTTER_PX: f32 = 10.0;
+/// Settings update indicator dot diameter (`8px`).
+pub const RAIL_UPDATE_DOT_SIZE_PX: f32 = 8.0;
+/// Bottom divider dimensions (`24x1px`).
+pub const RAIL_DIVIDER_WIDTH_PX: f32 = 24.0;
+pub const RAIL_DIVIDER_HEIGHT_PX: f32 = 1.0;
+/// Sole workspace account plush tile dimension (`24x24px`).
+pub const RAIL_ACCOUNT_TILE_PX: f32 = 24.0;
+/// Minimum vertical free gap between top nav group and bottom utilities (`12px`).
+pub const RAIL_MIN_FREE_GAP_PX: f32 = 12.0;
+/// Tooltip pill corner radius (`8px`).
+pub const RAIL_TOOLTIP_RADIUS_PX: f32 = 8.0;
 
 /// Atomic JSON filename storing user-pinned `PageRail` sections inside `preferences_dir`.
 pub const PAGE_RAIL_PINS_FILE: &str = "openbot-page-rail-pins-v1.json";
@@ -208,6 +230,8 @@ pub enum RailHelpAction {
 pub struct PageRailPinsPersisted {
     pub version: u32,
     pub pinned_sections: Vec<AppleSidebarSection>,
+    #[serde(default)]
+    pub hidden_bottom_items: Vec<PageRailHideableItem>,
 }
 
 /// Filters non-pinnable sections (`Chats`) and deduplicates pinned entries while preserving order.
@@ -221,32 +245,139 @@ pub fn sanitize_pinned_sections(raw: Vec<AppleSidebarSection>) -> Vec<AppleSideb
     out
 }
 
+/// Deduplicates hideable bottom items while preserving order.
+pub fn sanitize_hidden_bottom_items(raw: Vec<PageRailHideableItem>) -> Vec<PageRailHideableItem> {
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 /// Loads persisted `PageRail` pins from `<preferences_dir>/openbot-page-rail-pins-v1.json`.
 ///
-/// Missing or corrupt JSON falls back to [`DEFAULT_PINNED_SECTIONS`], while a valid file with
-/// `"pinned_sections": []` preserves the user's explicit empty pin set.
+/// Missing or syntax-corrupt JSON falls back to [`DEFAULT_PINNED_SECTIONS`]. A valid JSON object
+/// with `"pinned_sections": [...]` leniently drops unknown/empty section strings while preserving
+/// explicit empty `[]`.
 pub fn load_page_rail_pins(preferences_dir: &Path) -> Vec<AppleSidebarSection> {
     let path = preferences_dir.join(PAGE_RAIL_PINS_FILE);
     let Ok(bytes) = fs::read(&path) else {
         return DEFAULT_PINNED_SECTIONS.to_vec();
     };
-    match serde_json::from_slice::<PageRailPinsPersisted>(&bytes) {
-        Ok(parsed) => sanitize_pinned_sections(parsed.pinned_sections),
-        Err(_) => DEFAULT_PINNED_SECTIONS.to_vec(),
-    }
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return DEFAULT_PINNED_SECTIONS.to_vec();
+    };
+    let Some(arr) = val.get("pinned_sections").and_then(|v| v.as_array()) else {
+        return DEFAULT_PINNED_SECTIONS.to_vec();
+    };
+    let parsed: Vec<AppleSidebarSection> = arr
+        .iter()
+        .filter_map(|elem| serde_json::from_value::<AppleSidebarSection>(elem.clone()).ok())
+        .collect();
+    sanitize_pinned_sections(parsed)
 }
 
-/// Atomically persists `PageRail` pins to `<preferences_dir>/openbot-page-rail-pins-v1.json`.
-pub fn save_page_rail_pins(
+/// Loads persisted hidden optional bottom rail items from `<preferences_dir>/openbot-page-rail-pins-v1.json`.
+pub fn load_page_rail_hidden_items(preferences_dir: &Path) -> Vec<PageRailHideableItem> {
+    let path = preferences_dir.join(PAGE_RAIL_PINS_FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(arr) = val.get("hidden_bottom_items").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let parsed: Vec<PageRailHideableItem> = arr
+        .iter()
+        .filter_map(|elem| {
+            elem.as_str()
+                .and_then(PageRailHideableItem::parse)
+                .or_else(|| serde_json::from_value::<PageRailHideableItem>(elem.clone()).ok())
+        })
+        .collect();
+    sanitize_hidden_bottom_items(parsed)
+}
+
+/// Atomically persists `PageRail` pins and hidden optional bottom items.
+pub fn save_page_rail_prefs(
     preferences_dir: &Path,
     pins: &[AppleSidebarSection],
+    hidden: &[PageRailHideableItem],
 ) -> std::io::Result<()> {
     let path = preferences_dir.join(PAGE_RAIL_PINS_FILE);
     let payload = PageRailPinsPersisted {
         version: 1,
         pinned_sections: sanitize_pinned_sections(pins.to_vec()),
+        hidden_bottom_items: sanitize_hidden_bottom_items(hidden.to_vec()),
     };
     write_json_atomic(&path, &payload)
+}
+
+/// Atomically persists `PageRail` pins to `<preferences_dir>/openbot-page-rail-pins-v1.json`,
+/// preserving any previously saved hidden bottom items.
+pub fn save_page_rail_pins(
+    preferences_dir: &Path,
+    pins: &[AppleSidebarSection],
+) -> std::io::Result<()> {
+    let existing_hidden = load_page_rail_hidden_items(preferences_dir);
+    save_page_rail_prefs(preferences_dir, pins, &existing_hidden)
+}
+
+/// Single-source-of-truth tooltip pill layout consumed by `render_tooltip_pill`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TooltipLayoutSnapshot {
+    pub visible: bool,
+    pub label: String,
+    pub radius_px: f32,
+    pub z_index: usize,
+}
+
+pub fn compute_tooltip_layout(visible: bool, label: &str) -> TooltipLayoutSnapshot {
+    TooltipLayoutSnapshot {
+        visible,
+        label: label.to_string(),
+        radius_px: RAIL_TOOLTIP_RADIUS_PX,
+        z_index: OPENBOT_LAYER_TOOLTIP,
+    }
+}
+
+/// Single-source-of-truth bottom utility stack geometry for `PageRail`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageRailBottomLayout {
+    pub usage_ring_slots: usize,
+    pub collapsed_more_rings_count: usize,
+    pub min_free_px: f32,
+    pub help_visible: bool,
+    pub settings_visible: bool,
+    pub update_dot_px: f32,
+    pub update_dot_hex: &'static str,
+    pub divider_w_px: f32,
+    pub divider_h_px: f32,
+    pub account_tile_px: f32,
+    pub account_tile_is_plush: bool,
+}
+
+/// Single-source-of-truth `52px` left `PageRail` geometry snapshot consumed directly by `AppleAppSidebar::render`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageRailLayoutSnapshot {
+    pub visible: bool,
+    pub width_px: f32,
+    pub padding_top_px: f32,
+    pub padding_bottom_px: f32,
+    pub gap_px: f32,
+    pub button_size_px: f32,
+    pub button_radius_px: f32,
+    pub icon_size_px: f32,
+    pub icon_stroke_px: f32,
+    pub more_menu_open: bool,
+    pub more_menu_placement: &'static str,
+    pub more_menu_gutter_px: f32,
+    pub more_menu_left_px: f32,
+    pub bottom_items: PageRailBottomLayout,
 }
 
 /// Events emitted by [`AppleAppSidebar`] to [`crate::views::AppShell`].
@@ -300,6 +431,9 @@ pub struct AppleAppSidebar {
     pub help_menu_open: bool,
     pub has_update_notice: bool,
     pub usage_ring_metric: UsageRingMetric,
+    pub usage_ring_metrics: Vec<UsageRingMetric>,
+    pub hidden_bottom_items: Vec<PageRailHideableItem>,
+    pub undo_toast_item: Option<PageRailHideableItem>,
     pub narrow_hidden: bool,
     pub hovered_tooltip: Option<SharedString>,
     pub hovered_more_row: Option<AppleSidebarSection>,
@@ -318,6 +452,7 @@ impl AppleAppSidebar {
         language_id: impl Into<String>,
         pins: Vec<AppleSidebarSection>,
     ) -> Self {
+        let default_ring = default_usage_ring_metric();
         Self {
             active_section: AppleSidebarSection::Chats,
             highlight_active_section: true,
@@ -340,7 +475,10 @@ impl AppleAppSidebar {
             more_menu_open: false,
             help_menu_open: false,
             has_update_notice: false,
-            usage_ring_metric: default_usage_ring_metric(),
+            usage_ring_metric: default_ring.clone(),
+            usage_ring_metrics: vec![default_ring],
+            hidden_bottom_items: Vec::new(),
+            undo_toast_item: None,
             narrow_hidden: false,
             hovered_tooltip: None,
             hovered_more_row: None,
@@ -394,15 +532,60 @@ impl AppleAppSidebar {
     }
 
     pub fn set_usage_ring_metric(&mut self, metric: UsageRingMetric) {
-        self.usage_ring_metric = metric;
+        self.usage_ring_metric = metric.clone();
+        if self.usage_ring_metrics.is_empty() {
+            self.usage_ring_metrics.push(metric);
+        } else {
+            self.usage_ring_metrics[0] = metric;
+        }
+    }
+
+    pub fn set_usage_ring_metrics(&mut self, metrics: Vec<UsageRingMetric>) {
+        if let Some(first) = metrics.first() {
+            self.usage_ring_metric = first.clone();
+        }
+        self.usage_ring_metrics = metrics;
+    }
+
+    pub fn toggle_more_menu(&mut self) {
+        self.more_menu_open = !self.more_menu_open;
+        if self.more_menu_open {
+            self.help_menu_open = false;
+            self.usage_hover_open = false;
+            self.hovered_tooltip = None;
+        }
+    }
+
+    pub fn is_bottom_item_hidden(&self, item: PageRailHideableItem) -> bool {
+        self.hidden_bottom_items.contains(&item)
+    }
+
+    /// Hides an optional bottom rail item (`credits`, `marketplace`, `help`), refusing mandatory
+    /// items (`settings`, `account`). Sets `undo_toast_item` for Undo toast display.
+    pub fn hide_bottom_item_by_id(&mut self, id: &str) -> bool {
+        let Some(item) = PageRailHideableItem::parse(id) else {
+            return false;
+        };
+        if !self.hidden_bottom_items.contains(&item) {
+            self.hidden_bottom_items.push(item);
+        }
+        self.undo_toast_item = Some(item);
+        true
+    }
+
+    /// Reverses the last hidden optional bottom item and clears the Undo toast.
+    pub fn undo_hide_bottom_item(&mut self) -> Option<PageRailHideableItem> {
+        let item = self.undo_toast_item.take()?;
+        self.hidden_bottom_items.retain(|existing| *existing != item);
+        Some(item)
     }
 
     pub fn is_pinned(&self, section: AppleSidebarSection) -> bool {
         self.pinned_sections.contains(&section)
     }
 
-    /// Toggles pin membership for `section` (`Chats` is fixed and ignored), emitting `TogglePin`.
-    pub fn toggle_pin(&mut self, section: AppleSidebarSection, cx: &mut Context<Self>) -> bool {
+    /// Pure pin toggle used by both live GPUI clicks (`toggle_pin`) and headless state transitions.
+    pub fn toggle_pin_local(&mut self, section: AppleSidebarSection) -> bool {
         if !section.is_pinnable() {
             return false;
         }
@@ -411,9 +594,91 @@ impl AppleAppSidebar {
         } else {
             self.pinned_sections.push(section);
         }
+        true
+    }
+
+    /// Toggles pin membership for `section` (`Chats` is fixed and ignored), emitting `TogglePin`.
+    pub fn toggle_pin(&mut self, section: AppleSidebarSection, cx: &mut Context<Self>) -> bool {
+        if !self.toggle_pin_local(section) {
+            return false;
+        }
         cx.emit(AppleSidebarEvent::TogglePin(section));
         cx.notify();
         true
+    }
+
+    /// Single-source-of-truth geometry calculation consumed directly by `AppleAppSidebar::render`.
+    pub fn compute_layout(&self, viewport_h: f32) -> PageRailLayoutSnapshot {
+        let visible = !self.narrow_hidden;
+        let width_px = self.effective_width();
+        let help_visible = !self.is_bottom_item_hidden(PageRailHideableItem::Help);
+        let settings_visible = true;
+        let total_rings = self.usage_ring_metrics.len().max(1);
+        let top_btn_count = 1 + self.pinned_sections.len() + 1;
+        let top_h = TOP_CLEARANCE_HEIGHT
+            + (top_btn_count as f32) * RAIL_BUTTON_SIZE_PX
+            + (top_btn_count.saturating_sub(1) as f32) * RAIL_GROUP_GAP_PX;
+        let fixed_bottom_btns = usize::from(help_visible) + usize::from(settings_visible) + 1;
+        let divider_total_h = RAIL_DIVIDER_HEIGHT_PX + 4.0 + RAIL_GROUP_GAP_PX;
+        let fixed_bottom_h = RAIL_BOTTOM_PADDING_PX
+            + (fixed_bottom_btns as f32) * RAIL_BUTTON_SIZE_PX
+            + (fixed_bottom_btns.saturating_sub(1) as f32) * RAIL_GROUP_GAP_PX
+            + divider_total_h;
+        let slot_h = RAIL_BUTTON_SIZE_PX + RAIL_GROUP_GAP_PX;
+        let safe_vp_h = if viewport_h.is_finite() {
+            viewport_h.max(0.0)
+        } else {
+            0.0
+        };
+        let avail_for_rings = (safe_vp_h - top_h - fixed_bottom_h - RAIL_MIN_FREE_GAP_PX).max(0.0);
+        let max_ring_slots = ((avail_for_rings / slot_h).floor() as usize).max(1);
+        let (usage_ring_slots, collapsed_more_rings_count) = if total_rings <= max_ring_slots {
+            (total_rings, 0)
+        } else {
+            let shown = max_ring_slots.saturating_sub(1).max(1);
+            (shown, total_rings.saturating_sub(shown))
+        };
+        let rings_h = (usage_ring_slots as f32) * slot_h
+            + if collapsed_more_rings_count > 0 {
+                slot_h
+            } else {
+                0.0
+            };
+        let free_px = (safe_vp_h - top_h - fixed_bottom_h - rings_h).max(RAIL_MIN_FREE_GAP_PX);
+        let update_dot_hex = if self.palette.mode.is_dark() {
+            OPENBOT_BADGE_NEW_DARK
+        } else {
+            OPENBOT_BADGE_NEW_LIGHT
+        };
+
+        PageRailLayoutSnapshot {
+            visible,
+            width_px,
+            padding_top_px: TOP_CLEARANCE_HEIGHT,
+            padding_bottom_px: RAIL_BOTTOM_PADDING_PX,
+            gap_px: RAIL_GROUP_GAP_PX,
+            button_size_px: RAIL_BUTTON_SIZE_PX,
+            button_radius_px: RAIL_BUTTON_RADIUS_PX,
+            icon_size_px: RAIL_ICON_SIZE_PX,
+            icon_stroke_px: RAIL_ICON_STROKE_PX,
+            more_menu_open: self.more_menu_open,
+            more_menu_placement: RAIL_MORE_MENU_PLACEMENT,
+            more_menu_gutter_px: RAIL_MORE_MENU_GUTTER_PX,
+            more_menu_left_px: OPENBOT_PAGE_RAIL_WIDTH + RAIL_MORE_MENU_GUTTER_PX,
+            bottom_items: PageRailBottomLayout {
+                usage_ring_slots,
+                collapsed_more_rings_count,
+                min_free_px: free_px,
+                help_visible,
+                settings_visible,
+                update_dot_px: RAIL_UPDATE_DOT_SIZE_PX,
+                update_dot_hex,
+                divider_w_px: RAIL_DIVIDER_WIDTH_PX,
+                divider_h_px: RAIL_DIVIDER_HEIGHT_PX,
+                account_tile_px: RAIL_ACCOUNT_TILE_PX,
+                account_tile_is_plush: true,
+            },
+        }
     }
 
     /// Returns the currently active `PageRail` destination for visual highlight.
@@ -536,6 +801,7 @@ impl AppleAppSidebar {
 impl AppleAppSidebar {
     fn render_tooltip_pill(&self, label: SharedString) -> AnyElement {
         let ob = self.palette.openbot_palette();
+        let tip = compute_tooltip_layout(true, label.as_ref());
         deferred(
             div()
                 .absolute()
@@ -543,7 +809,7 @@ impl AppleAppSidebar {
                 .top(px(5.0))
                 .px(px(9.0))
                 .py(px(4.0))
-                .rounded(px(8.0))
+                .rounded(px(tip.radius_px))
                 .bg(ob.bg_surface())
                 .border_1()
                 .border_color(ob.border_strong_hairline())
@@ -551,9 +817,9 @@ impl AppleAppSidebar {
                 .text_size(px(12.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(ob.text_primary())
-                .child(label),
+                .child(tip.label),
         )
-        .with_priority(60)
+        .with_priority(tip.z_index)
         .into_any_element()
     }
 
@@ -643,7 +909,14 @@ impl AppleAppSidebar {
 }
 
 impl Render for AppleAppSidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = self.compute_layout(f32::from(window.viewport_size().height));
+        if !layout.visible {
+            return div()
+                .id("apple-app-sidebar")
+                .size_0()
+                .overflow_hidden();
+        }
         let ob = self.palette.openbot_palette();
         let lang = self.language_id.clone();
         let frame_bg = ob.bg_frame();
@@ -693,7 +966,8 @@ impl Render for AppleAppSidebar {
         } else {
             "fabushi-workspace".to_string()
         };
-        let account_logo = ServerPlushLogo::new(account_seed).with_size(24.0);
+        let account_logo =
+            ServerPlushLogo::new(account_seed).with_size(layout.bottom_items.account_tile_px);
 
         let mut live_usage = self.usage_ring_metric.clone();
         if !self.is_connected {
@@ -770,12 +1044,7 @@ impl Render for AppleAppSidebar {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.more_menu_open = !this.more_menu_open;
-                        if this.more_menu_open {
-                            this.help_menu_open = false;
-                            this.usage_hover_open = false;
-                            this.hovered_tooltip = None;
-                        }
+                        this.toggle_more_menu();
                         cx.notify();
                     }),
                 )
@@ -856,62 +1125,100 @@ impl Render for AppleAppSidebar {
                         )
                     }),
             )
-            .child(
-                div()
-                    .id("apple-sidebar-help-btn")
-                    .relative()
-                    .cursor_pointer()
-                    .w(px(RAIL_BUTTON_SIZE_PX))
-                    .h(px(RAIL_BUTTON_SIZE_PX))
-                    .rounded(px(RAIL_BUTTON_RADIUS_PX))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(help_active, |el| el.bg(active_bg))
-                    .when(!help_active, |el| el.hover(move |s| s.bg(hover_bg)))
-                    .text_size(px(15.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if help_active {
-                        icon_primary
-                    } else {
-                        icon_muted
-                    })
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered {
-                            if this.hovered_tooltip.as_ref() != Some(&help_hover) {
-                                this.hovered_tooltip = Some(help_hover.clone());
+            .when(layout.bottom_items.help_visible, |col| {
+                col.child(
+                    div()
+                        .id("apple-sidebar-help-btn")
+                        .relative()
+                        .cursor_pointer()
+                        .w(px(layout.button_size_px))
+                        .h(px(layout.button_size_px))
+                        .rounded(px(layout.button_radius_px))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(help_active, |el| el.bg(active_bg))
+                        .when(!help_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                        .text_size(px(15.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if help_active {
+                            icon_primary
+                        } else {
+                            icon_muted
+                        })
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                if this.hovered_tooltip.as_ref() != Some(&help_hover) {
+                                    this.hovered_tooltip = Some(help_hover.clone());
+                                    cx.notify();
+                                }
+                            } else if this.hovered_tooltip.as_ref() == Some(&help_hover) {
+                                this.hovered_tooltip = None;
                                 cx.notify();
                             }
-                        } else if this.hovered_tooltip.as_ref() == Some(&help_hover) {
-                            this.hovered_tooltip = None;
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.help_menu_open = !this.help_menu_open;
-                            if this.help_menu_open {
-                                this.more_menu_open = false;
-                                this.usage_hover_open = false;
-                                this.hovered_tooltip = None;
-                            }
-                            cx.notify();
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.help_menu_open = !this.help_menu_open;
+                                if this.help_menu_open {
+                                    this.more_menu_open = false;
+                                    this.usage_hover_open = false;
+                                    this.hovered_tooltip = None;
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.hide_bottom_item_by_id("help") {
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child("?")
+                        .when(show_help_tip, |el| {
+                            el.child(self.render_tooltip_pill(help_label))
                         }),
-                    )
-                    .child("?")
-                    .when(show_help_tip, |el| {
-                        el.child(self.render_tooltip_pill(help_label))
-                    }),
-            )
+                )
+            })
+            .when(self.undo_toast_item.is_some(), |col| {
+                col.child(
+                    div()
+                        .id("apple-sidebar-undo-hide-btn")
+                        .cursor_pointer()
+                        .w(px(layout.button_size_px))
+                        .h(px(22.0))
+                        .rounded(px(6.0))
+                        .bg(ob.bg_control_active())
+                        .hover(move |s| s.bg(hover_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_primary())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if this.undo_hide_bottom_item().is_some() {
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child("↺"),
+                )
+            })
             .child(
                 div()
                     .id("apple-sidebar-settings-btn")
                     .relative()
                     .cursor_pointer()
-                    .w(px(RAIL_BUTTON_SIZE_PX))
-                    .h(px(RAIL_BUTTON_SIZE_PX))
-                    .rounded(px(RAIL_BUTTON_RADIUS_PX))
+                    .w(px(layout.button_size_px))
+                    .h(px(layout.button_size_px))
+                    .rounded(px(layout.button_radius_px))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -938,7 +1245,7 @@ impl Render for AppleAppSidebar {
                     )
                     .child(tg_icon_rgba(
                         IconName::SettingsGear,
-                        RAIL_ICON_SIZE_PX,
+                        layout.icon_size_px,
                         if settings_active {
                             icon_primary
                         } else {
@@ -952,8 +1259,8 @@ impl Render for AppleAppSidebar {
                                 .absolute()
                                 .top(px(6.0))
                                 .right(px(6.0))
-                                .w(px(8.0))
-                                .h(px(8.0))
+                                .w(px(layout.bottom_items.update_dot_px))
+                                .h(px(layout.bottom_items.update_dot_px))
                                 .rounded_full()
                                 .bg(badge_new_col)
                                 .border_1()
@@ -966,8 +1273,8 @@ impl Render for AppleAppSidebar {
             )
             .child(
                 div()
-                    .w(px(24.0))
-                    .h(px(1.0))
+                    .w(px(layout.bottom_items.divider_w_px))
+                    .h(px(layout.bottom_items.divider_h_px))
                     .my(px(2.0))
                     .bg(divider_col),
             )
@@ -976,9 +1283,9 @@ impl Render for AppleAppSidebar {
                     .id("apple-sidebar-account-btn")
                     .relative()
                     .cursor_pointer()
-                    .w(px(RAIL_BUTTON_SIZE_PX))
-                    .h(px(RAIL_BUTTON_SIZE_PX))
-                    .rounded(px(RAIL_BUTTON_RADIUS_PX))
+                    .w(px(layout.button_size_px))
+                    .h(px(layout.button_size_px))
+                    .rounded(px(layout.button_radius_px))
                     .hover(move |s| s.bg(hover_bg))
                     .flex()
                     .items_center()
@@ -1005,8 +1312,8 @@ impl Render for AppleAppSidebar {
                     .child(
                         div()
                             .relative()
-                            .w(px(24.0))
-                            .h(px(24.0))
+                            .w(px(layout.bottom_items.account_tile_px))
+                            .h(px(layout.bottom_items.account_tile_px))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
@@ -1036,11 +1343,11 @@ impl Render for AppleAppSidebar {
 
         div()
             .id("apple-app-sidebar")
-            .w(px(OPENBOT_PAGE_RAIL_WIDTH))
+            .w(px(layout.width_px))
             .h_full()
             .flex_shrink_0()
             .bg(frame_bg)
-            .pb(px(RAIL_BOTTOM_PADDING_PX))
+            .pb(px(layout.padding_bottom_px))
             .flex()
             .flex_col()
             .items_center()
@@ -1055,7 +1362,7 @@ impl Render for AppleAppSidebar {
                         div()
                             .id("apple-sidebar-top-clearance")
                             .w_full()
-                            .h(px(TOP_CLEARANCE_HEIGHT))
+                            .h(px(layout.padding_top_px))
                             .flex_shrink_0()
                             .window_control_area(WindowControlArea::Drag),
                     )

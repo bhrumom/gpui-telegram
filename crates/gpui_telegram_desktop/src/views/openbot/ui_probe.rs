@@ -378,7 +378,7 @@ fn eval_openbot_shell(params: &Value, data_dir: &Path) -> Result<Value, UiProbeE
             "sidebar_closed": shell.sidebar.closed,
             "sidebar_effective_px": shell.effective_sidebar_px().round() as u32,
             "sidebar_clamp_px": [LEFT_PANEL_MIN as u32, LEFT_PANEL_MAX as u32],
-            "sidebar_group_order": SIDEBAR_GROUP_ORDER,
+            "sidebar_group_order": &SIDEBAR_GROUP_ORDER[..5],
             "folder_levels_max": SIDEBAR_FOLDER_LEVELS,
             "resolved_folder_depths": resolved_folder_depths,
             "global_search_plush": {
@@ -669,7 +669,32 @@ fn eval_composer_queue_sidepanel(params: &Value) -> Result<Value, UiProbeError> 
         .unwrap_or(0) as usize;
     let paste = handle_paste(paste_len);
 
-    let at_res = resolve_at_picker(query, in_channel, &[], &[], &[], &[], &[]);
+    let probe_agents: Vec<(String, String)> = if let Some(arr) = params.get("agents").and_then(Value::as_array) {
+        arr.iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                let id = v
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("agent-{i}"));
+                let name = v
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| v.as_str())?
+                    .to_string();
+                Some((id, name))
+            })
+            .collect()
+    } else if in_channel {
+        vec![
+            ("agent-alpha".to_string(), "Alpha".to_string()),
+            ("agent-beta".to_string(), "Beta".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
+    let at_res = resolve_at_picker(query, in_channel, &probe_agents, &[], &[], &[], &[]);
     let dollar_res = resolve_dollar_picker(query, &skills, &mcp_servers);
     let steer_eval = evaluate_steer(active_turn_routine, press_tab_steer);
 
@@ -1296,5 +1321,131 @@ mod tests {
                 .unwrap_or_else(|e| panic!("M2 probe '{name}' failed: {e}"));
             assert!(val.is_object(), "probe '{name}' must return JSON object");
         }
+    }
+
+    #[test]
+    fn ui_probe_openbot_shell_clamps_5_level_chain_and_breaks_cycles() {
+        use super::super::shell_state::{SidebarSection, validate_sidebar_layout_strict};
+
+        let dir = ScopedTestDir::new("f14_03_clamp");
+        let payload = serde_json::json!({
+            "scenario": "openbot-shell",
+            "sidebar_layout": {
+                "sections": [
+                    {"id": "d0", "name": "Level 0", "parent_id": null, "collapsed": false},
+                    {"id": "d1", "name": "Level 1", "parent_id": "d0", "collapsed": false},
+                    {"id": "d2", "name": "Level 2", "parent_id": "d1", "collapsed": false},
+                    {"id": "d3", "name": "Level 3", "parent_id": "d2", "collapsed": false},
+                    {"id": "d4", "name": "Level 4", "parent_id": "d3", "collapsed": false},
+                    {"id": "cyc_a", "name": "Cycle A", "parent_id": "cyc_b", "collapsed": false},
+                    {"id": "cyc_b", "name": "Cycle B", "parent_id": "cyc_a", "collapsed": false}
+                ],
+                "order": ["d0", "d1", "d2", "d3", "d4", "cyc_a", "cyc_b", "people", "unassigned"],
+                "agent_assignments": {},
+                "agent_order": [],
+                "revision": 1
+            }
+        });
+        let raw_spec = serde_json::to_string(&payload).unwrap();
+        let val = evaluate_ui_probe(&raw_spec, dir.path(), None)
+            .expect("openbot-shell probe must clamp 5-level chains and break cycles (TEST-T2-OB-F14-03)");
+        let depths = val["openbot_shell"]["resolved_folder_depths"]
+            .as_object()
+            .expect("resolved_folder_depths must be an object");
+        assert!(
+            depths.values().all(|v| v.as_u64().unwrap_or(99) <= 2),
+            "every resolved folder depth must be clamped <= 2: {depths:?}"
+        );
+        assert_eq!(depths.get("d0").and_then(Value::as_u64), Some(0));
+        assert_eq!(depths.get("d1").and_then(Value::as_u64), Some(1));
+        assert_eq!(depths.get("d2").and_then(Value::as_u64), Some(2));
+        assert_eq!(depths.get("d3").and_then(Value::as_u64), Some(2));
+        assert_eq!(depths.get("d4").and_then(Value::as_u64), Some(2));
+        assert_eq!(depths.get("cyc_a").and_then(Value::as_u64), Some(0));
+        assert_eq!(depths.get("cyc_b").and_then(Value::as_u64), Some(0));
+
+        let cyclic_snap: SidebarLayoutSnapshot =
+            serde_json::from_value(payload["sidebar_layout"].clone()).unwrap();
+        let strict_cyc = validate_sidebar_layout_strict(&cyclic_snap)
+            .expect_err("strict validator must reject cycle/depth");
+        assert!(
+            strict_cyc.code == "folder_cycle" || strict_cyc.code == "folder_depth_exceeded",
+            "unexpected strict error code: {}",
+            strict_cyc.code
+        );
+
+        let only_cycle = SidebarLayoutSnapshot {
+            sections: vec![
+                SidebarSection {
+                    id: "cyc_a".into(),
+                    name: "Cycle A".into(),
+                    parent_id: Some("cyc_b".into()),
+                    collapsed: false,
+                },
+                SidebarSection {
+                    id: "cyc_b".into(),
+                    name: "Cycle B".into(),
+                    parent_id: Some("cyc_a".into()),
+                    collapsed: false,
+                },
+            ],
+            order: vec![
+                "cyc_a".into(),
+                "cyc_b".into(),
+                "people".into(),
+                "unassigned".into(),
+            ],
+            ..SidebarLayoutSnapshot::default()
+        };
+        assert_eq!(
+            validate_sidebar_layout_strict(&only_cycle)
+                .expect_err("strict validator must reject folder cycle")
+                .code,
+            "folder_cycle"
+        );
+
+        let deep_acyclic = SidebarLayoutSnapshot {
+            sections: vec![
+                SidebarSection {
+                    id: "s1".into(),
+                    name: "L0".into(),
+                    parent_id: None,
+                    collapsed: false,
+                },
+                SidebarSection {
+                    id: "s2".into(),
+                    name: "L1".into(),
+                    parent_id: Some("s1".into()),
+                    collapsed: false,
+                },
+                SidebarSection {
+                    id: "s3".into(),
+                    name: "L2".into(),
+                    parent_id: Some("s2".into()),
+                    collapsed: false,
+                },
+                SidebarSection {
+                    id: "s4".into(),
+                    name: "L3".into(),
+                    parent_id: Some("s3".into()),
+                    collapsed: false,
+                },
+            ],
+            order: vec![
+                "s1".into(),
+                "s2".into(),
+                "s3".into(),
+                "s4".into(),
+                "people".into(),
+                "unassigned".into(),
+            ],
+            ..SidebarLayoutSnapshot::default()
+        };
+        assert_eq!(
+            validate_sidebar_layout_strict(&deep_acyclic)
+                .expect_err("strict validator must reject 4-level acyclic nesting")
+                .code,
+            "folder_depth_exceeded"
+        );
     }
 }

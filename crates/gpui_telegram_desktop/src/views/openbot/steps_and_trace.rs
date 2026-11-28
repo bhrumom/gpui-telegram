@@ -206,7 +206,7 @@ impl Default for AgentStepsState {
         Self {
             steps: Vec::new(),
             live: false,
-            expanded: true,
+            expanded: false,
             expanded_failed_ids: BTreeSet::new(),
             total_duration_ms: 0,
             reduced_motion: false,
@@ -226,11 +226,14 @@ impl AgentStepsState {
             .enumerate()
             .map(|(idx, v)| AgentStepEntry::from_probe_value(v, idx))
             .collect();
-        let total_duration_ms = steps.iter().filter_map(|s| s.duration_ms).sum();
+        let total_duration_ms = steps
+            .iter()
+            .filter_map(|s| s.duration_ms)
+            .fold(0u64, u64::saturating_add);
         Self {
             steps,
             live,
-            expanded: true,
+            expanded: live,
             expanded_failed_ids: BTreeSet::new(),
             total_duration_ms,
             reduced_motion,

@@ -15,7 +15,7 @@ use super::workspace::CommunityWorkspace;
 
 /// Normalizes any `TdesktopThemePalette` onto OpenBot `383a35d2`'s monochrome surface hierarchy
 /// for `CommunityWorkspace` while preserving `pal.mode` (`Day`/`Night`/`Classic`/`Tinted`) intact.
-pub(crate) fn community_openbot_palette(pal: TdesktopThemePalette) -> TdesktopThemePalette {
+pub fn community_openbot_palette(pal: TdesktopThemePalette) -> TdesktopThemePalette {
     let mut p = pal.with_openbot_chrome();
     if p.mode.is_dark() {
         p.stage_bg = 0x1A1A1A;
@@ -53,6 +53,44 @@ pub(crate) fn community_openbot_palette(pal: TdesktopThemePalette) -> TdesktopTh
         p.unread_badge_fg = 0xFFFFFF;
     }
     p
+}
+
+/// Computes live OpenBot Community Hub shell geometry and monochrome token audit (`UI-F18`),
+/// deriving `legacy_blue_pill_count` strictly from `community_openbot_palette(pal)`.
+pub fn compute_community_hub_layout(
+    pal: &TdesktopThemePalette,
+    vp_w: f32,
+) -> crate::views::content_hub::apple_primitives::ContentHubShellLayoutSnapshot {
+    use crate::views::content_hub::apple_primitives::{
+        is_legacy_blue_rgb, rgb24_to_hex, ContentHubShellLayoutSnapshot,
+        OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH, OPENBOT_MARKETPLACE_LEFT_NAV_WIDTH,
+        OPENBOT_PAGE_HEADER_HEIGHT,
+    };
+    let comm_pal = community_openbot_palette(*pal);
+    let mut legacy_blue_pill_count = 0usize;
+    for color in [
+        comm_pal.accent,
+        comm_pal.unread_badge_bg,
+        comm_pal.dialogs_active_bg,
+        comm_pal.card_bg,
+    ] {
+        if is_legacy_blue_rgb(color) {
+            legacy_blue_pill_count += 1;
+        }
+    }
+    ContentHubShellLayoutSnapshot {
+        active_page: "community",
+        viewport_width_px: if vp_w.is_finite() && vp_w > 0.0 { vp_w } else { 0.0 },
+        page_header_height_px: OPENBOT_PAGE_HEADER_HEIGHT,
+        left_nav_width_px: OPENBOT_MARKETPLACE_LEFT_NAV_WIDTH,
+        content_max_width_px: OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH,
+        canvas_hex: rgb24_to_hex(comm_pal.stage_bg),
+        card_surface_hex: rgb24_to_hex(comm_pal.card_bg),
+        hairline_hex: rgb24_to_hex(comm_pal.border_fg),
+        primary_cta_bg_hex: rgb24_to_hex(comm_pal.accent),
+        primary_cta_fg_hex: rgb24_to_hex(comm_pal.active_button_fg),
+        legacy_blue_pill_count,
+    }
 }
 
 /// Resolves a community media attachment or avatar reference into an HTTP(S)/file URL or local path.

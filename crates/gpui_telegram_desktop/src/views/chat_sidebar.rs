@@ -25,6 +25,9 @@
 //! State mutations/actions live in `views::sidebar::sidebar_state_ops` and
 //! GPUI `Render` lives in `views::sidebar::sidebar_main_render`.
 
+use std::fs;
+use std::path::Path;
+
 use gpui::{Context, Entity, Pixels, Point};
 use serde::{Deserialize, Serialize};
 
@@ -359,6 +362,7 @@ pub struct ChatSidebar {
     pub contact_chat_ids: std::collections::HashSet<u64>,
     pub group_chat_ids: std::collections::HashSet<u64>,
     pub channel_chat_ids: std::collections::HashSet<u64>,
+    pub group_member_briefs: std::collections::HashMap<u64, Vec<crate::components::avatar::ChannelAgentBrief>>,
     pub custom_folders: Vec<gpui_telegram_proto::contracts::chats::ChatFolderDto>,
     pub folder_tags_enabled: bool,
     pub include_muted_in_badge: bool,
@@ -404,6 +408,18 @@ pub struct ChatSidebar {
     pub pending_open_create_agent_studio: bool,
     pub pending_open_new_group: bool,
     pub pending_open_new_folder: bool,
+    pub pending_persist_openbot_width: bool,
+}
+
+/// Atomic JSON filename for persisted OpenBot `ChatSidebar` width & collapse state.
+pub const CHAT_SIDEBAR_PREF_FILE: &str = "openbot-chat-sidebar-v1.json";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatSidebarWidthPersisted {
+    pub version: u32,
+    pub openbot_width: f32,
+    pub is_collapsed: bool,
+    pub is_sidebar_closed: bool,
 }
 
 impl ChatSidebar {
@@ -475,6 +491,7 @@ impl ChatSidebar {
             contact_chat_ids: std::collections::HashSet::new(),
             group_chat_ids: std::collections::HashSet::new(),
             channel_chat_ids: std::collections::HashSet::new(),
+            group_member_briefs: std::collections::HashMap::new(),
             custom_folders: Vec::new(),
             folder_tags_enabled: false,
             include_muted_in_badge: false,
@@ -516,11 +533,14 @@ impl ChatSidebar {
             pending_open_create_agent_studio: false,
             pending_open_new_group: false,
             pending_open_new_folder: false,
+            pending_persist_openbot_width: false,
         }
     }
 
     pub fn set_width(&mut self, width: f32) {
-        self.width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+        if width.is_finite() {
+            self.width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+        }
     }
 
     pub fn reset_width(&mut self) {
@@ -534,6 +554,111 @@ impl ChatSidebar {
 
     pub fn set_has_leading_app_sidebar(&mut self, has_leading: bool) {
         self.has_leading_app_sidebar = has_leading;
+    }
+
+    /// Single source of truth for whether `ChatSidebar` renders an embedded bottom account footer
+    /// (suppressed when the leading `52px` `PageRail` owns the sole shell account footer — D2).
+    pub const fn renders_embedded_account_footer(&self) -> bool {
+        !self.has_leading_app_sidebar
+    }
+
+    /// Triggers OpenBot's `32px` sidebar search pill, arming `pending_open_global_search` when
+    /// running inside the OpenBot inset shell or falling back to inline search focus (`PAIR-08`).
+    pub fn trigger_openbot_search_pill(&mut self) -> bool {
+        self.close_openbot_popovers();
+        if self.has_leading_app_sidebar && self.palette.is_apple_style() {
+            self.pending_open_global_search = true;
+        } else {
+            self.focus_search();
+        }
+        self.pending_open_global_search
+    }
+
+    /// Triggers `+ -> New Agent` from OpenBot's sidebar menu, closing popovers and arming
+    /// `pending_open_create_agent_studio` (`PAIR-09`).
+    pub fn request_create_new_agent_from_plus_menu(&mut self) -> bool {
+        self.close_openbot_popovers();
+        self.pending_open_create_agent_studio = true;
+        true
+    }
+
+    /// Inserts or refreshes a 3D plush bot dialog row with full Fabushi/Grok avatar metadata (`PAIR-09`).
+    pub fn append_plush_bot_dialog(
+        &mut self,
+        chat_id: u64,
+        display_name: &str,
+        agent_id: &str,
+        shape: &str,
+        color_hex: &str,
+    ) {
+        let name = if display_name.trim().is_empty() {
+            format!("Bot #{chat_id}")
+        } else {
+            display_name.trim().to_string()
+        };
+        let eff_shape = if shape.trim().is_empty() {
+            "plush:cercle".to_string()
+        } else {
+            shape.trim().to_string()
+        };
+        let eff_color = if color_hex.trim().is_empty() {
+            "#3b93f0".to_string()
+        } else {
+            color_hex.trim().to_string()
+        };
+        let color_rgb = crate::components::avatar::parse_fabushi_hex_color(&eff_color)
+            .unwrap_or(0x3B93F0);
+        if !self.dialogs.iter().any(|d| d.id == chat_id) {
+            let init: String = name
+                .split_whitespace()
+                .filter_map(|w| w.chars().next())
+                .take(2)
+                .collect::<String>()
+                .to_uppercase();
+            let avatar_initials = if init.is_empty() {
+                name.chars().take(2).collect::<String>().to_uppercase()
+            } else {
+                init
+            };
+            self.dialogs.insert(
+                0,
+                DialogItemModel {
+                    id: chat_id,
+                    peer_name: name,
+                    avatar_initials: if avatar_initials.is_empty() {
+                        "AI".to_string()
+                    } else {
+                        avatar_initials
+                    },
+                    avatar_color: color_rgb,
+                    last_message: String::new(),
+                    timestamp: "刚刚".to_string(),
+                    unread_count: 0,
+                    is_muted: false,
+                    is_pinned: false,
+                    is_online: true,
+                    typing_indicator: None,
+                    delivery_status: DialogDeliveryStatus::Read,
+                    folder: "Bots".to_string(),
+                },
+            );
+        }
+        self.bot_ids.insert(chat_id);
+        self.bot_fabushi_visuals
+            .insert(chat_id, (eff_shape.clone(), color_rgb));
+        self.bot_grok_avatars.insert(
+            chat_id,
+            BotGrokAvatarVisual {
+                agent_id: if agent_id.trim().is_empty() {
+                    format!("bot-{chat_id}")
+                } else {
+                    agent_id.trim().to_string()
+                },
+                shape: eff_shape,
+                color: eff_color,
+                execution_state: "idle".to_string(),
+            },
+        );
     }
 
     pub fn effective_width(&self) -> f32 {
@@ -552,9 +677,11 @@ impl ChatSidebar {
         if self.has_leading_app_sidebar && self.palette.is_apple_style() {
             if self.is_collapsed {
                 OPENBOT_SIDEBAR_COMPACT_WIDTH
-            } else {
+            } else if self.openbot_width.is_finite() {
                 self.openbot_width
                     .clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH)
+            } else {
+                OPENBOT_SIDEBAR_DEFAULT_WIDTH
             }
         } else {
             self.effective_width()
@@ -563,6 +690,9 @@ impl ChatSidebar {
 
     /// Applies OpenBot `110px` collapse / `118px` expand resize hysteresis across `[128, 400]`.
     pub fn apply_openbot_drag_width(&mut self, drag_px: f32) {
+        if !drag_px.is_finite() {
+            return;
+        }
         if self.is_sidebar_closed {
             self.is_sidebar_closed = false;
         }
@@ -580,6 +710,41 @@ impl ChatSidebar {
         }
     }
 
+    /// Atomically persists the OpenBot sidebar width & collapse state to `<preferences_dir>/openbot-chat-sidebar-v1.json`.
+    pub fn save_openbot_width_prefs(&self, preferences_dir: &Path) -> std::io::Result<()> {
+        let path = preferences_dir.join(CHAT_SIDEBAR_PREF_FILE);
+        let safe_width = if self.openbot_width.is_finite() {
+            self.openbot_width
+                .clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH)
+        } else {
+            OPENBOT_SIDEBAR_DEFAULT_WIDTH
+        };
+        let payload = ChatSidebarWidthPersisted {
+            version: 1,
+            openbot_width: safe_width,
+            is_collapsed: self.is_collapsed,
+            is_sidebar_closed: self.is_sidebar_closed,
+        };
+        crate::views::openbot::shell_state::write_json_atomic(&path, &payload)
+    }
+
+    /// Loads and sanitizes the persisted OpenBot sidebar width from `<preferences_dir>/openbot-chat-sidebar-v1.json`.
+    pub fn load_openbot_width_prefs(&mut self, preferences_dir: &Path) -> f32 {
+        let path = preferences_dir.join(CHAT_SIDEBAR_PREF_FILE);
+        if let Ok(bytes) = fs::read(&path) {
+            if let Ok(parsed) = serde_json::from_slice::<ChatSidebarWidthPersisted>(&bytes) {
+                if parsed.openbot_width.is_finite() {
+                    self.openbot_width = parsed
+                        .openbot_width
+                        .clamp(OPENBOT_SIDEBAR_MIN_WIDTH, OPENBOT_SIDEBAR_MAX_WIDTH);
+                }
+                self.is_collapsed = parsed.is_collapsed;
+                self.is_sidebar_closed = parsed.is_sidebar_closed;
+            }
+        }
+        self.openbot_width
+    }
+
     /// Resets OpenBot sidebar width to `280.0` (double-click on resize handle).
     pub fn reset_openbot_width(&mut self) {
         self.is_sidebar_closed = false;
@@ -588,6 +753,7 @@ impl ChatSidebar {
             self.collapse_state_revision = self.collapse_state_revision.wrapping_add(1);
         }
         self.openbot_width = OPENBOT_SIDEBAR_DEFAULT_WIDTH;
+        self.pending_persist_openbot_width = true;
     }
 
     /// Toggles full `0px` closed sidebar (`Cmd+B`), syncing `is_collapsed` for existing shortcut invariants.
@@ -607,6 +773,22 @@ impl ChatSidebar {
             return;
         }
         self.toggle_collapsed_from_user();
+    }
+
+    /// Pure toggle for the circular `+` creation dropdown menu (`新建助手`, `新建群聊`, `新建分组`).
+    pub fn toggle_new_menu(&mut self) -> bool {
+        let next = !self.is_new_menu_open;
+        self.close_openbot_popovers();
+        self.is_new_menu_open = next;
+        next
+    }
+
+    /// Pure toggle for the `SlidersHorizontal` tab-visibility edit menu.
+    pub fn toggle_tabs_edit_menu(&mut self) -> bool {
+        let next = !self.is_tabs_edit_menu_open;
+        self.close_openbot_popovers();
+        self.is_tabs_edit_menu_open = next;
+        next
     }
 
     /// Dismisses any transient OpenBot sidebar popover menus (`+`, filter, edit-tabs, context menu).
@@ -731,6 +913,7 @@ impl ChatSidebar {
         self.contact_chat_ids.clear();
         self.group_chat_ids.clear();
         self.channel_chat_ids.clear();
+        self.group_member_briefs.clear();
         self.custom_folders.clear();
         self.is_loading_dialogs = false;
         self.has_synced_dialogs = false;

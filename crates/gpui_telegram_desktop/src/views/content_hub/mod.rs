@@ -1405,9 +1405,22 @@ pub(crate) fn render_community_reviews_panel(
 }
 
 impl Render for ContentHubWorkspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
-        let ob = pal.openbot_palette();
+        let vp_w = f32::from(window.viewport_size().width);
+        let active_page = match self.active_section {
+            ContentHubSection::Books => "books",
+            ContentHubSection::Music => "music",
+            ContentHubSection::Games => "games",
+            ContentHubSection::AppStore => "app_store",
+            ContentHubSection::MyCreations => "my_creations",
+        };
+        let shell_layout =
+            apple_primitives::compute_content_hub_shell_layout(&pal, vp_w, active_page);
+        let canvas_bg = rgb(apple_primitives::parse_hex_color(
+            &shell_layout.canvas_hex,
+            0x1A1A1A,
+        ));
         let show_music_bar = self.music_engine.current_track().is_some()
             || (self.active_section == ContentHubSection::Music
                 && self.active_game.is_none()
@@ -1430,7 +1443,7 @@ impl Render for ContentHubWorkspace {
         div()
             .id("content-hub-workspace")
             .size_full()
-            .bg(ob.bg_canvas())
+            .bg(canvas_bg)
             .flex()
             .flex_col()
             .overflow_hidden()

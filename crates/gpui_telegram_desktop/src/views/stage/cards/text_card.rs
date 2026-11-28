@@ -549,6 +549,10 @@ impl TextMessageView {
                 .text_size(px(11.0))
                 .text_color(rgb(0x40A7E3))
                 .child("✓✓"),
+            DeliveryStatus::Failed => div()
+                .text_size(px(11.0))
+                .text_color(rgb(0xFF453A))
+                .child("!"),
         }
     }
 

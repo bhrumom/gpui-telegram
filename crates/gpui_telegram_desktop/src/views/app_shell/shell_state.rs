@@ -566,6 +566,7 @@ pub fn should_switch_to_chats_on_sidebar_selection(
 
 fn delivery_status_rank(status: DeliveryStatus) -> u8 {
     match status {
+        DeliveryStatus::Failed => 0,
         DeliveryStatus::Sending => 0,
         DeliveryStatus::Sent => 1,
         DeliveryStatus::Read => 2,

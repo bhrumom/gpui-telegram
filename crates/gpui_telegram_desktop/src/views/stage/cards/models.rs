@@ -16,6 +16,7 @@ pub enum DeliveryStatus {
     Sending,
     Sent,
     Read,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

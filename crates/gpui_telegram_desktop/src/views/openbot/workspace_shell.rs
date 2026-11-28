@@ -35,8 +35,9 @@ use crate::theme::openbot_palette::{
 };
 
 use super::agent_studio::{
-    AgentSettingsState, FirstAgentSetupState, GlobalSearchState, render_agent_settings_panel,
-    render_first_agent_setup, render_global_search_modal,
+    AgentSettingsState, FirstAgentSetupState, FirstAgentSetupUiAction, GlobalSearchState,
+    render_agent_settings_panel, render_first_agent_setup, render_first_agent_setup_interactive,
+    render_global_search_modal,
 };
 use super::ask_ui::{RuntimeTurnCard, UiBlockCardState, render_runtime_turn_card, render_ui_block_card};
 use super::channel_editor::{
@@ -46,7 +47,9 @@ use super::channel_editor::{
 use super::channel_view::{
     ChannelConversationState, ChannelTimelineMessage, render_channel_conversation,
 };
-use super::composer::{ComposerState, ComposerTrigger, render_composer};
+use super::composer::{
+    ComposerState, ComposerTrigger, ComposerUiAction, render_composer, render_composer_interactive,
+};
 use super::conversation::{ChatTimelineRow, ConversationViewState, render_conversation_view};
 use super::os_surfaces::{
     DesktopOsSurfacesState, render_agent_dock, render_browser_dock, render_close_guard_dialog,
@@ -719,14 +722,16 @@ impl OpenBotWorkspaceShell {
             return;
         }
         if self.composer.active_turn_running || !self.queue_panel.items.is_empty() {
-            let eval = self.queue_panel.evaluate_steer_for_state(true);
-            if let Some(first) = self.queue_panel.items.first_mut() {
-                if eval.steered_on_tab {
-                    first.status = QueueDeliveryStatus::Running;
-                    first.routine_steer_refused = false;
-                } else if eval.steer_refused {
-                    first.routine_steer_refused = true;
-                }
+            if let Some((first_id, first_text)) = self
+                .queue_panel
+                .items
+                .first()
+                .map(|item| (item.delivery_id.clone(), item.text.clone()))
+            {
+                let routine = self.queue_panel.active_turn_routine;
+                let _ = self
+                    .queue_panel
+                    .enqueue_and_steer_on_tab(&first_id, &first_text, routine);
             }
         }
     }
@@ -753,6 +758,10 @@ impl OpenBotWorkspaceShell {
             self.show_agent_settings = false;
         } else if self.show_channel_settings {
             self.show_channel_settings = false;
+        } else if self.active_page == OpenBotPage::Agents
+            && matches!(self.active_target, ActiveOpenBotTarget::None)
+        {
+            let _ = self.handle_first_agent_setup_escape();
         }
     }
 
@@ -769,7 +778,11 @@ impl OpenBotWorkspaceShell {
         }
         if primary_mod && !chord.alt && !chord.shift && chord.code.eq_ignore_ascii_case("Period") {
             self.composer.active_turn_running = false;
-            self.queue_panel.pause();
+            if self.queue_panel.paused {
+                let _ = self.queue_panel.drain_all();
+            } else {
+                self.queue_panel.pause();
+            }
             return true;
         }
         if primary_mod && !chord.alt && chord.shift && chord.code.eq_ignore_ascii_case("KeyE") {
@@ -790,10 +803,20 @@ impl OpenBotWorkspaceShell {
         };
         match cmd {
             ShortcutCommand::ToggleSidebar => {
-                self.shell.sidebar.toggle_closed();
+                if self.active_page == OpenBotPage::Agents {
+                    self.shell.sidebar.toggle_closed();
+                }
             }
             ShortcutCommand::GlobalSearch => {
-                self.global_search.open = !self.global_search.open;
+                let modal_open = self.show_shortcuts_overlay
+                    || self.show_channel_create_dialog
+                    || self.show_server_settings
+                    || self.show_trace_dialog;
+                if self.global_search.open {
+                    self.global_search.close_palette();
+                } else {
+                    self.global_search.try_open_palette(modal_open);
+                }
             }
             ShortcutCommand::SearchChat => {
                 self.conversation.search.open = !self.conversation.search.open;
@@ -870,6 +893,56 @@ impl OpenBotWorkspaceShell {
         }
     }
 
+    /// Validates and submits `first_agent_setup`, registers the created plush bot, and navigates
+    /// directly into the new agent conversation (`UI-F08-06`).
+    pub fn submit_first_agent_setup(
+        &mut self,
+    ) -> Result<String, super::shell_state::ShellValidationError> {
+        let req = self.first_agent_setup.build_create_managed_bot_request()?;
+        let agent_id = format!("agent-{}", self.agents.len() + 1);
+        let item = SidebarAgentItem {
+            id: agent_id.clone(),
+            name: req.display_name.clone(),
+            title: req.title.clone(),
+            preview: req.description.clone(),
+            avatar_seed: self.first_agent_setup.avatar_seed.clone(),
+            avatar_shape: req.avatar_shape.clone(),
+            avatar_hue: self.first_agent_setup.avatar_hue,
+            avatar_color: self.first_agent_setup.avatar_color.clone(),
+            avatar_url: None,
+            mood: openbot_contracts::avatar::AvatarMood::Idle,
+            unread_count: 0,
+            waiting_reason: None,
+            waiting_summary: None,
+            routine_phase: None,
+            working: false,
+            usage_limited: false,
+            muted: false,
+            hidden_since: None,
+            is_person_dm: false,
+            threads: Vec::new(),
+        };
+        self.agents.push(item);
+        self.active_target = ActiveOpenBotTarget::Agent(agent_id.clone());
+        self.conversation.agent_id = agent_id.clone();
+        self.conversation.agent_name = req.display_name;
+        self.conversation.agent_avatar_seed = self.first_agent_setup.avatar_seed.clone();
+        self.conversation.agent_avatar_hue = self.first_agent_setup.avatar_hue;
+        self.conversation.agent_avatar_color = self.first_agent_setup.avatar_color.clone();
+        Ok(agent_id)
+    }
+
+    /// Handles `Escape` inside `FirstAgentSetup` (ignored in `First` mode; navigates back in `Additional` mode).
+    pub fn handle_first_agent_setup_escape(&mut self) -> bool {
+        if !self.first_agent_setup.handle_escape() {
+            return false;
+        }
+        if let Some(first) = self.agents.first() {
+            self.active_target = ActiveOpenBotTarget::Agent(first.id.clone());
+        }
+        true
+    }
+
     fn submit_composer_message(&mut self) {
         let text = self.composer.text.trim().to_string();
         if text.is_empty() && self.composer.attachments.is_empty() {
@@ -884,6 +957,61 @@ impl OpenBotWorkspaceShell {
             match &self.active_target {
                 ActiveOpenBotTarget::Channel(_) => {
                     if !self.channel_conversation.read_only {
+                        let t_pal = crate::theme::TdesktopThemePalette::build_openbot(
+                            if self.palette.scheme.is_dark() {
+                                crate::theme::TdesktopThemeMode::Night
+                            } else {
+                                crate::theme::TdesktopThemeMode::Day
+                            },
+                            0x0A84FF,
+                            14,
+                            16,
+                        );
+                        let markers = self
+                            .channel_conversation
+                            .record_routing_from_message(&text, &t_pal);
+                        if !markers.is_empty() {
+                            let routed_ids: Vec<String> = markers
+                                .last()
+                                .map(|m| m.agent_ids.clone())
+                                .unwrap_or_default();
+                            let workers: Vec<crate::components::bloub_avatar::ChannelWorkerBrief> =
+                                routed_ids
+                                    .iter()
+                                    .map(|aid| {
+                                        let name = self
+                                            .channel_conversation
+                                            .agent_names
+                                            .get(aid)
+                                            .cloned()
+                                            .or_else(|| {
+                                                self.agents
+                                                    .iter()
+                                                    .find(|a| &a.id == aid)
+                                                    .map(|a| a.name.clone())
+                                            })
+                                            .unwrap_or_else(|| aid.clone());
+                                        crate::components::bloub_avatar::ChannelWorkerBrief {
+                                            id: aid.clone(),
+                                            name,
+                                            avatar_seed: Some(aid.clone()),
+                                            avatar_hue: None,
+                                            avatar_color: None,
+                                            avatar_url: None,
+                                        }
+                                    })
+                                    .collect();
+                            if !workers.is_empty() {
+                                let existing_stopped =
+                                    self.channel_conversation.stopped_tasks.items.clone();
+                                self.channel_conversation.sync_multi_worker_turn(
+                                    &workers,
+                                    existing_stopped,
+                                    self.now_ms,
+                                    false,
+                                );
+                            }
+                        }
                         self.channel_conversation.messages.push(ChannelTimelineMessage {
                             id: format!("cmsg-{seq}"),
                             sequence: seq,
@@ -940,6 +1068,10 @@ impl OpenBotWorkspaceShell {
     /// Renders the complete 1:1 OpenBot desktop shell (`PageRail` + `ServerRail` + `WorkspaceSidebar`
     /// + active center surface + splittable `SidePanel` + deferred modals & 7 Desktop OS overlays).
     pub fn render_workspace_root(&self) -> Div {
+        self.render_workspace_root_with_cx(None)
+    }
+
+    fn render_workspace_root_with_cx(&self, cx: Option<&mut Context<Self>>) -> Div {
         let bg_frame = self
             .palette
             .rgba("--openbot-bg-frame")
@@ -1012,7 +1144,7 @@ impl OpenBotWorkspaceShell {
                     .flex()
                     .flex_col()
                     .bg(bg_canvas)
-                    .child(self.render_main_surface()),
+                    .child(self.render_main_surface(cx)),
             );
         }
 
@@ -1032,15 +1164,71 @@ impl OpenBotWorkspaceShell {
         self.attach_deferred_overlays(root)
     }
 
-    fn render_main_surface(&self) -> Div {
+    fn apply_composer_ui_action(&mut self, action: ComposerUiAction, cx: &mut Context<Self>) {
+        match action {
+            ComposerUiAction::AllowImages => {
+                self.composer.click_allow_images();
+            }
+            ComposerUiAction::ToggleAddMenu => {
+                let disabled = self.composer.channel_archived_read_only;
+                self.composer.try_toggle_add_menu(disabled);
+            }
+            ComposerUiAction::AcceptAtEveryone => {
+                self.composer.accept_at_everyone();
+            }
+            ComposerUiAction::InsertTag { kind, name, id } => {
+                self.composer.insert_tag_token(kind, &name, &id);
+            }
+            ComposerUiAction::AcceptDollar(item) => {
+                self.composer.accept_dollar_item(&item);
+            }
+            ComposerUiAction::OpenTrigger(trig) => {
+                self.composer.open_picker(trig, "");
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_first_agent_setup_action(
+        &mut self,
+        action: FirstAgentSetupUiAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            FirstAgentSetupUiAction::Submit => {
+                if let Err(err) = self.submit_first_agent_setup() {
+                    self.first_agent_setup.record_backend_error(err.message);
+                }
+            }
+            FirstAgentSetupUiAction::Cancel => {
+                self.handle_first_agent_setup_escape();
+            }
+            FirstAgentSetupUiAction::SelectSuggestion(id) => {
+                self.first_agent_setup.select_suggestion(&id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_main_surface(&self, cx: Option<&mut Context<Self>>) -> Div {
         match self.active_page {
             OpenBotPage::Agents => match &self.active_target {
                 ActiveOpenBotTarget::None if self.agents.is_empty() && self.channels.is_empty() => {
-                    render_first_agent_setup(&self.first_agent_setup, &self.palette, self.now_sec)
+                    if let Some(cx) = cx {
+                        render_first_agent_setup_interactive(
+                            &self.first_agent_setup,
+                            &self.palette,
+                            self.now_sec,
+                            cx,
+                            |this, act, cx| this.apply_first_agent_setup_action(act, cx),
+                        )
+                    } else {
+                        render_first_agent_setup(&self.first_agent_setup, &self.palette, self.now_sec)
+                    }
                 }
-                ActiveOpenBotTarget::Channel(_) => self.render_channel_surface(),
+                ActiveOpenBotTarget::Channel(_) => self.render_channel_surface(cx),
                 ActiveOpenBotTarget::Agent(_) | ActiveOpenBotTarget::None => {
-                    self.render_agent_conversation_surface()
+                    self.render_agent_conversation_surface(cx)
                 }
             },
             OpenBotPage::Workflows => {
@@ -1067,7 +1255,7 @@ impl OpenBotWorkspaceShell {
         }
     }
 
-    fn render_agent_conversation_surface(&self) -> Div {
+    fn render_agent_conversation_surface(&self, cx: Option<&mut Context<Self>>) -> Div {
         let mut column = div()
             .flex_1()
             .min_h(px(0.0))
@@ -1141,12 +1329,14 @@ impl OpenBotWorkspaceShell {
             )));
         }
 
-        column = column.child(
-            div()
-                .px(px(12.0))
-                .pb(px(12.0))
-                .child(render_composer(&self.composer, &self.palette)),
-        );
+        let composer_el = if let Some(cx) = cx {
+            render_composer_interactive(&self.composer, &self.palette, cx, |this, act, cx| {
+                this.apply_composer_ui_action(act, cx);
+            })
+        } else {
+            render_composer(&self.composer, &self.palette)
+        };
+        column = column.child(div().px(px(12.0)).pb(px(12.0)).child(composer_el));
 
         if self.show_agent_settings {
             let border = self
@@ -1177,7 +1367,7 @@ impl OpenBotWorkspaceShell {
         }
     }
 
-    fn render_channel_surface(&self) -> Div {
+    fn render_channel_surface(&self, cx: Option<&mut Context<Self>>) -> Div {
         let briefs = self.channel_agent_briefs();
         let mut column = div()
             .flex_1()
@@ -1199,13 +1389,36 @@ impl OpenBotWorkspaceShell {
                     )),
             );
 
-        if !self.channel_conversation.read_only {
+        let queue_texts: Vec<String> = self
+            .queue_panel
+            .items
+            .iter()
+            .map(|q| q.text.clone())
+            .collect();
+        let stack_layout = self.channel_conversation.build_composer_stack_layout(
+            &queue_texts,
+            !self.queue_panel.paused,
+            self.channel_conversation.reply_to_message_id.as_deref(),
+            None,
+        );
+        if stack_layout.visible && (!self.queue_panel.items.is_empty() || self.queue_panel.paused) {
             column = column.child(
                 div()
-                    .px(px(12.0))
-                    .pb(px(12.0))
-                    .child(render_composer(&self.composer, &self.palette)),
+                    .px(px(16.0))
+                    .pb(px(6.0))
+                    .child(render_queue_panel(&self.queue_panel, &self.palette)),
             );
+        }
+
+        if !self.channel_conversation.read_only {
+            let composer_el = if let Some(cx) = cx {
+                render_composer_interactive(&self.composer, &self.palette, cx, |this, act, cx| {
+                    this.apply_composer_ui_action(act, cx);
+                })
+            } else {
+                render_composer(&self.composer, &self.palette)
+            };
+            column = column.child(div().px(px(12.0)).pb(px(12.0)).child(composer_el));
         }
 
         if self.show_channel_settings {
@@ -1603,7 +1816,7 @@ impl OpenBotWorkspaceShell {
 }
 
 impl Render for OpenBotWorkspaceShell {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_pending_page_select();
         if let Some(sweep) = &mut self.theme_sweep {
             sweep.tick_now();
@@ -1611,7 +1824,7 @@ impl Render for OpenBotWorkspaceShell {
         if let Some(beam) = &mut self.beam_wave {
             beam.tick_now();
         }
-        self.render_workspace_root()
+        self.render_workspace_root_with_cx(Some(cx))
     }
 }
 

@@ -291,8 +291,9 @@ pub fn resolve_at_picker(
             .collect()
     };
 
-    let everyone_shown =
-        in_channel && (query_lower.is_empty() || "everyone".starts_with(&query_lower));
+    let everyone_shown = in_channel
+        && agents.len() > 1
+        && (query_lower.is_empty() || "everyone".starts_with(&query_lower));
 
     let mut ranked_agents: Vec<AtPickerAgentItem> = agents
         .iter()
@@ -554,32 +555,62 @@ pub enum ComposerSendMode {
     LiveVoice,
 }
 
-/// Action items inside the `+` `ComposerAddMenu` popover.
+/// Action items inside the `+` `ComposerAddMenu` popover (`UI-F12-03`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposerAddMenuItem {
     AttachFiles,
     PickSkill,
-    AskSideQuestion,
     TeachBrowserTask,
+    AskSideQuestion,
+    VoiceConversation,
     StartNewChat,
 }
 
 impl ComposerAddMenuItem {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AttachFiles,
         Self::PickSkill,
-        Self::AskSideQuestion,
         Self::TeachBrowserTask,
+        Self::AskSideQuestion,
+        Self::VoiceConversation,
         Self::StartNewChat,
     ];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::AttachFiles => "attach",
+            Self::PickSkill => "skill",
+            Self::TeachBrowserTask => "teach",
+            Self::AskSideQuestion => "side_question",
+            Self::VoiceConversation => "voice",
+            Self::StartNewChat => "new_chat",
+        }
+    }
+
+    pub fn items_for_peer(is_bot: bool, is_group: bool) -> Vec<Self> {
+        if is_bot && !is_group {
+            Self::ALL.to_vec()
+        } else if is_group {
+            vec![
+                Self::AttachFiles,
+                Self::PickSkill,
+                Self::AskSideQuestion,
+                Self::VoiceConversation,
+                Self::StartNewChat,
+            ]
+        } else {
+            vec![Self::AttachFiles, Self::VoiceConversation]
+        }
+    }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::AttachFiles => "Attach files",
             Self::PickSkill => "Pick $ skill or MCP",
-            Self::AskSideQuestion => "Ask side question",
             Self::TeachBrowserTask => "Teach browser task",
+            Self::AskSideQuestion => "Ask side question",
+            Self::VoiceConversation => "Voice conversation",
             Self::StartNewChat => "Start new chat",
         }
     }
@@ -588,8 +619,9 @@ impl ComposerAddMenuItem {
         match self {
             Self::AttachFiles => "Up to 10 files · 100 MiB each",
             Self::PickSkill => "Insert enabled skill or MCP server",
-            Self::AskSideQuestion => "Ephemeral tangent · up to 20 turns",
             Self::TeachBrowserTask => "Record steps in Browser pane",
+            Self::AskSideQuestion => "Ephemeral tangent · up to 20 turns",
+            Self::VoiceConversation => "Start live voice conversation",
             Self::StartNewChat => "Branch a fresh thread",
         }
     }
@@ -598,8 +630,9 @@ impl ComposerAddMenuItem {
         match self {
             Self::AttachFiles => IconName::Paperclip,
             Self::PickSkill => IconName::TerminalMcp,
-            Self::AskSideQuestion => IconName::Search,
             Self::TeachBrowserTask => IconName::ComputerDesktop,
+            Self::AskSideQuestion => IconName::Search,
+            Self::VoiceConversation => IconName::Mic,
             Self::StartNewChat => IconName::ComposePen,
         }
     }
@@ -748,6 +781,13 @@ impl ComposerState {
     /// Applies paste text: pastes `> 4_000` chars attach `pasted-text.txt`, otherwise inline
     /// text is appended up to the `100_000`-character message cap.
     pub fn paste_text(&mut self, pasted: &str) -> PasteResult {
+        if self.channel_archived_read_only {
+            return PasteResult {
+                pasted_as_file: false,
+                pasted_file_name: None,
+                inline_text_length: 0,
+            };
+        }
         let char_count = pasted.chars().count();
         let result = handle_paste(char_count);
         if result.pasted_as_file {
@@ -817,11 +857,21 @@ impl ComposerState {
         self.picker_query.clear();
     }
 
-    pub fn toggle_add_menu(&mut self) {
+    /// Toggles the composer `+` add menu unless explicitly disabled or in an archived read-only channel (`UI-F12`).
+    pub fn try_toggle_add_menu(&mut self, disabled: bool) -> bool {
+        if disabled || self.channel_archived_read_only {
+            self.add_menu_open = false;
+            return false;
+        }
         self.add_menu_open = !self.add_menu_open;
         if self.add_menu_open {
             self.active_trigger = None;
         }
+        self.add_menu_open
+    }
+
+    pub fn toggle_add_menu(&mut self) {
+        self.try_toggle_add_menu(false);
     }
 
     /// Inserts a serialized `@[Name](kind:id)` reference into `self.text` and closes the picker.
@@ -836,10 +886,38 @@ impl ComposerState {
         wire
     }
 
+    /// Inserts an atomic `@everyone` mention token and closes the active picker (`UI-F13-02`).
+    pub fn accept_at_everyone(&mut self) -> String {
+        let token = "@everyone";
+        if !self.text.is_empty() && !self.text.ends_with(char::is_whitespace) {
+            self.text.push(' ');
+        }
+        self.text.push_str(token);
+        self.text.push(' ');
+        self.close_picker();
+        token.to_string()
+    }
+
+    /// Accepts a `$` picker item (`Skill` -> `$skill:<slug> `, `Mcp` -> `$mcp:<slug> `, or tag token)
+    /// and closes the active picker (`UI-F13-03`).
+    pub fn accept_dollar_item(&mut self, item: &DollarPickerItem) -> String {
+        let token = match item.kind {
+            DollarPickerItemKind::Skill => format!("$skill:{}", item.id),
+            DollarPickerItemKind::Mcp => format!("$mcp:{}", item.id),
+        };
+        if !self.text.is_empty() && !self.text.ends_with(char::is_whitespace) {
+            self.text.push(' ');
+        }
+        self.text.push_str(&token);
+        self.text.push(' ');
+        self.close_picker();
+        token
+    }
+
     pub fn resolve_active_at_picker(&self) -> AtPickerResolution {
         resolve_at_picker(
             &self.picker_query,
-            self.in_channel,
+            self.in_channel && self.available_agents.len() > 1,
             &self.available_agents,
             &self.available_files,
             &self.available_tabs,
@@ -1451,7 +1529,7 @@ pub fn render_composer(state: &ComposerState, palette: &OpenBotPalette) -> Div {
 
     if let Some(trigger) = state.active_trigger {
         root = root.child(render_picker_popover(state, trigger, palette));
-    } else if state.add_menu_open {
+    } else if state.add_menu_open && !state.channel_archived_read_only {
         root = root.child(render_add_menu_popover(palette));
     }
 
@@ -1569,7 +1647,10 @@ pub fn render_composer(state: &ComposerState, palette: &OpenBotPalette) -> Div {
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(text_primary)
-                                .hover(move |s| s.bg(control_hover))
+                                .when(state.channel_archived_read_only, |el| el.opacity(0.4))
+                                .when(!state.channel_archived_read_only, |el| {
+                                    el.hover(move |s| s.bg(control_hover))
+                                })
                                 .child("+"),
                         )
                         .child(
@@ -1672,6 +1753,212 @@ pub fn render_composer(state: &ComposerState, palette: &OpenBotPalette) -> Div {
                         ),
                 ),
         );
+
+    root
+}
+
+/// Interactive UI action emitted by [`render_composer_interactive`] when mounted in GPUI.
+#[derive(Debug, Clone)]
+pub enum ComposerUiAction {
+    AllowImages,
+    ToggleAddMenu,
+    AcceptAtEveryone,
+    InsertTag {
+        kind: ChatTagKind,
+        name: String,
+        id: String,
+    },
+    AcceptDollar(DollarPickerItem),
+    OpenTrigger(ComposerTrigger),
+}
+
+/// Live interactive GPUI composer surface wiring `click_allow_images`, `try_toggle_add_menu`,
+/// `accept_at_everyone`, `insert_tag_token`, and `accept_dollar_item` to real click handlers.
+pub fn render_composer_interactive<V: 'static>(
+    state: &ComposerState,
+    palette: &OpenBotPalette,
+    cx: &mut Context<V>,
+    on_action: impl Fn(&mut V, ComposerUiAction, &mut Context<V>) + Clone + 'static,
+) -> Div {
+    let surface = palette_color(palette, "--openbot-bg-surface", 0x1a1a1d);
+    let border = palette_color(palette, "--openbot-border", 0x222222);
+    let control_bg = palette_color(palette, "--openbot-bg-control", 0x222225);
+    let control_hover = palette_color(palette, "--openbot-hover", 0x2a2a2e);
+    let text_primary = palette_color(palette, "--openbot-text-primary", 0xffffff);
+    let text_muted = palette_color(palette, "--openbot-text-muted", 0x979797);
+    let warning = palette_color(palette, "--openbot-warning", 0xff9412);
+    let warning_soft = palette_color(palette, "--openbot-warning-soft", 0x3a2810);
+    let text_on_accent = palette_color(palette, "--openbot-text-on-accent", 0xffffff);
+
+    let mut root = render_composer(state, palette);
+
+    if state.image_warning_banner_visible() {
+        let act = on_action.clone();
+        root = root.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .id("openbot-composer-allow-images-live")
+                        .cursor_pointer()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded(px(999.0))
+                        .bg(warning_soft)
+                        .border_1()
+                        .border_color(warning)
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(text_on_accent)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            act(this, ComposerUiAction::AllowImages, cx);
+                        }))
+                        .child("Allow Images"),
+                ),
+        );
+    }
+
+    if let Some(trigger) = state.active_trigger {
+        let mut quick_bar = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(4.0))
+            .px(px(4.0))
+            .py(px(2.0))
+            .bg(surface)
+            .border_t_1()
+            .border_color(border);
+        match trigger {
+            ComposerTrigger::At => {
+                let resolved = state.resolve_active_at_picker();
+                for (idx, ag) in resolved.agents.iter().take(4).enumerate() {
+                    let act = on_action.clone();
+                    let is_ev = ag.is_everyone;
+                    let ag_id = ag.id.clone();
+                    let ag_name = ag.name.clone();
+                    quick_bar = quick_bar.child(
+                        div()
+                            .id(("openbot-composer-pick-at", idx))
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(999.0))
+                            .bg(control_bg)
+                            .hover(move |s| s.bg(control_hover))
+                            .text_xs()
+                            .text_color(text_primary)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if is_ev {
+                                    act(this, ComposerUiAction::AcceptAtEveryone, cx);
+                                } else {
+                                    act(
+                                        this,
+                                        ComposerUiAction::InsertTag {
+                                            kind: ChatTagKind::Agent,
+                                            name: ag_name.clone(),
+                                            id: ag_id.clone(),
+                                        },
+                                        cx,
+                                    );
+                                }
+                            }))
+                            .child(ag.name.clone()),
+                    );
+                }
+            }
+            ComposerTrigger::Dollar => {
+                let resolved = state.resolve_active_dollar_picker();
+                for (idx, item) in resolved.dollar_items.iter().take(4).enumerate() {
+                    let act = on_action.clone();
+                    let cloned = item.clone();
+                    quick_bar = quick_bar.child(
+                        div()
+                            .id(("openbot-composer-pick-dollar", idx))
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(999.0))
+                            .bg(control_bg)
+                            .hover(move |s| s.bg(control_hover))
+                            .text_xs()
+                            .text_color(text_primary)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                act(this, ComposerUiAction::AcceptDollar(cloned.clone()), cx);
+                            }))
+                            .child(item.display_label.clone()),
+                    );
+                }
+            }
+        }
+        root = root.child(quick_bar);
+    }
+
+    let act_add = on_action.clone();
+    let act_at = on_action.clone();
+    let act_dollar = on_action;
+    let disabled = state.channel_archived_read_only;
+    root = root.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(4.0))
+            .child(
+                div()
+                    .id("openbot-composer-live-add-toggle")
+                    .cursor_pointer()
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(999.0))
+                    .bg(control_bg)
+                    .border_1()
+                    .border_color(border)
+                    .text_xs()
+                    .text_color(text_muted)
+                    .when(disabled, |el| el.opacity(0.4))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        act_add(this, ComposerUiAction::ToggleAddMenu, cx);
+                    }))
+                    .child("+ Menu"),
+            )
+            .child(
+                div()
+                    .id("openbot-composer-live-at-btn")
+                    .cursor_pointer()
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(999.0))
+                    .bg(control_bg)
+                    .text_xs()
+                    .text_color(text_muted)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        act_at(this, ComposerUiAction::OpenTrigger(ComposerTrigger::At), cx);
+                    }))
+                    .child("@"),
+            )
+            .child(
+                div()
+                    .id("openbot-composer-live-dollar-btn")
+                    .cursor_pointer()
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(999.0))
+                    .bg(control_bg)
+                    .text_xs()
+                    .text_color(text_muted)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        act_dollar(
+                            this,
+                            ComposerUiAction::OpenTrigger(ComposerTrigger::Dollar),
+                            cx,
+                        );
+                    }))
+                    .child("$"),
+            ),
+    );
 
     root
 }

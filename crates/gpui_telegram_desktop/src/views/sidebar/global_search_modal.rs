@@ -18,7 +18,7 @@ use crate::i18n::tr_str;
 use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
 use crate::views::openbot::agent_studio::{
     GlobalSearchResultItem, GlobalSearchSectionKind, GlobalSearchState, GlobalSearchTab,
-    GLOBAL_SEARCH_RESULT_HEIGHT_PX, GLOBAL_SEARCH_SECTION_HEIGHT_PX,
+    GLOBAL_SEARCH_DEBOUNCE_MS, GLOBAL_SEARCH_RESULT_HEIGHT_PX, GLOBAL_SEARCH_SECTION_HEIGHT_PX,
     GLOBAL_SEARCH_SPACED_SECTION_HEIGHT_PX,
 };
 use crate::views::sidebar::sidebar_search_view::{snippet_around, split_highlight_segments};
@@ -39,6 +39,7 @@ pub struct GlobalSearchModal {
     pub ime: TextInputController,
     pub pending_activate: Option<GlobalSearchResultItem>,
     pub pending_close: bool,
+    pub pending_remote_search: Option<(u64, String)>,
     pub selected_all: bool,
 }
 
@@ -49,7 +50,7 @@ impl GlobalSearchModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut state = GlobalSearchState::new(false);
-        state.open_palette();
+        state.try_open_palette(false);
         Self {
             state,
             palette,
@@ -58,6 +59,7 @@ impl GlobalSearchModal {
             ime: TextInputController::new(),
             pending_activate: None,
             pending_close: false,
+            pending_remote_search: None,
             selected_all: false,
         }
     }
@@ -89,6 +91,56 @@ impl GlobalSearchModal {
         std::mem::take(&mut self.pending_close)
     }
 
+    pub fn take_pending_remote_search(&mut self) -> Option<(u64, String)> {
+        self.pending_remote_search.take()
+    }
+
+    pub fn apply_remote_results(
+        &mut self,
+        seq: u64,
+        items: Vec<GlobalSearchResultItem>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let applied = self.state.apply_remote_results(seq, items);
+        if applied {
+            cx.notify();
+        }
+        applied
+    }
+
+    pub fn fail_remote_search(
+        &mut self,
+        seq: u64,
+        err: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let applied = self.state.fail_remote_search(seq, err);
+        if applied {
+            cx.notify();
+        }
+        applied
+    }
+
+    fn schedule_debounced_remote_search(&mut self, cx: &mut Context<Self>) {
+        if self.state.query.trim().is_empty() {
+            self.state.remote_error = None;
+            self.state.set_searching(false, now_wall_ms());
+            return;
+        }
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            app.background_executor()
+                .timer(std::time::Duration::from_millis(GLOBAL_SEARCH_DEBOUNCE_MS))
+                .await;
+            let _ = weak.update(app, |this, cx| {
+                if let Some(seq) = this.state.begin_remote_search(now_wall_ms()) {
+                    this.pending_remote_search = Some((seq, this.state.debounced_query.clone()));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn request_close(&mut self, cx: &mut Context<Self>) {
         self.ime.clear_ime_state();
         self.state.close_palette();
@@ -98,8 +150,20 @@ impl GlobalSearchModal {
 
     pub fn activate_item(&mut self, item: GlobalSearchResultItem, cx: &mut Context<Self>) {
         self.ime.clear_ime_state();
-        self.state.close_palette();
-        self.pending_activate = Some(item);
+        if let Some(pos) = self
+            .state
+            .flat_filtered_results()
+            .iter()
+            .position(|r| r.id == item.id)
+        {
+            self.state.selected_index = pos;
+        }
+        let activated = self.state.execute_selected().unwrap_or_else(|| {
+            self.state.last_activated_target_id = Some(item.id.clone());
+            self.state.close_palette();
+            item
+        });
+        self.pending_activate = Some(activated);
         self.pending_close = true;
         cx.notify();
     }
@@ -116,6 +180,7 @@ impl GlobalSearchModal {
         }
         self.state.push_query_text(&clean, now_ms);
         self.ime.clear_preedit();
+        self.schedule_debounced_remote_search(cx);
         cx.notify();
     }
 
@@ -206,6 +271,7 @@ impl GlobalSearchModal {
             } else {
                 self.state.backspace_query(now_ms);
             }
+            self.schedule_debounced_remote_search(cx);
             cx.notify();
             return;
         }
@@ -480,7 +546,13 @@ impl Render for GlobalSearchModal {
         let ob = self.palette.openbot_palette();
         let is_dark = self.palette.mode.is_dark();
         let lang = self.language_id.clone();
-        let card_bg = if is_dark { rgb(0x1E1E1E) } else { rgb(0xFFFFFF) };
+        let vp = window.viewport_size();
+        let modal_layout = crate::views::openbot::agent_studio::compute_global_search_modal_layout(
+            f32::from(vp.width),
+            f32::from(vp.height),
+            is_dark,
+        );
+        let card_bg = rgb(modal_layout.bg_rgb);
         let ring = ob
             .rgba("--openbot-dialog-ring")
             .unwrap_or_else(|| ob.border_strong_hairline());
@@ -491,13 +563,10 @@ impl Render for GlobalSearchModal {
         let text_pri = ob.text_primary();
         let text_sec = ob.text_secondary();
         let text_muted = ob.text_muted();
-
-        let vp = window.viewport_size();
-        let vp_w = f32::from(vp.width).max(640.0);
-        let vp_h = f32::from(vp.height).max(480.0);
-        let card_w = 640.0_f32.min((vp_w - 48.0).max(320.0));
-        let top_offset = (vp_h * 0.14).min(112.0).max(44.0);
-        let list_max_h = (vp_h - top_offset - 120.0).clamp(180.0, 400.0);
+        let card_w = modal_layout.width_px;
+        let top_offset = modal_layout.top_px;
+        let list_max_h = modal_layout.list_max_h_px;
+        let row_vms = self.state.build_visible_row_view_models();
 
         let fh = self.focus_handle.clone();
         let view = cx.entity().clone();
@@ -583,7 +652,9 @@ impl Render for GlobalSearchModal {
             );
             for item in items {
                 let row_idx = flat_idx;
-                let selected = row_idx == selected_idx;
+                let row_vm = row_vms.get(row_idx);
+                let selected = row_vm.map_or(row_idx == selected_idx, |vm| vm.selected);
+                let kbd_enter_visible = row_vm.map_or(selected, |vm| vm.kbd_enter_visible);
                 flat_idx += 1;
                 let leading = render_result_leading_visual(&item, text_muted);
                 let snippet = snippet_around(&item.subtitle, &query_snapshot);
@@ -666,7 +737,7 @@ impl Render for GlobalSearchModal {
                                     .child(b),
                             )
                         })
-                        .when(selected, |el| {
+                        .when(kbd_enter_visible, |el| {
                             el.child(
                                 div()
                                     .h(px(20.0))
@@ -685,8 +756,65 @@ impl Render for GlobalSearchModal {
             }
         }
 
-        if flat_idx == 0 {
-            let empty_plush = self.state.plush.render_element(now_ms, 56.0);
+        if let Some(remote_err) = self.state.remote_error.clone() {
+            let danger = ob.danger();
+            list_body = list_body.child(
+                div()
+                    .id("global-search-remote-error-banner")
+                    .mx(px(12.0))
+                    .my(px(6.0))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
+                    .bg(active_bg)
+                    .border_1()
+                    .border_color(danger)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(danger)
+                            .child(remote_err),
+                    )
+                    .child(
+                        div()
+                            .id("global-search-remote-retry-btn")
+                            .cursor_pointer()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .bg(kbd_bg)
+                            .hover(move |s| s.bg(hover_bg))
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_pri)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let seq = this.state.retry_remote_search(now_wall_ms());
+                                let q = if this.state.debounced_query.trim().is_empty() {
+                                    this.state.query.clone()
+                                } else {
+                                    this.state.debounced_query.clone()
+                                };
+                                this.pending_remote_search = Some((seq, q));
+                                cx.notify();
+                            }))
+                            .child(tr_str(&lang, "重试", "Retry")),
+                    ),
+            );
+        }
+
+        if self.state.is_plush_visible() || flat_idx == 0 {
+            let empty_plush = self
+                .state
+                .plush
+                .render_element(now_ms, modal_layout.plush_size_px);
             list_body = list_body.child(
                 div()
                     .min_h(px(148.0))
@@ -799,7 +927,7 @@ impl Render for GlobalSearchModal {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(48.0))
+                            .h(px(modal_layout.input_height_px))
                             .flex_shrink_0()
                             .w_full()
                             .pl(px(16.0))
@@ -816,7 +944,7 @@ impl Render for GlobalSearchModal {
                     .child(list_body)
                     .child(
                         div()
-                            .h(px(36.0))
+                            .h(px(modal_layout.footer_height_px))
                             .flex_shrink_0()
                             .w_full()
                             .px(px(16.0))

@@ -37,6 +37,107 @@ pub fn modal_card(width: f32, pal: TdesktopThemePalette) -> Div {
         })
 }
 
+pub const CONFIRM_DIALOG_MAX_WIDTH_PX: f32 = 460.0;
+pub const CONFIRM_DIALOG_RADIUS_PX: f32 = 16.0;
+pub const CONFIRM_DIALOG_DARK_BG: u32 = 0x161616;
+
+/// Interactive state machine for OpenBot `ConfirmDialog` (`UI-F19`):
+/// focuses `"cancel"` by default on destructive actions, blocks backdrop dismissal while pending,
+/// and restores focus to the opener upon dismissal/resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmDialogState {
+    pub open: bool,
+    pub destructive: bool,
+    pub pending: bool,
+    pub initial_focus: &'static str,
+    pub focus_restored_to_opener: bool,
+}
+
+impl ConfirmDialogState {
+    pub fn open_dialog(destructive: bool) -> Self {
+        Self {
+            open: true,
+            destructive,
+            pending: false,
+            initial_focus: if destructive { "cancel" } else { "confirm" },
+            focus_restored_to_opener: false,
+        }
+    }
+
+    pub fn closed(destructive: bool) -> Self {
+        Self {
+            open: false,
+            destructive,
+            pending: false,
+            initial_focus: if destructive { "cancel" } else { "confirm" },
+            focus_restored_to_opener: false,
+        }
+    }
+
+    pub fn set_pending(&mut self, pending: bool) {
+        self.pending = pending;
+    }
+
+    pub fn backdrop_dismiss_blocked(&self) -> bool {
+        self.pending
+    }
+
+    pub fn try_dismiss_backdrop(&mut self) -> bool {
+        if !self.open || self.pending {
+            return false;
+        }
+        self.open = false;
+        self.focus_restored_to_opener = true;
+        true
+    }
+
+    pub fn resolve_and_restore_focus(&mut self) -> bool {
+        self.pending = false;
+        self.open = false;
+        self.focus_restored_to_opener = true;
+        true
+    }
+}
+
+/// Single-source-of-truth layout snapshot for OpenBot `ConfirmDialog` (`UI-F19`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmDialogLayoutSnapshot {
+    pub open: bool,
+    pub destructive: bool,
+    pub pending: bool,
+    pub max_width_px: f32,
+    pub radius_px: f32,
+    pub bg_hex: String,
+    pub initial_focus: &'static str,
+    pub backdrop_dismiss_blocked: bool,
+    pub focus_restored_to_opener: bool,
+    pub z_index: usize,
+}
+
+pub fn compute_confirm_dialog_layout(
+    state: &ConfirmDialogState,
+    pal: &TdesktopThemePalette,
+) -> ConfirmDialogLayoutSnapshot {
+    let ob = pal.openbot_palette();
+    let bg_rgb = if ob.scheme.is_dark() {
+        CONFIRM_DIALOG_DARK_BG
+    } else {
+        crate::views::content_hub::apple_primitives::rgba_to_rgb24(ob.bg_surface())
+    };
+    ConfirmDialogLayoutSnapshot {
+        open: state.open,
+        destructive: state.destructive,
+        pending: state.pending,
+        max_width_px: CONFIRM_DIALOG_MAX_WIDTH_PX,
+        radius_px: CONFIRM_DIALOG_RADIUS_PX,
+        bg_hex: crate::views::content_hub::apple_primitives::rgb24_to_hex(bg_rgb),
+        initial_focus: state.initial_focus,
+        backdrop_dismiss_blocked: state.backdrop_dismiss_blocked(),
+        focus_restored_to_opener: state.focus_restored_to_opener,
+        z_index: crate::theme::OPENBOT_LAYER_DIALOG,
+    }
+}
+
 /// OpenBot `ConfirmDialog` card shell (`460px` max-width, `16px` radius, `#161616`/`#ffffff`,
 /// `1px` dialog ring, `40px` circular icon badge, body slot, and `border-t` actions bar).
 pub fn openbot_confirm_dialog_shell<V: 'static>(
@@ -51,11 +152,12 @@ pub fn openbot_confirm_dialog_shell<V: 'static>(
     cx: &mut Context<V>,
 ) -> Div {
     let ob = pal.openbot_palette();
-    let card_bg = if ob.scheme.is_dark() {
-        rgb(0x161616)
-    } else {
-        ob.bg_surface()
-    };
+    let state = ConfirmDialogState::open_dialog(destructive);
+    let layout = compute_confirm_dialog_layout(&state, &pal);
+    let card_bg = rgb(crate::views::content_hub::apple_primitives::parse_hex_color(
+        &layout.bg_hex,
+        CONFIRM_DIALOG_DARK_BG,
+    ));
     let dialog_ring = ob
         .rgba("--openbot-dialog-ring")
         .unwrap_or_else(|| ob.border_strong_hairline());
@@ -78,9 +180,9 @@ pub fn openbot_confirm_dialog_shell<V: 'static>(
 
     div()
         .w_full()
-        .max_w(px(460.0))
+        .max_w(px(layout.max_width_px))
         .max_h(px(620.0))
-        .rounded(px(16.0))
+        .rounded(px(layout.radius_px))
         .bg(card_bg)
         .border_1()
         .border_color(dialog_ring)

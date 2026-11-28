@@ -46,8 +46,8 @@ pub const SERVER_RAIL_WIDTH: f32 = 64.0;
 pub const NARROW_SERVER_RAIL_WIDTH: f32 = 56.0;
 /// Narrow viewport width breakpoint in pixels.
 pub const NARROW_WINDOW_BREAKPOINT_PX: u32 = 800;
-/// Default PageRail width in pixels.
-pub const PAGE_RAIL_WIDTH_PX: f32 = 56.0;
+/// Default PageRail width in pixels (`52px`, matching upstream `page-rail.css`).
+pub const PAGE_RAIL_WIDTH_PX: f32 = 52.0;
 /// Canonical People section identifier (`ipc-sidebar-layout.ts`).
 pub const SIDEBAR_PEOPLE_SECTION_ID: &str = "people";
 /// Canonical Unassigned section identifier (`ipc-sidebar-layout.ts`).
@@ -73,7 +73,9 @@ pub const SIDEBAR_PREF_FILE: &str = "openbot-sidebar-v1.json";
 /// Atomic page/server rail preferences JSON file name.
 pub const RAIL_PREF_FILE: &str = "openbot-rail-v1.json";
 /// Exact vertical group order rendered in `SidebarNav`.
-pub const SIDEBAR_GROUP_ORDER: [&str; 5] = ["pinned", "waiting", "unread", "sections", "hidden"];
+pub const SIDEBAR_GROUP_ORDER: [&str; 6] = [
+    "pinned", "waiting", "unread", "sections", "hidden", "archived",
+];
 
 /// Domain validation error for OpenBot shell, sidebar layout, pins, and agent studio forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,8 +403,18 @@ impl PageRailState {
         rings: &'a [UsageRingMetric],
         available_height_px: f32,
     ) -> (&'a [UsageRingMetric], &'a [UsageRingMetric]) {
-        let slot_h = self.usage_ring_spec.size_px + 6.0;
-        let max_slots = ((available_height_px.max(slot_h)) / slot_h).floor() as usize;
+        let base_sz = if self.usage_ring_spec.size_px.is_finite() && self.usage_ring_spec.size_px > 0.0 {
+            self.usage_ring_spec.size_px
+        } else {
+            28.0
+        };
+        let slot_h = base_sz + 6.0;
+        let safe_avail = if available_height_px.is_finite() {
+            available_height_px.max(slot_h)
+        } else {
+            slot_h
+        };
+        let max_slots = ((safe_avail / slot_h).floor() as usize).max(1);
         if rings.len() <= max_slots {
             (rings, &[])
         } else {
@@ -595,7 +607,7 @@ impl Default for ServerRailState {
 impl ServerRailState {
     pub fn new() -> Self {
         Self {
-            view_mode: ServerViewMode::Rail,
+            view_mode: ServerViewMode::Menu,
             active_server_id: "local".to_string(),
             servers: vec![ServerEntry::local_default()],
             hidden_folder_open: false,
@@ -941,6 +953,56 @@ pub fn validate_sidebar_layout(layout: &SidebarLayoutSnapshot) -> Result<(), She
     Ok(())
 }
 
+/// Validates sidebar folder nesting invariants (`SIDEBAR_FOLDER_LEVELS = 3`, max depth `2`,
+/// and acyclic parent chains) for interactive folder creation and nesting (`UI-F06`).
+pub fn validate_sidebar_folder_nesting(
+    sections: &[SidebarSection],
+) -> Result<(), ShellValidationError> {
+    let parent_by_id: BTreeMap<&str, Option<&str>> = sections
+        .iter()
+        .map(|s| (s.id.as_str(), s.parent_id.as_deref()))
+        .collect();
+    for section in sections {
+        let mut depth = 0usize;
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(section.id.as_str());
+        let mut cur = section.parent_id.as_deref();
+        while let Some(pid) = cur {
+            if !parent_by_id.contains_key(pid) {
+                break;
+            }
+            if !visited.insert(pid) {
+                return Err(ShellValidationError::new(
+                    "folder_cycle",
+                    format!("sidebar folder '{}' forms a parent cycle", section.id),
+                ));
+            }
+            depth += 1;
+            if depth >= SIDEBAR_FOLDER_LEVELS {
+                return Err(ShellValidationError::new(
+                    "folder_depth_exceeded",
+                    format!(
+                        "sidebar folder '{}' nesting depth ({depth}) exceeds max depth {}",
+                        section.id,
+                        SIDEBAR_FOLDER_LEVELS.saturating_sub(1)
+                    ),
+                ));
+            }
+            cur = parent_by_id.get(pid).copied().flatten();
+        }
+    }
+    Ok(())
+}
+
+/// Validates structural [`validate_sidebar_layout`] invariants plus strict folder nesting
+/// depth (`<= 2`) and cycle rejection via [`validate_sidebar_folder_nesting`].
+pub fn validate_sidebar_layout_strict(
+    layout: &SidebarLayoutSnapshot,
+) -> Result<(), ShellValidationError> {
+    validate_sidebar_layout(layout)?;
+    validate_sidebar_folder_nesting(&layout.sections)
+}
+
 /// Resolves cycle-safe nested folder depths clamped to `0..=(SIDEBAR_FOLDER_LEVELS - 1)` (`0..=2`).
 pub fn resolve_folder_depths(sections: &[SidebarSection]) -> BTreeMap<String, usize> {
     let max_depth = SIDEBAR_FOLDER_LEVELS.saturating_sub(1);
@@ -1033,13 +1095,19 @@ pub fn apply_sidebar_layout_action(
                 .position(|item| item == SIDEBAR_UNASSIGNED_SECTION_ID)
                 .unwrap_or(next.order.len());
             next.order.insert(insert_at, id);
-            validate_sidebar_layout(&next)?;
+            validate_sidebar_layout_strict(&next)?;
             next.revision = next.revision.saturating_add(1);
             *layout = next;
         }
         SidebarLayoutAction::Rename { section_id, name } => {
             let trimmed_len = name.trim().chars().count();
-            if trimmed_len == 0 || name.chars().count() > SIDEBAR_MAX_SECTION_NAME {
+            if trimmed_len == 0 {
+                return Err(ShellValidationError::new(
+                    "empty_section_name",
+                    "sidebar section name cannot be empty",
+                ));
+            }
+            if name.chars().count() > SIDEBAR_MAX_SECTION_NAME {
                 return Err(ShellValidationError::new(
                     "section_name_too_long",
                     format!(
@@ -1091,7 +1159,7 @@ pub fn apply_sidebar_layout_action(
             let target = match direction {
                 SidebarMoveDirection::Up => idx.saturating_sub(delta),
                 SidebarMoveDirection::Down => {
-                    (idx + delta).min(layout.order.len().saturating_sub(1))
+                    idx.saturating_add(delta).min(layout.order.len().saturating_sub(1))
                 }
             };
             if target != idx {
@@ -1159,22 +1227,25 @@ pub fn apply_sidebar_layout_action(
                     && layout.sections.iter().any(|s| s.id == *pid)
                     && !would_create_folder_cycle(&layout.sections, &section_id, Some(pid))
             });
-            if let Some(sec) = layout.sections.iter_mut().find(|s| s.id == section_id) {
+            let mut next = layout.clone();
+            if let Some(sec) = next.sections.iter_mut().find(|s| s.id == section_id) {
                 sec.parent_id = next_parent;
             }
             if let Some(before_id) = before_section_id
                 && before_id != section_id
-                && let Some(old_pos) = layout.order.iter().position(|id| id == &section_id)
+                && let Some(old_pos) = next.order.iter().position(|id| id == &section_id)
             {
-                let item = layout.order.remove(old_pos);
-                let new_pos = layout
+                let item = next.order.remove(old_pos);
+                let new_pos = next
                     .order
                     .iter()
                     .position(|id| id == &before_id)
-                    .unwrap_or(layout.order.len());
-                layout.order.insert(new_pos, item);
+                    .unwrap_or(next.order.len());
+                next.order.insert(new_pos, item);
             }
-            layout.revision = layout.revision.saturating_add(1);
+            validate_sidebar_layout_strict(&next)?;
+            next.revision = next.revision.saturating_add(1);
+            *layout = next;
         }
     }
     Ok(())
@@ -1406,7 +1477,7 @@ impl SidebarState {
         }
         self.closed = false;
         if self.compact {
-            if drag_px > LEFT_PANEL_EXPAND_THRESHOLD {
+            if drag_px >= LEFT_PANEL_EXPAND_THRESHOLD {
                 self.compact = false;
                 self.width_px = drag_px.clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX);
             }
@@ -1436,8 +1507,17 @@ impl SidebarState {
         if self.closed {
             return;
         }
-        let expanded_width = self.width_px.clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX);
-        let remaining = (window_width_px as f32) - server_rail_px - expanded_width;
+        let expanded_width = if self.width_px.is_finite() {
+            self.width_px.clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX)
+        } else {
+            LEFT_PANEL_DEFAULT
+        };
+        let safe_rail = if server_rail_px.is_finite() {
+            server_rail_px.max(0.0)
+        } else {
+            0.0
+        };
+        let remaining = (window_width_px as f32) - safe_rail - expanded_width;
         if remaining < CONVERSATION_MIN_WIDTH {
             self.compact = true;
         }
@@ -1455,8 +1535,10 @@ impl SidebarState {
             0.0
         } else if self.compact {
             LEFT_PANEL_COMPACT
-        } else {
+        } else if self.width_px.is_finite() {
             self.width_px.clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX)
+        } else {
+            LEFT_PANEL_DEFAULT
         }
     }
 
@@ -1592,7 +1674,7 @@ impl Default for RailPersistedState {
             active_page: OpenBotPage::Agents,
             pinned_pages: PAGE_RAIL_DEFAULT_PINNED_PAGES.to_vec(),
             hidden_items: Vec::new(),
-            server_view_mode: ServerViewMode::Rail,
+            server_view_mode: ServerViewMode::Menu,
             active_server_id: "local".to_string(),
         }
     }

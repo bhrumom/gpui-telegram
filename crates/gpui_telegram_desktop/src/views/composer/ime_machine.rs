@@ -182,32 +182,33 @@ impl ImeSafetyMachine {
                 self.state = ImeState::Idle;
             }
         }
-        if self.cursor_index >= self.text_buffer.len() {
+        let cur = super::editor_state::clamp_char_boundary(&self.text_buffer, self.cursor_index);
+        if cur >= self.text_buffer.len() {
             self.text_buffer.push_str(text);
             self.cursor_index = self.text_buffer.len();
         } else {
-            self.text_buffer.insert_str(self.cursor_index, text);
-            self.cursor_index += text.len();
+            self.text_buffer.insert_str(cur, text);
+            self.cursor_index = cur + text.len();
         }
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor_index > 0 && !self.text_buffer.is_empty() {
-            if let Some((start, end)) = super::editor_state::atomic_reference_chip_span_before_cursor(
-                &self.text_buffer,
-                self.cursor_index,
-            ) {
-                self.text_buffer.replace_range(start..end, "");
-                self.cursor_index = start;
-                return;
-            }
-            let mut prev_char_boundary = self.cursor_index - 1;
-            while !self.text_buffer.is_char_boundary(prev_char_boundary) && prev_char_boundary > 0 {
-                prev_char_boundary -= 1;
-            }
-            self.text_buffer.remove(prev_char_boundary);
-            self.cursor_index = prev_char_boundary;
+        let cur = super::editor_state::clamp_char_boundary(&self.text_buffer, self.cursor_index);
+        self.cursor_index = cur;
+        if cur == 0 || self.text_buffer.is_empty() {
+            return;
         }
+        if let Some((start, end)) = super::editor_state::atomic_reference_chip_span_before_cursor(
+            &self.text_buffer,
+            cur,
+        ) {
+            self.text_buffer.replace_range(start..end, "");
+            self.cursor_index = start;
+            return;
+        }
+        let prev = super::editor_state::prev_char_boundary(&self.text_buffer, cur);
+        self.text_buffer.replace_range(prev..cur, "");
+        self.cursor_index = prev;
     }
 
     pub fn clear(&mut self) {
@@ -241,5 +242,30 @@ impl ImeSafetyMachine {
 impl Default for ImeSafetyMachine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ime_insert_and_backspace_guard_oob_and_mid_utf8_cursor() {
+        let mut ime = ImeSafetyMachine::new();
+        ime.insert_text("你好🚀");
+        // Mid-UTF-8 byte offset inside '你' (3 bytes) and '🚀' (4 bytes)
+        ime.cursor_index = 1;
+        ime.insert_text("X");
+        assert_eq!(ime.text(), "X你好🚀");
+
+        // OOB cursor > text_buffer.len() must not panic in backspace
+        ime.cursor_index = 999;
+        ime.backspace();
+        assert_eq!(ime.text(), "X你好");
+
+        // Mid-UTF-8 byte offset in backspace removes the preceding char cleanly
+        ime.cursor_index = 2; // inside '你' (bytes 1..4), clamps to 1
+        ime.backspace();
+        assert_eq!(ime.text(), "你好");
     }
 }

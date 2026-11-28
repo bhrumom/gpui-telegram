@@ -202,13 +202,105 @@ pub fn creation_kind_label(kind: CreationKind, lang_id: &str) -> &'static str {
     }
 }
 
+/// Canonical OpenBot 2-column Marketplace left navigation sidebar width (`280px`).
+pub const OPENBOT_MARKETPLACE_LEFT_NAV_WIDTH: f32 = 280.0;
+/// Canonical OpenBot Marketplace centered content max-width (`880px`).
+pub const OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH: f32 = 880.0;
+/// Canonical OpenBot top `PageHeader` bar height (`38px`).
+pub const OPENBOT_PAGE_HEADER_HEIGHT: f32 = 38.0;
+
+/// Returns `true` when `rgb_val` matches a legacy Telegram/Apple blue pill color (`#007aff`, `#3390ec`, `#2b5278`, `#2aabee`).
+pub const fn is_legacy_blue_rgb(rgb_val: u32) -> bool {
+    matches!(rgb_val, 0x007AFF | 0x3390EC | 0x2B5278 | 0x2AABEE)
+}
+
+/// Converts a GPUI `Rgba` color into a packed `0xRRGGBB` 24-bit integer.
+pub fn rgba_to_rgb24(c: gpui::Rgba) -> u32 {
+    let r = (c.r.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let g = (c.g.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let b = (c.b.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (r << 16) | (g << 8) | b
+}
+
+/// Formats a packed `0xRRGGBB` integer as lowercase `#rrggbb`.
+pub fn rgb24_to_hex(rgb_val: u32) -> String {
+    format!("#{:06x}", rgb_val & 0x00FF_FFFF)
+}
+
+/// Single-source-of-truth OpenBot layout snapshot for all secondary content hubs (`UI-F18`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentHubShellLayoutSnapshot {
+    pub active_page: &'static str,
+    pub viewport_width_px: f32,
+    pub page_header_height_px: f32,
+    pub left_nav_width_px: f32,
+    pub content_max_width_px: f32,
+    pub canvas_hex: String,
+    pub card_surface_hex: String,
+    pub hairline_hex: String,
+    pub primary_cta_bg_hex: String,
+    pub primary_cta_fg_hex: String,
+    pub legacy_blue_pill_count: usize,
+}
+
+/// Computes live OpenBot Content Hub shell geometry and monochrome token audit (`UI-F18`),
+/// deriving `legacy_blue_pill_count` strictly from live palette, CTA, and accent colors.
+pub fn compute_content_hub_shell_layout(
+    pal: &TdesktopThemePalette,
+    vp_w: f32,
+    active_page: &'static str,
+) -> ContentHubShellLayoutSnapshot {
+    let ob = pal.openbot_palette();
+    let canvas_rgb = rgba_to_rgb24(ob.bg_canvas());
+    let card_rgb = rgba_to_rgb24(ob.bg_surface());
+    let hairline_rgb = rgba_to_rgb24(ob.border_hairline());
+    let primary_cta_bg_rgb = rgba_to_rgb24(ob.surface_light());
+    let primary_cta_fg_rgb = rgba_to_rgb24(ob.text_on_light());
+    let active_pill_rgb = rgba_to_rgb24(ob.bg_control_active());
+
+    let mut legacy_blue_pill_count = 0usize;
+    if !pal.is_apple_style() || is_legacy_blue_rgb(pal.accent) {
+        legacy_blue_pill_count += 1;
+    }
+    if is_legacy_blue_rgb(primary_cta_bg_rgb) {
+        legacy_blue_pill_count += 1;
+    }
+    if is_legacy_blue_rgb(active_pill_rgb) {
+        legacy_blue_pill_count += 1;
+    }
+    if is_legacy_blue_rgb(super::app_store_view::APPSTORE_ACCENT)
+        && (active_page == "app_store" || active_page == "marketplace")
+    {
+        legacy_blue_pill_count += 1;
+    }
+    if is_legacy_blue_rgb(creation_kind_accent(CreationKind::App)) {
+        legacy_blue_pill_count += 1;
+    }
+
+    ContentHubShellLayoutSnapshot {
+        active_page,
+        viewport_width_px: if vp_w.is_finite() && vp_w > 0.0 { vp_w } else { 0.0 },
+        page_header_height_px: OPENBOT_PAGE_HEADER_HEIGHT,
+        left_nav_width_px: OPENBOT_MARKETPLACE_LEFT_NAV_WIDTH,
+        content_max_width_px: OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH,
+        canvas_hex: rgb24_to_hex(canvas_rgb),
+        card_surface_hex: rgb24_to_hex(card_rgb),
+        hairline_hex: rgb24_to_hex(hairline_rgb),
+        primary_cta_bg_hex: rgb24_to_hex(primary_cta_bg_rgb),
+        primary_cta_fg_hex: rgb24_to_hex(primary_cta_fg_rgb),
+        legacy_blue_pill_count,
+    }
+}
+
 /// OpenBot monochrome primary CTA button (`#f0f0f0`/`#141414` dark, `#1c1c1e`/`#ffffff` light).
 pub(crate) fn openbot_primary_cta_btn(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     pal: TdesktopThemePalette,
 ) -> Stateful<Div> {
-    let ob = pal.openbot_palette();
+    let layout = compute_content_hub_shell_layout(&pal, 1280.0, "marketplace");
+    let cta_bg = rgb(parse_hex_color(&layout.primary_cta_bg_hex, 0xF0F0F0));
+    let cta_fg = rgb(parse_hex_color(&layout.primary_cta_fg_hex, 0x141414));
     let label_str: SharedString = label.into();
     div()
         .id(id)
@@ -216,8 +308,8 @@ pub(crate) fn openbot_primary_cta_btn(
         .px(px(14.0))
         .py(px(7.0))
         .rounded(px(8.0))
-        .bg(ob.surface_light())
-        .text_color(ob.text_on_light())
+        .bg(cta_bg)
+        .text_color(cta_fg)
         .hover(|s| s.opacity(0.84))
         .flex()
         .items_center()
@@ -266,6 +358,7 @@ pub(crate) fn openbot_page_header(
     pal: TdesktopThemePalette,
 ) -> Div {
     let ob = pal.openbot_palette();
+    let layout = compute_content_hub_shell_layout(&pal, 1280.0, "marketplace");
     let title_str: SharedString = title.into();
     let mut left = div()
         .flex_1()
@@ -292,13 +385,13 @@ pub(crate) fn openbot_page_header(
     );
 
     let mut bar = div()
-        .h(px(38.0))
+        .h(px(layout.page_header_height_px))
         .flex_shrink_0()
         .w_full()
         .px(px(16.0))
-        .bg(ob.bg_canvas())
+        .bg(rgb(parse_hex_color(&layout.canvas_hex, 0x1A1A1A)))
         .border_b_1()
-        .border_color(ob.border_hairline())
+        .border_color(rgb(parse_hex_color(&layout.hairline_hex, 0x262626)))
         .flex()
         .items_center()
         .justify_between()
@@ -358,7 +451,7 @@ pub(crate) fn openbot_marketplace_nav_item(
         })
 }
 
-/// OpenBot 2-column `Marketplace` browse shell: `240px` left sidebar nav + right scrollable
+/// OpenBot 2-column `Marketplace` browse shell: `280px` left sidebar nav + right scrollable
 /// `880px`-max centered canvas on `ob.bg_canvas()`.
 pub(crate) fn openbot_marketplace_shell(
     left_nav: Div,
@@ -366,23 +459,24 @@ pub(crate) fn openbot_marketplace_shell(
     pal: TdesktopThemePalette,
 ) -> Div {
     let ob = pal.openbot_palette();
+    let layout = compute_content_hub_shell_layout(&pal, 1280.0, "marketplace");
     div()
         .flex_1()
         .min_h(px(0.0))
         .w_full()
         .overflow_hidden()
-        .bg(ob.bg_canvas())
+        .bg(rgb(parse_hex_color(&layout.canvas_hex, 0x1A1A1A)))
         .flex()
         .flex_row()
         .child(
             div()
                 .id("openbot-marketplace-left-nav")
-                .w(px(240.0))
+                .w(px(layout.left_nav_width_px))
                 .flex_shrink_0()
                 .h_full()
                 .bg(ob.bg_sidebar())
                 .border_r_1()
-                .border_color(ob.border_hairline())
+                .border_color(rgb(parse_hex_color(&layout.hairline_hex, 0x262626)))
                 .p(px(12.0))
                 .overflow_y_scroll()
                 .child(left_nav),
@@ -393,10 +487,11 @@ pub(crate) fn openbot_marketplace_shell(
 /// Standard OpenBot grouped card surface (`14px` radius, `#212121`/`#ffffff`, crisp 1px border).
 pub fn apple_grouped_card(pal: TdesktopThemePalette) -> Div {
     let ob = pal.openbot_palette();
+    let layout = compute_content_hub_shell_layout(&pal, 1280.0, "marketplace");
     div()
         .w_full()
         .rounded(px(14.0))
-        .bg(ob.bg_surface())
+        .bg(rgb(parse_hex_color(&layout.card_surface_hex, 0x212121)))
         .border_1()
         .border_color(ob.frame_card_border())
         .overflow_hidden()

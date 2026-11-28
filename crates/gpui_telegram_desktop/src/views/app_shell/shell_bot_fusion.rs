@@ -6,7 +6,7 @@
 //! - In-chat Bot Quick Bar, inline `ask_ui` approval cards, Queue/Steer bar, ephemeral Side-Question,
 //!   `$` Skills/Routines/Workflows composer command execution, and 380px Bot Companion SidePanel.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
@@ -45,7 +45,7 @@ use crate::views::drawer::{
 use crate::views::nav_rail::NavDestination;
 use crate::views::openbot::channel_view::{
     render_tucked_awaiting_replies_section, render_tucked_stopped_tasks_section,
-    AwaitingReplyEntry, AwaitingReplyState, StoppedChannelTaskBannerItem,
+    AwaitingReplyEntry, AwaitingReplyState, ChannelStoppedTasksState,
 };
 use crate::views::openbot::side_panel::{
     CONVERSATION_PANEL_MIN, DRAG_START_PX, LAUNCHER_PRIMARY_PANES, MAX_SIDE_SPLITS,
@@ -77,6 +77,7 @@ pub struct OpenBotRightSidePanelState {
     pub side_question_last_error: Option<String>,
     pub browser_url_draft: String,
     pub files_filter_draft: String,
+    pub unavailable_tabs: BTreeSet<String>,
     pub last_synced_inspector_open: bool,
     pub last_synced_companion_open: bool,
 }
@@ -105,6 +106,7 @@ impl Default for OpenBotRightSidePanelState {
             side_question_last_error: None,
             browser_url_draft: "https://openbot.local".to_string(),
             files_filter_draft: String::new(),
+            unavailable_tabs: BTreeSet::new(),
             last_synced_inspector_open: false,
             last_synced_companion_open: false,
         }
@@ -129,6 +131,7 @@ impl OpenBotRightSidePanelState {
         self.more_menu_open = false;
         self.side_question_last_error = None;
         self.files_filter_draft.clear();
+        self.unavailable_tabs.clear();
         self.last_synced_inspector_open = false;
         self.last_synced_companion_open = false;
     }
@@ -240,6 +243,7 @@ impl OpenBotRightSidePanelState {
         self.state.open = true;
         self.state.maximized = false;
         self.open_tabs.clear();
+        self.unavailable_tabs.clear();
         self.active_top_tab = None;
         self.split_bottom_pane = None;
         self.add_menu_open = false;
@@ -247,12 +251,233 @@ impl OpenBotRightSidePanelState {
         self.sync_active_splits();
     }
 
+    /// Marks or clears an open side-panel file tab as unavailable (`UI-F15`).
+    pub fn mark_file_tab_unavailable(&mut self, tab_id: &str, missing: bool) {
+        if missing {
+            self.unavailable_tabs.insert(tab_id.to_string());
+        } else {
+            self.unavailable_tabs.remove(tab_id);
+        }
+    }
+
+    /// Checks a workspace file path on disk and records its unavailable-tab state.
+    /// Returns `true` when the file is missing/unavailable.
+    pub fn sync_file_tab_path_availability(
+        &mut self,
+        tab_id: &str,
+        path: &std::path::Path,
+    ) -> bool {
+        let missing = !path.exists();
+        self.mark_file_tab_unavailable(tab_id, missing);
+        missing
+    }
+
+    pub fn is_tab_unavailable(&self, tab_id: &str) -> bool {
+        self.unavailable_tabs.contains(tab_id)
+    }
+
+    pub fn has_any_unavailable_tab(&self) -> bool {
+        !self.unavailable_tabs.is_empty()
+    }
+
+    /// Attempts to open a 2nd vertical split, rejecting a 3rd split once `MAX_SIDE_SPLITS` (2) is reached (`T2-F15-02`).
+    pub fn try_split_down(&mut self, pane: SidePanelPaneKind) -> bool {
+        if self.active_top_tab.is_some() && self.split_bottom_pane.is_some() {
+            return false;
+        }
+        self.split_down(pane);
+        true
+    }
+
     pub fn clamp_width_for_workspace(&mut self, requested_px: f32, workspace_avail_px: f32) -> f32 {
-        let max_by_vp = (workspace_avail_px - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT);
-        let upper = SETTINGS_PANEL_MAX.min(max_by_vp);
-        self.state.width_px = requested_px.clamp(SETTINGS_PANEL_DEFAULT, upper);
+        let upper = if workspace_avail_px.is_finite() && workspace_avail_px > 0.0 {
+            let max_by_vp =
+                (workspace_avail_px - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT);
+            SETTINGS_PANEL_MAX.min(max_by_vp)
+        } else {
+            SETTINGS_PANEL_DEFAULT
+        };
+        let candidate = if requested_px.is_finite() {
+            requested_px
+        } else if self.state.width_px.is_finite() {
+            self.state.width_px
+        } else {
+            SETTINGS_PANEL_DEFAULT
+        };
+        self.state.width_px = candidate.clamp(SETTINGS_PANEL_DEFAULT, upper);
         self.state.width_px
     }
+
+    pub fn compute_header_layout(
+        &self,
+        target: SidePanelSettingsTarget,
+        avail_w: f32,
+        is_zh: bool,
+    ) -> SidePanelHeaderLayoutSnapshot {
+        let has_tabs = !self.open_tabs.is_empty() || self.split_bottom_pane.is_some();
+        let safe_w = if avail_w.is_finite() && avail_w > 0.0 {
+            avail_w.min(SETTINGS_PANEL_MAX)
+        } else if self.state.width_px.is_finite() {
+            self.state
+                .width_px
+                .clamp(SETTINGS_PANEL_DEFAULT, SETTINGS_PANEL_MAX)
+        } else {
+            SETTINGS_PANEL_DEFAULT
+        };
+        let total_tabs = self.open_tabs.len();
+        let avail_for_tabs = (safe_w - 122.0).max(78.0);
+        let max_visible_tabs = (avail_for_tabs / 78.0).floor().max(1.0) as usize;
+        let overflow_chevron_visible = total_tabs > max_visible_tabs;
+        let visible_tabs_count = total_tabs.min(max_visible_tabs);
+        let hidden_tabs_count = total_tabs.saturating_sub(visible_tabs_count);
+        let combined_actions_menu = has_tabs && (overflow_chevron_visible || safe_w < 380.0);
+        let open_tabs = self.open_tabs.iter().map(|p| p.as_str()).collect();
+        let add_pane_menu_items = LAUNCHER_PRIMARY_PANES
+            .iter()
+            .map(|p| p.launcher_label(target, is_zh).to_string())
+            .collect();
+        SidePanelHeaderLayoutSnapshot {
+            height_px: crate::views::openbot::side_panel::OPENBOT_SIDE_PANEL_HEADER_HEIGHT,
+            add_btn_size_px: 28.0,
+            more_btn_visible: has_tabs,
+            maximize_btn_visible: has_tabs && !combined_actions_menu,
+            toggle_btn_size_px: 28.0,
+            maximized: self.state.maximized,
+            open_tabs,
+            add_pane_menu_items,
+            launcher_visible: self.state.open && !has_tabs,
+            visible_tabs_count,
+            hidden_tabs_count,
+            overflow_chevron_visible,
+            combined_actions_menu,
+            unavailable_tab_flagged: self.has_any_unavailable_tab(),
+        }
+    }
+
+    pub fn compute_layout(
+        &self,
+        workspace_avail_px: f32,
+        panel_height_px: f32,
+    ) -> SidePanelLayoutSnapshot {
+        let safe_ws = if workspace_avail_px.is_finite() && workspace_avail_px > 0.0 {
+            workspace_avail_px
+        } else {
+            1000.0
+        };
+        let max_by_vp = (safe_ws - CONVERSATION_PANEL_MIN).max(SETTINGS_PANEL_DEFAULT);
+        let upper = SETTINGS_PANEL_MAX.min(max_by_vp);
+        let safe_stored_w = if self.state.width_px.is_finite() {
+            self.state.width_px
+        } else {
+            SETTINGS_PANEL_DEFAULT
+        };
+        let width_px = if !self.state.open {
+            0.0
+        } else if self.state.maximized {
+            safe_ws.max(SETTINGS_PANEL_DEFAULT)
+        } else {
+            safe_stored_w.clamp(SETTINGS_PANEL_DEFAULT, upper)
+        };
+        let effective_width_pct = if !self.state.open {
+            0
+        } else if self.state.maximized {
+            100
+        } else {
+            ((width_px / safe_ws) * 100.0).round().clamp(1.0, 100.0) as u32
+        };
+        let split_count = usize::from(self.active_top_tab.is_some())
+            + usize::from(self.split_bottom_pane.is_some());
+        let lower_share = if self.state.lower_share.is_finite() {
+            (self.state.lower_share as f32).clamp(0.22, 0.72)
+        } else {
+            0.45
+        };
+        let safe_h = if panel_height_px.is_finite() && panel_height_px > 0.0 {
+            panel_height_px
+        } else {
+            640.0
+        };
+        let body_h = (safe_h - crate::views::openbot::side_panel::OPENBOT_SIDE_PANEL_HEADER_HEIGHT)
+            .max(SIDE_MAIN_GROUP_MIN + SIDE_SPLIT_MIN + 5.0);
+        let (main_group_height_px, lower_split_height_px) = if self.split_bottom_pane.is_some() {
+            let usable = (body_h - 5.0).max(SIDE_MAIN_GROUP_MIN + SIDE_SPLIT_MIN);
+            let max_lower = (usable - SIDE_MAIN_GROUP_MIN).max(SIDE_SPLIT_MIN);
+            let lower_h = (usable * lower_share).clamp(SIDE_SPLIT_MIN, max_lower);
+            let main_h = (usable - lower_h).max(SIDE_MAIN_GROUP_MIN);
+            (main_h, lower_h)
+        } else {
+            (body_h.max(SIDE_MAIN_GROUP_MIN), 0.0)
+        };
+        let target = if self.state.settings.is_channel {
+            SidePanelSettingsTarget::Channel
+        } else {
+            SidePanelSettingsTarget::Assistant
+        };
+        SidePanelLayoutSnapshot {
+            open: self.state.open,
+            width_px,
+            persisted_width_px: safe_stored_w,
+            min_width_px: SETTINGS_PANEL_DEFAULT,
+            max_width_px: SETTINGS_PANEL_MAX,
+            conversation_min_px: CONVERSATION_PANEL_MIN,
+            maximized: self.state.maximized,
+            effective_width_pct,
+            launcher_visible: self.state.open && self.active_top_tab.is_none() && self.split_bottom_pane.is_none(),
+            open_tabs: self.open_tabs.clone(),
+            active_top_tab: self.active_top_tab,
+            split_bottom_pane: self.split_bottom_pane,
+            active_splits: self.state.active_splits.clone(),
+            split_count,
+            max_splits: MAX_SIDE_SPLITS,
+            lower_share,
+            main_group_height_px,
+            lower_split_height_px,
+            min_pane_px: crate::views::openbot::side_panel::SIDE_SPLIT_MIN,
+            header: self.compute_header_layout(target, width_px, false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidePanelHeaderLayoutSnapshot {
+    pub height_px: f32,
+    pub add_btn_size_px: f32,
+    pub more_btn_visible: bool,
+    pub maximize_btn_visible: bool,
+    pub toggle_btn_size_px: f32,
+    pub maximized: bool,
+    pub open_tabs: Vec<&'static str>,
+    pub add_pane_menu_items: Vec<String>,
+    pub launcher_visible: bool,
+    pub visible_tabs_count: usize,
+    pub hidden_tabs_count: usize,
+    pub overflow_chevron_visible: bool,
+    pub combined_actions_menu: bool,
+    pub unavailable_tab_flagged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidePanelLayoutSnapshot {
+    pub open: bool,
+    pub width_px: f32,
+    pub persisted_width_px: f32,
+    pub min_width_px: f32,
+    pub max_width_px: f32,
+    pub conversation_min_px: f32,
+    pub maximized: bool,
+    pub effective_width_pct: u32,
+    pub launcher_visible: bool,
+    pub open_tabs: Vec<SidePanelPaneKind>,
+    pub active_top_tab: Option<SidePanelPaneKind>,
+    pub split_bottom_pane: Option<SidePanelPaneKind>,
+    pub active_splits: Vec<SidePanelPaneKind>,
+    pub split_count: usize,
+    pub max_splits: usize,
+    pub lower_share: f32,
+    pub main_group_height_px: f32,
+    pub lower_split_height_px: f32,
+    pub min_pane_px: f32,
+    pub header: SidePanelHeaderLayoutSnapshot,
 }
 
 /// Grouped state for Native Bot Fusion stored on `AppShell`.
@@ -271,10 +496,12 @@ pub struct ShellBotFusionState {
     // M3 OpenBot tucked .composer-stack state (UI-F11 / UI-F14)
     pub awaiting_replies: Vec<AwaitingReplyEntry>,
     pub subtasks_collapsed: bool,
-    pub stopped_tasks: Vec<StoppedChannelTaskBannerItem>,
+    pub stopped_tasks: ChannelStoppedTasksState,
     pub browser_live_notice: Option<(String, bool)>,
     pub compacting_status: Option<String>,
     pub context_usage_ratio: Option<f32>,
+    pub composer_notice: Option<crate::views::openbot::queue_and_voice::ComposerNoticeState>,
+    pub open_waits_count: usize,
     // M4 Unified OpenBot Right `SidePanel` state (`UI-F15`)
     pub side_panel: OpenBotRightSidePanelState,
 }
@@ -289,10 +516,14 @@ impl ShellBotFusionState {
         self.side_question_last = None;
         self.awaiting_replies.clear();
         self.subtasks_collapsed = false;
-        self.stopped_tasks.clear();
+        self.stopped_tasks.items.clear();
+        self.stopped_tasks.resuming_ids.clear();
+        self.stopped_tasks.resume_dispatch_count = 0;
         self.browser_live_notice = None;
         self.compacting_status = None;
         self.context_usage_ratio = None;
+        self.composer_notice = None;
+        self.open_waits_count = 0;
         self.side_panel.reset_ui();
     }
 }
@@ -1435,14 +1666,75 @@ impl AppShell {
             .active_turn_id
             .clone()
             .unwrap_or_default();
-        let _ = rt.scheduler().queue_steer(QueueSteerInput {
+        let active_turn_routine = expected_turn.to_ascii_lowercase().contains("routine")
+            || rt.scheduler().queue_list(&ob_id).ok().is_some_and(|list| {
+                list.items.iter().any(|it| {
+                    matches!(it.sender, openbot_contracts::queue::QueueSender::Routine { .. })
+                        && (it.turn_id.as_deref() == Some(expected_turn.as_str())
+                            || matches!(
+                                it.status,
+                                openbot_contracts::queue::QueueDeliveryStatus::Running
+                                    | openbot_contracts::queue::QueueDeliveryStatus::Starting
+                            ))
+                })
+            });
+        let eval =
+            crate::views::openbot::queue_and_voice::evaluate_steer(active_turn_routine, true);
+        if eval.steer_refused {
+            self.push_bot_fusion_step(
+                "Steer",
+                "refused",
+                eval.tooltip
+                    .unwrap_or_else(|| "Routine run cannot be steered".to_string()),
+            );
+            self.enqueue_localized_toast(
+                "当前为定时任务轮次，暂不支持插队转向",
+                "Routine run cannot be steered; message kept queued",
+                2200,
+                cx,
+            );
+            self.refresh_active_bot_fusion_snapshot(cx);
+            cx.notify();
+            return;
+        }
+        match rt.scheduler().queue_steer(QueueSteerInput {
             agent_id: ob_id,
             delivery_id: delivery_id.clone(),
             expected_turn_id: expected_turn,
-            routine_turn: false,
-        });
-        self.push_bot_fusion_step("Steer", "triggered", format!("steered {delivery_id}"));
-        self.enqueue_localized_toast("已发起插队转向 (Steer)", "Steer signal sent", 1800, cx);
+            routine_turn: active_turn_routine,
+        }) {
+            Ok(outcome) if outcome.steered && !outcome.steer_refused => {
+                self.push_bot_fusion_step("Steer", "triggered", format!("steered {delivery_id}"));
+                self.enqueue_localized_toast(
+                    "已发起插队转向 (Steer)",
+                    "Steer signal sent",
+                    1800,
+                    cx,
+                );
+            }
+            Ok(outcome) => {
+                let reason = outcome
+                    .reason
+                    .unwrap_or_else(|| "Steer refused; kept queued".to_string());
+                self.push_bot_fusion_step("Steer", "refused", reason.clone());
+                let toast = if self.active_lang_id().starts_with("zh") {
+                    "未能插队转向，消息保留在队列中".to_string()
+                } else {
+                    reason
+                };
+                self.show_toast(toast, 2200, cx);
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                self.push_bot_fusion_step("Steer", "failed", msg.clone());
+                let toast = if self.active_lang_id().starts_with("zh") {
+                    format!("插队转向失败：{msg}")
+                } else {
+                    msg
+                };
+                self.show_toast(toast, 2200, cx);
+            }
+        }
         self.refresh_active_bot_fusion_snapshot(cx);
         cx.notify();
     }
@@ -1487,15 +1779,24 @@ impl AppShell {
                 Some(err.to_string()),
             ),
         };
-        self.bot_fusion.side_question_last = Some((q.clone(), answer.clone()));
-        self.bot_fusion.side_panel.side_question_last_error = err_opt;
-        let _ = self
+        match self
             .bot_fusion
             .side_panel
             .state
             .question
-            .append_turn(q.clone(), answer);
-        self.push_bot_fusion_step("Side-Question", "ephemeral", q);
+            .append_turn(q.clone(), answer.clone())
+        {
+            Ok(()) => {
+                self.bot_fusion.side_question_last = Some((q.clone(), answer));
+                self.bot_fusion.side_panel.side_question_last_error = err_opt;
+                self.push_bot_fusion_step("Side-Question", "ephemeral", q);
+            }
+            Err(append_err) => {
+                self.bot_fusion.side_panel.state.question.draft_question = q.clone();
+                self.bot_fusion.side_panel.side_question_last_error = Some(append_err);
+                self.push_bot_fusion_step("Side-Question", "cap_reached", q);
+            }
+        }
         self.refresh_active_bot_fusion_snapshot(cx);
         cx.notify();
     }
@@ -1969,6 +2270,9 @@ impl AppShell {
                     }
                     cx.notify();
                 },
+                |this, _agent_id, cx| {
+                    this.open_unified_side_panel_pane(SidePanelPaneKind::Subagent, cx);
+                },
                 |this, cx| {
                     this.bot_fusion.awaiting_replies.clear();
                     cx.notify();
@@ -1984,15 +2288,44 @@ impl AppShell {
                 lang,
                 cx,
                 |this, task_id, cx| {
-                    this.bot_fusion.stopped_tasks.retain(|t| t.task_id != task_id);
-                    cx.notify();
+                    if this.bot_fusion.stopped_tasks.begin_resume(&task_id) {
+                        this.bot_fusion
+                            .stopped_tasks
+                            .items
+                            .retain(|t| t.task_id != task_id);
+                        this.bot_fusion.stopped_tasks.finish_resume(&task_id);
+                        cx.notify();
+                    }
                 },
                 |this, cx| {
-                    this.bot_fusion.stopped_tasks.clear();
-                    cx.notify();
+                    let ids: Vec<String> = this
+                        .bot_fusion
+                        .stopped_tasks
+                        .items
+                        .iter()
+                        .map(|t| t.task_id.clone())
+                        .collect();
+                    let mut resumed_any = false;
+                    for tid in ids {
+                        if this.bot_fusion.stopped_tasks.begin_resume(&tid) {
+                            this.bot_fusion
+                                .stopped_tasks
+                                .items
+                                .retain(|t| t.task_id != tid);
+                            this.bot_fusion.stopped_tasks.finish_resume(&tid);
+                            resumed_any = true;
+                        }
+                    }
+                    if resumed_any {
+                        cx.notify();
+                    }
                 },
                 |this, task_id, cx| {
-                    this.bot_fusion.stopped_tasks.retain(|t| t.task_id != task_id);
+                    this.bot_fusion.stopped_tasks.finish_resume(&task_id);
+                    this.bot_fusion
+                        .stopped_tasks
+                        .items
+                        .retain(|t| t.task_id != task_id);
                     cx.notify();
                 },
             ) {
@@ -2133,7 +2466,153 @@ impl AppShell {
                 );
             }
 
-            if sections.is_empty() {
+            let queue_texts: Vec<String> = snap
+                .queue_items
+                .iter()
+                .map(|q| q.text.clone())
+                .collect();
+            let awaiting_names: Vec<String> = self
+                .bot_fusion
+                .awaiting_replies
+                .iter()
+                .map(|a| a.agent_name.clone())
+                .collect();
+            let awaiting_all_settled = !self.bot_fusion.awaiting_replies.is_empty()
+                && self.bot_fusion.awaiting_replies.iter().all(|a| {
+                    matches!(
+                        a.state,
+                        AwaitingReplyState::Replied
+                            | AwaitingReplyState::Stopped
+                            | AwaitingReplyState::Failed
+                    )
+                });
+            let stopped_ids: Vec<String> = self
+                .bot_fusion
+                .stopped_tasks
+                .items
+                .iter()
+                .map(|s| s.task_id.clone())
+                .collect();
+            let stack_layout = crate::views::openbot::queue_and_voice::compute_composer_stack_layout(
+                &crate::views::openbot::queue_and_voice::ComposerStackInput {
+                    queue_items: &queue_texts,
+                    queue_can_steer: !snap.queue_paused,
+                    reply_sender: None,
+                    awaiting_tasks: &awaiting_names,
+                    awaiting_all_settled,
+                    stopped_tasks: &stopped_ids,
+                    open_waits_count: self.bot_fusion.open_waits_count,
+                    notice: self.bot_fusion.composer_notice.as_ref(),
+                },
+            );
+            if let Some(ref notice) = self.bot_fusion.composer_notice {
+                let copyable = stack_layout.notice_has_copy_details || notice.has_copy_details();
+                let dismissible = notice.dismissible;
+                let copy_text = notice
+                    .reference
+                    .clone()
+                    .unwrap_or_else(|| notice.body.clone());
+                let notice_msg = notice
+                    .title
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| notice.body.clone());
+                sections.push(
+                    div()
+                        .id("composer-stack-notice-bar")
+                        .min_h(px(28.0))
+                        .px(px(13.0))
+                        .py(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(ob.warning())
+                                .child(notice_msg),
+                        )
+                        .when(copyable, |row| {
+                            row.child(
+                                div()
+                                    .id("composer-stack-notice-copy")
+                                    .cursor_pointer()
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded(px(6.0))
+                                    .bg(ob.bg_control())
+                                    .text_size(px(11.0))
+                                    .text_color(ob.text_secondary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                copy_text.clone(),
+                                            ));
+                                            this.show_toast(
+                                                tr_str(this.active_lang_id(), "已复制详情", "Copied details")
+                                                    .to_string(),
+                                                1600,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .child(tr_str(&lang, "复制详情", "Copy details")),
+                            )
+                        })
+                        .when(dismissible, |row| {
+                            row.child(
+                                div()
+                                    .id("composer-stack-notice-dismiss")
+                                    .cursor_pointer()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(6.0))
+                                    .bg(ob.bg_control())
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_secondary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.bot_fusion.composer_notice = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            )
+                        })
+                        .into_any_element(),
+                );
+            }
+            if stack_layout.open_waits_count > 0 {
+                let wait_count = stack_layout.open_waits_count;
+                sections.push(
+                    div()
+                        .id("composer-stack-open-waits")
+                        .h(px(28.0))
+                        .px(px(13.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(ob.text_muted())
+                                .child(if lang.starts_with("zh") {
+                                    format!("等待确认 ({wait_count})")
+                                } else {
+                                    format!("Open waits ({wait_count})")
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if sections.is_empty() && !stack_layout.visible {
                 return None;
             }
 
@@ -2141,10 +2620,11 @@ impl AppShell {
                 .id("bot-fusion-composer-strip")
                 .w_full()
                 .max_w(px(760.0))
-                .rounded_tl(px(14.0))
-                .rounded_tr(px(14.0))
+                .rounded_tl(px(stack_layout.radius_px))
+                .rounded_tr(px(stack_layout.radius_px))
                 .rounded_bl(px(10.0))
                 .rounded_br(px(10.0))
+                .pb(px(stack_layout.overlap_bottom_px))
                 .bg(tucked_bg)
                 .border_1()
                 .border_color(tucked_border)
@@ -2165,7 +2645,7 @@ impl AppShell {
                     .bg(ob.bg_canvas())
                     .px(px(16.0))
                     .pt(px(2.0))
-                    .pb(px(2.0))
+                    .mb(px(-stack_layout.overlap_bottom_px))
                     .flex()
                     .justify_center()
                     .child(tucked)
@@ -2930,12 +3410,7 @@ impl AppShell {
             || !self.inspector.read(cx).embedded_in_side_panel
         {
             self.inspector.update(cx, |insp, icx| {
-                insp.embedded_in_side_panel = true;
-                if insp_should_open {
-                    insp.open();
-                } else {
-                    insp.close();
-                }
+                insp.sync_inspector_for_unified_side_panel(insp_should_open);
                 icx.notify();
             });
         }
@@ -2972,11 +3447,10 @@ impl AppShell {
         if pane == SidePanelPaneKind::Settings {
             self.sync_bot_published_creations_to_inspector(cx);
             self.inspector.update(cx, |insp, icx| {
-                insp.embedded_in_side_panel = true;
                 insp.active_tab = InspectorTab::Profile;
                 insp.subpage = InspectorSubpage::Main;
                 insp.openbot_subpage = None;
-                insp.open();
+                insp.sync_inspector_for_unified_side_panel(true);
                 icx.notify();
             });
         }
@@ -3028,7 +3502,15 @@ impl AppShell {
         pane: SidePanelPaneKind,
         cx: &mut Context<Self>,
     ) {
-        self.bot_fusion.side_panel.split_down(pane);
+        if !self.bot_fusion.side_panel.try_split_down(pane) {
+            self.enqueue_localized_toast(
+                "右侧面板最多支持 2 个分屏窗格",
+                "Side panel supports at most 2 split panes",
+                1800,
+                cx,
+            );
+            return;
+        }
         self.sync_unified_side_panel_flags(cx);
         cx.notify();
     }
@@ -3432,6 +3914,10 @@ impl AppShell {
                 }
             }
             OpenBotInspectorAction::SetChannelContextIsolation(isolated) => {
+                self.stage.update(cx, |st, st_cx| {
+                    st.is_channel_isolated = isolated;
+                    st_cx.notify();
+                });
                 if let Some(cid) = active_chat {
                     self.show_chat_toast(
                         cid,
@@ -3481,12 +3967,16 @@ impl AppShell {
         let lang = self.active_lang_id().to_string();
         let is_zh = lang.starts_with("zh");
         let target = self.side_panel_settings_target(cx);
+        let hdr_layout = self
+            .bot_fusion
+            .side_panel
+            .compute_header_layout(target, width_px, is_zh);
         let open_tabs = self.bot_fusion.side_panel.open_tabs.clone();
         let active_top = self.bot_fusion.side_panel.active_top_tab;
         let has_split = self.bot_fusion.side_panel.split_bottom_pane.is_some();
         let add_open = self.bot_fusion.side_panel.add_menu_open;
         let more_open = self.bot_fusion.side_panel.more_menu_open;
-        let has_tabs = !open_tabs.is_empty() || has_split;
+        let has_tabs = hdr_layout.more_btn_visible;
 
         let mut tabs_row = div()
             .id("openbot-sidepanel-header-tabs")
@@ -3498,8 +3988,15 @@ impl AppShell {
             .gap(px(2.0))
             .overflow_hidden();
 
-        for (idx, pane) in open_tabs.iter().copied().enumerate() {
+        for (idx, pane) in open_tabs
+            .iter()
+            .copied()
+            .take(hdr_layout.visible_tabs_count)
+            .enumerate()
+        {
             let is_active = active_top == Some(pane);
+            let tab_unavailable = self.bot_fusion.side_panel.is_tab_unavailable(pane.as_str())
+                || (pane == SidePanelPaneKind::Files && hdr_layout.unavailable_tab_flagged);
             let label = pane.localized_tab_label(target, is_zh);
             let tab_el = div()
                 .id(("openbot-sp-tab", idx))
@@ -3509,6 +4006,7 @@ impl AppShell {
                 .min_w(px(76.0))
                 .px(px(8.0))
                 .mb(px(if is_active { 0.0 } else { 5.0 }))
+                .when(tab_unavailable, |el| el.opacity(0.55))
                 .when(is_active, |el| {
                     el.rounded_t(px(8.0))
                         .bg(ob.bg_canvas())
@@ -3561,7 +4059,19 @@ impl AppShell {
                                     ob.text_secondary()
                                 })
                                 .child(label),
-                        ),
+                        )
+                        .when(tab_unavailable, |el| {
+                            el.child(
+                                div()
+                                    .px(px(4.0))
+                                    .rounded(px(4.0))
+                                    .bg(ob.bg_control())
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.warning())
+                                    .child("!"),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -3795,7 +4305,7 @@ impl AppShell {
         let mut slot = div()
             .id("openbot-right-panel-top-slot")
             .relative()
-            .h(px(OPENBOT_SIDE_PANEL_HEADER_HEIGHT))
+            .h(px(hdr_layout.height_px))
             .bg(ob.bg_frame())
             .px(px(8.0))
             .flex()
@@ -3815,7 +4325,22 @@ impl AppShell {
                 .mr(px(2.0))
                 .bg(ob.border_strong_hairline()),
         )
-        .child(tabs_row)
+        .child(tabs_row.when(hdr_layout.overflow_chevron_visible, |row| {
+            row.child(
+                div()
+                    .id("openbot-sp-hdr-overflow-chevron")
+                    .h(px(24.0))
+                    .px(px(6.0))
+                    .mb(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(ob.text_muted())
+                    .child(format!("▾ +{}", hdr_layout.hidden_tabs_count)),
+            )
+        }))
         .child(
             div()
                 .flex()
@@ -3935,19 +4460,27 @@ impl AppShell {
         &mut self,
         pal: &TdesktopThemePalette,
         workspace_avail_px: f32,
+        panel_height_px: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ob = pal.openbot_palette();
         let lang = self.active_lang_id().to_string();
         let is_zh = lang.starts_with("zh");
         let target = self.side_panel_settings_target(cx);
-        let maximized = self.bot_fusion.side_panel.state.maximized;
-        let clamped_w = self
+        let sp_layout = self
             .bot_fusion
             .side_panel
-            .clamp_width_for_workspace(self.bot_fusion.side_panel.state.width_px, workspace_avail_px);
-        let active_top = self.bot_fusion.side_panel.active_top_tab;
-        let bottom_pane = self.bot_fusion.side_panel.split_bottom_pane;
+            .compute_layout(workspace_avail_px, panel_height_px);
+        let maximized = sp_layout.maximized;
+        let clamped_w = if maximized {
+            sp_layout.width_px
+        } else {
+            self.bot_fusion
+                .side_panel
+                .clamp_width_for_workspace(sp_layout.width_px, workspace_avail_px)
+        };
+        let active_top = sp_layout.active_top_tab;
+        let bottom_pane = sp_layout.split_bottom_pane;
 
         let resizer_handle = (!maximized).then(|| {
             div()
@@ -4032,7 +4565,6 @@ impl AppShell {
         } else {
             let top_kind = active_top.unwrap_or(SidePanelPaneKind::Settings);
             let top_body = self.render_unified_side_pane_body(top_kind, pal, &lang, cx);
-            let lower_share = self.bot_fusion.side_panel.state.lower_share.clamp(0.22, 0.72);
 
             let mut split_col = div()
                 .flex_1()
@@ -4044,7 +4576,7 @@ impl AppShell {
                 .child(
                     div()
                         .flex_1()
-                        .min_h(px(SIDE_MAIN_GROUP_MIN))
+                        .min_h(px(sp_layout.main_group_height_px.min(SIDE_MAIN_GROUP_MIN)))
                         .w_full()
                         .overflow_hidden()
                         .flex()
@@ -4055,7 +4587,7 @@ impl AppShell {
             if let Some(bot_kind) = bottom_pane {
                 let bot_body = self.render_unified_side_pane_body(bot_kind, pal, &lang, cx);
                 let bot_label = bot_kind.localized_tab_label(target, is_zh);
-                let lower_h = (520.0 * lower_share as f32).max(SIDE_SPLIT_MIN);
+                let lower_h = sp_layout.lower_split_height_px;
                 split_col = split_col
                     .child(
                         div()
@@ -4521,6 +5053,23 @@ impl AppShell {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
+                                        let fpath = std::path::Path::new(&fname);
+                                        if fpath.is_absolute()
+                                            && this
+                                                .bot_fusion
+                                                .side_panel
+                                                .sync_file_tab_path_availability(
+                                                    SidePanelPaneKind::Files.as_str(),
+                                                    fpath,
+                                                )
+                                        {
+                                            this.show_non_chat_toast(
+                                                "File is no longer available on disk.",
+                                                2400,
+                                                cx,
+                                            );
+                                            return;
+                                        }
                                         this.show_media_viewer(fname.clone(), false, cx);
                                     }),
                                 )
@@ -5336,5 +5885,55 @@ mod tests {
         let (shape, hue, color_hex) = normalize_fabushi_plush_spec("plush:poulpe", "violet");
         assert!(shape.is_some());
         assert!(hue.is_some() || color_hex.is_some());
+    }
+
+    #[std::prelude::v1::test]
+    fn side_panel_clamp_width_and_layout_guard_non_finite_inputs() {
+        let mut sp = OpenBotRightSidePanelState::default();
+        sp.open_pane(SidePanelPaneKind::Settings);
+        assert_eq!(sp.clamp_width_for_workspace(520.0, 1200.0), 520.0);
+
+        // Non-finite requested_px preserves prior finite width clamped to workspace
+        assert_eq!(sp.clamp_width_for_workspace(f32::NAN, 1200.0), 520.0);
+        assert_eq!(sp.clamp_width_for_workspace(f32::INFINITY, 1200.0), 520.0);
+        assert_eq!(sp.clamp_width_for_workspace(f32::NEG_INFINITY, 1200.0), 520.0);
+
+        // Non-finite or <= 0 workspace_avail_px clamps upper bound to SETTINGS_PANEL_DEFAULT
+        assert_eq!(
+            sp.clamp_width_for_workspace(600.0, f32::NAN),
+            SETTINGS_PANEL_DEFAULT
+        );
+        assert_eq!(
+            sp.clamp_width_for_workspace(600.0, f32::INFINITY),
+            SETTINGS_PANEL_DEFAULT
+        );
+        assert_eq!(
+            sp.clamp_width_for_workspace(600.0, 0.0),
+            SETTINGS_PANEL_DEFAULT
+        );
+        assert_eq!(
+            sp.clamp_width_for_workspace(600.0, -200.0),
+            SETTINGS_PANEL_DEFAULT
+        );
+
+        // Poisoned internal state fields never produce NaN/Inf layout geometry
+        sp.state.width_px = f32::NAN;
+        sp.state.lower_share = f64::NAN;
+        assert_eq!(
+            sp.clamp_width_for_workspace(f32::NAN, 1200.0),
+            SETTINGS_PANEL_DEFAULT
+        );
+
+        sp.state.width_px = f32::INFINITY;
+        sp.state.lower_share = f64::INFINITY;
+        sp.split_bottom_pane = Some(SidePanelPaneKind::Files);
+        let snap = sp.compute_layout(1200.0, 720.0);
+        assert!(snap.width_px.is_finite());
+        assert!(snap.persisted_width_px.is_finite());
+        assert!(snap.lower_share.is_finite());
+        assert!(snap.main_group_height_px.is_finite());
+        assert!(snap.lower_split_height_px.is_finite());
+        let hdr = sp.compute_header_layout(SidePanelSettingsTarget::Assistant, f32::INFINITY, false);
+        assert!(hdr.visible_tabs_count <= sp.open_tabs.len());
     }
 }

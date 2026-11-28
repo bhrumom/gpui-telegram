@@ -6,6 +6,115 @@ use crate::theme::palette::TdesktopThemePalette;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
+pub const SETTINGS_LEFT_NAV_WIDTH_PX: f32 = 220.0;
+pub const SETTINGS_TOPBAR_HEIGHT_PX: f32 = 48.0;
+pub const SETTINGS_CONTENT_MAX_WIDTH_PX: f32 = 960.0;
+pub const SETTINGS_MODAL_MAX_WIDTH_PX: f32 = 1180.0;
+pub const SETTINGS_MODAL_MAX_HEIGHT_PX: f32 = 860.0;
+pub const SETTINGS_CARD_RADIUS_PX: f32 = 12.0;
+pub const SETTINGS_ROW_MIN_HEIGHT_PX: f32 = 64.0;
+pub const SETTINGS_CARD_BG_DARK: u32 = 0x1E1E1E;
+pub const SETTINGS_CARD_BG_LIGHT: u32 = 0xFFFFFF;
+
+/// State controller for OpenBot's sticky bottom `SaveBarDock` inside `SettingsPage` (`UI-F19`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaveBarDockState {
+    pub dirty: bool,
+    pub saving: bool,
+    pub error: Option<String>,
+    pub save_count: usize,
+    pub discard_count: usize,
+}
+
+impl SaveBarDockState {
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.error = None;
+    }
+
+    pub fn discard(&mut self) {
+        self.dirty = false;
+        self.saving = false;
+        self.error = None;
+        self.discard_count = self.discard_count.saturating_add(1);
+    }
+
+    pub fn commit_save(
+        &mut self,
+        toaster: &mut crate::views::app_shell::modal_container::OpenBotToasterState,
+    ) {
+        self.dirty = false;
+        self.saving = false;
+        self.error = None;
+        self.save_count = self.save_count.saturating_add(1);
+        toaster.push_toast(
+            crate::views::app_shell::modal_container::OpenBotToastTone::Success,
+            "Saved",
+            None,
+        );
+    }
+
+    pub fn fail_save(
+        &mut self,
+        err: impl Into<String>,
+        toaster: &mut crate::views::app_shell::modal_container::OpenBotToasterState,
+    ) {
+        let msg = err.into();
+        self.saving = false;
+        self.error = Some(msg.clone());
+        toaster.push_toast(
+            crate::views::app_shell::modal_container::OpenBotToastTone::Error,
+            msg,
+            None,
+        );
+    }
+
+    pub const fn is_visible(&self) -> bool {
+        self.dirty || self.saving || self.error.is_some()
+    }
+}
+
+/// Single-source-of-truth OpenBot 2-column `SettingsPage` layout snapshot (`UI-F19`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsPageLayoutSnapshot {
+    pub open: bool,
+    pub left_nav_px: f32,
+    pub topbar_height_px: f32,
+    pub content_max_px: f32,
+    pub modal_max_width_px: f32,
+    pub modal_max_height_px: f32,
+    pub card_bg_hex: String,
+    pub card_radius_px: f32,
+    pub row_min_height_px: f32,
+    pub save_bar_dock_visible: bool,
+    pub search_results_count: usize,
+}
+
+/// Computes live `SettingsPage` geometry & card surface tokens directly from `SettingsRouter`.
+pub fn compute_settings_page_layout(
+    router: &super::SettingsRouter,
+) -> SettingsPageLayoutSnapshot {
+    let ob = router.palette.openbot_palette();
+    let card_rgb = if ob.scheme.is_dark() {
+        SETTINGS_CARD_BG_DARK
+    } else {
+        SETTINGS_CARD_BG_LIGHT
+    };
+    SettingsPageLayoutSnapshot {
+        open: router.is_open,
+        left_nav_px: SETTINGS_LEFT_NAV_WIDTH_PX,
+        topbar_height_px: SETTINGS_TOPBAR_HEIGHT_PX,
+        content_max_px: SETTINGS_CONTENT_MAX_WIDTH_PX,
+        modal_max_width_px: SETTINGS_MODAL_MAX_WIDTH_PX,
+        modal_max_height_px: SETTINGS_MODAL_MAX_HEIGHT_PX,
+        card_bg_hex: crate::views::content_hub::apple_primitives::rgb24_to_hex(card_rgb),
+        card_radius_px: SETTINGS_CARD_RADIUS_PX,
+        row_min_height_px: SETTINGS_ROW_MIN_HEIGHT_PX,
+        save_bar_dock_visible: router.save_bar.is_visible(),
+        search_results_count: router.ranked_nav_search_results().len(),
+    }
+}
+
 pub fn settings_container(pal: TdesktopThemePalette) -> Div {
     let ob = pal.openbot_palette();
     div()
@@ -21,10 +130,15 @@ pub fn settings_container(pal: TdesktopThemePalette) -> Div {
 
 pub fn settings_card(pal: TdesktopThemePalette) -> Div {
     let ob = pal.openbot_palette();
+    let card_bg = rgb(if ob.scheme.is_dark() {
+        SETTINGS_CARD_BG_DARK
+    } else {
+        SETTINGS_CARD_BG_LIGHT
+    });
     div()
         .w_full()
-        .rounded(px(pal.scaled_px(12.0)))
-        .bg(ob.bg_surface())
+        .rounded(px(pal.scaled_px(SETTINGS_CARD_RADIUS_PX)))
+        .bg(card_bg)
         .border_1()
         .border_color(ob.frame_card_border())
         .px(px(pal.scaled_px(16.0)))
@@ -109,7 +223,7 @@ pub fn settings_toggle_row<V: 'static>(
     div()
         .cursor_pointer()
         .w_full()
-        .min_h(px(pal.scaled_px(if subtitle.is_some() { 60.0 } else { 48.0 })))
+        .min_h(px(pal.scaled_px(SETTINGS_ROW_MIN_HEIGHT_PX)))
         .px(px(pal.scaled_px(10.0)))
         .py(px(pal.scaled_px(8.0)))
         .rounded(px(pal.scaled_px(8.0)))
@@ -217,7 +331,7 @@ pub fn settings_action_row<V: 'static>(
     div()
         .cursor_pointer()
         .w_full()
-        .min_h(px(pal.scaled_px(48.0)))
+        .min_h(px(pal.scaled_px(SETTINGS_ROW_MIN_HEIGHT_PX)))
         .px(px(pal.scaled_px(10.0)))
         .py(px(pal.scaled_px(8.0)))
         .rounded(px(pal.scaled_px(8.0)))

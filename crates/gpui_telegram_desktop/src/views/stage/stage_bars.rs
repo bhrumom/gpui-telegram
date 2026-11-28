@@ -538,6 +538,13 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
             external_hosted: false,
             available_width_px: 720.0,
             is_isolated_lock: false,
+            is_archived: false,
+            provider_connected: true,
+            pending_model_badge: None,
+            reduced_motion: false,
+            window_glass: false,
+            sidebar_closed: false,
+            topbar_controls_right_edge_px: 0.0,
             message_ttl_seconds,
         };
         let _ = (show_apple_subtitle, is_online);
@@ -667,15 +674,71 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
     bar
 }
 
+pub const CHAT_SEARCH_WIDTH_PX: f32 = 308.0;
+pub const CHAT_SEARCH_HEIGHT_PX: f32 = 34.0;
+pub const CHAT_SEARCH_RIGHT_OFFSET_PX: f32 = 16.0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatSearchBarLayout {
+    pub open: bool,
+    pub width_px: f32,
+    pub height_px: f32,
+    pub right_offset_px: f32,
+    pub match_counter: String,
+    pub query: String,
+}
+
+pub fn compute_chat_search_bar_layout(
+    open: bool,
+    query: &str,
+    cursor: usize,
+    total: usize,
+    side_panel_width_px: f32,
+) -> ChatSearchBarLayout {
+    let match_counter = if total == 0 {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", cursor.saturating_add(1).min(total), total)
+    };
+    let safe_side_w = if side_panel_width_px.is_finite() {
+        side_panel_width_px.max(0.0)
+    } else {
+        0.0
+    };
+    ChatSearchBarLayout {
+        open,
+        width_px: CHAT_SEARCH_WIDTH_PX,
+        height_px: CHAT_SEARCH_HEIGHT_PX,
+        right_offset_px: CHAT_SEARCH_RIGHT_OFFSET_PX + safe_side_w,
+        match_counter,
+        query: query.to_string(),
+    }
+}
+
 pub fn render_stage_search_bar<V: 'static>(
     search_query: &str,
     search_match_cursor: usize,
     search_match_total: usize,
+    side_panel_width_px: f32,
     palette: &TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let search_layout = compute_chat_search_bar_layout(
+        true,
+        search_query,
+        search_match_cursor,
+        search_match_total,
+        side_panel_width_px,
+    );
+    let safe_side_w = if side_panel_width_px.is_finite() && side_panel_width_px > 0.0 {
+        side_panel_width_px
+    } else {
+        0.0
+    };
+    let stage_local_right_px =
+        (search_layout.right_offset_px - safe_side_w).max(CHAT_SEARCH_RIGHT_OFFSET_PX);
     let a_focus = on_action.clone();
     let a_prev = on_action.clone();
     let a_next = on_action.clone();
@@ -701,9 +764,9 @@ pub fn render_stage_search_bar<V: 'static>(
             .id("stage-in-chat-search-bar")
             .absolute()
             .top(px(12.0))
-            .right(px(16.0))
-            .w(px(308.0))
-            .h(px(34.0))
+            .right(px(stage_local_right_px))
+            .w(px(search_layout.width_px))
+            .h(px(search_layout.height_px))
             .px(px(10.0))
             .rounded(px(12.0))
             .bg(ob.bg_control())
@@ -1499,6 +1562,80 @@ pub fn render_scroll_to_bottom_fab<V: 'static>(
     fab.into_any_element()
 }
 
+pub const OPENBOT_HEADER_TAB_FILLET_RADIUS_PX: f32 = 8.0;
+pub const OPENBOT_HEADER_TAB_TRANSITION_MS: u32 = 240;
+pub const OPENBOT_HEADER_TITLE_BTN_HEIGHT_PX: f32 = 28.0;
+pub const OPENBOT_HEADER_TITLE_AVATAR_PX: f32 = 18.0;
+pub const OPENBOT_HEADER_MODEL_PICKER_HEIGHT_PX: f32 = 28.0;
+pub const OPENBOT_HEADER_PINNED_POPOVER_MAX_WIDTH_PX: f32 = 420.0;
+pub const OPENBOT_HEADER_TOGGLE_SIZE_PX: f32 = 28.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderModelPickerFitMode {
+    Full,
+    Name,
+    Icon,
+}
+
+impl HeaderModelPickerFitMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Name => "name",
+            Self::Icon => "icon",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Single-source-of-truth layout snapshot for OpenBot's `38px` non-overlapping `ConversationHeader` (`UI-F09`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotHeaderLayoutSnapshot {
+    pub height_px: f32,
+    pub position_mode: &'static str,
+    pub bg_strip_hex: String,
+    pub header_rect: HeaderRect,
+    pub timeline_rect: HeaderRect,
+    pub overlaps_timeline: bool,
+    pub tab_shape_visible: bool,
+    pub tab_fillet_radius_px: f32,
+    pub tab_fill_hex: String,
+    pub tab_transition_ms: u32,
+    pub tab_disabled_by_motion_or_glass: bool,
+    pub title_btn_height_px: f32,
+    pub title_avatar_px: f32,
+    pub title_disabled: bool,
+    pub title_subtitle_visible: bool,
+    pub title_click_target_pane: &'static str,
+    pub new_thread_btn_visible: bool,
+    pub thread_tabs_count: usize,
+    pub model_picker_visible: bool,
+    pub model_picker_height_px: f32,
+    pub model_picker_disabled: bool,
+    pub model_picker_opacity: f32,
+    pub model_picker_tooltip: Option<&'static str>,
+    pub model_picker_fit_mode: HeaderModelPickerFitMode,
+    pub pending_badge_visible: bool,
+    pub pinned_popover_open: bool,
+    pub pinned_popover_max_width_px: f32,
+    pub pinned_count: usize,
+    pub pinned_empty_state_visible: bool,
+    pub side_panel_toggle_size_px: f32,
+    pub side_panel_hairline_visible: bool,
+    pub isolation_lock_visible: bool,
+    pub group_avatar_layout: ChannelAvatarLayout,
+    pub group_avatar_row_limit: usize,
+    pub wrapped_to_multiline: bool,
+    pub actions_clipped: bool,
+}
+
 /// Props for OpenBot `38px` `ConversationHeader` (`UI-F09`).
 pub struct OpenBotHeaderProps<'a> {
     pub chat_id: Option<u64>,
@@ -1526,7 +1663,152 @@ pub struct OpenBotHeaderProps<'a> {
     pub external_hosted: bool,
     pub available_width_px: f32,
     pub is_isolated_lock: bool,
+    pub is_archived: bool,
+    pub provider_connected: bool,
+    pub pending_model_badge: Option<&'a str>,
+    pub reduced_motion: bool,
+    pub window_glass: bool,
+    pub sidebar_closed: bool,
+    pub topbar_controls_right_edge_px: f32,
     pub message_ttl_seconds: u32,
+}
+
+/// Computes the single-source-of-truth geometry, tab shape, and auto-fit decisions consumed
+/// directly by [`render_openbot_conversation_header`].
+pub fn compute_openbot_header_layout(
+    props: &OpenBotHeaderProps<'_>,
+    palette: &TdesktopThemePalette,
+) -> OpenBotHeaderLayoutSnapshot {
+    let ob = palette.openbot_palette();
+    let has_chat = props.chat_id.is_some();
+    let is_bot = props.is_bot_chat || props.active_fabushi_bot.is_some();
+    let is_group = props.is_group_chat;
+    let main_tab_active = props.active_thread_id.is_none();
+    let shifted_start_px = if props.sidebar_closed {
+        if props.topbar_controls_right_edge_px.is_finite() {
+            props.topbar_controls_right_edge_px.clamp(44.0, 2000.0)
+        } else {
+            44.0
+        }
+    } else {
+        0.0
+    };
+    let avail_w = if props.available_width_px.is_finite() && props.available_width_px > 0.0 {
+        props.available_width_px
+    } else {
+        0.0
+    };
+    let header_rect = HeaderRect {
+        x: shifted_start_px,
+        y: 0.0,
+        w: avail_w,
+        h: OPENBOT_HEADER_HEIGHT,
+    };
+    let timeline_rect = HeaderRect {
+        x: shifted_start_px,
+        y: OPENBOT_HEADER_HEIGHT,
+        w: avail_w,
+        h: 682.0,
+    };
+    let overlaps_timeline = (header_rect.y + header_rect.h) > timeline_rect.y;
+    let title_click_target_pane = if !main_tab_active {
+        "main_chat"
+    } else if is_bot && !is_group {
+        "assistant_settings"
+    } else if is_group {
+        "channel_settings"
+    } else {
+        "contact_profile"
+    };
+    let model_picker_fit_mode = if avail_w >= 720.0 {
+        HeaderModelPickerFitMode::Full
+    } else if avail_w >= 520.0 {
+        HeaderModelPickerFitMode::Name
+    } else {
+        HeaderModelPickerFitMode::Icon
+    };
+    let tab_disabled_by_motion_or_glass = props.reduced_motion || props.window_glass;
+    let tab_shape_visible = has_chat && props.external_hosted && !props.window_glass;
+    let model_picker_visible = has_chat && is_bot && !is_group;
+    let min_title_w = if has_chat { 96.0 } else { 0.0 };
+    let model_picker_w = if model_picker_visible {
+        match model_picker_fit_mode {
+            HeaderModelPickerFitMode::Full => 136.0,
+            HeaderModelPickerFitMode::Name => 88.0,
+            HeaderModelPickerFitMode::Icon => 32.0,
+        }
+    } else {
+        0.0
+    };
+    let actions_w = if !has_chat {
+        28.0
+    } else if props.right_panel_slot_open {
+        96.0
+    } else {
+        132.0
+    };
+    let required_row_w = min_title_w + model_picker_w + actions_w;
+    let wrapped_to_multiline = false;
+    let actions_clipped = avail_w <= 0.0 || avail_w < required_row_w;
+
+    OpenBotHeaderLayoutSnapshot {
+        height_px: OPENBOT_HEADER_HEIGHT,
+        position_mode: "flex_flow",
+        bg_strip_hex: ob
+            .token("--openbot-bg-frame")
+            .unwrap_or("#0d0d0d")
+            .to_string(),
+        header_rect,
+        timeline_rect,
+        overlaps_timeline,
+        tab_shape_visible,
+        tab_fillet_radius_px: OPENBOT_HEADER_TAB_FILLET_RADIUS_PX,
+        tab_fill_hex: ob
+            .token("--openbot-bg-canvas")
+            .unwrap_or("#1a1a1a")
+            .to_string(),
+        tab_transition_ms: if props.reduced_motion {
+            0
+        } else {
+            OPENBOT_HEADER_TAB_TRANSITION_MS
+        },
+        tab_disabled_by_motion_or_glass,
+        title_btn_height_px: OPENBOT_HEADER_TITLE_BTN_HEIGHT_PX,
+        title_avatar_px: OPENBOT_HEADER_TITLE_AVATAR_PX,
+        title_disabled: is_group && props.is_archived,
+        title_subtitle_visible: !props.subtitle.trim().is_empty() && avail_w >= 720.0,
+        title_click_target_pane,
+        new_thread_btn_visible: has_chat && is_bot && !is_group,
+        thread_tabs_count: if has_chat {
+            1 + props.thread_tabs.len()
+        } else {
+            0
+        },
+        model_picker_visible,
+        model_picker_height_px: OPENBOT_HEADER_MODEL_PICKER_HEIGHT_PX,
+        model_picker_disabled: !props.provider_connected,
+        model_picker_opacity: if props.provider_connected { 1.0 } else { 0.48 },
+        model_picker_tooltip: if props.provider_connected {
+            None
+        } else {
+            Some("Provider disconnected — connect in Settings to change model")
+        },
+        model_picker_fit_mode,
+        pending_badge_visible: props
+            .pending_model_badge
+            .is_some_and(|s| !s.trim().is_empty()),
+        pinned_popover_open: props.pinned_popover_open,
+        pinned_popover_max_width_px: OPENBOT_HEADER_PINNED_POPOVER_MAX_WIDTH_PX,
+        pinned_count: props.pinned_count,
+        pinned_empty_state_visible: props.pinned_popover_open && props.pinned_count == 0,
+        side_panel_toggle_size_px: OPENBOT_HEADER_TOGGLE_SIZE_PX,
+        side_panel_hairline_visible: !props.right_panel_slot_open,
+        isolation_lock_visible: has_chat && props.is_isolated_lock,
+        group_avatar_layout: ChannelAvatarLayout::Row,
+        group_avatar_row_limit: crate::components::bloub_avatar::CHANNEL_ROW_LIMIT,
+        wrapped_to_multiline,
+        actions_clipped,
+    }
 }
 
 fn openbot_header_icon_btn<V: 'static>(
@@ -1543,8 +1825,8 @@ fn openbot_header_icon_btn<V: 'static>(
     let active_bg = ob.bg_control_active();
     div()
         .id(id)
-        .w(px(28.0))
-        .h(px(28.0))
+        .w(px(OPENBOT_HEADER_TOGGLE_SIZE_PX))
+        .h(px(OPENBOT_HEADER_TOGGLE_SIZE_PX))
         .flex_shrink_0()
         .rounded(px(6.0))
         .when(active, |el| el.bg(active_bg))
@@ -1573,6 +1855,7 @@ pub fn render_openbot_conversation_header<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, TopBarUiAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let layout = compute_openbot_header_layout(props, palette);
     let ob = palette.openbot_palette();
     let is_dark = palette.mode.is_dark();
     let has_chat = props.chat_id.is_some();
@@ -1590,7 +1873,7 @@ pub fn render_openbot_conversation_header<V: 'static>(
     if !has_chat {
         return div()
             .id("openbot-conversation-header")
-            .h(px(OPENBOT_HEADER_HEIGHT))
+            .h(px(layout.height_px))
             .w_full()
             .flex_shrink_0()
             .bg(frame_bg)
@@ -1604,7 +1887,7 @@ pub fn render_openbot_conversation_header<V: 'static>(
     let (mood, activity) = activity_str_to_openbot_mood(props.bot_activity_state);
     let sub_lower = props.subtitle.to_ascii_lowercase();
     let is_online = sub_lower == "online" || props.subtitle == "在线";
-    let show_subtitle = !props.subtitle.trim().is_empty() && props.available_width_px >= 460.0;
+    let show_subtitle = layout.title_subtitle_visible;
     let main_tab_active = props.active_thread_id.is_none();
 
     let avatar_el: AnyElement = if is_group {
@@ -1677,8 +1960,8 @@ pub fn render_openbot_conversation_header<V: 'static>(
                         .absolute()
                         .bottom(px(-0.5))
                         .right(px(-0.5))
-                        .w(px(6.0))
-                        .h(px(6.0))
+                        .w(px(crate::views::conversation_stage::DIRECT_DM_ONLINE_DOT_PX))
+                        .h(px(crate::views::conversation_stage::DIRECT_DM_ONLINE_DOT_PX))
                         .rounded_full()
                         .bg(ob.success())
                         .border_1()
@@ -1689,29 +1972,26 @@ pub fn render_openbot_conversation_header<V: 'static>(
     };
 
     let a_title = on_action.clone();
-    let title_click_action = if !main_tab_active {
-        TopBarUiAction::SelectThread(None)
-    } else if is_bot {
-        TopBarUiAction::OpenAssistantSettings
-    } else if is_group {
-        TopBarUiAction::OpenChannelSettings
-    } else {
-        TopBarUiAction::OpenContactProfile
+    let title_click_action = match layout.title_click_target_pane {
+        "main_chat" => TopBarUiAction::SelectThread(None),
+        "assistant_settings" => TopBarUiAction::OpenAssistantSettings,
+        "channel_settings" => TopBarUiAction::OpenChannelSettings,
+        _ => TopBarUiAction::OpenContactProfile,
     };
     let hover_bg = ob.hover();
     let title_inner = div()
         .id("topbar-peer-header")
         .relative()
-        .h(px(32.0))
+        .h(px(layout.title_btn_height_px))
         .max_w(px(340.0))
         .px(px(10.0))
-        .cursor_pointer()
+        .when(!layout.title_disabled, |el| el.cursor_pointer())
         .flex()
         .items_center()
         .gap(px(7.0))
-        .when(props.external_hosted && main_tab_active, |el| {
-            el.rounded_tl(px(8.0))
-                .rounded_tr(px(8.0))
+        .when(layout.tab_shape_visible && main_tab_active, |el| {
+            el.rounded_tl(px(layout.tab_fillet_radius_px))
+                .rounded_tr(px(layout.tab_fillet_radius_px))
                 .bg(canvas_bg)
                 .border_t_1()
                 .border_l_1()
@@ -1728,19 +2008,20 @@ pub fn render_openbot_conversation_header<V: 'static>(
                         .bg(canvas_bg),
                 )
         })
-        .when(!props.external_hosted || !main_tab_active, |el| {
-            el.h(px(28.0))
-                .mb(px(4.0))
+        .when(!layout.tab_shape_visible || !main_tab_active, |el| {
+            el.mb(px(4.0))
                 .rounded(px(6.0))
-                .hover(move |s| s.bg(hover_bg))
+                .when(!layout.title_disabled, |s| s.hover(move |h| h.bg(hover_bg)))
         })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                a_title(this, title_click_action.clone(), cx);
-            }),
-        )
+        .when(!layout.title_disabled, |el| {
+            el.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    a_title(this, title_click_action.clone(), cx);
+                }),
+            )
+        })
         .child(avatar_el)
         .child(
             div()
@@ -1767,7 +2048,7 @@ pub fn render_openbot_conversation_header<V: 'static>(
                     .child(format!("· {}", props.subtitle)),
             )
         })
-        .when(props.is_isolated_lock, |el| {
+        .when(layout.isolation_lock_visible, |el| {
             el.child(openbot_stage_icon(OpenBotStageIcon::Lock, 12.0, ob.text_muted()))
         })
         .when(props.message_ttl_seconds > 0, |el| {
@@ -1784,14 +2065,24 @@ pub fn render_openbot_conversation_header<V: 'static>(
             )
         });
 
-    let title_tab = if props.external_hosted && main_tab_active {
+    let title_tab = if layout.tab_shape_visible && main_tab_active {
         div()
             .flex()
             .items_end()
             .h_full()
-            .child(render_tab_concave_fillet(true, 8.0, canvas_bg, tab_border))
+            .child(render_tab_concave_fillet(
+                true,
+                layout.tab_fillet_radius_px,
+                canvas_bg,
+                tab_border,
+            ))
             .child(title_inner)
-            .child(render_tab_concave_fillet(false, 8.0, canvas_bg, tab_border))
+            .child(render_tab_concave_fillet(
+                false,
+                layout.tab_fillet_radius_px,
+                canvas_bg,
+                tab_border,
+            ))
             .into_any_element()
     } else {
         div().flex().items_end().h_full().child(title_inner).into_any_element()
@@ -1806,7 +2097,7 @@ pub fn render_openbot_conversation_header<V: 'static>(
         .min_w(px(0.0))
         .child(title_tab);
 
-    if is_bot {
+    if layout.new_thread_btn_visible {
         for (tid, tlabel) in props.thread_tabs.iter().take(4) {
             let is_sel = props.active_thread_id == Some(tid.as_str());
             let tid_owned = tid.clone();
@@ -1814,13 +2105,13 @@ pub fn render_openbot_conversation_header<V: 'static>(
             let tab_hover = ob.hover();
             let tab_el = div()
                 .id(SharedString::from(format!("hdr-thread-tab-{}", tid)))
-                .h(px(if is_sel && props.external_hosted { 32.0 } else { 28.0 }))
+                .h(px(if is_sel && layout.tab_shape_visible { 32.0 } else { 28.0 }))
                 .max_w(px(140.0))
                 .px(px(9.0))
-                .when(!is_sel || !props.external_hosted, |el| {
+                .when(!is_sel || !layout.tab_shape_visible, |el| {
                     el.mb(px(4.0)).rounded(px(6.0)).hover(move |s| s.bg(tab_hover))
                 })
-                .when(is_sel && props.external_hosted, |el| {
+                .when(is_sel && layout.tab_shape_visible, |el| {
                     el.rounded_tl(px(8.0))
                         .rounded_tr(px(8.0))
                         .bg(canvas_bg)
@@ -1874,15 +2165,15 @@ pub fn render_openbot_conversation_header<V: 'static>(
         .items_center()
         .gap(px(4.0));
 
-    if is_bot && !is_group {
+    if layout.model_picker_visible {
         let model_lbl = if props.active_model_label.trim().is_empty() {
             tr_str(lang_id, "默认模型", "Auto").to_string()
         } else {
             props.active_model_label.trim().to_string()
         };
-        let show_model_text = props.available_width_px >= 420.0;
+        let show_model_text = layout.model_picker_fit_mode != HeaderModelPickerFitMode::Icon;
         let show_effort = !props.active_thinking_effort.trim().is_empty()
-            && props.available_width_px >= 540.0;
+            && layout.model_picker_fit_mode == HeaderModelPickerFitMode::Full;
         let a_model = on_action.clone();
         let pill_bg = if props.model_picker_open {
             ob.bg_control_active()
@@ -1890,34 +2181,42 @@ pub fn render_openbot_conversation_header<V: 'static>(
             ob.bg_surface()
         };
         let pill_hover = ob.bg_control_hover();
+        let pending_badge = props.pending_model_badge.map(str::to_string);
         right_actions = right_actions.child(
             div()
                 .id("hdr-model-picker-btn")
-                .h(px(28.0))
+                .h(px(layout.model_picker_height_px))
                 .px(px(8.0))
                 .rounded_full()
                 .bg(pill_bg)
                 .border_1()
                 .border_color(ob.border_hairline())
-                .hover(move |s| s.bg(pill_hover))
-                .cursor_pointer()
+                .opacity(layout.model_picker_opacity)
+                .when(!layout.model_picker_disabled, |el| {
+                    el.hover(move |s| s.bg(pill_hover))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_model(this, TopBarUiAction::ToggleModelPicker, cx);
+                            }),
+                        )
+                })
                 .flex()
                 .items_center()
                 .gap(px(5.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        a_model(this, TopBarUiAction::ToggleModelPicker, cx);
-                    }),
-                )
                 .child(
                     div()
                         .w(px(7.0))
                         .h(px(7.0))
                         .rounded_full()
                         .flex_shrink_0()
-                        .bg(ob.success()),
+                        .bg(if layout.model_picker_disabled {
+                            ob.text_dim()
+                        } else {
+                            ob.success()
+                        }),
                 )
                 .when(show_model_text, |el| {
                     el.child(
@@ -1940,6 +2239,21 @@ pub fn render_openbot_conversation_header<V: 'static>(
                             .text_color(ob.text_muted())
                             .child(format!("· {}", props.active_thinking_effort)),
                     )
+                })
+                .when(layout.pending_badge_visible, |el| {
+                    el.when_some(pending_badge, |row, badge| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded_full()
+                                .bg(ob.bg_control_active())
+                                .text_size(px(10.5))
+                                .text_color(ob.text_secondary())
+                                .child(badge),
+                        )
+                    })
                 })
                 .child(openbot_stage_icon(
                     OpenBotStageIcon::ChevronDown,
@@ -2055,22 +2369,26 @@ pub fn render_openbot_conversation_header<V: 'static>(
 
     div()
         .id("openbot-conversation-header")
-        .h(px(OPENBOT_HEADER_HEIGHT))
+        .h(px(layout.height_px))
         .w_full()
         .flex_shrink_0()
+        .when(!layout.wrapped_to_multiline, |el| el.overflow_hidden())
         .px(px(8.0))
+        .when(props.sidebar_closed && !props.external_hosted, |el| {
+            el.pl(px(layout.header_rect.x.max(8.0)))
+        })
         .bg(frame_bg)
         .when(!props.external_hosted, |el| {
             el.border_b_1().border_color(tab_border)
         })
         .flex()
         .items_center()
-        .gap(px(6.0))
+        .gap(px(if layout.actions_clipped { 2.0 } else { 6.0 }))
         .child(heading_group)
         .child(
             div()
                 .flex_1()
-                .min_w(px(16.0))
+                .min_w(px(if layout.actions_clipped { 4.0 } else { 16.0 }))
                 .h_full()
                 .window_control_area(WindowControlArea::Drag),
         )
@@ -2131,7 +2449,7 @@ pub fn render_openbot_pinned_messages_popover<V: 'static>(
         .top(px(8.0))
         .right(px(48.0))
         .w(px(360.0))
-        .max_w(px(420.0))
+        .max_w(px(OPENBOT_HEADER_PINNED_POPOVER_MAX_WIDTH_PX))
         .max_h(px(340.0))
         .rounded(px(14.0))
         .bg(ob.bg_surface())

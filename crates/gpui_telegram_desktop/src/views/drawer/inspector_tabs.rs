@@ -337,6 +337,27 @@ impl OpenBotSettingsSubpage {
             Self::ChannelFolders => tr_str(lang, "频道文件夹", "Channel Folders"),
         }
     }
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Creations => "creations",
+            Self::BackupModels => "backup_models",
+            Self::Instructions => "instructions",
+            Self::Memories => "memories",
+            Self::Skills => "skills",
+            Self::DataTables => "data_tables",
+            Self::Routines => "routines",
+            Self::Workflows => "workflows",
+            Self::Usage => "usage",
+            Self::Permissions => "permissions",
+            Self::Folders => "folders",
+            Self::Advanced => "advanced",
+            Self::SharedMedia => "shared_media",
+            Self::ChannelMemories => "channel_memories",
+            Self::ChannelRoutines => "channel_routines",
+            Self::ChannelFolders => "channel_folders",
+        }
+    }
 }
 
 /// Active inline IME text input inside the embedded OpenBot `Settings` pane.
@@ -366,6 +387,22 @@ pub enum OpenBotConfirmGuard {
     ChannelCompactContext,
     ChannelDeleteHistory,
     ChannelRemoveMember { user_id: u64, name: String },
+    ContactBlock,
+}
+
+impl OpenBotConfirmGuard {
+    /// Returns `true` for destructive guards that require `ConfirmDialog`'s cancel-first focus (`PAIR-24`).
+    pub const fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::WidenPermissionsFull
+                | Self::BotDeleteHistory
+                | Self::BotDeleteAgent
+                | Self::ChannelDeleteHistory
+                | Self::ChannelRemoveMember { .. }
+                | Self::ContactBlock
+        )
+    }
 }
 
 /// Group/Channel browser access policy matching OpenBot `ChannelBrowser`.

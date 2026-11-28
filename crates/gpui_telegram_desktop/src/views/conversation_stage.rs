@@ -32,7 +32,9 @@ use crate::components::tool_permission_dock::{
     render_tool_permission_dock_inline, PendingToolApproval, ToolApprovalDecision,
     ToolPermissionDock,
 };
-use crate::theme::{solid_bubble_takes_dark_text, TdesktopThemePalette};
+use crate::theme::{
+    solid_bubble_takes_dark_text, solid_bubble_text_rgb, TdesktopThemePalette,
+};
 use crate::views::openbot::steps_and_trace::AgentStepEntry;
 use crate::views::stage::history_drag_area::HistoryDragArea;
 use crate::views::stage::history_view_highlight_manager::{
@@ -50,15 +52,17 @@ use crate::views::stage::stage_bubble::{
 };
 use crate::views::stage::stage_context_menu::ReactionOverlayMode;
 use crate::views::stage::stage_bars::{
-    render_openbot_conversation_header, render_openbot_model_picker_popover,
-    render_openbot_pinned_messages_popover, render_pinned_banner_46px,
-    render_scroll_to_bottom_fab, render_stage_more_menu_overlay, render_stage_search_bar,
-    render_stage_top_bar_with_group, OpenBotHeaderProps, TopBarUiAction,
+    compute_chat_search_bar_layout, render_openbot_conversation_header,
+    render_openbot_model_picker_popover, render_openbot_pinned_messages_popover,
+    render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
+    render_stage_search_bar, render_stage_top_bar_with_group, ChatSearchBarLayout,
+    OpenBotHeaderProps, TopBarUiAction,
 };
 use crate::views::stage::wallpaper::{
     render_empty_history_placeholder, render_empty_no_chat_pill, render_loading_history_skeleton,
     render_openbot_agent_empty_state, render_openbot_channel_empty_state,
     render_openbot_stage_backdrop, render_syncing_workspace_placeholder, render_themed_wallpaper,
+    resolve_openbot_stage_backdrop_hex,
 };
 pub use crate::views::stage::cards::*;
 
@@ -447,6 +451,117 @@ pub struct PinnedBannerEntry {
     pub thumb_url: Option<String>,
 }
 
+pub const AGENT_ACTIVITY_AVATAR_PX: f32 = 32.0;
+pub const AGENT_ACTIVITY_STEPS_MAX_HEIGHT_PX: f32 = 220.0;
+pub const AGENT_ACTIVITY_ELAPSED_AFTER_SECS: u64 = 5;
+pub const AGENT_ACTIVITY_PLAIN_ELAPSED_AFTER_SECS: u64 = 60;
+pub const SCROLL_RAIL_TICK_HEIGHT_PX: f32 = 2.0;
+pub const SCROLL_RAIL_WAVE_WIDTHS_PX: [f32; 5] = [4.0, 8.0, 10.0, 12.0, 16.0];
+pub const DIRECT_DM_STREAM_WIDTH_PX: f32 = 760.0;
+pub const DIRECT_DM_ONLINE_DOT_PX: f32 = 5.0;
+pub const DIRECT_DM_TYPING_IDLE_TIMEOUT_MS: u64 = 3_000;
+
+/// Single-source-of-truth layout snapshot for OpenBot's bubble-less `AgentActivity` thinking row (`UI-F10-02`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentActivityLayoutSnapshot {
+    pub visible: bool,
+    pub bubble_less: bool,
+    pub avatar_px: f32,
+    pub shimmer_active: bool,
+    pub shimmer_frozen_reduced_motion: bool,
+    pub steps_max_height_px: f32,
+    pub elapsed_visible: bool,
+}
+
+pub fn compute_agent_activity_layout(
+    active: bool,
+    elapsed_secs: u64,
+    plain_mode: bool,
+    reduced_motion: bool,
+) -> AgentActivityLayoutSnapshot {
+    let threshold = if plain_mode {
+        AGENT_ACTIVITY_PLAIN_ELAPSED_AFTER_SECS
+    } else {
+        AGENT_ACTIVITY_ELAPSED_AFTER_SECS
+    };
+    AgentActivityLayoutSnapshot {
+        visible: active,
+        bubble_less: true,
+        avatar_px: AGENT_ACTIVITY_AVATAR_PX,
+        shimmer_active: active && !reduced_motion,
+        shimmer_frozen_reduced_motion: active && reduced_motion,
+        steps_max_height_px: AGENT_ACTIVITY_STEPS_MAX_HEIGHT_PX,
+        elapsed_visible: active && elapsed_secs >= threshold,
+    }
+}
+
+/// Single-source-of-truth layout snapshot for `ChatScrollRail` minimap wave ticks (`UI-F10-05`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollRailLayoutSnapshot {
+    pub visible: bool,
+    pub tick_px: f32,
+    pub wave_widths_px: [f32; 5],
+}
+
+pub fn compute_scroll_rail_layout(msg_count: usize, turn_count: usize) -> ScrollRailLayoutSnapshot {
+    ScrollRailLayoutSnapshot {
+        visible: msg_count >= 3 && turn_count >= 2,
+        tick_px: SCROLL_RAIL_TICK_HEIGHT_PX,
+        wave_widths_px: SCROLL_RAIL_WAVE_WIDTHS_PX,
+    }
+}
+
+/// Live `DirectConversation` human 1:1 DM typing/presence controller (`DirectConversation.tsx:L175`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DirectDmState {
+    pub peer_online: bool,
+    pub typing_active: bool,
+    pub last_typing_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectDmSnapshot {
+    pub stream_width_px: f32,
+    pub online_dot_px: f32,
+    pub typing_active: bool,
+    pub typing_idle_timeout_ms: u64,
+    pub send_disabled: bool,
+}
+
+impl DirectDmState {
+    pub fn on_text_input(&mut self, value: &str, now_ms: u64) {
+        if value.trim().is_empty() {
+            self.typing_active = false;
+            self.last_typing_ms = None;
+        } else {
+            self.typing_active = true;
+            self.last_typing_ms = Some(now_ms);
+        }
+    }
+
+    pub fn tick(&mut self, now_ms: u64) {
+        if let Some(last) = self.last_typing_ms {
+            if now_ms.saturating_sub(last) >= DIRECT_DM_TYPING_IDLE_TIMEOUT_MS {
+                self.typing_active = false;
+            }
+        }
+    }
+
+    pub fn send_disabled(&self, draft: &str) -> bool {
+        draft.trim().is_empty()
+    }
+
+    pub fn snapshot(&self, draft: &str) -> DirectDmSnapshot {
+        DirectDmSnapshot {
+            stream_width_px: DIRECT_DM_STREAM_WIDTH_PX,
+            online_dot_px: DIRECT_DM_ONLINE_DOT_PX,
+            typing_active: self.typing_active,
+            typing_idle_timeout_ms: DIRECT_DM_TYPING_IDLE_TIMEOUT_MS,
+            send_disabled: self.send_disabled(draft),
+        }
+    }
+}
+
 pub struct ConversationStage {
     pub active_chat_id: Option<u64>,
     pub chat_title: String,
@@ -586,8 +701,19 @@ pub struct ConversationStage {
     pub scroll_rail_hovered: bool,
     pub scroll_rail_hovered_turn_idx: Option<usize>,
     pub group_member_briefs: Vec<ChannelAgentBrief>,
+    pub chat_custom_colors: HashMap<u64, String>,
     pub chat_bg_tint_hex: Option<String>,
     pub explicit_bubble_accent_hex: Option<String>,
+    pub active_side_panel_width_px: f32,
+    pub channel_activity: crate::components::bloub_avatar::ChannelActivityIndicatorState,
+    pub is_channel_isolated: bool,
+    pub is_archived_chat: bool,
+    pub provider_connected: bool,
+    pub pending_model_badge: Option<String>,
+    pub reduced_motion: bool,
+    pub window_glass: bool,
+    pub direct_dm: DirectDmState,
+    pub direct_dm_draft: String,
 }
 
 impl ConversationStage {
@@ -728,11 +854,41 @@ impl ConversationStage {
             scroll_rail_hovered: false,
             scroll_rail_hovered_turn_idx: None,
             group_member_briefs: Vec::new(),
+            chat_custom_colors: HashMap::new(),
             chat_bg_tint_hex: None,
             explicit_bubble_accent_hex: None,
+            active_side_panel_width_px: 0.0,
+            channel_activity: crate::components::bloub_avatar::ChannelActivityIndicatorState::default(),
+            is_channel_isolated: false,
+            is_archived_chat: false,
+            provider_connected: true,
+            pending_model_badge: None,
+            reduced_motion: false,
+            window_glass: false,
+            direct_dm: DirectDmState::default(),
+            direct_dm_draft: String::new(),
         };
         stage.row_height_cache.rebuild_prefix_sums(&stage.messages);
         stage
+    }
+
+    /// Synchronizes live human 1:1 DM composer input into [`DirectDmState`] (`UI-F10-06`).
+    pub fn sync_direct_dm_input(&mut self, draft: &str, now_ms: u64) {
+        self.direct_dm_draft = draft.to_string();
+        if !self.is_bot_chat && !self.is_group_chat && self.active_fabushi_bot.is_none() {
+            self.direct_dm.on_text_input(draft, now_ms);
+        } else {
+            self.direct_dm.typing_active = false;
+            self.direct_dm.last_typing_ms = None;
+        }
+    }
+
+    /// Appends a new thread tab to the conversation header and focuses it (`UI-F09-04`).
+    pub fn append_and_focus_thread_tab(&mut self, title: impl Into<String>) -> String {
+        let tid = format!("thread-{}", self.thread_tabs.len() + 1);
+        self.thread_tabs.push((tid.clone(), title.into()));
+        self.active_thread_id = Some(tid.clone());
+        tid
     }
 
     pub fn take_stage_action(&mut self) -> Option<StageAction> {
@@ -975,8 +1131,66 @@ impl ConversationStage {
         self.thread_tabs.clear();
         self.scroll_rail_hovered = false;
         self.scroll_rail_hovered_turn_idx = None;
+        self.chat_custom_colors.clear();
         self.chat_bg_tint_hex = None;
         self.explicit_bubble_accent_hex = None;
+        self.active_side_panel_width_px = 0.0;
+        self.channel_activity =
+            crate::components::bloub_avatar::ChannelActivityIndicatorState::default();
+    }
+
+    /// Applies (or resets) the active chat's custom color across both the OKLab backdrop tint
+    /// and WCAG-safe outgoing bubble palette, persisting per-chat across `set_chat` (`PAIR-02`).
+    pub fn apply_chat_color(&mut self, color_hex: Option<String>) {
+        let normalized = color_hex
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        self.chat_bg_tint_hex = normalized.clone();
+        self.explicit_bubble_accent_hex = normalized.clone();
+        if let Some(cid) = self.active_chat_id {
+            if let Some(hex) = normalized {
+                self.chat_custom_colors.insert(cid, hex);
+            } else {
+                self.chat_custom_colors.remove(&cid);
+            }
+        }
+    }
+
+    /// Returns the live OKLab-clamped OpenBot stage backdrop hex for the active chat (`PAIR-02`).
+    pub fn resolved_backdrop_hex(&self) -> String {
+        resolve_openbot_stage_backdrop_hex(&self.palette, self.chat_bg_tint_hex.as_deref())
+    }
+
+    /// Resolves the live message-row palette for the active chat, applying any explicit
+    /// per-chat color override with WCAG contrast-safe outgoing text color (`PAIR-02`).
+    pub fn resolved_message_row_palette(&self) -> TdesktopThemePalette {
+        let mut row_palette = self.palette;
+        // OpenBot UI-F10: Keep neutral monochrome outgoing bubbles (#242424 dark / #fcfcfc light)
+        // by default; only honor an explicit user chat-color override with WCAG contrast safety.
+        if row_palette.is_apple_style() {
+            if let Some(ref accent_hex) = self.explicit_bubble_accent_hex {
+                if let Some(rgb_u32) = crate::components::avatar::parse_fabushi_hex_color(accent_hex) {
+                    row_palette.msg_out_bg = rgb_u32;
+                    row_palette.msg_out_bg_top = rgb_u32;
+                    row_palette.msg_out_bg_bottom = rgb_u32;
+                    let dark_fg = solid_bubble_takes_dark_text(accent_hex);
+                    row_palette.msg_out_fg = solid_bubble_text_rgb(accent_hex);
+                    row_palette.msg_out_secondary_fg = if dark_fg { 0x4A4A4F } else { 0xDCDCDC };
+                }
+            }
+        }
+        row_palette
+    }
+
+    /// Computes the workspace-relative layout of the floating in-chat search pill (`PAIR-14`).
+    pub fn chat_search_bar_layout(&self) -> ChatSearchBarLayout {
+        compute_chat_search_bar_layout(
+            self.search_open,
+            &self.search_query,
+            self.search_match_cursor,
+            self.search_match_ids.len(),
+            self.active_side_panel_width_px,
+        )
     }
 
     pub fn sync_measured_row_heights(&mut self) -> bool {
@@ -1092,8 +1306,11 @@ impl ConversationStage {
             self.expanded_error_msg_ids.clear();
             self.expanded_steps_msg_ids.clear();
             self.expanded_long_msg_ids.clear();
-            self.chat_bg_tint_hex = None;
-            self.explicit_bubble_accent_hex = None;
+            let saved_color = self.chat_custom_colors.get(&chat_id).cloned();
+            self.chat_bg_tint_hex = saved_color.clone();
+            self.explicit_bubble_accent_hex = saved_color;
+            self.channel_activity =
+                crate::components::bloub_avatar::ChannelActivityIndicatorState::default();
         }
         self.active_chat_id = Some(chat_id);
         self.chat_title = title.to_string();
@@ -1210,21 +1427,7 @@ impl ConversationStage {
             })
             .map(|m| m.id);
 
-        let mut row_palette = self.palette;
-        // OpenBot UI-F10: Keep neutral monochrome outgoing bubbles (#242424 dark / #fcfcfc light)
-        // by default; only honor an explicit user chat-color override with WCAG contrast safety.
-        if row_palette.is_apple_style() {
-            if let Some(ref accent_hex) = self.explicit_bubble_accent_hex {
-                if let Some(rgb_u32) = crate::components::avatar::parse_fabushi_hex_color(accent_hex) {
-                    row_palette.msg_out_bg = rgb_u32;
-                    row_palette.msg_out_bg_top = rgb_u32;
-                    row_palette.msg_out_bg_bottom = rgb_u32;
-                    let dark_fg = solid_bubble_takes_dark_text(accent_hex);
-                    row_palette.msg_out_fg = if dark_fg { 0x141414 } else { 0xFFFFFF };
-                    row_palette.msg_out_secondary_fg = if dark_fg { 0x4A4A4F } else { 0xDCDCDC };
-                }
-            }
-        }
+        let row_palette = self.resolved_message_row_palette();
         let is_direct_human = !is_group_chat
             && !self.is_bot_chat
             && self.active_fabushi_bot.is_none();
@@ -1364,7 +1567,8 @@ impl ConversationStage {
                 turns.push((msg.id, title_snip, reply_snip));
             }
         }
-        if turns.len() < 2 {
+        let sr_layout = compute_scroll_rail_layout(self.messages.len(), turns.len());
+        if !sr_layout.visible {
             return None;
         }
         let max_ticks = 40usize;
@@ -1412,11 +1616,11 @@ impl ConversationStage {
             let id_jump = *msg_id;
             let dist = hovered_idx.map(|h| h.abs_diff(idx));
             let (tick_w, alpha) = match dist {
-                Some(0) => (16.0_f32, 0.95_f32),
-                Some(1) => (12.0, 0.56),
-                Some(2) => (10.0, 0.38),
-                _ if rail_hovered => (8.0, 0.26),
-                _ => (4.0, 0.18),
+                Some(0) => (sr_layout.wave_widths_px[4], 0.95_f32),
+                Some(1) => (sr_layout.wave_widths_px[3], 0.56),
+                Some(2) => (sr_layout.wave_widths_px[2], 0.38),
+                _ if rail_hovered => (sr_layout.wave_widths_px[1], 0.26),
+                _ => (sr_layout.wave_widths_px[0], 0.18),
             };
             rail_col = rail_col.child(
                 div()
@@ -1447,7 +1651,7 @@ impl ConversationStage {
                     .child(
                         div()
                             .w(px(tick_w))
-                            .h(px(2.0))
+                            .h(px(sr_layout.tick_px))
                             .rounded_full()
                             .bg(TdesktopThemePalette::rgba_with_alpha(tick_base_rgb, alpha)),
                     ),
@@ -1743,7 +1947,14 @@ impl Render for ConversationStage {
                     right_panel_slot_open: false,
                     external_hosted: false,
                     available_width_px: stage_w,
-                    is_isolated_lock: false,
+                    is_isolated_lock: is_group_chat && self.is_channel_isolated,
+                    is_archived: self.is_archived_chat,
+                    provider_connected: self.provider_connected,
+                    pending_model_badge: self.pending_model_badge.as_deref(),
+                    reduced_motion: self.reduced_motion,
+                    window_glass: self.window_glass,
+                    sidebar_closed: false,
+                    topbar_controls_right_edge_px: 0.0,
                     message_ttl_seconds: self.message_ttl_seconds,
                 };
                 root = root.child(render_openbot_conversation_header(
@@ -1790,6 +2001,7 @@ impl Render for ConversationStage {
                         &self.search_query,
                         self.search_match_cursor,
                         self.search_match_ids.len(),
+                        self.active_side_panel_width_px,
                         &self.palette,
                         &self.lang_id,
                         cx,
@@ -2150,20 +2362,48 @@ impl Render for ConversationStage {
                                     self.active_chat_id.unwrap_or(0),
                                     self.chat_title
                                 );
-                                let plush = render_fabushi_plush_avatar(
-                                    self.active_fabushi_bot.as_ref(),
-                                    &seed,
-                                    32.0,
-                                    mood,
-                                    act,
-                                );
                                 let elapsed_secs = self
                                     .bot_activity_started_at_ms
                                     .map(|s| stage_now_ms().saturating_sub(s) / 1000)
                                     .unwrap_or(0);
                                 let has_live_steps = !self.live_agent_steps.is_empty();
+                                let act_layout = compute_agent_activity_layout(
+                                    true,
+                                    elapsed_secs,
+                                    !has_live_steps,
+                                    self.reduced_motion,
+                                );
+                                let plush = render_fabushi_plush_avatar(
+                                    self.active_fabushi_bot.as_ref(),
+                                    &seed,
+                                    act_layout.avatar_px,
+                                    mood,
+                                    act,
+                                );
                                 let steps_open = self.bot_activity_steps_expanded;
                                 let hover_bg = ob.hover();
+                                let shimmer_label: AnyElement = if act_layout.shimmer_active {
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_muted())
+                                        .child(status_label)
+                                        .with_animation(
+                                            "openbot-agent-activity-shimmer",
+                                            Animation::new(Duration::from_millis(2250))
+                                                .repeat()
+                                                .with_easing(pulsating_between(0.48, 1.0)),
+                                            |d, delta| d.opacity(delta),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_muted())
+                                        .child(status_label)
+                                        .into_any_element()
+                                };
                                 el.child(
                                     div()
                                         .id("stage-bot-thinking-indicator")
@@ -2187,21 +2427,8 @@ impl Render for ConversationStage {
                                                         .flex()
                                                         .items_center()
                                                         .gap(px(6.0))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(13.0))
-                                                                .font_weight(FontWeight::MEDIUM)
-                                                                .text_color(ob.text_muted())
-                                                                .child(status_label)
-                                                                .with_animation(
-                                                                    "openbot-agent-activity-shimmer",
-                                                                    Animation::new(Duration::from_millis(2250))
-                                                                        .repeat()
-                                                                        .with_easing(pulsating_between(0.48, 1.0)),
-                                                                    |d, delta| d.opacity(delta),
-                                                                ),
-                                                        )
-                                                        .when(elapsed_secs >= 5, |row| {
+                                                        .child(shimmer_label)
+                                                        .when(act_layout.elapsed_visible, |row| {
                                                             row.child(
                                                                 div()
                                                                     .text_size(px(12.0))
@@ -2334,15 +2561,99 @@ impl Render for ConversationStage {
                             }
                         },
                     )
+                    .when(
+                        is_apple
+                            && !self.is_bot_chat
+                            && !self.is_group_chat
+                            && self.active_fabushi_bot.is_none()
+                            && self.active_chat_id.is_some(),
+                        |el| {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            self.direct_dm.tick(now_ms);
+                            let dm_snap = self.direct_dm.snapshot(&self.direct_dm_draft);
+                            let ob_dm = self.palette.openbot_palette();
+                            if dm_snap.typing_active {
+                                el.child(
+                                    div()
+                                        .id("stage-direct-dm-typing-strip")
+                                        .w_full()
+                                        .max_w(px(dm_snap.stream_width_px))
+                                        .mx_auto()
+                                        .px(px(16.0))
+                                        .py(px(4.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .w(px(dm_snap.online_dot_px))
+                                                .h(px(dm_snap.online_dot_px))
+                                                .rounded_full()
+                                                .bg(ob_dm.success()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(ob_dm.text_muted())
+                                                .child(crate::i18n::tr_str(
+                                                    &self.lang_id,
+                                                    "正在输入…",
+                                                    "Typing...",
+                                                )),
+                                        ),
+                                )
+                            } else {
+                                el
+                            }
+                        },
+                    )
+                    .when(
+                        is_apple
+                            && is_group_chat
+                            && self.channel_activity.snapshot(stage_now_ms()).visible,
+                        |el| {
+                            let now_ms = stage_now_ms();
+                            let snap = self.channel_activity.snapshot(now_ms);
+                            let label_text = if self.lang_id.starts_with("zh") {
+                                "正在工作"
+                            } else if snap.worker_count > 1 {
+                                "are working"
+                            } else {
+                                "is working"
+                            };
+                            el.child(
+                                div()
+                                    .id("stage-channel-activity-indicator")
+                                    .w_full()
+                                    .px(px(16.0))
+                                    .pt(px(8.0))
+                                    .pb(px(6.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .child(self.channel_activity.render(
+                                        label_text,
+                                        self.palette.mode.is_dark(),
+                                        now_ms as f64 / 1000.0,
+                                    )),
+                            )
+                        },
+                    )
                     .when(bottom_spacer_height > 0.0, |el| {
                         el.child(div().id("stage-bottom-spacer").w_full().h(px(bottom_spacer_height)).flex_shrink_0())
                     }),
             )
             .when(is_apple && self.search_open, |el| {
+                let _search_bar_snap = self.chat_search_bar_layout();
+                let _backdrop_hex = self.resolved_backdrop_hex();
                 el.child(render_stage_search_bar(
                     &self.search_query,
                     self.search_match_cursor,
                     self.search_match_ids.len(),
+                    self.active_side_panel_width_px,
                     &self.palette,
                     &self.lang_id,
                     cx,

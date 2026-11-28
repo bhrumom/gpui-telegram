@@ -9,10 +9,48 @@ use crate::views::canonical_composer::{
 };
 use crate::views::composer::composer_ui::ComposerBarAction;
 use crate::views::composer::editor_state::detect_autocomplete_trigger;
-use crate::views::composer::field_autocomplete::{AutocompleteChooseMethod, BotCommandRow};
+use crate::views::composer::field_autocomplete::{
+    AutocompleteChooseMethod, BotCommandRow, MentionRow,
+};
 use crate::views::composer::popups_ui::{render_autocomplete_popup, ComposerPopupAction};
 use crate::views::composer::selector_ui::SelectorUiAction;
 use crate::views::composer::{AttachmentKind, KeyAction, TextStyleKind};
+
+/// Formats the inserted mention token when accepting an `@` autocomplete row (`PAIR-16`).
+///
+/// - `@everyone` always inserts `"@everyone "`.
+/// - When `openbot_chips` is `true`, inserts an atomic OpenBot `ReferenceChip` token
+///   `@[Display Name](agent|member:<id>) ` so inline `24px` chips, atomic Backspace, and
+///   channel routing markers work end-to-end.
+/// - Otherwise preserves classic Telegram `@username ` insertion.
+pub fn format_mention_insertion_token(m: &MentionRow, openbot_chips: bool) -> String {
+    if m.is_everyone() {
+        return "@everyone ".to_string();
+    }
+    let clean_un = m.username.trim().trim_start_matches('@');
+    if openbot_chips {
+        let label = if !m.name.trim().is_empty() {
+            m.name.trim()
+        } else if !clean_un.is_empty() {
+            clean_un
+        } else {
+            "user"
+        };
+        let kind = if m.is_bot { "agent" } else { "member" };
+        let id = if m.user_id > 0 {
+            m.user_id.to_string()
+        } else if !clean_un.is_empty() {
+            clean_un.to_string()
+        } else {
+            label.to_string()
+        };
+        format!("@[{label}]({kind}:{id}) ")
+    } else if !clean_un.is_empty() {
+        format!("@{clean_un} ")
+    } else {
+        format!("@{} ", m.name.trim())
+    }
+}
 
 /// Returns `true` only when `s` consists solely of Unicode Emoji characters (plus optional
 /// variation selectors / ZWJ / skin-tone modifiers) and contains at least one actual emoji symbol.
@@ -368,11 +406,7 @@ impl CanonicalComposer {
                 "tab" => {
                     let sel = self.autocomplete.selected_index.max(0) as usize;
                     if let Some(m) = self.autocomplete.mention_rows.get(sel) {
-                        let insert = if !m.username.trim().is_empty() {
-                            format!("@{} ", m.username.trim().trim_start_matches('@'))
-                        } else {
-                            format!("@{} ", m.name.trim())
-                        };
+                        let insert = format_mention_insertion_token(m, self.palette.is_apple_style());
                         self.replace_active_trigger_token(&insert);
                         self.autocomplete.hide();
                         return true;
@@ -381,11 +415,7 @@ impl CanonicalComposer {
                 "enter" if !is_shift => {
                     let sel = self.autocomplete.selected_index.max(0) as usize;
                     if let Some(m) = self.autocomplete.mention_rows.get(sel) {
-                        let insert = if !m.username.trim().is_empty() {
-                            format!("@{} ", m.username.trim().trim_start_matches('@'))
-                        } else {
-                            format!("@{} ", m.name.trim())
-                        };
+                        let insert = format_mention_insertion_token(m, self.palette.is_apple_style());
                         self.replace_active_trigger_token(&insert);
                         self.autocomplete.hide();
                         return true;
@@ -496,8 +526,11 @@ impl CanonicalComposer {
     }
 
     pub(crate) fn replace_active_trigger_token(&mut self, replacement: &str) {
-        let cur = self.ime_machine.cursor_index;
         let text = self.ime_machine.text().to_string();
+        let cur = crate::views::composer::editor_state::clamp_char_boundary(
+            &text,
+            self.ime_machine.cursor_index,
+        );
         if let Some((_trig, _tok, start)) = detect_autocomplete_trigger(&text, cur) {
             self.editor.push_undo(&self.ime_machine);
             self.ime_machine.text_buffer.replace_range(start..cur, replacement);
@@ -507,6 +540,22 @@ impl CanonicalComposer {
             self.editor.insert_at_cursor(&mut self.ime_machine, replacement);
         }
         self.autocomplete.hide();
+    }
+
+    /// Handles focus loss / blur on the composer: cancels any active IME composition
+    /// and clears `is_input_focused` (`UI-F12-05`), while preserving open autocomplete popups
+    /// across transient overlay focus transfers (such as `QuickDrawerSearch`).
+    pub fn on_focus_lost(&mut self) -> bool {
+        let mut changed = false;
+        if self.ime_machine.is_composing() {
+            self.ime_machine.on_ime_cancel();
+            changed = true;
+        }
+        if self.is_input_focused {
+            self.is_input_focused = false;
+            changed = true;
+        }
+        changed
     }
 
     pub fn submit_primary(&mut self) {
@@ -945,8 +994,7 @@ impl CanonicalComposer {
                 match add_act {
                     ComposerOpenBotAddAction::AttachFiles => self.prompt_native_files(cx),
                     ComposerOpenBotAddAction::InsertSkillTrigger => {
-                        self.editor.insert_at_cursor(&mut self.ime_machine, "$");
-                        self.sync_autocomplete();
+                        self.trigger_add_menu_skill_picker();
                     }
                     ComposerOpenBotAddAction::Formatting => self.toggle_formatting(),
                     ComposerOpenBotAddAction::EmojiPicker => self.toggle_emoji_picker(),
@@ -961,6 +1009,25 @@ impl CanonicalComposer {
             }
         }
         cx.notify();
+    }
+
+    /// Triggers OpenBot's `+ -> $ Skill` picker from the composer add menu, closing the drawer,
+    /// focusing the input, spacing `" $"` mid-word when needed, and syncing `$` autocomplete (`PAIR-18`).
+    pub fn trigger_add_menu_skill_picker(&mut self) {
+        self.attachments_drawer.close();
+        self.is_input_focused = true;
+        let text = self.ime_machine.text();
+        let mut cur = self.ime_machine.cursor_index.min(text.len());
+        while cur > 0 && !text.is_char_boundary(cur) {
+            cur -= 1;
+        }
+        let needs_leading_space = text[..cur]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_whitespace());
+        let trigger = if needs_leading_space { " $" } else { "$" };
+        self.editor.insert_at_cursor(&mut self.ime_machine, trigger);
+        self.sync_autocomplete();
     }
 
     pub(crate) fn handle_selector_action(&mut self, action: SelectorUiAction, cx: &mut Context<Self>) {

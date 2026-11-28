@@ -103,7 +103,11 @@ fn banner_row<V: 'static>(
     let tucked_border: Rgba = if is_dark { rgb(0x222222).into() } else { rgb(0xE6E6EA).into() };
     let hover_bg = ob.hover();
     let row = div()
-        .h(px(if is_apple { 36.0 } else { 42.0 }))
+        .min_h(px(if is_apple {
+            crate::views::openbot::queue_and_voice::COMPOSER_REPLY_PREVIEW_MIN_HEIGHT_PX
+        } else {
+            42.0
+        }))
         .w_full()
         .px(px(if is_apple { 12.0 } else { 14.0 }))
         .when(is_apple, |el| {
@@ -374,17 +378,29 @@ pub fn render_text_input_strip_with_full_options<V: 'static>(
     )
 }
 
-/// Splits a composer text slice into plain-text runs and completed inline OpenBot `ReferenceChip`s
-/// (`@[Name](kind:id)`, `$skill:slug`, `$workflow:slug`, `$routine:slug`, `$mcp:slug`, `@everyone`).
-fn render_composer_inline_slice(
+/// Extracts structured OpenBot inline `ReferenceChip` layouts (`@[Name](kind:id)`,
+/// `$skill:slug`, `$workflow:slug`, `$routine:slug`, `$mcp:slug`, `@everyone`) from a composer text slice.
+/// Consumed directly by [`render_composer_inline_slice`] (single source of truth).
+pub fn extract_composer_inline_chips(
     slice: &str,
-    scope_prefix: &str,
     palette: &TdesktopThemePalette,
-) -> Vec<AnyElement> {
-    let mut out = Vec::new();
+) -> Vec<crate::views::stage::openbot_stage_chrome::OpenBotReferenceChipLayout> {
+    extract_composer_inline_chip_spans(slice, palette)
+        .into_iter()
+        .map(|(_, _, chip)| chip)
+        .collect()
+}
+
+fn extract_composer_inline_chip_spans(
+    slice: &str,
+    palette: &TdesktopThemePalette,
+) -> Vec<(
+    usize,
+    usize,
+    crate::views::stage::openbot_stage_chrome::OpenBotReferenceChipLayout,
+)> {
+    let mut chips = Vec::new();
     let mut pos = 0usize;
-    let mut plain = String::new();
-    let mut chip_idx = 0usize;
     let bytes = slice.as_bytes();
     while pos < bytes.len() {
         let rem = &slice[pos..];
@@ -395,30 +411,32 @@ fn render_composer_inline_slice(
                 if let Some(cp) = after.find(')') {
                     let target = &after[..cp];
                     if !label.is_empty() && !target.is_empty() {
-                        if !plain.is_empty() {
-                            out.push(div().child(std::mem::take(&mut plain)).into_any_element());
-                        }
-                        let kind = target.split_once(':').map(|(k, _)| k).unwrap_or("agent");
-                        out.push(
-                            render_openbot_reference_chip(
-                                SharedString::from(format!("cmp-chip-{}-{}", scope_prefix, chip_idx)),
+                        let (kind, id) = target.split_once(':').unwrap_or(("agent", target));
+                        let token_len = 2 + cb + 2 + cp + 1;
+                        chips.push((
+                            pos,
+                            pos + token_len,
+                            crate::views::stage::openbot_stage_chrome::compute_openbot_reference_chip_layout(
                                 kind,
+                                id,
                                 label,
+                                &rem[..token_len],
+                                false,
                                 palette,
-                            )
-                            .into_any_element(),
-                        );
-                        chip_idx += 1;
-                        pos += 2 + cb + 2 + cp + 1;
+                            ),
+                        ));
+                        pos += token_len;
                         continue;
                     }
                 }
             }
         }
-        if rem.starts_with('$')
-            && (pos == 0 || slice[..pos].ends_with(|c: char| c.is_whitespace()))
-            && rem.len() > 2
-        {
+        let leading_boundary_ok = pos == 0
+            || slice[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '（' | '[' | '【'));
+        if leading_boundary_ok && rem.starts_with('$') && rem.len() > 2 {
             let tok_len = 1 + rem[1..]
                 .find(|c: char| !c.is_alphanumeric() && !matches!(c, '_' | '-' | ':' | '.'))
                 .unwrap_or(rem.len() - 1);
@@ -429,53 +447,194 @@ fn render_composer_inline_slice(
                     if matches!(kind_lc.as_str(), "skill" | "workflow" | "routine" | "mcp")
                         && !slug.is_empty()
                     {
-                        if !plain.is_empty() {
-                            out.push(div().child(std::mem::take(&mut plain)).into_any_element());
-                        }
-                        out.push(
-                            render_openbot_reference_chip(
-                                SharedString::from(format!("cmp-chip-{}-{}", scope_prefix, chip_idx)),
+                        chips.push((
+                            pos,
+                            pos + tok_len,
+                            crate::views::stage::openbot_stage_chrome::compute_openbot_reference_chip_layout(
                                 &kind_lc,
+                                slug,
                                 tok,
+                                tok,
+                                false,
                                 palette,
-                            )
-                            .into_any_element(),
-                        );
-                        chip_idx += 1;
+                            ),
+                        ));
                         pos += tok_len;
                         continue;
                     }
                 }
             }
         }
-        if rem.starts_with("@everyone")
+        if leading_boundary_ok
+            && rem.starts_with("@everyone")
             && (rem.len() == 9
                 || rem[9..].chars().next().is_some_and(|c| c.is_whitespace()))
         {
-            if !plain.is_empty() {
-                out.push(div().child(std::mem::take(&mut plain)).into_any_element());
-            }
-            out.push(
-                render_openbot_reference_chip(
-                    SharedString::from(format!("cmp-chip-{}-{}", scope_prefix, chip_idx)),
+            chips.push((
+                pos,
+                pos + 9,
+                crate::views::stage::openbot_stage_chrome::compute_openbot_reference_chip_layout(
+                    "everyone",
                     "everyone",
                     "@everyone",
+                    "@everyone",
+                    false,
                     palette,
-                )
-                .into_any_element(),
-            );
-            chip_idx += 1;
+                ),
+            ));
             pos += 9;
             continue;
         }
         let ch = rem.chars().next().unwrap();
-        plain.push(ch);
         pos += ch.len_utf8();
     }
-    if !plain.is_empty() {
-        out.push(div().child(plain).into_any_element());
+    chips
+}
+
+/// Splits a composer text slice into plain-text runs and completed inline OpenBot `ReferenceChip`s
+/// (`@[Name](kind:id)`, `$skill:slug`, `$workflow:slug`, `$routine:slug`, `$mcp:slug`, `@everyone`).
+fn render_composer_inline_slice(
+    slice: &str,
+    scope_prefix: &str,
+    palette: &TdesktopThemePalette,
+) -> Vec<AnyElement> {
+    let chips = extract_composer_inline_chip_spans(slice, palette);
+    if chips.is_empty() {
+        return if slice.is_empty() {
+            Vec::new()
+        } else {
+            vec![div().child(slice.to_string()).into_any_element()]
+        };
+    }
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for (chip_idx, (start, end, chip)) in chips.iter().enumerate() {
+        if *start >= cursor && *end <= slice.len() {
+            if *start > cursor {
+                out.push(div().child(slice[cursor..*start].to_string()).into_any_element());
+            }
+            out.push(
+                render_openbot_reference_chip(
+                    SharedString::from(format!("cmp-chip-{}-{}", scope_prefix, chip_idx)),
+                    &chip.kind,
+                    &chip.label,
+                    palette,
+                )
+                .into_any_element(),
+            );
+            cursor = *end;
+        }
+    }
+    if cursor < slice.len() {
+        out.push(div().child(slice[cursor..].to_string()).into_any_element());
     }
     out
+}
+
+pub const OPENBOT_COMPOSER_COMPACT_HEIGHT_PX: f32 = 48.0;
+pub const OPENBOT_COMPOSER_EXPANDED_MIN_HEIGHT_PX: f32 = 96.0;
+pub const OPENBOT_COMPOSER_COMPACT_RADIUS_PX: f32 = 24.0;
+pub const OPENBOT_COMPOSER_EXPANDED_RADIUS_PX: f32 = 14.0;
+pub const OPENBOT_COMPOSER_ACTION_BTN_PX: f32 = 28.0;
+pub const OPENBOT_DICTATION_WAVEFORM_BARS: usize = 12;
+pub const OPENBOT_DICTATION_WIDTH_PX: f32 = 170.0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotComposerStripLayout {
+    pub compact: bool,
+    pub idle_row_count: usize,
+    pub height_px: f32,
+    pub min_height_px: f32,
+    pub border_radius_px: f32,
+    pub surface_hex: String,
+    pub add_btn_px: f32,
+    pub add_btn_disabled: bool,
+    pub action_circle_px: f32,
+    pub action_circle_bg_hex: String,
+    pub action_circle_kind: &'static str,
+    pub send_disabled: bool,
+    pub dictation_active: bool,
+    pub dictation_width_px: f32,
+    pub dictation_bars: usize,
+    pub attachments_count: usize,
+    pub legacy_chip_strip_present: bool,
+    pub detached_slash_present: bool,
+    pub legacy_aa_emoji_row_present: bool,
+    pub focus_border_is_telegram_blue: bool,
+    pub send_btn_is_telegram_blue: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compute_openbot_composer_strip_layout(
+    text: &str,
+    raw_content_h: f32,
+    attachments_count: usize,
+    is_agent_busy: bool,
+    send_disabled: bool,
+    dictation_active: bool,
+    is_focused: bool,
+    palette: &TdesktopThemePalette,
+) -> OpenBotComposerStripLayout {
+    let ob = palette.openbot_palette();
+    let legacy_mode = !palette.is_apple_style();
+    let has_attachments = attachments_count > 0;
+    let is_empty = text.trim().is_empty();
+    let is_expanded = text.contains('\n') || raw_content_h > 46.5 || has_attachments;
+    let compact = !is_expanded;
+    let min_height_px = if compact {
+        OPENBOT_COMPOSER_COMPACT_HEIGHT_PX
+    } else {
+        OPENBOT_COMPOSER_EXPANDED_MIN_HEIGHT_PX
+    };
+    let border_radius_px = if compact {
+        OPENBOT_COMPOSER_COMPACT_RADIUS_PX
+    } else {
+        OPENBOT_COMPOSER_EXPANDED_RADIUS_PX
+    };
+    let action_circle_kind = if is_agent_busy && is_empty && !has_attachments {
+        "stop"
+    } else if !is_empty || has_attachments {
+        "send"
+    } else {
+        "voice"
+    };
+    let surface_hex = if legacy_mode {
+        crate::views::content_hub::apple_primitives::rgb24_to_hex(palette.composer_bg)
+    } else {
+        ob.token("--openbot-bg-surface")
+            .unwrap_or("#212121")
+            .to_string()
+    };
+    let action_circle_bg_hex = if legacy_mode {
+        crate::views::content_hub::apple_primitives::rgb24_to_hex(palette.accent)
+    } else {
+        ob.token("--openbot-surface-light")
+            .unwrap_or("#f0f0f0")
+            .to_string()
+    };
+    OpenBotComposerStripLayout {
+        compact,
+        idle_row_count: if legacy_mode { 2 } else { 1 },
+        height_px: min_height_px,
+        min_height_px,
+        border_radius_px,
+        surface_hex,
+        add_btn_px: OPENBOT_COMPOSER_ACTION_BTN_PX,
+        add_btn_disabled: send_disabled,
+        action_circle_px: OPENBOT_COMPOSER_ACTION_BTN_PX,
+        action_circle_bg_hex,
+        action_circle_kind,
+        send_disabled,
+        dictation_active,
+        dictation_width_px: OPENBOT_DICTATION_WIDTH_PX,
+        dictation_bars: OPENBOT_DICTATION_WAVEFORM_BARS,
+        attachments_count,
+        legacy_chip_strip_present: legacy_mode,
+        detached_slash_present: legacy_mode,
+        legacy_aa_emoji_row_present: legacy_mode,
+        focus_border_is_telegram_blue: legacy_mode && is_focused,
+        send_btn_is_telegram_blue: legacy_mode,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -564,9 +723,10 @@ pub fn render_text_input_strip_openbot<V: 'static>(
             })
             .child(placeholder_text)
             .into_any_element()
-    } else if let Some((s, e)) = selection {
-        let s = clamp_char_boundary(text, s);
-        let e = clamp_char_boundary(text, e);
+    } else if let Some((raw_s, raw_e)) = selection {
+        let s_clamped = clamp_char_boundary(text, raw_s);
+        let e_clamped = clamp_char_boundary(text, raw_e);
+        let (s, e) = (s_clamped.min(e_clamped), s_clamped.max(e_clamped));
         div()
             .w_full()
             .flex()
@@ -631,9 +791,19 @@ pub fn render_text_input_strip_openbot<V: 'static>(
 
     let raw_content_h = f32::from(content_height);
     if is_apple {
-        let is_expanded = text.contains('\n') || raw_content_h > 46.5 || has_attachments;
-        let pill_radius = if is_expanded { 14.0 } else { 24.0 };
-        let pill_min_h = if is_expanded { 96.0 } else { 48.0 };
+        let cmp_layout = compute_openbot_composer_strip_layout(
+            text,
+            raw_content_h,
+            usize::from(has_attachments),
+            is_agent_busy,
+            send_disabled,
+            false,
+            is_focused,
+            palette,
+        );
+        let is_expanded = !cmp_layout.compact;
+        let pill_radius = cmp_layout.border_radius_px;
+        let pill_min_h = cmp_layout.min_height_px;
         let pill_border: Rgba = if is_focused {
             ob.text_dim()
         } else {
@@ -646,19 +816,22 @@ pub fn render_text_input_strip_openbot<V: 'static>(
 
         let attach_btn = div()
             .id("cmp-attach-btn")
-            .w(px(28.0))
-            .h(px(28.0))
+            .w(px(cmp_layout.add_btn_px))
+            .h(px(cmp_layout.add_btn_px))
             .rounded_full()
             .flex_shrink_0()
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg))
+            .when(cmp_layout.add_btn_disabled, |el| el.opacity(0.4))
+            .when(!cmp_layout.add_btn_disabled, |el| {
+                el.cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        a_att(this, ComposerBarAction::ToggleAttachments, cx);
+                    }))
+            })
             .flex()
             .items_center()
             .justify_center()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                a_att(this, ComposerBarAction::ToggleAttachments, cx);
-            }))
             .child(openbot_stage_icon(OpenBotStageIcon::Plus, 16.0, icon_muted));
 
         let mic_btn = div()
@@ -1113,14 +1286,18 @@ pub fn render_voice_recording_strip<V: 'static>(
                         .child(format!("{:01}:{:02}.{}", mins, secs, tenths)),
                 )
                 .child(
-                    div().flex().items_center().gap(px(2.5)).children((0..14).map(|i| {
-                        let h = 6.0 + (((i * 7 + (dur * 10.0) as usize) % 5) as f32) * 3.0;
-                        div()
-                            .w(px(2.5))
-                            .h(px(h))
-                            .rounded_full()
-                            .bg(if is_apple { ob.text_muted() } else { rgb(palette.accent).into() })
-                    })),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.5))
+                        .children((0..OPENBOT_DICTATION_WAVEFORM_BARS).map(|i| {
+                            let h = 6.0 + (((i * 7 + (dur * 10.0) as usize) % 5) as f32) * 3.0;
+                            div()
+                                .w(px(2.5))
+                                .h(px(h))
+                                .rounded_full()
+                                .bg(if is_apple { ob.text_muted() } else { rgb(palette.accent).into() })
+                        })),
                 ),
         )
         .child(

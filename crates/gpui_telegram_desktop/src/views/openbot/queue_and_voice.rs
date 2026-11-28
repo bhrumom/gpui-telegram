@@ -408,6 +408,48 @@ impl QueuePanelState {
     pub fn evaluate_steer_for_state(&self, press_tab: bool) -> SteerEvaluation {
         evaluate_steer(self.active_turn_routine, press_tab)
     }
+
+    /// Enqueues a busy follow-up delivery (if not already present) and evaluates `Tab` steer
+    /// against `active_turn_routine`, updating the queued item's running/refused state (`PAIR-19`).
+    pub fn enqueue_and_steer_on_tab(
+        &mut self,
+        delivery_id: &str,
+        text: &str,
+        active_turn_routine: bool,
+    ) -> (SteerEvaluation, bool) {
+        self.active_turn_routine = active_turn_routine;
+        if !self.items.iter().any(|i| i.delivery_id == delivery_id) {
+            let _ = self.push_item(delivery_id, text, QueueSender::User);
+        }
+        let eval = self.evaluate_steer_for_state(true);
+        let mut steered = false;
+        let target_idx = self
+            .items
+            .iter()
+            .position(|i| i.delivery_id == delivery_id)
+            .or_else(|| (!self.items.is_empty()).then_some(0));
+        if let Some(target) = target_idx.and_then(|idx| self.items.get_mut(idx)) {
+            if eval.steered_on_tab {
+                target.status = QueueDeliveryStatus::Running;
+                target.routine_steer_refused = false;
+                steered = true;
+            } else if eval.steer_refused {
+                target.routine_steer_refused = true;
+            }
+        }
+        (eval, steered)
+    }
+
+    /// Drains all queued items and clears transient edit/drag locks when returning to idle (`PAIR-19`).
+    pub fn drain_all(&mut self) -> usize {
+        let drained = self.items.len();
+        self.items.clear();
+        self.edit_lock = None;
+        self.dragging_index = None;
+        self.drag_target_index = None;
+        self.paused = false;
+        drained
+    }
 }
 
 fn palette_color(palette: &OpenBotPalette, token: &str, fallback: u32) -> Rgba {
@@ -1077,4 +1119,143 @@ pub fn render_voice_pill(
                         .child(tg_icon_rgba(IconName::Hangup, 13.0, text_on_accent)),
                 ),
         )
+}
+
+pub const COMPOSER_STACK_RADIUS_PX: f32 = 14.0;
+pub const COMPOSER_STACK_OVERLAP_BOTTOM_PX: f32 = 24.0;
+pub const COMPOSER_STACK_Z_INDEX: usize = 10;
+pub const COMPOSER_PILL_Z_INDEX: usize = 11;
+pub const COMPOSER_STACK_ROW_HEIGHT_PX: f32 = 29.0;
+pub const COMPOSER_STACK_MAX_VISIBLE_ROWS: usize = 7;
+pub const COMPOSER_REPLY_PREVIEW_MIN_HEIGHT_PX: f32 = 42.0;
+pub const COMPOSER_OPEN_WAITS_MAX: usize = 20;
+pub const COMPOSER_NOTICE_MAX_BODY_CHARS: usize = 240;
+
+/// Dismissible tucked notice card (`ComposerNotice`) with optional copy-details reference (`UI-F14-06`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerNoticeState {
+    pub title: Option<String>,
+    pub body: String,
+    pub reference: Option<String>,
+    pub dismissible: bool,
+}
+
+impl ComposerNoticeState {
+    pub fn is_truncated(&self) -> bool {
+        self.body.chars().count() > COMPOSER_NOTICE_MAX_BODY_CHARS
+    }
+
+    pub fn has_copy_details(&self) -> bool {
+        self.reference
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty())
+            || self.is_truncated()
+    }
+}
+
+pub struct ComposerStackInput<'a> {
+    pub queue_items: &'a [String],
+    pub queue_can_steer: bool,
+    pub reply_sender: Option<&'a str>,
+    pub awaiting_tasks: &'a [String],
+    pub awaiting_all_settled: bool,
+    pub stopped_tasks: &'a [String],
+    pub open_waits_count: usize,
+    pub notice: Option<&'a ComposerNoticeState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposerStackLayoutSnapshot {
+    pub visible: bool,
+    pub height_px: f32,
+    pub radius_px: f32,
+    pub overlap_bottom_px: f32,
+    pub z_index: usize,
+    pub composer_z_index: usize,
+    pub queue_row_height_px: f32,
+    pub queue_items: Vec<String>,
+    pub queue_visible_rows: usize,
+    pub queue_can_steer: bool,
+    pub reply_preview_visible: bool,
+    pub reply_preview_min_height_px: f32,
+    pub reply_preview_sender: Option<String>,
+    pub awaiting_visible: bool,
+    pub awaiting_title: &'static str,
+    pub awaiting_tasks: Vec<String>,
+    pub awaiting_dismiss_available: bool,
+    pub stopped_visible: bool,
+    pub stopped_tasks: Vec<String>,
+    pub open_waits_count: usize,
+    pub notice_visible: bool,
+    pub notice_has_copy_details: bool,
+    pub notice_truncated: bool,
+}
+
+/// Computes the single-source-of-truth tucked `.composer-stack` geometry consumed directly by
+/// `render_bot_fusion_composer_strip` (`UI-F14`).
+pub fn compute_composer_stack_layout(input: &ComposerStackInput<'_>) -> ComposerStackLayoutSnapshot {
+    let queue_visible_rows = input.queue_items.len().min(COMPOSER_STACK_MAX_VISIBLE_ROWS);
+    let reply_preview_visible = input
+        .reply_sender
+        .is_some_and(|s| !s.trim().is_empty());
+    let awaiting_visible = !input.awaiting_tasks.is_empty();
+    let stopped_visible = !input.stopped_tasks.is_empty();
+    let open_waits_count = input.open_waits_count.min(COMPOSER_OPEN_WAITS_MAX);
+    let notice_visible = input.notice.is_some();
+    let visible = queue_visible_rows > 0
+        || reply_preview_visible
+        || awaiting_visible
+        || stopped_visible
+        || open_waits_count > 0
+        || notice_visible;
+
+    let mut height_px = 0.0_f32;
+    if queue_visible_rows > 0 {
+        height_px += 26.0 + (queue_visible_rows as f32) * COMPOSER_STACK_ROW_HEIGHT_PX;
+    }
+    if reply_preview_visible {
+        height_px += COMPOSER_REPLY_PREVIEW_MIN_HEIGHT_PX;
+    }
+    if awaiting_visible {
+        height_px += 28.0 + (input.awaiting_tasks.len().min(COMPOSER_STACK_MAX_VISIBLE_ROWS) as f32) * COMPOSER_STACK_ROW_HEIGHT_PX;
+    }
+    if stopped_visible {
+        height_px += 28.0 + (input.stopped_tasks.len().min(COMPOSER_STACK_MAX_VISIBLE_ROWS) as f32) * COMPOSER_STACK_ROW_HEIGHT_PX;
+    }
+    if open_waits_count > 0 {
+        height_px += COMPOSER_STACK_ROW_HEIGHT_PX;
+    }
+    if notice_visible {
+        height_px += 40.0;
+    }
+
+    ComposerStackLayoutSnapshot {
+        visible,
+        height_px,
+        radius_px: COMPOSER_STACK_RADIUS_PX,
+        overlap_bottom_px: if visible {
+            COMPOSER_STACK_OVERLAP_BOTTOM_PX
+        } else {
+            0.0
+        },
+        z_index: COMPOSER_STACK_Z_INDEX,
+        composer_z_index: COMPOSER_PILL_Z_INDEX,
+        queue_row_height_px: COMPOSER_STACK_ROW_HEIGHT_PX,
+        queue_items: input.queue_items.to_vec(),
+        queue_visible_rows,
+        queue_can_steer: input.queue_can_steer,
+        reply_preview_visible,
+        reply_preview_min_height_px: COMPOSER_REPLY_PREVIEW_MIN_HEIGHT_PX,
+        reply_preview_sender: input.reply_sender.map(str::to_string),
+        awaiting_visible,
+        awaiting_title: "Subtasks",
+        awaiting_tasks: input.awaiting_tasks.to_vec(),
+        awaiting_dismiss_available: awaiting_visible && input.awaiting_all_settled,
+        stopped_visible,
+        stopped_tasks: input.stopped_tasks.to_vec(),
+        open_waits_count,
+        notice_visible,
+        notice_has_copy_details: input.notice.is_some_and(ComposerNoticeState::has_copy_details),
+        notice_truncated: input.notice.is_some_and(ComposerNoticeState::is_truncated),
+    }
 }

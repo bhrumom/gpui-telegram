@@ -2139,6 +2139,58 @@ fn render_channel_picture_editor_popover(
         .into_any_element()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotChannelSettingsLayout {
+    pub mounted: bool,
+    pub avatar_px: f32,
+    pub picture_popover_width_px: f32,
+    pub icon_catalog_count: usize,
+    pub icon_hues_count: usize,
+    pub name: String,
+    pub read_only: bool,
+    pub members_count: usize,
+    pub browser_policy: String,
+    pub context_isolated: bool,
+    pub subpages_present: [&'static str; 3],
+    pub memories_count: usize,
+    pub routines_count: usize,
+    pub folders_count: usize,
+    pub context_actions_visible: bool,
+    pub compact_disabled: bool,
+    pub context_actions: [&'static str; 3],
+}
+
+pub fn compute_openbot_channel_settings_layout(
+    inspector: &ContextInspector,
+) -> OpenBotChannelSettingsLayout {
+    let name = if !inspector.channel_draft_name.trim().is_empty() {
+        inspector.channel_draft_name.clone()
+    } else {
+        inspector.profile.name.clone()
+    };
+    OpenBotChannelSettingsLayout {
+        mounted: inspector.is_open
+            && inspector.embedded_in_side_panel
+            && inspector.members.is_group_or_channel,
+        avatar_px: 62.0,
+        picture_popover_width_px: crate::components::bloub_avatar::EDITOR_MAX_WIDTH_PX,
+        icon_catalog_count: CHANNEL_ICON_CATALOG.len(),
+        icon_hues_count: CHANNEL_ICON_HUES.len(),
+        name,
+        read_only: inspector.channel_archived,
+        members_count: inspector.members.members.len(),
+        browser_policy: inspector.channel_browser_access.as_policy_str(),
+        context_isolated: inspector.channel_context_isolated,
+        subpages_present: ["memories", "routines", "folders"],
+        memories_count: inspector.channel_memories.len(),
+        routines_count: inspector.bot_fusion.routines.len(),
+        folders_count: inspector.channel_folders.len(),
+        context_actions_visible: !inspector.channel_archived,
+        compact_disabled: inspector.channel_archived || !inspector.channel_provider_supports_compact,
+        context_actions: ["compact", "new_conversation", "delete_history"],
+    }
+}
+
 /// Renders OpenBot's `ChannelSettingsPane` (`UI-F17`) inside `打开 群聊设置`.
 pub fn render_openbot_channel_settings_root(
     inspector: &ContextInspector,
@@ -2146,9 +2198,10 @@ pub fn render_openbot_channel_settings_root(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
+    let ch_layout = compute_openbot_channel_settings_layout(inspector);
     let ob = pal.openbot_palette();
     let is_dark = pal.mode.is_dark();
-    let read_only = inspector.channel_archived;
+    let read_only = ch_layout.read_only;
     let preedit = inspector.openbot_input_preedit(cx);
     let copied_prefix = tr_str(lang, "已复制", "Copied").to_string();
 
@@ -2185,8 +2238,8 @@ pub fn render_openbot_channel_settings_root(
         .or(inspector.profile.avatar_path.as_ref())
     {
         div()
-            .w(px(62.0))
-            .h(px(62.0))
+            .w(px(ch_layout.avatar_px))
+            .h(px(ch_layout.avatar_px))
             .rounded(px(20.0))
             .overflow_hidden()
             .border_1()
@@ -2262,7 +2315,7 @@ pub fn render_openbot_channel_settings_root(
             col.child(render_channel_picture_editor_popover(inspector, pal, lang, cx))
         });
 
-    let ch_name = if inspector.channel_draft_name.is_empty() {
+    let ch_name = if inspector.channel_draft_name.trim().is_empty() {
         inspector.profile.name.clone()
     } else {
         inspector.channel_draft_name.clone()
@@ -2345,6 +2398,21 @@ pub fn render_openbot_channel_settings_root(
                             )
                             .child(tr_str(lang, "保存群聊设置", "Save Channel Info")),
                     ),
+            )
+        })
+        .when_some(inspector.channel_validation_error.clone(), |col, err| {
+            col.child(
+                div()
+                    .id("openbot-ch-validation-error")
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.danger())
+                    .text_size(px(11.5))
+                    .text_color(ob.danger())
+                    .child(err),
             )
         });
 
@@ -2696,25 +2764,36 @@ pub fn render_openbot_channel_settings_root(
     let links_group = ob_inset_group(tr_str(lang, "频道资源", "Channel Resources"), &ob, link_rows);
 
     // ChannelContextActions (hidden when archived)
+    let compact_disabled = ch_layout.compact_disabled;
     let context_actions = (!read_only).then(|| {
         ob_inset_group(
             tr_str(lang, "上下文操作", "Conversation Context"),
             &ob,
             vec![
-                ob_inset_row(
-                    "openbot-ch-compact-ctx",
-                    IconName::FolderAll,
-                    tr_str(lang, "压缩对话", "Compact context"),
-                    Some(tr_str(lang, "压缩", "Compact").to_string()),
-                    false,
-                    false,
-                    &ob,
-                    |this, _| {
-                        this.pending_confirm_guard =
-                            Some(OpenBotConfirmGuard::ChannelCompactContext);
-                    },
-                    cx,
-                ),
+                div()
+                    .w_full()
+                    .when(compact_disabled, |el| el.opacity(0.45))
+                    .child(ob_inset_row(
+                        "openbot-ch-compact-ctx",
+                        IconName::FolderAll,
+                        tr_str(lang, "压缩对话", "Compact context"),
+                        Some(if compact_disabled {
+                            tr_str(lang, "不可用", "Unavailable").to_string()
+                        } else {
+                            tr_str(lang, "压缩", "Compact").to_string()
+                        }),
+                        false,
+                        false,
+                        &ob,
+                        |this, _| {
+                            if !this.channel_archived && this.channel_provider_supports_compact {
+                                this.pending_confirm_guard =
+                                    Some(OpenBotConfirmGuard::ChannelCompactContext);
+                            }
+                        },
+                        cx,
+                    ))
+                    .into_any_element(),
                 ob_inset_row(
                     "openbot-ch-new-conv",
                     IconName::ComposePen,
@@ -3180,92 +3259,98 @@ pub fn render_openbot_channel_settings_root(
         .child(browser_and_isolation)
         .child(links_group)
         .when_some(context_actions, |col, acts| col.child(acts))
-        .when_some(guard, |col, g| match g {
-            OpenBotConfirmGuard::ChannelCompactContext => col.child(ob_confirm_guard_card(
-                "openbot-guard-ch-compact",
-                tr_str(lang, "确认压缩频道上下文？", "Compact Channel Context?"),
-                tr_str(
-                    lang,
-                    "将总结早期对话以释放上下文窗口空间。",
-                    "Summarizes earlier turns to free up context budget.",
-                ),
-                tr_str(lang, "确认压缩", "Compact"),
-                false,
-                &ob,
-                lang,
-                |this, _| {
-                    this.pending_openbot_action =
-                        Some(OpenBotInspectorAction::CompactChannelContext);
-                },
-                cx,
-            )),
-            OpenBotConfirmGuard::ChannelNewConversation => col.child(ob_confirm_guard_card(
-                "openbot-guard-ch-new",
-                tr_str(lang, "确认开启新对话？", "Start New Conversation?"),
-                tr_str(
-                    lang,
-                    "将开启新的群聊上下文线程。",
-                    "Starts a fresh conversation thread in this channel.",
-                ),
-                tr_str(lang, "确认开启", "Start"),
-                false,
-                &ob,
-                lang,
-                |this, _| {
-                    this.pending_openbot_action =
-                        Some(OpenBotInspectorAction::StartNewChannelConversation);
-                },
-                cx,
-            )),
-            OpenBotConfirmGuard::ChannelDeleteHistory => col.child(ob_confirm_guard_card(
-                "openbot-guard-ch-delhist",
-                tr_str(lang, "确认删除群聊历史记录？", "Delete Channel History?"),
-                tr_str(
-                    lang,
-                    "将永久清空该群聊中的所有消息记录，无法撤销。",
-                    "Permanently clears all messages in this channel.",
-                ),
-                tr_str(lang, "确认删除", "Delete"),
-                true,
-                &ob,
-                lang,
-                |this, _| {
-                    this.pending_openbot_action = Some(OpenBotInspectorAction::DeleteChatHistory);
-                },
-                cx,
-            )),
-            OpenBotConfirmGuard::ChannelRemoveMember { user_id, name } => {
-                let nm = name.clone();
-                col.child(ob_confirm_guard_card(
-                    "openbot-guard-ch-rm-mem",
-                    &format!("{} {name}?", tr_str(lang, "确认移除成员", "Remove member")),
+        .when_some(guard, |col, g| {
+            let is_danger = inspector
+                .active_confirm_dialog_state()
+                .map(|s| s.destructive)
+                .unwrap_or_else(|| g.is_destructive());
+            match g {
+                OpenBotConfirmGuard::ChannelCompactContext => col.child(ob_confirm_guard_card(
+                    "openbot-guard-ch-compact",
+                    tr_str(lang, "确认压缩频道上下文？", "Compact Channel Context?"),
                     tr_str(
                         lang,
-                        "移除后该成员将不再接收本群消息。",
-                        "This member will be removed from the channel.",
+                        "将总结早期对话以释放上下文窗口空间。",
+                        "Summarizes earlier turns to free up context budget.",
                     ),
-                    tr_str(lang, "确认移除", "Remove"),
-                    true,
+                    tr_str(lang, "确认压缩", "Compact"),
+                    is_danger,
                     &ob,
                     lang,
-                    move |this, _| {
-                        this.members.members.retain(|m| m.id != user_id);
-                        if this.channel_lead_user_id == Some(user_id) {
-                            this.channel_lead_user_id = this.members.members.first().map(|m| m.id);
-                        }
-                        if this.channel_browser_access == ChannelBrowserAccess::Member(user_id) {
-                            this.channel_browser_access = ChannelBrowserAccess::None;
-                        }
+                    |this, _| {
                         this.pending_openbot_action =
-                            Some(OpenBotInspectorAction::RemoveChannelMember {
-                                user_id,
-                                member_name: nm.clone(),
-                            });
+                            Some(OpenBotInspectorAction::CompactChannelContext);
                     },
                     cx,
-                ))
+                )),
+                OpenBotConfirmGuard::ChannelNewConversation => col.child(ob_confirm_guard_card(
+                    "openbot-guard-ch-new",
+                    tr_str(lang, "确认开启新对话？", "Start New Conversation?"),
+                    tr_str(
+                        lang,
+                        "将开启新的群聊上下文线程。",
+                        "Starts a fresh conversation thread in this channel.",
+                    ),
+                    tr_str(lang, "确认开启", "Start"),
+                    is_danger,
+                    &ob,
+                    lang,
+                    |this, _| {
+                        this.pending_openbot_action =
+                            Some(OpenBotInspectorAction::StartNewChannelConversation);
+                    },
+                    cx,
+                )),
+                OpenBotConfirmGuard::ChannelDeleteHistory => col.child(ob_confirm_guard_card(
+                    "openbot-guard-ch-delhist",
+                    tr_str(lang, "确认删除群聊历史记录？", "Delete Channel History?"),
+                    tr_str(
+                        lang,
+                        "将永久清空该群聊中的所有消息记录，无法撤销。",
+                        "Permanently clears all messages in this channel.",
+                    ),
+                    tr_str(lang, "确认删除", "Delete"),
+                    is_danger,
+                    &ob,
+                    lang,
+                    |this, _| {
+                        this.pending_openbot_action = Some(OpenBotInspectorAction::DeleteChatHistory);
+                    },
+                    cx,
+                )),
+                OpenBotConfirmGuard::ChannelRemoveMember { user_id, name } => {
+                    let nm = name.clone();
+                    col.child(ob_confirm_guard_card(
+                        "openbot-guard-ch-rm-mem",
+                        &format!("{} {name}?", tr_str(lang, "确认移除成员", "Remove member")),
+                        tr_str(
+                            lang,
+                            "移除后该成员将不再接收本群消息。",
+                            "This member will be removed from the channel.",
+                        ),
+                        tr_str(lang, "确认移除", "Remove"),
+                        is_danger,
+                        &ob,
+                        lang,
+                        move |this, _| {
+                            this.members.members.retain(|m| m.id != user_id);
+                            if this.channel_lead_user_id == Some(user_id) {
+                                this.channel_lead_user_id = this.members.members.first().map(|m| m.id);
+                            }
+                            if this.channel_browser_access == ChannelBrowserAccess::Member(user_id) {
+                                this.channel_browser_access = ChannelBrowserAccess::None;
+                            }
+                            this.pending_openbot_action =
+                                Some(OpenBotInspectorAction::RemoveChannelMember {
+                                    user_id,
+                                    member_name: nm.clone(),
+                                });
+                        },
+                        cx,
+                    ))
+                }
+                _ => col,
             }
-            _ => col,
         })
         .child(members_group)
         .when_some(inline_picker, |col, p| col.child(p))
@@ -3509,6 +3594,57 @@ pub fn render_openbot_channel_subpage(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotContactProfileLayout {
+    pub mounted: bool,
+    pub host: &'static str,
+    pub avatar_px: f32,
+    pub handle: String,
+    pub online: bool,
+    pub online_dot_hex: String,
+    pub block_confirm_open: bool,
+    pub blocked: bool,
+    pub destructive_confirm_gated: bool,
+}
+
+pub fn compute_openbot_contact_profile_layout(
+    inspector: &ContextInspector,
+    pal: &TdesktopThemePalette,
+) -> OpenBotContactProfileLayout {
+    let ob = pal.openbot_palette();
+    let status = inspector.profile.status.trim();
+    let clean_handle = inspector
+        .profile
+        .username
+        .trim()
+        .trim_start_matches('@');
+    let handle = if clean_handle.is_empty() {
+        String::new()
+    } else {
+        format!("@{clean_handle}")
+    };
+    let success_rgb = crate::views::content_hub::apple_primitives::rgba_to_rgb24(ob.success());
+    OpenBotContactProfileLayout {
+        mounted: inspector.is_open
+            && inspector.embedded_in_side_panel
+            && !inspector.profile.is_bot
+            && !inspector.members.is_group_or_channel,
+        host: if inspector.embedded_in_side_panel {
+            "side_panel_contact_profile"
+        } else {
+            "classic_drawer"
+        },
+        avatar_px: 62.0,
+        handle,
+        online: status.eq_ignore_ascii_case("online") || status == "在线",
+        online_dot_hex: crate::views::content_hub::apple_primitives::rgb24_to_hex(success_rgb),
+        block_confirm_open: inspector.pending_confirm_guard
+            == Some(OpenBotConfirmGuard::ContactBlock),
+        blocked: inspector.is_contact_blocked,
+        destructive_confirm_gated: pal.is_apple_style(),
+    }
+}
+
 /// Renders the OpenBot-styled 1:1 Human Contact Profile (`UI-F17`) inside `打开 联系人资料`.
 pub fn render_openbot_contact_profile_root(
     inspector: &ContextInspector,
@@ -3516,6 +3652,7 @@ pub fn render_openbot_contact_profile_root(
     lang: &str,
     cx: &mut Context<ContextInspector>,
 ) -> AnyElement {
+    let contact_layout = compute_openbot_contact_profile_layout(inspector, &pal);
     let ob = pal.openbot_palette();
     let model = &inspector.profile;
     let layout = build_contact_profile_layout(model, &inspector.members, pal, lang);
@@ -3523,13 +3660,18 @@ pub fn render_openbot_contact_profile_root(
 
     let avatar_el: AnyElement = if let Some(ref path) = model.avatar_path {
         div()
-            .w(px(62.0))
-            .h(px(62.0))
+            .w(px(contact_layout.avatar_px))
+            .h(px(contact_layout.avatar_px))
             .rounded_full()
             .overflow_hidden()
             .border_1()
             .border_color(ob.border_hairline())
-            .child(img(path.clone()).w(px(62.0)).h(px(62.0)).object_fit(ObjectFit::Cover))
+            .child(
+                img(path.clone())
+                    .w(px(contact_layout.avatar_px))
+                    .h(px(contact_layout.avatar_px))
+                    .object_fit(ObjectFit::Cover),
+            )
             .into_any_element()
     } else {
         let init = if model.avatar_initials.trim().is_empty() {
@@ -3538,8 +3680,8 @@ pub fn render_openbot_contact_profile_root(
             model.avatar_initials.clone()
         };
         div()
-            .w(px(62.0))
-            .h(px(62.0))
+            .w(px(contact_layout.avatar_px))
+            .h(px(contact_layout.avatar_px))
             .rounded_full()
             .bg(rgb(if model.avatar_color != 0 {
                 model.avatar_color
@@ -3556,13 +3698,17 @@ pub fn render_openbot_contact_profile_root(
             .into_any_element()
     };
 
-    let online = model.status.trim().eq_ignore_ascii_case("online") || model.status.trim() == "在线";
+    let online = contact_layout.online;
+    let online_dot_rgb = crate::views::content_hub::apple_primitives::parse_hex_color(
+        &contact_layout.online_dot_hex,
+        0x31CF76,
+    );
     let status_txt = if online {
         tr_str(lang, "在线", "Online").to_string()
     } else if !model.status.trim().is_empty() {
         model.status.clone()
     } else {
-        model.username.clone()
+        contact_layout.handle.clone()
     };
 
     let hero = div()
@@ -3588,7 +3734,13 @@ pub fn render_openbot_contact_profile_root(
                     .items_center()
                     .gap(px(5.0))
                     .when(online, |r| {
-                        r.child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(ob.success()))
+                        r.child(
+                            div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .rounded_full()
+                                .bg(rgb(online_dot_rgb)),
+                        )
                     })
                     .child(
                         div()
@@ -3773,13 +3925,39 @@ pub fn render_openbot_contact_profile_root(
                 false,
                 true,
                 &ob,
-                |this, _| {
-                    this.is_contact_blocked = !this.is_contact_blocked;
+                move |this, _| {
+                    if blocked {
+                        this.is_contact_blocked = false;
+                        this.pending_confirm_guard = None;
+                    } else {
+                        this.pending_confirm_guard = Some(OpenBotConfirmGuard::ContactBlock);
+                    }
                 },
                 cx,
             ),
         ],
     );
+
+    let confirm_block_card = contact_layout.block_confirm_open.then(|| {
+        ob_confirm_guard_card(
+            "inspector-confirm-block-contact",
+            tr_str(lang, "拉黑该联系人？", "Block this contact?"),
+            tr_str(
+                lang,
+                "拉黑后对方将无法向你发送消息，你可以随时取消拉黑。",
+                "Blocked contacts cannot message you until you unblock them.",
+            ),
+            tr_str(lang, "确认拉黑", "Block"),
+            true,
+            &ob,
+            lang,
+            |this, _| {
+                this.is_contact_blocked = true;
+                this.pending_confirm_guard = None;
+            },
+            cx,
+        )
+    });
 
     div()
         .w_full()
@@ -3803,6 +3981,7 @@ pub fn render_openbot_contact_profile_root(
         .when_some(info_group, |col, g| col.child(g))
         .child(media_card)
         .child(actions_group)
+        .when_some(confirm_block_card, |col, card| col.child(card))
         .into_any_element()
 }
 

@@ -6,7 +6,7 @@ use gpui::*;
 use std::collections::HashSet;
 
 use crate::i18n::tr_str;
-use crate::theme::{tg_icon_rgba, IconName, TdesktopThemePalette};
+use crate::theme::{tg_icon_rgba, IconName, OPENBOT_LAYER_DROPDOWN, TdesktopThemePalette};
 use crate::views::chat_sidebar::OPENBOT_TABS_HEIGHT;
 use crate::views::sidebar::dialogs_quick_action::{DialogsQuickAction, QuickDialogAction};
 use crate::views::sidebar::dialogs_row_view::SidebarContextAction;
@@ -29,6 +29,52 @@ pub fn localize_folder_label(folder: &str, lang_id: &str) -> String {
     }
 }
 
+/// Canonical OpenBot inline thread sub-row height (`sidebar-threads.css:L96`: `30px`).
+pub const OPENBOT_THREAD_SUBROW_HEIGHT_PX: f32 = 30.0;
+
+/// Single-source-of-truth layout snapshot for `SidebarTabs` (`32px`, `2px` underline, zero blue pills).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotSidebarTabsLayout {
+    pub visible: bool,
+    pub height_px: f32,
+    pub active_id: String,
+    pub active_underline_px: f32,
+    pub active_underline_hex: &'static str,
+    pub uses_blue_pill: bool,
+    pub unread_badge_height_px: f32,
+    pub sliders_menu_open: bool,
+}
+
+pub fn compute_openbot_sidebar_tabs_layout(
+    is_compact: bool,
+    is_closed: bool,
+    use_inline_search: bool,
+    active_folder: &str,
+    is_edit_menu_open: bool,
+    palette: &TdesktopThemePalette,
+) -> OpenBotSidebarTabsLayout {
+    let active_id = active_folder.trim().to_ascii_lowercase();
+    let is_apple = palette.is_apple_style();
+    OpenBotSidebarTabsLayout {
+        visible: !is_compact && !is_closed && !use_inline_search,
+        height_px: OPENBOT_TABS_HEIGHT,
+        active_id: if active_id.is_empty() {
+            "all".to_string()
+        } else {
+            active_id
+        },
+        active_underline_px: 2.0,
+        active_underline_hex: if palette.mode.is_dark() {
+            "#ffffff"
+        } else {
+            "#141414"
+        },
+        uses_blue_pill: !is_apple,
+        unread_badge_height_px: 18.0,
+        sliders_menu_open: is_edit_menu_open,
+    }
+}
+
 /// Renders OpenBot's exact `32px` flat underline `SidebarTabs` (`全部` + `未读` + visible folders)
 /// with the right-aligned `28x28` `SlidersHorizontal` tab-visibility trigger.
 #[allow(clippy::too_many_arguments)]
@@ -44,6 +90,14 @@ pub fn render_openbot_sidebar_tabs<V: 'static>(
     on_select_folder: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
     on_toggle_edit_menu: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> AnyElement {
+    let tabs_layout = compute_openbot_sidebar_tabs_layout(
+        false,
+        false,
+        false,
+        active_folder,
+        is_edit_menu_open,
+        palette,
+    );
     let ob = palette.openbot_palette();
     let text_pri = ob.text_primary();
     let text_sec = ob.text_secondary();
@@ -85,7 +139,7 @@ pub fn render_openbot_sidebar_tabs<V: 'static>(
                 .id(("sidebar-folder-tab", idx as u64))
                 .cursor_pointer()
                 .relative()
-                .h(px(OPENBOT_TABS_HEIGHT))
+                .h(px(tabs_layout.height_px))
                 .flex_shrink_0()
                 .px(px(6.0))
                 .flex()
@@ -105,8 +159,8 @@ pub fn render_openbot_sidebar_tabs<V: 'static>(
                 .when(show_badge, |el| {
                     el.child(
                         div()
-                            .h(px(18.0))
-                            .min_w(px(18.0))
+                            .h(px(tabs_layout.unread_badge_height_px))
+                            .min_w(px(tabs_layout.unread_badge_height_px))
                             .px(px(4.0))
                             .rounded_full()
                             .bg(if is_active { badge_active_bg } else { badge_idle_bg })
@@ -130,7 +184,7 @@ pub fn render_openbot_sidebar_tabs<V: 'static>(
                             .bottom_0()
                             .left_0()
                             .right_0()
-                            .h(px(2.0))
+                            .h(px(tabs_layout.active_underline_px))
                             .rounded_full()
                             .bg(text_pri),
                     )
@@ -144,7 +198,7 @@ pub fn render_openbot_sidebar_tabs<V: 'static>(
         .mx(px(4.0))
         .mb(px(4.0))
         .pr(px(4.0))
-        .h(px(OPENBOT_TABS_HEIGHT))
+        .h(px(tabs_layout.height_px))
         .flex_shrink_0()
         .border_b_1()
         .border_color(hover_bg)
@@ -533,7 +587,11 @@ pub fn render_forum_topics_subtree<V: 'static>(
             div()
                 .id(("sidebar-topic-row", tid))
                 .cursor_pointer()
-                .h(px(34.0))
+                .h(px(if is_apple {
+                    OPENBOT_THREAD_SUBROW_HEIGHT_PX
+                } else {
+                    34.0
+                }))
                 .w_full()
                 .pl(px(58.0))
                 .pr(px(10.0))
@@ -649,18 +707,101 @@ pub fn render_dialog_context_menu<V: 'static>(
         rgb(palette.border_fg)
     };
 
-    let items: [(IconName, String, SidebarContextAction, bool); 6] = [
-        (IconName::Pin, if is_pinned { tr_str(lang_id, "取消置顶", "Unpin").into() } else { tr_str(lang_id, "置顶对话", "Pin").into() }, SidebarContextAction::TogglePin(dialog_id), false),
-        (IconName::Mute, if is_muted { tr_str(lang_id, "取消静音", "Unmute").into() } else { tr_str(lang_id, "静音通知", "Mute").into() }, SidebarContextAction::ToggleMute(dialog_id), false),
-        (IconName::CheckDouble, if has_unread { tr_str(lang_id, "标记为已读", "Mark as Read").into() } else { tr_str(lang_id, "标记为未读", "Mark as Unread").into() }, SidebarContextAction::ToggleUnread(dialog_id), false),
-        (IconName::ArchivedChats, if is_archived { tr_str(lang_id, "取消归档", "Unarchive").into() } else { tr_str(lang_id, "归档对话", "Archive").into() }, SidebarContextAction::ToggleArchive(dialog_id), false),
-        (IconName::Close, tr_str(lang_id, "清空历史记录", "Clear History").into(), SidebarContextAction::ClearHistory(dialog_id), false),
-        (IconName::DeleteTrash, tr_str(lang_id, "删除对话", "Delete Chat").into(), SidebarContextAction::DeleteChat(dialog_id), true),
-    ];
+    let items: Vec<(IconName, String, SidebarContextAction, bool)> = if is_apple {
+        super::dialogs_row_view::openbot_context_menu_actions(dialog_id)
+            .into_iter()
+            .map(|act| match act {
+                SidebarContextAction::TogglePin(_) => (
+                    IconName::Pin,
+                    if is_pinned {
+                        tr_str(lang_id, "取消置顶", "Unpin").into()
+                    } else {
+                        tr_str(lang_id, "置顶对话", "Pin").into()
+                    },
+                    act,
+                    false,
+                ),
+                SidebarContextAction::MoveToFolder(_) => (
+                    IconName::FolderWork,
+                    tr_str(lang_id, "移至分组", "Move to Folder").into(),
+                    act,
+                    false,
+                ),
+                SidebarContextAction::ToggleHide(_) => (
+                    IconName::ArchivedChats,
+                    if is_archived {
+                        tr_str(lang_id, "取消隐藏", "Unhide").into()
+                    } else {
+                        tr_str(lang_id, "隐藏对话", "Hide").into()
+                    },
+                    act,
+                    false,
+                ),
+                SidebarContextAction::ToggleMute(_) => (
+                    IconName::Mute,
+                    if is_muted {
+                        tr_str(lang_id, "取消静音", "Unmute").into()
+                    } else {
+                        tr_str(lang_id, "静音通知", "Mute").into()
+                    },
+                    act,
+                    false,
+                ),
+                SidebarContextAction::ToggleUnread(_) => (
+                    IconName::CheckDouble,
+                    if has_unread {
+                        tr_str(lang_id, "标记为已读", "Mark as Read").into()
+                    } else {
+                        tr_str(lang_id, "标记为未读", "Mark as Unread").into()
+                    },
+                    act,
+                    false,
+                ),
+                SidebarContextAction::OpenSettings(_) => (
+                    IconName::SettingsGear,
+                    tr_str(lang_id, "打开设置", "Settings").into(),
+                    act,
+                    false,
+                ),
+                SidebarContextAction::ToggleArchive(_) => (
+                    IconName::ArchivedChats,
+                    if is_archived {
+                        tr_str(lang_id, "取消归档", "Unarchive").into()
+                    } else {
+                        tr_str(lang_id, "归档对话", "Archive").into()
+                    },
+                    act,
+                    false,
+                ),
+                SidebarContextAction::ClearHistory(_) => (
+                    IconName::Close,
+                    tr_str(lang_id, "清空历史记录", "Clear History").into(),
+                    act,
+                    false,
+                ),
+                SidebarContextAction::DeleteChat(_) => (
+                    IconName::DeleteTrash,
+                    tr_str(lang_id, "删除对话", "Delete Chat").into(),
+                    act,
+                    true,
+                ),
+            })
+            .collect()
+    } else {
+        vec![
+            (IconName::Pin, if is_pinned { tr_str(lang_id, "取消置顶", "Unpin").into() } else { tr_str(lang_id, "置顶对话", "Pin").into() }, SidebarContextAction::TogglePin(dialog_id), false),
+            (IconName::Mute, if is_muted { tr_str(lang_id, "取消静音", "Unmute").into() } else { tr_str(lang_id, "静音通知", "Mute").into() }, SidebarContextAction::ToggleMute(dialog_id), false),
+            (IconName::CheckDouble, if has_unread { tr_str(lang_id, "标记为已读", "Mark as Read").into() } else { tr_str(lang_id, "标记为未读", "Mark as Unread").into() }, SidebarContextAction::ToggleUnread(dialog_id), false),
+            (IconName::ArchivedChats, if is_archived { tr_str(lang_id, "取消归档", "Unarchive").into() } else { tr_str(lang_id, "归档对话", "Archive").into() }, SidebarContextAction::ToggleArchive(dialog_id), false),
+            (IconName::Close, tr_str(lang_id, "清空历史记录", "Clear History").into(), SidebarContextAction::ClearHistory(dialog_id), false),
+            (IconName::DeleteTrash, tr_str(lang_id, "删除对话", "Delete Chat").into(), SidebarContextAction::DeleteChat(dialog_id), true),
+        ]
+    };
+    let sep_idx = if is_apple { 7 } else { 4 };
 
     let mut rows: Vec<AnyElement> = Vec::with_capacity(items.len() + 1);
     for (idx, (icon, label, act, danger)) in items.into_iter().enumerate() {
-        if idx == 4 {
+        if idx == sep_idx {
             rows.push(
                 div()
                     .h(px(1.0))
@@ -737,7 +878,7 @@ pub fn render_dialog_context_menu<V: 'static>(
                     .gap(px(1.0))
                     .children(rows),
             )
-            .with_priority(40),
+            .with_priority(OPENBOT_LAYER_DROPDOWN),
         )
         .into_any_element()
 }

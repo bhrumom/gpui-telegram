@@ -741,8 +741,16 @@ impl GlobalSearchPlushState {
         center_y: f64,
         now_ms: f64,
     ) {
-        if self.reduced_motion {
-            self.gaze = None;
+        if self.reduced_motion
+            || !caret_x.is_finite()
+            || !caret_y.is_finite()
+            || !center_x.is_finite()
+            || !center_y.is_finite()
+            || !now_ms.is_finite()
+        {
+            if self.reduced_motion {
+                self.gaze = None;
+            }
             return;
         }
         self.look_started_ms = None;
@@ -755,7 +763,7 @@ impl GlobalSearchPlushState {
 
     pub fn set_searching(&mut self, searching: bool, now_ms: f64) {
         self.searching = searching;
-        if !searching && self.waiting_for_search_end && !self.reduced_motion {
+        if !searching && self.waiting_for_search_end && !self.reduced_motion && now_ms.is_finite() {
             self.start_look_for_result(now_ms);
         }
     }
@@ -767,7 +775,7 @@ impl GlobalSearchPlushState {
     }
 
     pub fn tick(&mut self, now_ms: f64) -> GlobalSearchPlushSample {
-        if self.reduced_motion {
+        if self.reduced_motion || !now_ms.is_finite() {
             return GlobalSearchPlushSample::default();
         }
         if let Some(deadline) = self.idle_deadline_ms {
@@ -837,7 +845,10 @@ impl GlobalSearchPlushState {
         let sz = size_px.max(8.0);
         let mut mascot = PlushMascot::new(sz);
         if let Some((gx, gy)) = sample.gaze {
-            mascot.extra_eye_offset_px = ((gx as f32) * 4.0, (gy as f32) * 3.0);
+            mascot.extra_eye_offset_px = (
+                (gx.clamp(-1.0, 1.0) * 0.07 * f64::from(sz)) as f32,
+                (gy.clamp(-1.0, 1.0) * 0.05 * f64::from(sz)) as f32,
+            );
         } else {
             mascot.extra_eye_offset_px = (sample.eye_dart_x_px as f32, 0.0);
         }

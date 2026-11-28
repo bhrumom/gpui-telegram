@@ -423,16 +423,34 @@ pub fn render_loading_history_skeleton(
         .into_any_element()
 }
 
+/// Single-source-of-truth OKLab-clamped OpenBot stage backdrop color hex (`UI-F01` + `UI-F10`).
+pub fn resolve_openbot_stage_backdrop_hex(
+    palette: &TdesktopThemePalette,
+    custom_chat_color_hex: Option<&str>,
+) -> String {
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
+    if let Some(hex) = custom_chat_color_hex {
+        let trimmed = hex.trim();
+        if !trimmed.is_empty() {
+            if let Ok(clamped) = crate::theme::readable_chat_background_for_dark(trimmed, is_dark) {
+                return clamped;
+            }
+        }
+    }
+    ob.token("--openbot-bg-canvas")
+        .unwrap_or(if is_dark { "#1a1a1a" } else { "#f5f5f6" })
+        .to_string()
+}
+
 /// Renders OpenBot's optional OKLab-clamped chat canvas background (defaulting cleanly to `#1a1a1a` / `#f5f5f6`).
 pub fn render_openbot_stage_backdrop(
     palette: &TdesktopThemePalette,
     custom_chat_color_hex: Option<&str>,
 ) -> AnyElement {
     let ob = palette.openbot_palette();
-    let is_dark = palette.mode.is_dark();
-    let bg_rgba = custom_chat_color_hex
-        .and_then(|hex| crate::theme::readable_chat_background_for_dark(hex, is_dark).ok())
-        .and_then(|clamped| crate::theme::openbot_palette::parse_css_color_to_rgba(&clamped))
+    let resolved_hex = resolve_openbot_stage_backdrop_hex(palette, custom_chat_color_hex);
+    let bg_rgba = crate::theme::openbot_palette::parse_css_color_to_rgba(&resolved_hex)
         .unwrap_or_else(|| ob.bg_canvas());
     div()
         .id("openbot-stage-backdrop")
@@ -443,6 +461,24 @@ pub fn render_openbot_stage_backdrop(
 }
 
 /// Renders OpenBot's `AgentChatEmptyState` (`64px` 3D plush hero + heading + bio + sample preview).
+pub const AGENT_EMPTY_STATE_AVATAR_PX: f32 = 64.0;
+pub const AGENT_EMPTY_STATE_HEADING_PX: f32 = 32.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentEmptyStateLayout {
+    pub visible: bool,
+    pub avatar_px: f32,
+    pub heading_px: f32,
+}
+
+pub fn compute_agent_empty_state_layout(has_messages: bool) -> AgentEmptyStateLayout {
+    AgentEmptyStateLayout {
+        visible: !has_messages,
+        avatar_px: AGENT_EMPTY_STATE_AVATAR_PX,
+        heading_px: AGENT_EMPTY_STATE_HEADING_PX,
+    }
+}
+
 pub fn render_openbot_agent_empty_state(
     chat_id: u64,
     agent_name: &str,
@@ -451,13 +487,14 @@ pub fn render_openbot_agent_empty_state(
     palette: &TdesktopThemePalette,
     lang_id: &str,
 ) -> AnyElement {
+    let layout = compute_agent_empty_state_layout(false);
     let ob = palette.openbot_palette();
     let is_zh = lang_id.starts_with("zh");
     let seed = format!("bot_{}_{}", chat_id, agent_name);
     let plush = super::openbot_stage_chrome::render_fabushi_plush_avatar(
         active_fabushi_bot,
         &seed,
-        64.0,
+        layout.avatar_px,
         openbot_contracts::avatar::AvatarMood::Idle,
         None,
     );
@@ -507,8 +544,8 @@ pub fn render_openbot_agent_empty_state(
                 .child(plush)
                 .child(
                     div()
-                        .text_size(px(24.0))
-                        .line_height(px(30.0))
+                        .text_size(px(layout.heading_px))
+                        .line_height(px(38.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(ob.text_primary())
                         .child(heading),

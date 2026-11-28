@@ -316,6 +316,7 @@ pub fn reset_account_conversation_views(
     sidebar.contact_chat_ids.clear();
     sidebar.group_chat_ids.clear();
     sidebar.channel_chat_ids.clear();
+    sidebar.group_member_briefs.clear();
     sidebar.clear_selection();
     sidebar.inner_widget.total_rows = 0;
     sidebar.folders = vec![("All".to_string(), 0)];
@@ -354,6 +355,13 @@ pub fn select_authoritative_dialog(
     sidebar.inner_widget.selected_index = Some(idx);
 
     let subtitle = peer_subtitle_for_dialog(&dialog);
+    let is_bot = dialog.folder == "Bots" || sidebar.bot_ids.contains(&chat_id);
+    let is_group_or_channel = !is_bot
+        && (dialog.folder == "Groups"
+            || dialog.folder == "Channels"
+            || sidebar.group_chat_ids.contains(&chat_id)
+            || sidebar.channel_chat_ids.contains(&chat_id));
+
     stage.set_chat(
         dialog.id,
         &dialog.peer_name,
@@ -361,20 +369,26 @@ pub fn select_authoritative_dialog(
         &dialog.avatar_initials,
         dialog.avatar_color,
     );
-    stage.is_group_chat = dialog.folder == "Groups" || dialog.folder == "Channels";
+    stage.is_bot_chat = is_bot;
+    stage.is_group_chat = is_group_or_channel;
     stage.is_saved_messages = dialog.peer_name == "Saved Messages" || dialog.peer_name == "收藏夹";
+    if is_group_or_channel {
+        if let Some(briefs) = sidebar.group_member_briefs.get(&chat_id) {
+            stage.set_group_member_briefs(briefs.clone());
+        }
+    }
 
     if is_chat_switch {
+        let _ = inspector.flush_dirty_bot_identity_before_peer_switch(
+            format!("chat:{chat_id}"),
+            dialog.peer_name.clone(),
+            subtitle.clone(),
+        );
         inspector.clear_peer_facts();
     }
-    let is_bot = dialog.folder == "Bots" || sidebar.bot_ids.contains(&chat_id);
-    let is_group_or_channel = !is_bot
-        && (dialog.folder == "Groups"
-            || dialog.folder == "Channels"
-            || sidebar.group_chat_ids.contains(&chat_id)
-            || sidebar.channel_chat_ids.contains(&chat_id));
     inspector.profile.is_bot = is_bot;
     inspector.members.is_group_or_channel = is_group_or_channel;
+    inspector.bot_chat_bubble_color = stage.chat_bg_tint_hex.clone();
 
     let avatar_initials = if dialog.avatar_initials.trim().is_empty() {
         derive_initials(&dialog.peer_name)

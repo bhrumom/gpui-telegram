@@ -932,6 +932,26 @@ impl AppShell {
         is_bot: bool,
         cx: &mut Context<Self>,
     ) {
+        let matched_fabushi_visual = if is_bot {
+            self.miniapps
+                .fabushi_bots
+                .iter()
+                .find(|fb| {
+                    (fb.bot_user_id > 0 && fb.bot_user_id as u64 == chat_id)
+                        || title_hint
+                            .as_deref()
+                            .is_some_and(|t| !t.trim().is_empty() && fb.display_name.eq_ignore_ascii_case(t.trim()))
+                })
+                .map(|fb| {
+                    (
+                        fb.agent_id.clone(),
+                        fb.avatar_shape.clone(),
+                        fb.avatar_color.clone(),
+                    )
+                })
+        } else {
+            None
+        };
         let mut inserted_new = false;
         let sel_rev = self.sidebar.update(cx, |sb, sb_cx| {
             if !sb.dialogs.iter().any(|d| d.id == chat_id) {
@@ -939,29 +959,32 @@ impl AppShell {
                     .clone()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| format!("Chat #{chat_id}"));
-                let init = derive_initials(&peer_name);
-                sb.dialogs.insert(
-                    0,
-                    DialogItemModel {
-                        id: chat_id,
-                        peer_name,
-                        avatar_initials: if init.is_empty() { "TG".into() } else { init },
-                        avatar_color: peer_avatar_color(chat_id),
-                        last_message: String::new(),
-                        timestamp: "刚刚".to_string(),
-                        unread_count: 0,
-                        is_muted: false,
-                        is_pinned: false,
-                        is_online: is_bot,
-                        typing_indicator: None,
-                        delivery_status: DialogDeliveryStatus::Read,
-                        folder: if is_bot {
-                            "Bots".to_string()
-                        } else {
-                            "All".to_string()
+                if is_bot {
+                    let (aid, shape, color) = matched_fabushi_visual
+                        .clone()
+                        .unwrap_or_else(|| (format!("bot-{chat_id}"), "plush:cercle".to_string(), "#3b93f0".to_string()));
+                    sb.append_plush_bot_dialog(chat_id, &peer_name, &aid, &shape, &color);
+                } else {
+                    let init = derive_initials(&peer_name);
+                    sb.dialogs.insert(
+                        0,
+                        DialogItemModel {
+                            id: chat_id,
+                            peer_name,
+                            avatar_initials: if init.is_empty() { "TG".into() } else { init },
+                            avatar_color: peer_avatar_color(chat_id),
+                            last_message: String::new(),
+                            timestamp: "刚刚".to_string(),
+                            unread_count: 0,
+                            is_muted: false,
+                            is_pinned: false,
+                            is_online: false,
+                            typing_indicator: None,
+                            delivery_status: DialogDeliveryStatus::Read,
+                            folder: "All".to_string(),
                         },
-                    },
-                );
+                    );
+                }
                 inserted_new = true;
             }
             if is_bot {

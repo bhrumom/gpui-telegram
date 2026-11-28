@@ -4042,9 +4042,15 @@ impl CommunityWorkspace {
         self.last_layout_mode = layout;
 
         let pal = self.palette;
+        let comm_layout = super::shared_widgets::compute_community_hub_layout(&pal, viewport_width_px);
+        let canvas_bg = rgb(crate::views::content_hub::apple_primitives::parse_hex_color(
+            &comm_layout.canvas_hex,
+            pal.stage_bg,
+        ));
         let active_modal = self.state.active_modal;
         let active_popover = self.state.active_popover.clone();
         let center = self.render_route_content(cx);
+        let header_title = tr_str(&self.language_id, "社区", "Community");
 
         div()
             .id("community-workspace-root")
@@ -4052,10 +4058,21 @@ impl CommunityWorkspace {
             .flex_1()
             .min_w(px(0.0))
             .h_full()
-            .bg(rgb(pal.stage_bg))
+            .bg(canvas_bg)
             .overflow_hidden()
             .flex()
             .flex_col()
+            .when(layout != CommunityLayoutMode::OneColumn, |col| {
+                col.child(
+                    crate::views::content_hub::apple_primitives::openbot_page_header(
+                        header_title,
+                        None,
+                        None,
+                        pal,
+                    )
+                    .h(px(comm_layout.page_header_height_px)),
+                )
+            })
             .when(layout == CommunityLayoutMode::OneColumn, |col| {
                 col.child(render_compact_top_nav(self, cx))
             })

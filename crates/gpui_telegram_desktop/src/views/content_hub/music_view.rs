@@ -17,7 +17,7 @@ use crate::views::content_hub::apple_primitives::{
     filter_pill, format_duration_ms, format_duration_secs, hero_banner,
     openbot_marketplace_nav_item, openbot_marketplace_shell, openbot_page_header,
     openbot_primary_cta_btn, openbot_secondary_btn, rating_pill, render_editable_field_box,
-    review_status_badge,
+    review_status_badge, OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH,
 };
 use crate::views::content_hub::music_player_bar::MUSIC_ACCENT;
 use crate::views::content_hub::{
@@ -958,7 +958,7 @@ pub fn render_music_hub_view(
     let body_scroll = div().id("apple-music-hub-scroll").child(
         div()
             .w_full()
-            .max_w(px(880.0))
+            .max_w(px(OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH))
             .mx_auto()
             .px(px(24.0))
             .py(px(20.0))

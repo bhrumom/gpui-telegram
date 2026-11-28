@@ -113,15 +113,16 @@ pub fn plain_text_of_segments(segs: &[StyledSegment]) -> String {
 }
 
 pub fn utf16_to_byte_range(text: &str, offset_utf16: usize, length_utf16: usize) -> Option<(usize, usize)> {
+    let target_end_u16 = offset_utf16.saturating_add(length_utf16);
     let mut cur_u16 = 0usize;
     let mut start_byte = if offset_utf16 == 0 { Some(0) } else { None };
-    let mut end_byte = if offset_utf16 + length_utf16 == 0 { Some(0) } else { None };
+    let mut end_byte = if target_end_u16 == 0 { Some(0) } else { None };
     for (byte_idx, ch) in text.char_indices() {
         if start_byte.is_none() && cur_u16 >= offset_utf16 {
             start_byte = Some(byte_idx);
         }
-        cur_u16 += ch.len_utf16();
-        if end_byte.is_none() && cur_u16 >= offset_utf16 + length_utf16 {
+        cur_u16 = cur_u16.saturating_add(ch.len_utf16());
+        if end_byte.is_none() && cur_u16 >= target_end_u16 {
             end_byte = Some(byte_idx + ch.len_utf8());
             break;
         }
@@ -138,7 +139,11 @@ pub fn utf16_to_byte_range(text: &str, offset_utf16: usize, length_utf16: usize)
 }
 
 pub fn byte_to_utf16_offset(text: &str, byte_idx: usize) -> usize {
-    text[..byte_idx.min(text.len())].encode_utf16().count()
+    let mut safe = byte_idx.min(text.len());
+    while safe > 0 && !text.is_char_boundary(safe) {
+        safe -= 1;
+    }
+    text[..safe].encode_utf16().count()
 }
 
 pub fn parse_rich_blocks(text: &str, explicit: &[RichEntity]) -> Vec<RichBlock> {
@@ -864,11 +869,14 @@ fn parse_inline_markdown(text: &str, spoiler_id: &mut usize) -> Vec<StyledSegmen
                 }
             }
         }
-        if (rem.starts_with('@')
-            || rem.starts_with('#')
-            || (rem.starts_with('/')
-                && (pos == 0
-                    || text[..pos].ends_with(|c: char| c.is_whitespace() || c == '(' || c == '（'))))
+        let leading_ok = pos == 0
+            || text[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == '(' || c == '（');
+        if (rem.starts_with('#')
+            || (rem.starts_with('@') && leading_ok)
+            || (rem.starts_with('/') && leading_ok))
             && rem.len() > 1
         {
             let prefix = rem.chars().next().unwrap();

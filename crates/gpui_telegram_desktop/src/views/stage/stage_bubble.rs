@@ -44,8 +44,178 @@ use super::stage_context_menu::{
 /// Compact minimum bubble width in Apple Messages style so short messages like "好" / "OK"
 /// hug tightly as sleek pills without altering `history_element::MSG_MIN_WIDTH` (`160.0`).
 pub const APPLE_MSG_MIN_WIDTH: f32 = 38.0;
-const APPLE_AVATAR_SIZE: f32 = 32.0;
-const APPLE_AVATAR_SKIP: f32 = 44.0;
+pub const APPLE_AVATAR_SIZE: f32 = 32.0;
+pub const APPLE_AVATAR_SKIP: f32 = 36.0;
+pub const OPENBOT_ENTRY_GAP_PX: f32 = 12.0;
+pub const OPENBOT_GROUPED_GAP_PX: f32 = 4.0;
+pub const OPENBOT_BUBBLE_RADIUS_OUTER_PX: f32 = 22.0;
+pub const OPENBOT_BUBBLE_RADIUS_GROUPED_PX: f32 = 6.0;
+pub const OPENBOT_ERROR_PRE_MAX_HEIGHT_PX: f32 = 160.0;
+pub const OPENBOT_REPLY_QUOTE_BORDER_PX: f32 = 2.0;
+pub const OPENBOT_REPLY_QUOTE_MAX_HEIGHT_PX: f32 = 60.0;
+
+/// Single-source-of-truth error drawer button label (`"Show error"` / `"Hide error"`).
+pub fn openbot_error_drawer_btn_label(expanded: bool, lang_id: &str) -> &'static str {
+    if expanded {
+        tr_str(lang_id, "隐藏错误详情", "Hide error")
+    } else {
+        tr_str(lang_id, "显示错误详情", "Show error")
+    }
+}
+
+/// Single-source-of-truth layout snapshot for OpenBot 1:1 chat message bubbles (`UI-F10`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotBubbleLayoutSnapshot {
+    pub author: &'static str,
+    pub entry_gap_px: f32,
+    pub grouped_gap_px: f32,
+    pub bg_hex: String,
+    pub resolved_text_hex: String,
+    pub uses_legacy_blue: bool,
+    pub radius_outer_px: f32,
+    pub radius_grouped_px: f32,
+    pub actions_opacity_rest: f32,
+    pub time_opacity_rest: f32,
+    pub actions_opacity_hover: f32,
+    pub structured_error_quarantined: bool,
+    pub contains_raw_json_wall: bool,
+    pub error_drawer_open: bool,
+    pub error_drawer_btn_label: &'static str,
+    pub error_pre_max_height_px: f32,
+    pub wide_table_or_code: bool,
+    pub pending_error_retry: bool,
+}
+
+pub fn compute_openbot_bubble_layout(
+    msg: &MessageItemModel,
+    _group: BubbleGroupLayout,
+    _is_row_hovered: bool,
+    error_expanded: bool,
+    palette: &TdesktopThemePalette,
+    lang_id: &str,
+) -> OpenBotBubbleLayoutSnapshot {
+    let is_outgoing = msg.direction == MessageDirection::Outgoing;
+    let bg_u32 = if is_outgoing {
+        palette.msg_out_bg
+    } else {
+        palette.msg_in_bg
+    };
+    let fg_u32 = if is_outgoing {
+        palette.msg_out_fg
+    } else {
+        palette.text_primary
+    };
+    let bg_hex = format!("#{:06x}", bg_u32 & 0x00FF_FFFF);
+    let resolved_text_hex = format!("#{:06x}", fg_u32 & 0x00FF_FFFF);
+    let uses_legacy_blue = bg_u32 == 0x007AFF || bg_u32 == 0x0A84FF || bg_u32 == 0x3390EC;
+    let raw_text = match &msg.content {
+        MessageContent::Text { text, .. } => text.as_str(),
+        _ => "",
+    };
+    let structured_error = if !is_outgoing {
+        extract_structured_error_payload(raw_text)
+    } else {
+        None
+    };
+    let structured_error_quarantined = structured_error.is_some();
+    let contains_raw_json_wall = if structured_error_quarantined {
+        false
+    } else {
+        let trimmed = raw_text.trim();
+        trimmed.starts_with("{\"error\"") || trimmed.contains("\"stack_trace\"")
+    };
+    let wide_table_or_code =
+        raw_text.contains("```") || (raw_text.contains('|') && raw_text.contains("---"));
+    let pending_error_retry = is_outgoing && msg.delivery_status == DeliveryStatus::Failed;
+
+    OpenBotBubbleLayoutSnapshot {
+        author: if is_outgoing { "user" } else { "assistant" },
+        entry_gap_px: OPENBOT_ENTRY_GAP_PX,
+        grouped_gap_px: OPENBOT_GROUPED_GAP_PX,
+        bg_hex,
+        resolved_text_hex,
+        uses_legacy_blue,
+        radius_outer_px: OPENBOT_BUBBLE_RADIUS_OUTER_PX,
+        radius_grouped_px: OPENBOT_BUBBLE_RADIUS_GROUPED_PX,
+        actions_opacity_rest: 0.0,
+        time_opacity_rest: 0.0,
+        actions_opacity_hover: 1.0,
+        structured_error_quarantined,
+        contains_raw_json_wall,
+        error_drawer_open: error_expanded,
+        error_drawer_btn_label: openbot_error_drawer_btn_label(error_expanded, lang_id),
+        error_pre_max_height_px: OPENBOT_ERROR_PRE_MAX_HEIGHT_PX,
+        wide_table_or_code,
+        pending_error_retry,
+    }
+}
+
+/// Single-source-of-truth layout snapshot for multi-author OpenBot group (Channel) messages (`UI-F11`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotGroupMessageLayout {
+    pub show_author: bool,
+    pub bubble_style: &'static str,
+    pub author_gutter_px: f32,
+    pub author_avatar_px: f32,
+    pub author_avatar_clickable: bool,
+    pub author_name_clickable: bool,
+    pub author_label: String,
+    pub author_name_color: String,
+    pub consecutive_header_collapsed: bool,
+}
+
+pub fn compute_group_message_layout(
+    messages: &[MessageItemModel],
+    idx: usize,
+    sender_hue: Option<openbot_contracts::avatar::AvatarHue>,
+    sender_color_override: Option<&str>,
+) -> OpenBotGroupMessageLayout {
+    let Some(msg) = messages.get(idx) else {
+        return OpenBotGroupMessageLayout {
+            show_author: true,
+            bubble_style: "classic",
+            author_gutter_px: APPLE_AVATAR_SKIP,
+            author_avatar_px: APPLE_AVATAR_SIZE,
+            author_avatar_clickable: false,
+            author_name_clickable: false,
+            author_label: crate::views::openbot::channel_view::UNAVAILABLE_CHANNEL_AUTHOR_LABEL
+                .to_string(),
+            author_name_color: openbot_contracts::avatar::avatar_head_color(
+                "unavailable",
+                sender_hue,
+                sender_color_override,
+            ),
+            consecutive_header_collapsed: false,
+        };
+    };
+    let (attached_prev, _) = crate::views::conversation_stage::compute_attachment(messages, idx);
+    let is_outgoing = msg.direction == MessageDirection::Outgoing;
+    let author_label = crate::views::openbot::channel_view::resolve_channel_author_label(
+        Some(&msg.sender_name),
+    )
+    .to_string();
+    let seed = if msg.sender_name.is_empty() {
+        format!("sender-{}", msg.sender_id)
+    } else {
+        msg.sender_name.clone()
+    };
+    let author_name_color = openbot_contracts::avatar::avatar_head_color(
+        &seed,
+        sender_hue,
+        sender_color_override,
+    );
+    OpenBotGroupMessageLayout {
+        show_author: !is_outgoing,
+        bubble_style: "classic",
+        author_gutter_px: APPLE_AVATAR_SKIP,
+        author_avatar_px: APPLE_AVATAR_SIZE,
+        author_avatar_clickable: !is_outgoing && msg.sender_id > 0,
+        author_name_clickable: !is_outgoing && msg.sender_id > 0,
+        author_label,
+        author_name_color,
+        consecutive_header_collapsed: attached_prev,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BubbleGroupLayout {
@@ -87,6 +257,7 @@ pub enum BubbleUiAction {
         user_id: u64,
         sender_name: String,
     },
+    RetryFailedMessage(u64),
 }
 
 /// Optional OpenBot-specific per-row context passed into `render_message_row_openbot`.
@@ -587,7 +758,9 @@ pub fn render_message_row_openbot<V: 'static>(
                     || text.contains("分配")
                     || text.contains("转交")
                     || text.contains("joined")
-                    || text.contains("加入"));
+                    || text.contains("加入")
+                    || text.contains("asked")
+                    || text.contains("已询问"));
             let pill_hover = ob.hover();
             return div()
                 .id(SharedString::from(format!("svc-row-{}", msg_id)))
@@ -693,14 +866,20 @@ pub fn render_message_row_openbot<V: 'static>(
             .into_any_element();
     }
 
+    let bubble_layout =
+        compute_openbot_bubble_layout(msg, group, is_row_hovered, extra.error_expanded, palette, lang_id);
     let is_apple_out = is_apple && is_outgoing;
     let eff_r = if is_apple {
-        22.0
+        bubble_layout.radius_outer_px
     } else {
         palette.bubble_radius_px as f32
     };
     let r_lg = if is_apple { eff_r } else { palette.scaled_px(eff_r) };
-    let r_sm = if is_apple { 6.0 } else { palette.scaled_px(4.0) };
+    let r_sm = if is_apple {
+        bubble_layout.radius_grouped_px
+    } else {
+        palette.scaled_px(4.0)
+    };
     let (tl, tr, br, bl) = if is_outgoing {
         (
             r_lg,
@@ -806,7 +985,7 @@ pub fn render_message_row_openbot<V: 'static>(
     });
     let avatar_skip = if !is_outgoing && group.reserve_avatar_column {
         if is_apple {
-            APPLE_AVATAR_SKIP
+            compute_group_message_layout(std::slice::from_ref(msg), 0, None, None).author_gutter_px
         } else {
             MSG_PHOTO_SKIP
         }
@@ -995,6 +1174,7 @@ pub fn render_message_row_openbot<V: 'static>(
                 .id(SharedString::from(format!("reply-hdr-{}", msg_id)))
                 .w_full()
                 .min_w(px(0.0))
+                .when(is_apple, |el| el.max_h(px(OPENBOT_REPLY_QUOTE_MAX_HEIGHT_PX)))
                 .overflow_hidden()
                 .mb(px(5.0))
                 .pl(px(8.0))
@@ -1301,9 +1481,16 @@ pub fn render_message_row_openbot<V: 'static>(
         .when(is_outgoing, |el| el.items_end().ml(px(if is_apple { 28.0 } else { 56.0 })))
         .when(!is_outgoing, |el| el.items_start().mr(px(if is_apple { 28.0 } else { 56.0 })));
 
-    if is_apple && !is_outgoing && !group.attached_to_prev && (extra.is_group_chat || group.show_sender_name) && !msg.sender_name.trim().is_empty() {
+    if is_apple
+        && !is_outgoing
+        && !group.attached_to_prev
+        && (extra.is_group_chat || (group.show_sender_name && !msg.sender_name.trim().is_empty()))
+    {
         let sender_uid = msg.sender_id;
-        let sender_name = msg.sender_name.clone();
+        let sender_name = crate::views::openbot::channel_view::resolve_channel_author_label(
+            Some(&msg.sender_name),
+        )
+        .to_string();
         let hue_name = extra
             .sender_hue_name
             .filter(|h| TdesktopThemePalette::is_tinted_bot_hue(h))
@@ -1361,6 +1548,46 @@ pub fn render_message_row_openbot<V: 'static>(
         stack = stack.child(render_inline_bot_keyboard(msg_id, kb, palette, cx, move |this, i, cx| {
             a_bot(this, BubbleUiAction::Interactive(i), cx);
         }));
+    }
+
+    if is_apple && !has_any_selection && bubble_layout.pending_error_retry {
+        let a_retry = on_action.clone();
+        stack = stack.child(
+            div()
+                .id(SharedString::from(format!("bubble-retry-row-{}", msg_id)))
+                .mt(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(ob.danger())
+                        .child(tr_str(lang_id, "发送失败", "Failed to send")),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("bubble-retry-btn-{}", msg_id)))
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(999.0))
+                        .bg(ob.bg_control())
+                        .border_1()
+                        .border_color(ob.danger())
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.danger())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_retry(this, BubbleUiAction::RetryFailedMessage(msg_id), cx);
+                            }),
+                        )
+                        .child(tr_str(lang_id, "重试", "Retry")),
+                ),
+        );
     }
 
     if is_apple && !has_any_selection {
@@ -1532,9 +1759,13 @@ pub fn render_message_row_openbot<V: 'static>(
     let _ = is_last_outgoing;
 
     let base_pt: f32 = if group.attached_to_prev {
-        2.0
+        if is_apple {
+            bubble_layout.grouped_gap_px
+        } else {
+            2.0
+        }
     } else if is_apple {
-        12.0
+        bubble_layout.entry_gap_px
     } else {
         7.0
     };
@@ -1596,7 +1827,7 @@ pub fn render_message_row_openbot<V: 'static>(
         row = row.child(
             div()
                 .w(px(av_skip))
-                .pr(px(if is_apple { 8.0 } else { 6.0 }))
+                .pr(px(if is_apple { 4.0 } else { 6.0 }))
                 .flex_shrink_0()
                 .flex()
                 .justify_start()
@@ -2079,6 +2310,7 @@ fn render_bottom_meta_strip(
                 DeliveryStatus::Sending => (IconName::ClockSending, fg),
                 DeliveryStatus::Sent => (IconName::CheckSingle, palette.check_sent_fg),
                 DeliveryStatus::Read => (IconName::CheckDouble, palette.check_read_fg),
+                DeliveryStatus::Failed => (IconName::Close, 0xFF453A),
             };
             el.child(tg_icon(icon, palette.scaled_px(13.0), tint))
         })
@@ -2375,11 +2607,7 @@ fn render_structured_error_step_card<V: 'static>(
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(ob.text_muted())
-                                .child(if expanded {
-                                    tr_str(lang_id, "隐藏错误详情", "Hide error")
-                                } else {
-                                    tr_str(lang_id, "显示错误详情", "Show error")
-                                }),
+                                .child(openbot_error_drawer_btn_label(expanded, lang_id)),
                         ),
                 )
                 .when(expanded, |row| {
@@ -2416,7 +2644,7 @@ fn render_structured_error_step_card<V: 'static>(
                 div()
                     .id(SharedString::from(format!("agent-step-error-pre-{}", msg_id)))
                     .w_full()
-                    .max_h(px(160.0))
+                    .max_h(px(OPENBOT_ERROR_PRE_MAX_HEIGHT_PX))
                     .overflow_y_scroll()
                     .rounded(px(4.0))
                     .bg(ob.bg_control())
@@ -2574,5 +2802,61 @@ mod tests {
     fn ignores_normal_assistant_prose_and_short_json() {
         assert!(extract_structured_error_payload("Hello! Here is your summary.").is_none());
         assert!(extract_structured_error_payload("{\"hello\": \"world\"}").is_none());
+    }
+
+    #[std::prelude::v1::test]
+    fn group_message_layout_guards_empty_and_oob_index_and_bubble_derives_retry() {
+        let fallback = compute_group_message_layout(&[], 0, None, None);
+        assert_eq!(
+            fallback.author_label,
+            crate::views::openbot::channel_view::UNAVAILABLE_CHANNEL_AUTHOR_LABEL
+        );
+        assert!(!fallback.author_avatar_clickable);
+        assert!(!fallback.author_name_clickable);
+
+        let pal = TdesktopThemePalette::build_openbot(
+            crate::theme::TdesktopThemeMode::Night,
+            0x007CF7,
+            14,
+            16,
+        );
+        let failed_msg = MessageItemModel {
+            id: 42,
+            sender_id: 1,
+            sender_name: "Me".to_string(),
+            avatar_initials: "ME".to_string(),
+            avatar_color: 0x007CF7,
+            direction: MessageDirection::Outgoing,
+            timestamp: "10:02".to_string(),
+            content: MessageContent::Text {
+                text: "Retry me".to_string(),
+                is_edited: false,
+            },
+            delivery_status: DeliveryStatus::Failed,
+            is_pinned: false,
+            reply_to: None,
+            reactions: Vec::new(),
+            bot_keyboard: None,
+        };
+        let oob = compute_group_message_layout(&[failed_msg.clone()], 9, None, None);
+        assert_eq!(
+            oob.author_label,
+            crate::views::openbot::channel_view::UNAVAILABLE_CHANNEL_AUTHOR_LABEL
+        );
+        let grp = BubbleGroupLayout {
+            attached_to_prev: false,
+            attached_to_next: false,
+            show_sender_name: false,
+            show_bottom_avatar: false,
+            show_tail: false,
+            reserve_avatar_column: false,
+        };
+        let layout_failed = compute_openbot_bubble_layout(&failed_msg, grp, false, false, &pal, "en");
+        assert!(layout_failed.pending_error_retry);
+
+        let mut sent_msg = failed_msg;
+        sent_msg.delivery_status = DeliveryStatus::Read;
+        let layout_sent = compute_openbot_bubble_layout(&sent_msg, grp, false, false, &pal, "en");
+        assert!(!layout_sent.pending_error_retry);
     }
 }

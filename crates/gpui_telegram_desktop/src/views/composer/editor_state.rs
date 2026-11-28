@@ -78,9 +78,21 @@ impl ComposerEditorState {
         })
     }
 
+    pub fn clamped_selected_range(&self, text: &str, cursor: usize) -> Option<(usize, usize)> {
+        let cur = clamp_char_boundary(text, cursor);
+        self.selection_anchor.and_then(|raw_anc| {
+            let anc = clamp_char_boundary(text, raw_anc);
+            if anc == cur {
+                None
+            } else {
+                Some((anc.min(cur), anc.max(cur)))
+            }
+        })
+    }
+
     pub fn selected_text<'a>(&self, ime: &'a ImeSafetyMachine) -> Option<&'a str> {
-        let cur = clamp_char_boundary(&ime.text_buffer, ime.cursor_index);
-        self.selected_range(cur).and_then(|(s, e)| ime.text_buffer.get(s..e))
+        self.clamped_selected_range(&ime.text_buffer, ime.cursor_index)
+            .and_then(|(s, e)| ime.text_buffer.get(s..e))
     }
 
     pub fn select_all(&mut self, ime: &mut ImeSafetyMachine) {
@@ -98,7 +110,7 @@ impl ComposerEditorState {
         if extend_selection && self.selection_anchor.is_none() {
             self.selection_anchor = Some(cur);
         } else if !extend_selection {
-            if let Some((s, _)) = self.selected_range(cur) {
+            if let Some((s, _)) = self.clamped_selected_range(&ime.text_buffer, cur) {
                 ime.cursor_index = s;
                 self.selection_anchor = None;
                 return;
@@ -117,7 +129,7 @@ impl ComposerEditorState {
         if extend_selection && self.selection_anchor.is_none() {
             self.selection_anchor = Some(cur);
         } else if !extend_selection {
-            if let Some((_, e)) = self.selected_range(cur) {
+            if let Some((_, e)) = self.clamped_selected_range(&ime.text_buffer, cur) {
                 ime.cursor_index = e;
                 self.selection_anchor = None;
                 return;
@@ -154,7 +166,7 @@ impl ComposerEditorState {
     pub fn insert_at_cursor(&mut self, ime: &mut ImeSafetyMachine, text: &str) {
         self.push_undo(ime);
         let cur = clamp_char_boundary(&ime.text_buffer, ime.cursor_index);
-        if let Some((s, e)) = self.selected_range(cur) {
+        if let Some((s, e)) = self.clamped_selected_range(&ime.text_buffer, cur) {
             ime.text_buffer.replace_range(s..e, text);
             ime.cursor_index = s + text.len();
             self.selection_anchor = None;
@@ -168,7 +180,7 @@ impl ComposerEditorState {
     pub fn backspace_or_delete_sel(&mut self, ime: &mut ImeSafetyMachine) {
         self.push_undo(ime);
         let cur = clamp_char_boundary(&ime.text_buffer, ime.cursor_index);
-        if let Some((s, e)) = self.selected_range(cur) {
+        if let Some((s, e)) = self.clamped_selected_range(&ime.text_buffer, cur) {
             ime.text_buffer.replace_range(s..e, "");
             ime.cursor_index = s;
             self.selection_anchor = None;
@@ -185,7 +197,7 @@ impl ComposerEditorState {
     pub fn delete_forward(&mut self, ime: &mut ImeSafetyMachine) {
         self.push_undo(ime);
         let cur = clamp_char_boundary(&ime.text_buffer, ime.cursor_index);
-        if let Some((s, e)) = self.selected_range(cur) {
+        if let Some((s, e)) = self.clamped_selected_range(&ime.text_buffer, cur) {
             ime.text_buffer.replace_range(s..e, "");
             ime.cursor_index = s;
             self.selection_anchor = None;
@@ -198,7 +210,7 @@ impl ComposerEditorState {
     pub fn wrap_selection(&mut self, ime: &mut ImeSafetyMachine, prefix: &str, suffix: &str) {
         self.push_undo(ime);
         let cur = clamp_char_boundary(&ime.text_buffer, ime.cursor_index);
-        if let Some((s, e)) = self.selected_range(cur) {
+        if let Some((s, e)) = self.clamped_selected_range(&ime.text_buffer, cur) {
             let inner = ime.text_buffer[s..e].to_string();
             let wrapped = format!("{}{}{}", prefix, inner, suffix);
             ime.text_buffer.replace_range(s..e, &wrapped);
@@ -221,10 +233,11 @@ pub fn clamp_char_boundary(s: &str, mut idx: usize) -> usize {
 }
 
 pub fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    let idx = clamp_char_boundary(s, idx);
     if idx == 0 {
         return 0;
     }
-    let mut p = (idx - 1).min(s.len());
+    let mut p = idx - 1;
     while p > 0 && !s.is_char_boundary(p) {
         p -= 1;
     }
@@ -276,9 +289,19 @@ pub fn detect_autocomplete_trigger(text: &str, cursor: usize) -> Option<(char, S
         .unwrap_or(0);
     let token = &prefix[token_start..];
     let first = token.chars().next()?;
-    if first == '$'
-        || (matches!(first, '@' | '/' | '#' | ':') && !token[first.len_utf8()..].contains(':'))
-    {
+    if first == '$' {
+        let rest = &token[1..];
+        if !rest.is_empty()
+            && rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '$'))
+        {
+            return None;
+        }
+        return Some((first, token.to_string(), token_start));
+    }
+    if matches!(first, '@' | '/' | '#' | ':') && !token[first.len_utf8()..].contains(':') {
         Some((first, token.to_string(), token_start))
     } else {
         None
@@ -286,38 +309,68 @@ pub fn detect_autocomplete_trigger(text: &str, cursor: usize) -> Option<(char, S
 }
 
 /// If the cursor sits immediately after a completed OpenBot structured reference chip
-/// `@[Display Name](kind:id)` (optionally followed by a single trailing space), returns
-/// `(start_byte, end_byte)` on valid UTF-8 boundaries so Backspace deletes the chip atomically.
+/// (`@[Display Name](kind:id)`, `@everyone`, or `$skill:<slug>` / `$mcp:<slug>` / `$workflow:<slug>` /
+/// `$routine:<slug>`, optionally followed by a single trailing space), returns `(start_byte, end_byte)`
+/// on valid UTF-8 boundaries so Backspace deletes the chip atomically.
 pub fn atomic_reference_chip_span_before_cursor(text: &str, cursor: usize) -> Option<(usize, usize)> {
     let cur = clamp_char_boundary(text, cursor);
     if cur == 0 {
         return None;
     }
     let prefix = &text[..cur];
-    let chip_end = if let Some(without_space) = prefix.strip_suffix(' ') {
-        if without_space.ends_with(')') {
-            without_space.len()
-        } else {
-            return None;
+    let trimmed = prefix.strip_suffix(' ').unwrap_or(prefix);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Structured `@[Display Name](kind:id)` reference chip.
+    if trimmed.ends_with(')') {
+        let chip_end = trimmed.len();
+        let before_close = &text[..chip_end - 1];
+        if let Some(lp_idx) = before_close.rfind("](") {
+            let target = &before_close[lp_idx + 2..];
+            if !target.is_empty()
+                && !target.contains(')')
+                && !target.contains('\n')
+                && target.contains(':')
+            {
+                let before_br = &text[..lp_idx];
+                if let Some(start_idx) = before_br.rfind("@[") {
+                    let label = &before_br[start_idx + 2..];
+                    if !label.is_empty() && !label.contains(']') && !label.contains('\n') {
+                        return Some((start_idx, cur));
+                    }
+                }
+            }
         }
-    } else if prefix.ends_with(')') {
-        prefix.len()
-    } else {
-        return None;
-    };
-    let before_close = &text[..chip_end - 1];
-    let lp_idx = before_close.rfind("](")?;
-    let target = &before_close[lp_idx + 2..];
-    if target.is_empty() || target.contains(')') || target.contains('\n') || !target.contains(':') {
-        return None;
     }
-    let before_br = &text[..lp_idx];
-    let start_idx = before_br.rfind("@[")?;
-    let label = &before_br[start_idx + 2..];
-    if label.is_empty() || label.contains(']') || label.contains('\n') {
-        return None;
+
+    // 2. Word-bounded `@everyone` and `$skill:<slug>` / `$mcp:<slug>` / `$workflow:<slug>` / `$routine:<slug>` chips.
+    let token_start = trimmed
+        .rfind(|c: char| c.is_whitespace())
+        .map(|idx| idx + trimmed[idx..].chars().next().map_or(1, char::len_utf8))
+        .unwrap_or(0);
+    let token = &trimmed[token_start..];
+    if token.eq_ignore_ascii_case("@everyone") {
+        return Some((token_start, cur));
     }
-    Some((start_idx, cur))
+    if let Some(rest) = token.strip_prefix('$') {
+        if let Some((kind, slug)) = rest.split_once(':') {
+            let valid_kind = matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "skill" | "mcp" | "workflow" | "routine"
+            );
+            if valid_kind
+                && !slug.is_empty()
+                && slug
+                    .chars()
+                    .all(|c| !c.is_whitespace() && !matches!(c, '$' | '@' | '\n' | '\r'))
+            {
+                return Some((token_start, cur));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -340,5 +393,38 @@ mod atomic_chip_tests {
         let mut ed = ComposerEditorState::new();
         ed.backspace_or_delete_sel(&mut ime);
         assert_eq!(ime.text(), "hello (world");
+    }
+
+    #[std::prelude::v1::test]
+    fn selection_and_prev_char_boundary_guard_stale_oob_and_mid_utf8_offsets() {
+        assert_eq!(prev_char_boundary("你好", 999), 3);
+        assert_eq!(prev_char_boundary("你好", 6), 3);
+        assert_eq!(prev_char_boundary("你好", 3), 0);
+        assert_eq!(prev_char_boundary("", 99), 0);
+
+        let mut ime = ImeSafetyMachine::with_text("你好世界");
+        let mut ed = ComposerEditorState::new();
+        // Mid-UTF-8 anchor + OOB cursor must not panic across any editor mutation
+        ed.selection_anchor = Some(2);
+        ime.cursor_index = 999;
+        assert_eq!(ed.selected_text(&ime), Some("你好世界"));
+
+        ed.wrap_selection(&mut ime, "**", "**");
+        assert_eq!(ime.text(), "**你好世界**");
+
+        ed.selection_anchor = Some(999);
+        ime.cursor_index = 4; // inside '你'
+        ed.insert_at_cursor(&mut ime, "!");
+        assert!(ime.text().ends_with('!'));
+
+        ed.selection_anchor = Some(999);
+        ime.cursor_index = 1;
+        ed.backspace_or_delete_sel(&mut ime);
+        assert_eq!(ime.text(), "*");
+
+        ed.selection_anchor = Some(50);
+        ime.cursor_index = 0;
+        ed.delete_forward(&mut ime);
+        assert_eq!(ime.text(), "");
     }
 }

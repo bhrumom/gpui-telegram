@@ -138,13 +138,15 @@ pub enum ThemePaletteError {
     InvalidColor(String),
     CssInjectionAttempt(String),
     UnknownBackdropScene(String),
+    InvalidFontFamily(String),
 }
 
 impl ThemePaletteError {
-    /// Canonical error code (`"io_error"` vs `"validation_error"`).
+    /// Canonical error code (`"io_error"`, `"invalid_font_family"`, or `"validation_error"`).
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Io(_) => "io_error",
+            Self::InvalidFontFamily(_) => "invalid_font_family",
             Self::OversizedFile(_)
             | Self::InvalidPaletteId(_)
             | Self::InvalidJson(_)
@@ -174,6 +176,7 @@ impl fmt::Display for ThemePaletteError {
             Self::InvalidColor(msg) => write!(f, "invalid theme color: {msg}"),
             Self::CssInjectionAttempt(msg) => write!(f, "rejected CSS injection attempt: {msg}"),
             Self::UnknownBackdropScene(msg) => write!(f, "unknown chat backdrop scene: {msg}"),
+            Self::InvalidFontFamily(msg) => write!(f, "invalid font family: {msg}"),
         }
     }
 }
@@ -1270,6 +1273,31 @@ pub fn try_solid_bubble_takes_dark_text(color: &str) -> Result<bool, ThemePalett
 pub fn solid_bubble_takes_dark_text(color: &str) -> bool {
     try_solid_bubble_takes_dark_text(color).unwrap_or(false)
 }
+
+/// Resolves the WCAG foreground RGB integer (`0x141414` dark vs `0xFFFFFF` white) for a solid bubble color.
+pub fn solid_bubble_text_rgb(color: &str) -> u32 {
+    if solid_bubble_takes_dark_text(color) {
+        0x141414
+    } else {
+        0xFFFFFF
+    }
+}
+
+/// Resolves the WCAG foreground hex (`"#141414"` dark vs `"#ffffff"` white) for a solid bubble color.
+pub fn solid_bubble_text_hex(color: &str) -> &'static str {
+    if solid_bubble_takes_dark_text(color) {
+        "#141414"
+    } else {
+        "#ffffff"
+    }
+}
+
+/// Canonical OpenBot z-index layer hierarchy (`packages/brand/src/tokens.css:L351-L358`).
+pub const OPENBOT_LAYER_DROPDOWN: usize = 40;
+pub const OPENBOT_LAYER_POPOVER: usize = 60;
+pub const OPENBOT_LAYER_DIALOG: usize = 100;
+pub const OPENBOT_LAYER_TOAST: usize = 120;
+pub const OPENBOT_LAYER_TOOLTIP: usize = 240;
 
 /// Supported OpenBot interface zoom percentages (`@openbot/contracts/app-interface-size`).
 pub const APP_INTERFACE_SIZES: [u16; 10] = [67, 75, 80, 90, 100, 110, 125, 150, 175, 200];

@@ -1240,7 +1240,7 @@ impl AppShell {
         })
         .detach();
         cx.observe(&self.composer, move |shell, comp, cx| {
-            let (att_opt, focused, launch_miniapp, kb_press, selected_send_as, comp_isolated) =
+            let (att_opt, focused, launch_miniapp, kb_press, selected_send_as, comp_isolated, draft_text) =
                 comp.update(cx, |c, _| {
                     (
                         c.submitted_attachment.take(),
@@ -1249,8 +1249,16 @@ impl AppShell {
                         c.take_bot_keyboard_press(),
                         c.selected_send_as_peer_id,
                         c.is_compose_isolated,
+                        c.text().to_string(),
                     )
                 });
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            shell.stage.update(cx, |st, _| {
+                st.sync_direct_dm_input(&draft_text, now_ms);
+            });
             let is_compose_or_modal = shell.is_compose_or_creation_modal_active(cx);
             let composer_focus_active = focused
                 && shell.is_chats_inline_unoccluded(cx)
@@ -2104,6 +2112,7 @@ impl AppShell {
             }
             SettingsRouterEvent::CheckForUpdates => self.trigger_update_check(true, cx),
             SettingsRouterEvent::TriggerOneClickUpdate => self.trigger_one_click_update(cx),
+            SettingsRouterEvent::ShowToast(msg) => self.show_non_chat_toast(msg.clone(), 2400, cx),
         }
     }
 }

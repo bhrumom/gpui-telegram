@@ -54,6 +54,8 @@ pub struct SidebarAgentItem {
     pub title: String,
     pub preview: String,
     pub avatar_seed: String,
+    #[serde(default)]
+    pub avatar_shape: Option<String>,
     pub avatar_hue: Option<AvatarHue>,
     pub avatar_color: Option<String>,
     pub avatar_url: Option<String>,
@@ -79,6 +81,7 @@ impl SidebarAgentItem {
             title: summary.title.clone(),
             preview: summary.preview.clone(),
             avatar_seed: summary.avatar_seed.clone(),
+            avatar_shape: None,
             avatar_hue: summary.avatar_hue,
             avatar_color: summary.avatar_color.clone().flatten(),
             avatar_url: summary.avatar_url.clone(),

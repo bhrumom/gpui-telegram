@@ -157,6 +157,7 @@ pub enum SettingsRouterEvent {
     ActiveInputFieldChanged,
     CheckForUpdates,
     TriggerOneClickUpdate,
+    ShowToast(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +413,8 @@ const SETTINGS_NAV_SEARCH_CATALOG: &[SettingsNavSearchRow] = &[
 
 /// Manages settings navigation stack, modal rendering, and lazy instantiation of all settings sections.
 pub struct SettingsRouter {
+    pub is_open: bool,
+    pub save_bar: super::settings_theme_ui::SaveBarDockState,
     pub settings_section: SettingsSectionType,
     pub settings_stack: Vec<SettingsSectionType>,
     pub standalone_computers_mode: bool,
@@ -515,6 +518,8 @@ impl SettingsRouter {
     ) -> Self {
         let lang_id = if is_chinese_locale { "zh-CN" } else { "en" };
         Self {
+            is_open: true,
+            save_bar: super::settings_theme_ui::SaveBarDockState::default(),
             settings_section: SettingsSectionType::Main,
             settings_stack: Vec::new(),
             standalone_computers_mode: false,
@@ -1023,6 +1028,35 @@ impl SettingsRouter {
         Self::rank_nav_search_entries(&self.nav_search_query)
     }
 
+    /// Maps a `GlobalSearch` (`Cmd+K`) `"setting:*"` item ID to its authoritative [`SettingsSectionType`] (`PAIR-12`).
+    pub fn resolve_global_search_settings_section(item_id: &str) -> Option<SettingsSectionType> {
+        match item_id.trim() {
+            "setting:main" => Some(SettingsSectionType::Main),
+            "setting:chat" => Some(SettingsSectionType::Chat),
+            "setting:folders" => Some(SettingsSectionType::Folders),
+            "setting:ai_providers" => Some(SettingsSectionType::AiProviders),
+            "setting:privacy" => Some(SettingsSectionType::PrivacySecurity),
+            "setting:shortcuts" => Some(SettingsSectionType::Shortcuts),
+            _ => None,
+        }
+    }
+
+    /// Opens the corresponding settings section directly from an activated `GlobalSearchResultItem` (`PAIR-12`).
+    pub fn open_from_global_search_hit(
+        &mut self,
+        item: &crate::views::openbot::agent_studio::GlobalSearchResultItem,
+    ) -> Option<SettingsSectionType> {
+        let target = Self::resolve_global_search_settings_section(&item.id)?;
+        self.is_open = true;
+        self.nav_search_focused = false;
+        if target != SettingsSectionType::Computers {
+            self.standalone_computers_mode = false;
+        }
+        self.settings_stack.clear();
+        self.settings_section = target;
+        Some(target)
+    }
+
     /// Navigates to `target`, clearing history when entering the settings modal or pushing onto the history stack.
     pub fn navigate_to(
         &mut self,
@@ -1030,6 +1064,7 @@ impl SettingsRouter {
         entering_settings_modal: bool,
         cx: &mut Context<Self>,
     ) {
+        self.is_open = true;
         self.nav_search_focused = false;
         if self.settings_section == SettingsSectionType::Calls && target != SettingsSectionType::Calls {
             self.stop_mic_test_if_active(cx);
@@ -1113,8 +1148,23 @@ impl SettingsRouter {
         }
     }
 
+    /// Pure progressive Escape handler (`UI-F19`):
+    /// 1st Esc clears `nav_search_query` (returns `true`, keeping settings open);
+    /// 2nd Esc closes settings (`is_open = false`, returns `false`).
+    pub fn handle_escape_key(&mut self) -> bool {
+        if !self.nav_search_query.is_empty() {
+            self.nav_search_query.clear();
+            self.nav_search_selected_index = 0;
+            return true;
+        }
+        self.nav_search_focused = false;
+        self.is_open = false;
+        false
+    }
+
     /// Resets section and navigation stack and emits `SettingsRouterEvent::CloseRequested`.
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.is_open = false;
         self.stop_mic_test_if_active(cx);
         self.clear_all_preedits(cx);
         self.standalone_computers_mode = false;
@@ -1131,6 +1181,7 @@ impl SettingsRouter {
     /// Stops any active mic test, clears section preedits, and resets the navigation stack
     /// back to `Main` without emitting `SettingsRouterEvent::CloseRequested`.
     pub fn close_silent(&mut self, cx: &mut Context<Self>) {
+        self.is_open = false;
         self.stop_mic_test_if_active(cx);
         self.clear_all_preedits(cx);
         let changed = self.settings_section != SettingsSectionType::Main
@@ -1652,13 +1703,10 @@ impl SettingsRouter {
                     return Some(false);
                 }
                 "escape" => {
-                    if !self.nav_search_query.is_empty() {
-                        self.nav_search_query.clear();
-                        self.nav_search_selected_index = 0;
+                    if self.handle_escape_key() {
                         cx.notify();
                         return Some(true);
                     }
-                    self.nav_search_focused = false;
                     self.sync_active_input_key(cx);
                     cx.notify();
                     return Some(false);

@@ -3,7 +3,7 @@
 //! Mirrors `ChannelConversation.tsx`, `channel-conversation-rows.ts`, `ChannelActivityIndicator.tsx`,
 //! `AwaitingReplies.tsx`, and `ChannelStoppedTasks.tsx`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -43,6 +43,26 @@ pub const CHANNEL_REPLY_LIMIT: usize = openbot_contracts::channels::CHANNEL_REPL
 pub const CHANNEL_REPLY_CHARACTERS: usize = openbot_contracts::channels::CHANNEL_REPLY_CHARACTERS;
 /// Minimum conversation viewport width (`424px`).
 pub const CHANNEL_CONVERSATION_MIN_WIDTH_PX: f32 = 424.0;
+/// Fallback display label shown when a channel message author has been deleted or is unavailable (`UI-F11`).
+pub const UNAVAILABLE_CHANNEL_AUTHOR_LABEL: &str = "Unavailable agent";
+
+/// Returns the live context-menu items for a channel based on its archived state (`UI-F11`).
+pub fn channel_context_menu_items(archived: bool) -> Vec<&'static str> {
+    if archived {
+        vec!["Restore"]
+    } else {
+        vec!["Archive", "Settings"]
+    }
+}
+
+/// Resolves a channel author display label, falling back to [`UNAVAILABLE_CHANNEL_AUTHOR_LABEL`]
+/// when the agent is deleted or has an empty/whitespace name (`UI-F11`).
+pub fn resolve_channel_author_label<'a>(author_name: Option<&'a str>) -> &'a str {
+    author_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(UNAVAILABLE_CHANNEL_AUTHOR_LABEL)
+}
 
 /// Single coordinator routing event before consecutive-action merging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +424,10 @@ pub struct ChannelStoppedTasksState {
     pub items: Vec<StoppedChannelTaskBannerItem>,
     pub open_reassign_dropdown_task_id: Option<String>,
     pub can_cancel: bool,
+    #[serde(default)]
+    pub resuming_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub resume_dispatch_count: usize,
 }
 
 impl Default for ChannelStoppedTasksState {
@@ -412,6 +436,8 @@ impl Default for ChannelStoppedTasksState {
             items: Vec::new(),
             open_reassign_dropdown_task_id: None,
             can_cancel: true,
+            resuming_ids: BTreeSet::new(),
+            resume_dispatch_count: 0,
         }
     }
 }
@@ -422,7 +448,32 @@ impl ChannelStoppedTasksState {
             items,
             open_reassign_dropdown_task_id: None,
             can_cancel: true,
+            resuming_ids: BTreeSet::new(),
+            resume_dispatch_count: 0,
         }
+    }
+
+    /// Idempotent double-click guard for resuming a stopped channel task (`UI-F14`).
+    /// Returns `true` only on the first in-flight resume dispatch for an existing stopped task.
+    pub fn begin_resume(&mut self, task_id: &str) -> bool {
+        if !self.items.iter().any(|item| item.task_id == task_id) {
+            return false;
+        }
+        if !self.resuming_ids.insert(task_id.to_string()) {
+            return false;
+        }
+        self.resume_dispatch_count = self.resume_dispatch_count.saturating_add(1);
+        true
+    }
+
+    /// Clears the in-flight resume guard for `task_id` once resumption settles or cancels.
+    pub fn finish_resume(&mut self, task_id: &str) {
+        self.resuming_ids.remove(task_id);
+    }
+
+    /// Returns `true` while a resume request for `task_id` is currently in flight.
+    pub fn is_resuming(&self, task_id: &str) -> bool {
+        self.resuming_ids.contains(task_id)
     }
 
     /// Hydrates stopped/failed root task banners from contract [`ChannelTask`] rows.
@@ -484,6 +535,7 @@ impl ChannelStoppedTasksState {
 
     pub fn remove_task(&mut self, task_id: &str) {
         self.items.retain(|item| item.task_id != task_id);
+        self.resuming_ids.remove(task_id);
         if self.open_reassign_dropdown_task_id.as_deref() == Some(task_id) {
             self.open_reassign_dropdown_task_id = None;
         }
@@ -741,6 +793,8 @@ pub struct ChannelConversationState {
     pub archived: bool,
     pub reactions_enabled: bool,
     pub pins_enabled: bool,
+    pub mark_unread_enabled: bool,
+    pub thread_branch_enabled: bool,
     pub read_only: bool,
     pub messages: Vec<ChannelTimelineMessage>,
     pub routing_events: Vec<ChannelRoutingEvent>,
@@ -777,6 +831,8 @@ impl ChannelConversationState {
             archived: false,
             reactions_enabled: false,
             pins_enabled: false,
+            mark_unread_enabled: false,
+            thread_branch_enabled: false,
             read_only: false,
             messages: Vec::new(),
             routing_events: Vec::new(),
@@ -791,6 +847,23 @@ impl ChannelConversationState {
             reply_to_message_id: None,
             agent_names: BTreeMap::new(),
         }
+    }
+
+    /// Context-menu actions exposed for this channel based on its archived state (`UI-F11`).
+    pub fn context_menu_items(&self) -> Vec<&'static str> {
+        channel_context_menu_items(self.archived)
+    }
+
+    /// Resolves a member/author display name from `agent_names`, falling back to `"Unavailable agent"`.
+    pub fn resolve_author_label<'a>(&'a self, agent_id: &str) -> &'a str {
+        resolve_channel_author_label(self.agent_names.get(agent_id).map(String::as_str))
+    }
+
+    /// Returns `true` when `reply_to_message_id` references a message that is no longer present
+    /// in this channel timeline (deleted or evicted), triggering the dashed unavailable-reply notice (`UI-F11-05`).
+    pub fn is_reply_target_unavailable(&self, reply_to_message_id: &str) -> bool {
+        let trimmed = reply_to_message_id.trim();
+        trimmed.is_empty() || !self.messages.iter().any(|m| m.id == trimmed)
     }
 
     pub fn from_channel(channel: &Channel) -> Self {
@@ -863,8 +936,116 @@ impl ChannelConversationState {
         }
     }
 
+    /// Atomically synchronizes multi-worker channel activity, `AwaitingReplies`, and
+    /// `ChannelStoppedTasks` for a live group turn (`PAIR-17`).
+    pub fn sync_multi_worker_turn(
+        &mut self,
+        active_workers: &[ChannelWorkerBrief],
+        stopped_items: Vec<StoppedChannelTaskBannerItem>,
+        now_ms: u64,
+        reduced_motion: bool,
+    ) {
+        self.sync_activity_workers(active_workers, now_ms, reduced_motion);
+        for worker in active_workers {
+            self.awaiting_replies.upsert_entry(AwaitingReplyEntry {
+                agent_id: worker.id.clone(),
+                agent_name: worker.name.clone(),
+                state: AwaitingReplyState::Working,
+                preview: None,
+                delivery_id: None,
+                waiting_reason: None,
+            });
+        }
+        for stopped in &stopped_items {
+            if let Some(owner_id) = stopped.owner_agent_id.as_deref() {
+                if !self.awaiting_replies.mark_stopped(owner_id) {
+                    let owner_name = self
+                        .agent_names
+                        .get(owner_id)
+                        .cloned()
+                        .unwrap_or_else(|| owner_id.to_string());
+                    self.awaiting_replies.upsert_entry(AwaitingReplyEntry {
+                        agent_id: owner_id.to_string(),
+                        agent_name: owner_name,
+                        state: AwaitingReplyState::Stopped,
+                        preview: stopped.error.clone(),
+                        delivery_id: None,
+                        waiting_reason: None,
+                    });
+                }
+            }
+        }
+        self.stopped_tasks = ChannelStoppedTasksState::new(stopped_items);
+    }
+
+    /// Extracts `@[Name](agent:id)` and `@everyone` reference chips from a sent group message,
+    /// records merged `channel-routing` events on this conversation, and returns their render markers (`PAIR-16`).
+    pub fn record_routing_from_message(
+        &mut self,
+        text: &str,
+        palette: &crate::theme::TdesktopThemePalette,
+    ) -> Vec<ChannelActionMarkerLayout> {
+        let events = extract_routing_events_from_message_text(text, &self.members, palette);
+        if events.is_empty() {
+            return Vec::new();
+        }
+        self.routing_events.extend(events);
+        self.merged_routing_rows = merge_consecutive_routing_events(&self.routing_events);
+        compute_routing_action_markers(&self.merged_routing_rows, &self.agent_names)
+    }
+
+    /// Computes the tucked `.composer-stack` layout directly from this channel's awaiting replies,
+    /// stopped tasks, wait notices, and archive state (`PAIR-17`).
+    pub fn build_composer_stack_layout(
+        &self,
+        queue_items: &[String],
+        queue_can_steer: bool,
+        reply_sender: Option<&str>,
+        notice: Option<&crate::views::openbot::queue_and_voice::ComposerNoticeState>,
+    ) -> crate::views::openbot::queue_and_voice::ComposerStackLayoutSnapshot {
+        let awaiting_names: Vec<String> = if self.awaiting_replies.visible(self.archived) {
+            self.awaiting_replies
+                .entries
+                .iter()
+                .map(|e| e.agent_name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let stopped_ids: Vec<String> = if self.stopped_tasks.is_visible(self.archived) {
+            self.stopped_tasks
+                .items
+                .iter()
+                .map(|s| s.task_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let open_waits_count = if self.archived {
+            0
+        } else {
+            self.wait_notices.len()
+        };
+        crate::views::openbot::queue_and_voice::compute_composer_stack_layout(
+            &crate::views::openbot::queue_and_voice::ComposerStackInput {
+                queue_items,
+                queue_can_steer,
+                reply_sender,
+                awaiting_tasks: &awaiting_names,
+                awaiting_all_settled: self.awaiting_replies.all_settled(),
+                stopped_tasks: &stopped_ids,
+                open_waits_count,
+                notice,
+            },
+        )
+    }
+
     pub fn set_wait_notices_from_contract(&mut self, waits: &[ChannelTaskWait]) {
-        self.wait_notices = waits.iter().map(ChannelTaskWaitNotice::from_contract).collect();
+        self.wait_notices = waits
+            .iter()
+            .take(crate::views::openbot::queue_and_voice::COMPOSER_OPEN_WAITS_MAX)
+            .map(ChannelTaskWaitNotice::from_contract)
+            .collect();
     }
 
     pub fn voice_attribution(&self) -> ChannelVoiceAttribution {
@@ -1139,6 +1320,78 @@ pub fn render_channel_header(
         )
 }
 
+fn default_channel_routing_kind() -> &'static str {
+    "channel-routing"
+}
+
+/// Single-source-of-truth view-model for centered `ChatActionMarker` pills (`UI-F11-05`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelActionMarkerLayout {
+    #[serde(skip_deserializing, default = "default_channel_routing_kind")]
+    pub kind: &'static str,
+    pub action: String,
+    pub label: String,
+    pub agent_ids: Vec<String>,
+    pub clickable_pills: bool,
+}
+
+/// Extracts `ChannelRoutingEvent` entries from `@[Name](agent:id)` and `@everyone` chips
+/// embedded in a sent group message (`PAIR-16`).
+pub fn extract_routing_events_from_message_text(
+    text: &str,
+    channel_member_ids: &[String],
+    palette: &crate::theme::TdesktopThemePalette,
+) -> Vec<ChannelRoutingEvent> {
+    let chips =
+        crate::views::stage::entities_render::extract_rendered_message_reference_chips(text, palette);
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    for chip in chips {
+        if chip.kind == "everyone" {
+            for member_id in channel_member_ids {
+                let id = member_id.trim();
+                if !id.is_empty() && seen.insert(id.to_string()) {
+                    events.push(ChannelRoutingEvent {
+                        action: "asked".to_string(),
+                        agent_id: id.to_string(),
+                    });
+                }
+            }
+        } else if matches!(chip.kind.as_str(), "agent" | "bot") {
+            let id = chip.id.trim();
+            if !id.is_empty() && seen.insert(id.to_string()) {
+                events.push(ChannelRoutingEvent {
+                    action: "asked".to_string(),
+                    agent_id: id.to_string(),
+                });
+            }
+        }
+    }
+    events
+}
+
+pub fn compute_routing_action_markers(
+    rows: &[MergedRoutingRow],
+    agent_names: &BTreeMap<String, String>,
+) -> Vec<ChannelActionMarkerLayout> {
+    rows.iter()
+        .map(|row| {
+            let names: Vec<String> = row
+                .agent_ids
+                .iter()
+                .map(|id| agent_names.get(id).cloned().unwrap_or_else(|| id.clone()))
+                .collect();
+            ChannelActionMarkerLayout {
+                kind: "channel-routing",
+                action: row.action.clone(),
+                label: format!("{} {}", row.action, format_human_list(&names)),
+                agent_ids: row.agent_ids.clone(),
+                clickable_pills: !row.agent_ids.is_empty(),
+            }
+        })
+        .collect()
+}
+
 /// Renders a compact centered `channel-routing` action marker row (`joinRoutingRows`).
 pub fn render_channel_routing_row(
     row: &MergedRoutingRow,
@@ -1148,12 +1401,16 @@ pub fn render_channel_routing_row(
     let bg_surface = view_rgba(palette, "--openbot-bg-surface", 0x212121);
     let border_col = view_rgba(palette, "--openbot-border-strong", 0x2c2c2e);
     let text_muted = view_rgba(palette, "--openbot-text-muted", 0x979797);
-    let names: Vec<String> = row
-        .agent_ids
-        .iter()
-        .map(|id| agent_names.get(id).cloned().unwrap_or_else(|| id.clone()))
-        .collect();
-    let label = format!("{} {}", row.action, format_human_list(&names));
+    let marker = compute_routing_action_markers(std::slice::from_ref(row), agent_names)
+        .into_iter()
+        .next()
+        .unwrap_or(ChannelActionMarkerLayout {
+            kind: "channel-routing",
+            action: row.action.clone(),
+            label: row.action.clone(),
+            agent_ids: row.agent_ids.clone(),
+            clickable_pills: false,
+        });
 
     div()
         .w_full()
@@ -1168,12 +1425,13 @@ pub fn render_channel_routing_row(
                 .px(px(10.0))
                 .py(px(3.0))
                 .rounded_full()
+                .when(marker.clickable_pills, |el| el.cursor_pointer())
                 .bg(bg_surface)
                 .border_1()
                 .border_color(border_col)
                 .text_size(px(11.5))
                 .text_color(text_muted)
-                .child(label),
+                .child(marker.label),
         )
         .child(div().flex_1().max_w(px(80.0)).h(px(1.0)).bg(border_col))
 }
@@ -1586,17 +1844,23 @@ pub fn render_stopped_tasks_banner(
                         .items_center()
                         .gap(px(6.0))
                         .when(can_continue, |el| {
+                            let is_resuming = stopped.is_resuming(&item.task_id);
                             el.child(
                                 div()
                                     .px(px(11.0))
                                     .py(px(5.0))
                                     .rounded(px(8.0))
                                     .bg(accent)
-                                    .cursor_pointer()
+                                    .when(is_resuming, |d| d.opacity(0.45))
+                                    .when(!is_resuming, |d| d.cursor_pointer())
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(text_on_accent)
-                                    .child(STOPPED_TASK_RECOVERY_ACTION_LABELS[0]),
+                                    .child(if is_resuming {
+                                        "Resuming..."
+                                    } else {
+                                        STOPPED_TASK_RECOVERY_ACTION_LABELS[0]
+                                    }),
                             )
                         })
                         .when(!candidates.is_empty(), |el| {
@@ -1673,6 +1937,7 @@ pub fn render_stopped_tasks_banner(
 fn render_channel_message_row(
     msg: &ChannelTimelineMessage,
     is_lead: bool,
+    reply_target_unavailable: bool,
     folded: Option<&FoldedBotCommentary>,
     agents: &[ChannelAgentBrief],
     palette: &OpenBotPalette,
@@ -1760,23 +2025,34 @@ fn render_channel_message_row(
         .flex_col()
         .gap(px(5.0))
         .when(msg.reply_to_message_id.is_some(), |el| {
-            let preview = msg
-                .reply_preview
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("Replying to earlier channel message");
+            let preview = if reply_target_unavailable {
+                "Original message unavailable"
+            } else {
+                msg.reply_preview
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Replying to earlier channel message")
+            };
             el.child(
                 div()
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(8.0))
                     .bg(bg_control)
-                    .border_l_2()
-                    .border_color(accent)
+                    .when(reply_target_unavailable, |q| {
+                        q.border_1().border_dashed().border_color(border_col)
+                    })
+                    .when(!reply_target_unavailable, |q| {
+                        q.border_l_2().border_color(accent)
+                    })
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .child(tg_icon_rgba(IconName::Reply, 11.0, accent))
+                    .child(tg_icon_rgba(
+                        IconName::Reply,
+                        11.0,
+                        if reply_target_unavailable { text_muted } else { accent },
+                    ))
                     .child(
                         div()
                             .text_size(px(11.5))
@@ -1817,7 +2093,10 @@ fn render_channel_message_row(
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(author_name_color)
-                                .child(msg.author.name.clone()),
+                                .child(
+                                    resolve_channel_author_label(Some(&msg.author.name))
+                                        .to_string(),
+                                ),
                         )
                         .when(is_lead && !is_human, |b| {
                             b.child(div().text_size(px(11.0)).text_color(rgb(0xf0b429)).child("👑"))
@@ -1927,8 +2206,18 @@ pub fn render_channel_conversation(
             .or_else(|| msg.task_id.clone())
             .unwrap_or_else(|| msg.id.clone());
         let folded = folded_map.get(&(msg.author.id.clone(), turn_key));
+        let reply_unavailable = msg
+            .reply_to_message_id
+            .as_deref()
+            .is_some_and(|rid| state.is_reply_target_unavailable(rid));
         timeline = timeline.child(render_channel_message_row(
-            msg, is_lead, folded, agents, palette, now_sec,
+            msg,
+            is_lead,
+            reply_unavailable,
+            folded,
+            agents,
+            palette,
+            now_sec,
         ));
     }
 
@@ -1936,13 +2225,7 @@ pub fn render_channel_conversation(
         let worker_names: Vec<&str> = state
             .active_running_agent_ids
             .iter()
-            .map(|id| {
-                state
-                    .agent_names
-                    .get(id)
-                    .map(String::as_str)
-                    .unwrap_or(id.as_str())
-            })
+            .map(|id| state.resolve_author_label(id))
             .collect();
         let sentence = channel_activity_sentence(&worker_names);
         let label = if sentence.is_empty() {
@@ -1969,6 +2252,7 @@ pub fn render_channel_conversation(
         palette,
     );
 
+    let menu_items = state.context_menu_items();
     let footer = if state.read_only || state.archived {
         div()
             .w_full()
@@ -1978,9 +2262,33 @@ pub fn render_channel_conversation(
             .bg(bg_control)
             .border_1()
             .border_color(border_col)
-            .text_size(px(12.5))
-            .text_color(text_muted)
-            .child("This channel is archived (read-only). Restore it in Channel Settings to post.")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(text_muted)
+                    .child("This channel is archived (read-only). Restore it in Channel Settings to post."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .children(menu_items.into_iter().map(|action_label| {
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(border_col)
+                            .text_size(px(11.0))
+                            .text_color(text_pri)
+                            .child(action_label)
+                    })),
+            )
     } else {
         div()
             .w_full()
@@ -1994,6 +2302,20 @@ pub fn render_channel_conversation(
             .items_center()
             .justify_between()
             .gap(px(10.0))
+            .when(state.mark_unread_enabled || state.thread_branch_enabled, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .when(state.mark_unread_enabled, |r| {
+                            r.child(div().text_size(px(11.0)).text_color(text_muted).child("Unread"))
+                        })
+                        .when(state.thread_branch_enabled, |r| {
+                            r.child(div().text_size(px(11.0)).text_color(text_muted).child("Branch"))
+                        }),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -2204,6 +2526,7 @@ pub fn render_tucked_awaiting_replies_section<V: 'static>(
     cx: &mut Context<V>,
     on_toggle_collapse: impl Fn(&mut V, &mut Context<V>) + 'static,
     on_stop_agent: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
+    on_inspect_wait: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
     on_dismiss_all: impl Fn(&mut V, &mut Context<V>) + 'static,
 ) -> Option<AnyElement> {
     if entries.is_empty() {
@@ -2301,8 +2624,11 @@ pub fn render_tucked_awaiting_replies_section<V: 'static>(
             .flex_col();
         for (idx, entry) in entries.iter().enumerate() {
             let aid = entry.agent_id.clone();
+            let aid_inspect = entry.agent_id.clone();
             let stop_cb = on_stop_agent.clone();
+            let inspect_cb = on_inspect_wait.clone();
             let is_active = entry.state.is_active();
+            let can_answer = entry.can_answer();
             let status_txt = match entry.state {
                 AwaitingReplyState::Working => if is_zh { "思考中" } else { "Working" },
                 AwaitingReplyState::Asked => if is_zh { "待响应" } else { "Asked" },
@@ -2326,7 +2652,7 @@ pub fn render_tucked_awaiting_replies_section<V: 'static>(
             rows_el = rows_el.child(
                 div()
                     .id(("composer-stack-subtask-row", idx))
-                    .h(px(29.0))
+                    .h(px(crate::views::openbot::queue_and_voice::COMPOSER_STACK_ROW_HEIGHT_PX))
                     .px(px(13.0))
                     .flex()
                     .items_center()
@@ -2358,6 +2684,36 @@ pub fn render_tucked_awaiting_replies_section<V: 'static>(
                             .text_color(status_col)
                             .child(status_txt),
                     )
+                    .when(is_active, |r| {
+                        r.child(
+                            div()
+                                .id(("composer-stack-subtask-inspect", idx))
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(ob.bg_control())
+                                .border_1()
+                                .border_color(ob.border_hairline())
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(stop_hover))
+                                .text_size(px(11.0))
+                                .text_color(if can_answer { ob.warning() } else { ob.text_secondary() })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        inspect_cb(this, aid_inspect.clone(), cx);
+                                    }),
+                                )
+                                .child(if can_answer {
+                                    if is_zh { "响应" } else { "Answer" }
+                                } else if is_zh {
+                                    "查看"
+                                } else {
+                                    "Inspect"
+                                }),
+                        )
+                    })
                     .when(is_active, |r| {
                         r.child(
                             div()
@@ -2393,7 +2749,7 @@ pub fn render_tucked_awaiting_replies_section<V: 'static>(
 /// Interactive tucked-stack `ChannelStoppedTasks` section renderer (`Continue` / `Resume all` / `Cancel`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_tucked_stopped_tasks_section<V: 'static>(
-    items: &[StoppedChannelTaskBannerItem],
+    stopped: &ChannelStoppedTasksState,
     palette: &crate::theme::TdesktopThemePalette,
     lang_id: &str,
     cx: &mut Context<V>,
@@ -2401,6 +2757,7 @@ pub fn render_tucked_stopped_tasks_section<V: 'static>(
     on_resume_all: impl Fn(&mut V, &mut Context<V>) + 'static,
     on_cancel_one: impl Fn(&mut V, String, &mut Context<V>) + Clone + 'static,
 ) -> Option<AnyElement> {
+    let items = &stopped.items;
     if items.is_empty() {
         return None;
     }
@@ -2461,6 +2818,7 @@ pub fn render_tucked_stopped_tasks_section<V: 'static>(
         let tid_cancel = item.task_id.clone();
         let cb_cont = on_continue_one.clone();
         let cb_cancel = on_cancel_one.clone();
+        let is_resuming = stopped.is_resuming(&item.task_id);
         let label = item
             .error
             .clone()
@@ -2468,7 +2826,7 @@ pub fn render_tucked_stopped_tasks_section<V: 'static>(
         box_el = box_el.child(
             div()
                 .id(("composer-stack-stopped-row", idx))
-                .h(px(29.0))
+                .h(px(crate::views::openbot::queue_and_voice::COMPOSER_STACK_ROW_HEIGHT_PX))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -2490,7 +2848,8 @@ pub fn render_tucked_stopped_tasks_section<V: 'static>(
                         .py(px(2.0))
                         .rounded(px(5.0))
                         .bg(ob.surface_light())
-                        .cursor_pointer()
+                        .when(is_resuming, |el| el.opacity(0.45))
+                        .when(!is_resuming, |el| el.cursor_pointer())
                         .text_size(px(11.0))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(ob.text_on_light())
@@ -2498,10 +2857,18 @@ pub fn render_tucked_stopped_tasks_section<V: 'static>(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                cb_cont(this, tid_cont.clone(), cx);
+                                if !is_resuming {
+                                    cb_cont(this, tid_cont.clone(), cx);
+                                }
                             }),
                         )
-                        .child(if is_zh { "继续" } else { "Continue" }),
+                        .child(if is_resuming {
+                            if is_zh { "继续中..." } else { "Resuming..." }
+                        } else if is_zh {
+                            "继续"
+                        } else {
+                            "Continue"
+                        }),
                 )
                 .child(
                     div()

@@ -10,7 +10,8 @@ use crate::views::chat_sidebar::{
 };
 use crate::views::nav_rail::{NavDestination, NavRail};
 use crate::views::sidebar::dialogs_row_view::{
-    render_dialog_avatar, render_openbot_dialog_avatar_with_badge, SidebarDialogMeta,
+    render_dialog_avatar, render_openbot_dialog_avatar_with_badge, resolve_dialog_felt_badge_state,
+    resolve_dialog_preview_priority, SidebarDialogMeta,
 };
 use crate::views::sidebar::openbot_sidebar_chrome::{
     openbot_vector_icon, OpenBotChromeIcon,
@@ -155,7 +156,7 @@ pub(super) fn render_floating_pill_tooltip_at(
             .text_color(pill_fg)
             .child(label.to_string()),
     )
-    .with_priority(25)
+    .with_priority(crate::theme::OPENBOT_LAYER_TOOLTIP)
 }
 
 fn render_collapsed_icon_btn<V: 'static>(
@@ -257,6 +258,19 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
     cx: &mut Context<V>,
     on_action: impl Fn(&mut V, UnifiedSidebarAction, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
+    let search_layout = crate::views::sidebar::openbot_sidebar_chrome::compute_openbot_sidebar_search_row_layout(
+        true,
+        false,
+        dialogs.len(),
+        false,
+        palette,
+        lang_id,
+    );
+    let compact_grid = crate::views::sidebar::dialogs_renderer::compute_openbot_pinned_grid_layout(
+        dialogs.len().max(1),
+        true,
+        palette,
+    );
     let ob = palette.openbot_palette();
     let is_dark = palette.mode.is_dark();
     let hover_bg = ob.hover();
@@ -314,34 +328,36 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
                     ),
             )
         })
-        .child(
-            div()
-                .w_full()
-                .px(px(12.0))
-                .pt(px(if external_topbar_hosted { 11.0 } else { 6.0 }))
-                .pb(px(6.0))
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .id("sidebar-compact-search-btn")
-                        .w_full()
-                        .h(px(32.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(hover_bg))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                on_search(this, UnifiedSidebarAction::OpenGlobalSearch, cx);
-                            }),
-                        )
-                        .child(tg_icon_rgba(IconName::Search, 16.0, muted)),
-                ),
-        )
+        .when(search_layout.compact_search_visible, |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .pt(px(if external_topbar_hosted { 11.0 } else { 6.0 }))
+                    .pb(px(6.0))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .id("sidebar-compact-search-btn")
+                            .w_full()
+                            .h(px(search_layout.compact_search_size_px))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover_bg))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    on_search(this, UnifiedSidebarAction::OpenGlobalSearch, cx);
+                                }),
+                            )
+                            .child(tg_icon_rgba(IconName::Search, 16.0, muted)),
+                    ),
+            )
+        })
         .child(
             div()
                 .id("rail-dialogs-scroll")
@@ -388,21 +404,26 @@ pub fn render_openbot_compact_sidebar<V: 'static>(
                     } else {
                         0xF5F5F6
                     };
+                    let badge_state = resolve_dialog_felt_badge_state(
+                        dialog,
+                        meta,
+                        &resolve_dialog_preview_priority(dialog, meta, lang_id),
+                    );
                     let avatar = render_openbot_dialog_avatar_with_badge(
                         dialog,
                         meta,
                         palette,
-                        48.0,
+                        compact_grid.avatar_px,
                         tile_surface_hex,
                         is_active,
-                        lang_id,
+                        badge_state,
                     );
 
                     div()
                         .id(("rail-dialog-btn", dialog_id as usize))
                         .relative()
-                        .w(px(60.0))
-                        .h(px(60.0))
+                        .w(px(compact_grid.tile_w_px))
+                        .h(px(compact_grid.tile_h_px))
                         .p(px(6.0))
                         .rounded(px(8.0))
                         .flex_shrink_0()

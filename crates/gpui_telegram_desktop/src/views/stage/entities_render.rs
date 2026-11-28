@@ -577,30 +577,56 @@ fn render_inline_segments<V: 'static>(
                     ));
                     chunk_idx += 1;
                 }
+                let raw_ref_token = if kind == "everyone" {
+                    "@everyone".to_string()
+                } else if matches!(kind.as_str(), "skill" | "workflow" | "routine" | "mcp") {
+                    if label.starts_with('$') {
+                        label.clone()
+                    } else {
+                        format!("${kind}:{id}")
+                    }
+                } else {
+                    format!("@[{label}]({kind}:{id})")
+                };
+                let chip_meta = extract_rendered_message_reference_chips(&raw_ref_token, palette)
+                    .into_iter()
+                    .next();
+                let resolved_label = chip_meta
+                    .as_ref()
+                    .map(|c| c.label.as_str())
+                    .unwrap_or(label.as_str());
+                let resolved_token = chip_meta
+                    .as_ref()
+                    .map(|c| c.token.clone())
+                    .unwrap_or(raw_ref_token);
+                let can_navigate = chip_meta
+                    .as_ref()
+                    .map(|c| c.try_navigate_on_click())
+                    .unwrap_or(true);
                 let act = on_action.clone();
                 let click_action = match kind.as_str() {
-                    "skill" | "workflow" | "routine" | "mcp" => RichTextAction::ClickBotCommand(
-                        if label.starts_with('$') {
-                            label.clone()
-                        } else {
-                            format!("${kind}:{id}")
-                        },
-                    ),
-                    "agent" | "bot" => RichTextAction::ClickMention(format!("@{label}")),
+                    "skill" | "workflow" | "routine" | "mcp" => {
+                        RichTextAction::ClickBotCommand(resolved_token)
+                    }
+                    "agent" | "bot" => RichTextAction::ClickMention(format!("@{resolved_label}")),
                     "everyone" => RichTextAction::ClickMention("@everyone".to_string()),
-                    _ => RichTextAction::ClickBotCommand(format!("openbot_ref:{kind}:{id}:{label}")),
+                    _ => RichTextAction::ClickBotCommand(format!(
+                        "openbot_ref:{kind}:{id}:{resolved_label}"
+                    )),
                 };
                 let chip = render_openbot_reference_chip(
                     SharedString::from(format!("msg-ref-chip-{}-{}-{}", msg_id, block_key, s_idx)),
                     &kind,
-                    &label,
+                    resolved_label,
                     palette,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        act(this, click_action.clone(), cx);
+                        if can_navigate {
+                            act(this, click_action.clone(), cx);
+                        }
                     }),
                 );
                 row = row.child(chip);
@@ -639,6 +665,45 @@ fn render_inline_segments<V: 'static>(
         cx,
         on_action,
     )
+}
+
+/// Extracts all rendered `ReferenceChip` pills parsed from a sent message text using the exact
+/// same `parse_rich_blocks` + `compute_openbot_reference_chip_layout` pipeline as live message bubbles (`UI-F13-05`).
+pub fn extract_rendered_message_reference_chips(
+    text: &str,
+    palette: &TdesktopThemePalette,
+) -> Vec<crate::views::stage::openbot_stage_chrome::OpenBotReferenceChipLayout> {
+    let blocks = super::entities::parse_rich_blocks(text, &[]);
+    let mut chips = Vec::new();
+    for block in blocks {
+        let segs = match block {
+            super::entities::RichBlock::Paragraph(s)
+            | super::entities::RichBlock::Heading { segments: s, .. }
+            | super::entities::RichBlock::ListItem { segments: s, .. } => s,
+            _ => continue,
+        };
+        for seg in segs {
+            if let Some((kind, id, label)) = seg.flags.reference_chip {
+                let token = if kind == "everyone" {
+                    "@everyone".to_string()
+                } else if matches!(kind.as_str(), "skill" | "workflow" | "routine" | "mcp") {
+                    if label.starts_with('$') {
+                        label.clone()
+                    } else {
+                        format!("${kind}:{id}")
+                    }
+                } else {
+                    format!("@[{label}]({kind}:{id})")
+                };
+                chips.push(
+                    crate::views::stage::openbot_stage_chrome::compute_openbot_reference_chip_layout(
+                        &kind, &id, &label, &token, false, palette,
+                    ),
+                );
+            }
+        }
+    }
+    chips
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -95,13 +95,18 @@ impl SettingsRouter {
             ob.text_primary()
         };
 
+        let card_bg = gpui::rgb(if ob.scheme.is_dark() {
+            super::settings_theme_ui::SETTINGS_CARD_BG_DARK
+        } else {
+            super::settings_theme_ui::SETTINGS_CARD_BG_LIGHT
+        });
         div()
             .cursor_pointer()
-            .min_h(px(pal.scaled_px(64.0)))
+            .min_h(px(pal.scaled_px(super::settings_theme_ui::SETTINGS_ROW_MIN_HEIGHT_PX)))
             .px(px(pal.scaled_px(16.0)))
             .py(px(pal.scaled_px(12.0)))
-            .rounded(px(pal.scaled_px(12.0)))
-            .bg(ob.bg_surface())
+            .rounded(px(pal.scaled_px(super::settings_theme_ui::SETTINGS_CARD_RADIUS_PX)))
+            .bg(card_bg)
             .border_1()
             .border_color(if is_selected {
                 ob.border_strong_hairline()
@@ -475,8 +480,9 @@ impl SettingsRouter {
                 .into_any_element()
         };
 
+        let page_layout = super::settings_theme_ui::compute_settings_page_layout(self);
         div()
-            .w(px(220.0))
+            .w(px(page_layout.left_nav_px))
             .flex_shrink_0()
             .h_full()
             .bg(ob.bg_sidebar())
@@ -671,6 +677,7 @@ impl SettingsRouter {
         let text_sec = ob.text_secondary();
         let text_muted = ob.text_muted();
 
+        let page_layout = super::settings_theme_ui::compute_settings_page_layout(self);
         let crumbs = self.settings_section.breadcrumb_path();
 
         div()
@@ -692,7 +699,7 @@ impl SettingsRouter {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(48.0))
+                            .h(px(page_layout.topbar_height_px))
                             .flex_shrink_0()
                             .w_full()
                             .px(px(20.0))
@@ -835,14 +842,100 @@ impl SettingsRouter {
                             .child(
                                 div()
                                     .w_full()
-                                    .max_w(px(960.0))
+                                    .max_w(px(page_layout.content_max_px))
                                     .mx_auto()
                                     .px(px(24.0))
                                     .py(px(16.0))
                                     .pb(px(32.0))
                                     .child(self.render_active_section(cx)),
                             ),
-                    ),
+                    )
+                    .when(page_layout.save_bar_dock_visible, |col| {
+                        let dock_bg = gpui::rgb(if ob.scheme.is_dark() {
+                            super::settings_theme_ui::SETTINGS_CARD_BG_DARK
+                        } else {
+                            super::settings_theme_ui::SETTINGS_CARD_BG_LIGHT
+                        });
+                        let err_msg = self.save_bar.error.clone();
+                        col.child(
+                            div()
+                                .id("settings-save-bar-dock")
+                                .w_full()
+                                .px(px(24.0))
+                                .py(px(12.0))
+                                .bg(dock_bg)
+                                .border_t_1()
+                                .border_color(ob.border_hairline())
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(if err_msg.is_some() {
+                                            ob.danger()
+                                        } else {
+                                            text_sec
+                                        })
+                                        .child(err_msg.unwrap_or_else(|| {
+                                            tr_str(lang, "有未保存的设置更改", "Unsaved settings changes")
+                                                .to_string()
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .id("settings-save-bar-discard")
+                                                .cursor_pointer()
+                                                .px(px(12.0))
+                                                .py(px(6.0))
+                                                .rounded(px(8.0))
+                                                .bg(ob.bg_control())
+                                                .border_1()
+                                                .border_color(ob.border_strong_hairline())
+                                                .text_size(px(12.5))
+                                                .text_color(text_pri)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.save_bar.discard();
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(tr_str(lang, "放弃", "Discard")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("settings-save-bar-commit")
+                                                .cursor_pointer()
+                                                .px(px(14.0))
+                                                .py(px(6.0))
+                                                .rounded(px(8.0))
+                                                .bg(ob.surface_light())
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(ob.text_on_light())
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        let mut toast = crate::views::app_shell::modal_container::OpenBotToasterState::default();
+                                                        this.save_bar.commit_save(&mut toast);
+                                                        if let Some(t) = toast.toasts.pop() {
+                                                            cx.emit(super::SettingsRouterEvent::ShowToast(t.message));
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(tr_str(lang, "保存更改", "Save changes")),
+                                        ),
+                                ),
+                        )
+                    }),
             )
     }
 }
@@ -880,6 +973,7 @@ impl Render for SettingsRouter {
             })
             .child(panel_body);
 
+        let page_layout = super::settings_theme_ui::compute_settings_page_layout(self);
         if is_standalone_computers {
             let box_w = pal.scaled_px(960.0).min(1160.0);
             let box_h = pal.scaled_px(660.0).min(860.0);
@@ -887,9 +981,9 @@ impl Render for SettingsRouter {
         } else {
             modal_box = modal_box
                 .w_full()
-                .max_w(px(1180.0))
+                .max_w(px(page_layout.modal_max_width_px))
                 .h_full()
-                .max_h(px(860.0));
+                .max_h(px(page_layout.modal_max_height_px));
         }
 
         div()

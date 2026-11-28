@@ -379,11 +379,11 @@ pub fn normalize_fabushi_plush_spec(
     raw_shape: &str,
     raw_color: &str,
 ) -> (Option<BloubShape>, Option<AvatarHue>, Option<String>) {
-    let trimmed_shape = raw_shape.trim();
-    let stripped = trimmed_shape
+    let lower_shape = raw_shape.trim().to_ascii_lowercase();
+    let stripped = lower_shape
         .strip_prefix("plush:")
-        .or_else(|| trimmed_shape.strip_prefix("bloub:"))
-        .unwrap_or(trimmed_shape);
+        .or_else(|| lower_shape.strip_prefix("bloub:"))
+        .unwrap_or(lower_shape.as_str());
     let shape = BloubShape::parse(stripped)
         .or_else(|| legacy_shape_to_bloub_shape(stripped));
 
@@ -517,6 +517,72 @@ pub enum ReferenceChipTone {
     File,
 }
 
+pub const OPENBOT_REFERENCE_CHIP_HEIGHT_PX: f32 = 24.0;
+pub const OPENBOT_REFERENCE_CHIP_RADIUS_PX: f32 = 6.0;
+pub const OPENBOT_REFERENCE_CHIP_DARK_BG_RGB: u32 = 0x262626;
+pub const OPENBOT_REFERENCE_CHIP_DARK_BG_HEX: &str = "#262626";
+pub const OPENBOT_REFERENCE_CHIP_LIGHT_BG_RGB: u32 = 0xE8E8EB;
+pub const OPENBOT_REFERENCE_CHIP_LIGHT_BG_HEX: &str = "#e8e8eb";
+
+/// Single-source-of-truth geometry & token snapshot for OpenBot `24px` `ReferenceChip` pills (`UI-F13`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenBotReferenceChipLayout {
+    pub kind: String,
+    pub id: String,
+    pub label: String,
+    pub token: String,
+    pub height_px: f32,
+    pub radius_px: f32,
+    pub bg_hex: String,
+    pub clickable: bool,
+    pub unavailable: bool,
+}
+
+impl OpenBotReferenceChipLayout {
+    /// Returns `true` iff clicking this chip is allowed to navigate (clickable and available, `UI-F13`).
+    pub fn try_navigate_on_click(&self) -> bool {
+        self.clickable && !self.unavailable
+    }
+}
+
+pub fn compute_openbot_reference_chip_layout(
+    kind: &str,
+    id: &str,
+    label: &str,
+    token: &str,
+    unavailable: bool,
+    palette: &TdesktopThemePalette,
+) -> OpenBotReferenceChipLayout {
+    let ob = palette.openbot_palette();
+    let is_dark = palette.mode.is_dark();
+    let kind_lc = kind.trim().to_ascii_lowercase();
+    let bg_hex = match kind_lc.as_str() {
+        "skill" | "mcp" | "workflow" | "routine" | "command" => ob
+            .token("--openbot-accent-soft")
+            .unwrap_or("#1a304d")
+            .to_string(),
+        "file" | "path" | "quote" => file_reference_tone(label).colors(ob.scheme).1.to_string(),
+        _ => {
+            if is_dark {
+                OPENBOT_REFERENCE_CHIP_DARK_BG_HEX.to_string()
+            } else {
+                OPENBOT_REFERENCE_CHIP_LIGHT_BG_HEX.to_string()
+            }
+        }
+    };
+    OpenBotReferenceChipLayout {
+        kind: kind_lc,
+        id: id.to_string(),
+        label: label.to_string(),
+        token: token.to_string(),
+        height_px: OPENBOT_REFERENCE_CHIP_HEIGHT_PX,
+        radius_px: OPENBOT_REFERENCE_CHIP_RADIUS_PX,
+        bg_hex,
+        clickable: !unavailable,
+        unavailable,
+    }
+}
+
 /// Renders an OpenBot `24px` `ReferenceChip` pill (`h: 24px`, `rounded(6px)`, `px: 6px`, `12px` medium).
 pub fn render_openbot_reference_chip(
     id: impl Into<ElementId>,
@@ -524,10 +590,11 @@ pub fn render_openbot_reference_chip(
     label: &str,
     palette: &TdesktopThemePalette,
 ) -> Stateful<Div> {
+    let layout = compute_openbot_reference_chip_layout(kind, label, label, label, false, palette);
     let ob = palette.openbot_palette();
     let is_dark = palette.mode.is_dark();
-    let kind_lc = kind.trim().to_ascii_lowercase();
-    let tone = match kind_lc.as_str() {
+    let kind_lc = layout.kind.as_str();
+    let tone = match kind_lc {
         "skill" | "mcp" | "workflow" | "routine" | "command" => ReferenceChipTone::SkillOrMcp,
         "file" | "path" | "quote" => ReferenceChipTone::File,
         _ => ReferenceChipTone::Default,
@@ -553,11 +620,11 @@ pub fn render_openbot_reference_chip(
         }
         ReferenceChipTone::Default => {
             let bg: Rgba = if is_dark {
-                rgb(0x2A2A2C).into()
+                rgb(OPENBOT_REFERENCE_CHIP_DARK_BG_RGB).into()
             } else {
-                rgb(0xE8E8EB).into()
+                rgb(OPENBOT_REFERENCE_CHIP_LIGHT_BG_RGB).into()
             };
-            let icon = match kind_lc.as_str() {
+            let icon = match kind_lc {
                 "everyone" => OpenBotStageIcon::UsersRound,
                 "tab" | "url" => OpenBotStageIcon::Globe,
                 _ => OpenBotStageIcon::Sparkles,
@@ -570,13 +637,13 @@ pub fn render_openbot_reference_chip(
 
     div()
         .id(id)
-        .h(px(24.0))
+        .h(px(layout.height_px))
         .max_w(px(220.0))
         .px(px(6.0))
-        .rounded(px(6.0))
+        .rounded(px(layout.radius_px))
         .bg(chip_bg)
         .hover(move |s| s.bg(hover_bg))
-        .cursor_pointer()
+        .when(layout.try_navigate_on_click(), |el| el.cursor_pointer())
         .flex_shrink_0()
         .flex()
         .items_center()

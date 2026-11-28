@@ -223,6 +223,10 @@ pub struct ContextInspector {
     pub bot_draft_name: String,
     pub bot_draft_title: String,
     pub bot_draft_description: String,
+    pub bot_autosave: BotIdentityAutosaveState,
+    /// Pending `InspectorAction::PatchFabushiBot` flushed right before a peer switch (`PAIR-22`).
+    /// Intentionally preserved across `clear_peer_facts()` so `AppShell` can dispatch it reliably.
+    pub pending_flushed_bot_patch: Option<InspectorAction>,
     pub bot_avatar_style_flat: bool,
     pub bot_avatar_expression: BloubExpression,
     pub bot_avatar_custom_photo: Option<String>,
@@ -238,6 +242,9 @@ pub struct ContextInspector {
     pub bot_folder_draft: String,
     pub bot_folder_draft_excluded: bool,
     pub bot_busy_mode: String,
+    pub bot_is_busy: bool,
+    pub bot_busy_toast_message: Option<String>,
+    pub bot_pending_access_level: Option<String>,
     pub bot_data_tables: Vec<(String, usize)>,
     pub published_creations: Vec<BotPublishedCreationSummary>,
     // M4 OpenBot ChannelSettingsPane state
@@ -251,11 +258,13 @@ pub struct ContextInspector {
     pub channel_browser_access: ChannelBrowserAccess,
     pub channel_context_isolated: bool,
     pub channel_archived: bool,
+    pub channel_provider_supports_compact: bool,
     pub channel_lead_user_id: Option<u64>,
     pub channel_memories: Vec<String>,
     pub channel_memory_draft: String,
     pub channel_folders: Vec<String>,
     pub channel_folder_draft: String,
+    pub channel_validation_error: Option<String>,
 }
 
 impl ContextInspector {
@@ -322,6 +331,8 @@ impl ContextInspector {
             bot_draft_name: String::new(),
             bot_draft_title: String::new(),
             bot_draft_description: String::new(),
+            bot_autosave: BotIdentityAutosaveState::default(),
+            pending_flushed_bot_patch: None,
             bot_avatar_style_flat: false,
             bot_avatar_expression: BloubExpression::Neutre,
             bot_avatar_custom_photo: None,
@@ -337,6 +348,9 @@ impl ContextInspector {
             bot_folder_draft: String::new(),
             bot_folder_draft_excluded: false,
             bot_busy_mode: "steer".to_string(),
+            bot_is_busy: false,
+            bot_busy_toast_message: None,
+            bot_pending_access_level: None,
             bot_data_tables: Vec::new(),
             published_creations: Vec::new(),
             channel_picture_editor_open: false,
@@ -349,11 +363,13 @@ impl ContextInspector {
             channel_browser_access: ChannelBrowserAccess::Everyone,
             channel_context_isolated: false,
             channel_archived: false,
+            channel_provider_supports_compact: true,
             channel_lead_user_id: None,
             channel_memories: Vec::new(),
             channel_memory_draft: String::new(),
             channel_folders: Vec::new(),
             channel_folder_draft: String::new(),
+            channel_validation_error: None,
         }
     }
 
@@ -500,6 +516,7 @@ impl ContextInspector {
         self.channel_memory_draft.clear();
         self.channel_folders.clear();
         self.channel_folder_draft.clear();
+        self.channel_validation_error = None;
     }
 
     pub fn open_add_member_picker(&mut self, candidates: Vec<AddMemberCandidate>) {
@@ -621,7 +638,15 @@ impl ContextInspector {
         let name = self.bot_draft_name.trim().to_string();
         let title = self.bot_draft_title.trim().to_string();
         let desc = self.bot_draft_description.trim().to_string();
+        let editing_name = self.openbot_text_focus == Some(OpenBotInspectorTextField::BotName);
         self.openbot_text_focus = None;
+        if editing_name || !name.is_empty() {
+            if let Err(err) = validate_bot_profile_name(&name) {
+                self.bot_autosave.save_error = Some(err.to_string());
+                return false;
+            }
+        }
+        self.bot_autosave.save_error = None;
         if let Some(ref fab) = self.active_fabushi_bot {
             let bot_id = fab.bot_user_id.max(0) as u64;
             if bot_id > 0 {
@@ -648,7 +673,107 @@ impl ContextInspector {
         false
     }
 
+    /// Returns `true` while the inspected bot is actively running a turn (`UI-F16-03`).
+    pub fn is_bot_busy(&self) -> bool {
+        self.bot_is_busy
+            || self.active_fabushi_bot.as_ref().is_some_and(|b| {
+                matches!(
+                    b.execution_state.trim().to_ascii_lowercase().as_str(),
+                    "thinking" | "working" | "running" | "streaming"
+                )
+            })
+    }
+
+    /// Attempts to start a new chat session from Bot Settings; blocks with a busy toast while busy (`UI-F16-03`).
+    pub fn try_start_new_chat_from_settings(&mut self) -> NewChatFromSettingsOutcome {
+        if self.is_bot_busy() {
+            let msg = "Agent is currently busy; wait for the active turn to finish before starting a new chat.";
+            self.bot_busy_toast_message = Some(msg.to_string());
+            NewChatFromSettingsOutcome {
+                new_chat_busy_toast: true,
+                chat_reset: false,
+                toast_message: Some(msg),
+            }
+        } else {
+            self.bot_busy_toast_message = None;
+            self.pending_confirm_guard = Some(OpenBotConfirmGuard::BotNewSession);
+            NewChatFromSettingsOutcome {
+                new_chat_busy_toast: false,
+                chat_reset: true,
+                toast_message: None,
+            }
+        }
+    }
+
+    /// Attempts to arm Delete History confirmation from Bot Settings; disabled while the agent is busy (`UI-F16-03`).
+    pub fn try_delete_bot_history_from_settings(&mut self) -> bool {
+        if self.is_bot_busy() {
+            self.bot_busy_toast_message =
+                Some("Cannot delete chat history while the agent is busy.".to_string());
+            false
+        } else {
+            self.bot_busy_toast_message = None;
+            self.pending_confirm_guard = Some(OpenBotConfirmGuard::BotDeleteHistory);
+            true
+        }
+    }
+
+    /// Returns `true` iff transitioning from `current` to `next` widens permissions (`workspace < ask < full`).
+    pub fn requires_permission_confirm(current: &str, next: &str) -> bool {
+        fn rank(level: &str) -> u8 {
+            match level.trim().to_ascii_lowercase().as_str() {
+                "workspace" | "strict" => 0,
+                "ask" => 1,
+                "full" | "autonomous" => 2,
+                _ => 1,
+            }
+        }
+        rank(next) > rank(current)
+    }
+
+    /// Requests changing the bot's access level; widening requires explicit confirmation while narrowing/same applies immediately.
+    /// Returns `true` if a confirmation dialog is required before applying.
+    pub fn request_bot_access_level_change(&mut self, next: &str) -> bool {
+        let normalized = match next.trim().to_ascii_lowercase().as_str() {
+            "full" | "autonomous" => "full",
+            "workspace" | "strict" => "workspace",
+            _ => "ask",
+        };
+        if Self::requires_permission_confirm(&self.bot_access_level, normalized) {
+            self.bot_pending_access_level = Some(normalized.to_string());
+            self.pending_confirm_guard = Some(OpenBotConfirmGuard::WidenPermissionsFull);
+            true
+        } else {
+            self.bot_access_level = normalized.to_string();
+            self.bot_pending_access_level = None;
+            self.pending_confirm_guard = None;
+            self.pending_openbot_action = Some(OpenBotInspectorAction::SetBotPermissions {
+                access: normalized.to_string(),
+                computer_use: self.bot_computer_use,
+                allow_automation: self.bot_allow_automation,
+            });
+            false
+        }
+    }
+
+    /// Commits a pending permission-widening change after user confirmation.
+    pub fn confirm_pending_access_level_change(&mut self) {
+        let target = self
+            .bot_pending_access_level
+            .take()
+            .unwrap_or_else(|| "full".to_string());
+        self.bot_access_level = target.clone();
+        self.pending_confirm_guard = None;
+        self.pending_openbot_action = Some(OpenBotInspectorAction::SetBotPermissions {
+            access: target,
+            computer_use: self.bot_computer_use,
+            allow_automation: self.bot_allow_automation,
+        });
+    }
+
     /// Commits edited Group/Channel Name, Title & Instructions via `OpenBotInspectorAction::UpdateChatInfo`.
+    /// Reverts blank names on blur to `self.profile.name` and enforces UTF-16 limits
+    /// (`<= CHANNEL_NAME_MAX_LEN = 80`, `<= CHANNEL_INSTRUCTIONS_MAX_LEN = 2000`, `UI-F17-01`).
     pub fn commit_channel_identity_draft(&mut self) -> bool {
         if self.channel_archived {
             return false;
@@ -658,8 +783,34 @@ impl ContextInspector {
         let instructions = self.channel_draft_instructions.trim().to_string();
         self.openbot_text_focus = None;
         if name.is_empty() {
+            self.channel_draft_name = self.profile.name.clone();
+            let err = "Channel name cannot be blank".to_string();
+            self.channel_validation_error = Some(err.clone());
+            self.bot_autosave.save_error = Some(err);
             return false;
         }
+        let name_u16 = name.encode_utf16().count();
+        if name_u16 > crate::views::openbot::channel_editor::CHANNEL_NAME_MAX_LEN {
+            let err = format!(
+                "Channel name exceeds maximum limit of {} characters ({name_u16}).",
+                crate::views::openbot::channel_editor::CHANNEL_NAME_MAX_LEN
+            );
+            self.channel_validation_error = Some(err.clone());
+            self.bot_autosave.save_error = Some(err);
+            return false;
+        }
+        let instr_u16 = instructions.encode_utf16().count();
+        if instr_u16 > crate::views::openbot::channel_editor::CHANNEL_INSTRUCTIONS_MAX_LEN {
+            let err = format!(
+                "Channel instructions exceed maximum limit of {} characters ({instr_u16}).",
+                crate::views::openbot::channel_editor::CHANNEL_INSTRUCTIONS_MAX_LEN
+            );
+            self.channel_validation_error = Some(err.clone());
+            self.bot_autosave.save_error = Some(err);
+            return false;
+        }
+        self.channel_validation_error = None;
+        self.bot_autosave.save_error = None;
         let about = if !title.is_empty() && !instructions.is_empty() {
             format!("{title}\n{instructions}")
         } else if !instructions.is_empty() {
@@ -669,6 +820,7 @@ impl ContextInspector {
         };
         self.profile.name = name.clone();
         self.profile.bio = about.clone();
+        self.channel_draft_name = name.clone();
         self.pending_openbot_action = Some(OpenBotInspectorAction::UpdateChatInfo {
             title: name,
             about,
@@ -774,30 +926,111 @@ impl ContextInspector {
         })
         .detach();
     }
+    /// Flushes any dirty bot identity edits (`name` / `bio`) to the outgoing `active_agent_id`
+    /// BEFORE switching peers (Bot -> Group, Bot -> Human, or Bot A -> Bot B), queuing a
+    /// `PatchFabushiBot` action that survives `clear_peer_facts()` (`PAIR-22`).
+    pub fn flush_dirty_bot_identity_before_peer_switch(
+        &mut self,
+        next_id: impl Into<String>,
+        next_name: impl Into<String>,
+        next_bio: impl Into<String>,
+    ) -> Option<InspectorAction> {
+        let prev_bot_id = self
+            .active_fabushi_bot
+            .as_ref()
+            .map(|b| b.bot_user_id.max(0) as u64)
+            .filter(|&id| id > 0)
+            .or_else(|| (self.profile.bot_id > 0).then_some(self.profile.bot_id))
+            .unwrap_or(0);
+        let flushed = self
+            .bot_autosave
+            .flush_before_agent_switch(next_id, next_name, next_bio);
+        if flushed && prev_bot_id > 0 {
+            let act = InspectorAction::PatchFabushiBot {
+                bot_id: prev_bot_id,
+                req: gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                    display_name: self
+                        .bot_autosave
+                        .last_flushed_name
+                        .clone()
+                        .filter(|s| !s.trim().is_empty()),
+                    description: self.bot_autosave.last_flushed_bio.clone(),
+                    ..Default::default()
+                },
+            };
+            self.pending_flushed_bot_patch = Some(act.clone());
+            Some(act)
+        } else {
+            None
+        }
+    }
+
+    /// Drains any queued `PatchFabushiBot` produced during a peer-switch flush (`PAIR-22`).
+    pub fn take_pending_flushed_bot_patch(&mut self) -> Option<InspectorAction> {
+        self.pending_flushed_bot_patch.take()
+    }
+
+    /// Queues `OpenBotInspectorAction::OpenPublishedCreation` for the creation at `index` (`PAIR-23`).
+    pub fn open_published_creation_at(&mut self, index: usize) -> Option<OpenBotInspectorAction> {
+        let item = self.published_creations.get(index)?;
+        let act = OpenBotInspectorAction::OpenPublishedCreation {
+            creation_id: item.creation_id.clone(),
+            kind_code: item.kind_code,
+        };
+        self.pending_openbot_action = Some(act.clone());
+        Some(act)
+    }
+
+    /// Maps the currently armed inline `OpenBotConfirmGuard` into the canonical OpenBot
+    /// `ConfirmDialogState` (`460px`, cancel-first on destructive actions) (`PAIR-24`).
+    pub fn active_confirm_dialog_state(
+        &self,
+    ) -> Option<crate::views::boxes::modal_theme::ConfirmDialogState> {
+        self.pending_confirm_guard
+            .as_ref()
+            .map(|guard| {
+                crate::views::boxes::modal_theme::ConfirmDialogState::open_dialog(
+                    guard.is_destructive(),
+                )
+            })
+    }
+
     pub fn set_active_fabushi_bot(&mut self, bot: Option<gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto>) {
-        self.active_fabushi_bot = bot.clone();
         let editing_coding = self.subpage == InspectorSubpage::Main
             && matches!(
                 self.bot_config_focus,
                 BotConfigFocusField::CodingWorkspace | BotConfigFocusField::CodingModel
             );
         if let Some(ref b) = bot {
+            let next_id = if !b.agent_id.trim().is_empty() {
+                b.agent_id.clone()
+            } else {
+                format!("bot-{}", b.bot_user_id)
+            };
+            let next_name = if b.display_name.trim().is_empty() {
+                self.profile.name.clone()
+            } else {
+                b.display_name.clone()
+            };
+            let next_bio = if b.description.trim().is_empty() {
+                self.profile.bio.clone()
+            } else {
+                b.description.clone()
+            };
+            let _ = self.flush_dirty_bot_identity_before_peer_switch(
+                next_id,
+                next_name.clone(),
+                next_bio.clone(),
+            );
+            self.active_fabushi_bot = bot.clone();
             if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotName) {
-                self.bot_draft_name = if b.display_name.trim().is_empty() {
-                    self.profile.name.clone()
-                } else {
-                    b.display_name.clone()
-                };
+                self.bot_draft_name = next_name;
             }
             if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotTitle) {
                 self.bot_draft_title = b.title.clone();
             }
             if self.openbot_text_focus != Some(OpenBotInspectorTextField::BotDescription) {
-                self.bot_draft_description = if b.description.trim().is_empty() {
-                    self.profile.bio.clone()
-                } else {
-                    b.description.clone()
-                };
+                self.bot_draft_description = next_bio;
             }
             self.bot_access_level = match b.approval_mode.trim().to_ascii_lowercase().as_str() {
                 "autonomous" | "full" => "full".to_string(),
@@ -816,6 +1049,13 @@ impl ContextInspector {
                 }
                 return;
             }
+        } else {
+            if self.bot_autosave.dirty {
+                let next_name = self.profile.name.clone();
+                let next_bio = self.profile.bio.clone();
+                let _ = self.flush_dirty_bot_identity_before_peer_switch("", next_name, next_bio);
+            }
+            self.active_fabushi_bot = None;
         }
         self.coding_draft_bot_id = 0;
     }
@@ -872,7 +1112,14 @@ impl ContextInspector {
     pub fn set_peer(&mut self, name: &str, subtitle: &str, initials: &str, color: u32) {
         if name.trim().is_empty() { self.clear_peer(); return; }
         let same = !self.profile.name.is_empty() && self.profile.name == name && self.profile.avatar_initials == initials && self.profile.avatar_color == color;
-        if !same { self.clear_peer_facts(); }
+        if !same {
+            self.bot_autosave.flush_before_agent_switch(
+                format!("peer:{name}"),
+                name.to_string(),
+                subtitle.to_string(),
+            );
+            self.clear_peer_facts();
+        }
         self.profile.name = name.to_string();
         self.profile.bio = subtitle.to_string();
         self.profile.avatar_initials = initials.to_string();
@@ -1232,6 +1479,28 @@ impl ContextInspector {
         }
     }
 
+    fn now_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn sync_bot_autosave_from_active_field(&mut self) {
+        let now = Self::now_epoch_ms();
+        match self.openbot_text_focus {
+            Some(OpenBotInspectorTextField::BotName) => {
+                let draft = self.bot_draft_name.clone();
+                self.bot_autosave.edit_name(draft, now);
+            }
+            Some(OpenBotInspectorTextField::BotDescription) => {
+                let draft = self.bot_draft_description.clone();
+                self.bot_autosave.edit_bio(draft, now);
+            }
+            _ => {}
+        }
+    }
+
     pub fn push_bot_input_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if !self.is_bot_input_active() {
             return false;
@@ -1241,6 +1510,7 @@ impl ContextInspector {
         }
         if let Some(dst) = self.active_bot_draft_mut() {
             dst.push_str(text);
+            self.sync_bot_autosave_from_active_field();
             cx.notify();
             return true;
         }
@@ -1256,6 +1526,7 @@ impl ContextInspector {
         }
         if let Some(dst) = self.active_bot_draft_mut() {
             dst.clear();
+            self.sync_bot_autosave_from_active_field();
             cx.notify();
             return true;
         }
@@ -1273,15 +1544,18 @@ impl ContextInspector {
         }
         match key {
             "backspace" | "delete" => {
-                if let Some(dst) = self.active_bot_draft_mut() {
-                    let changed = if is_alt {
+                let changed = if let Some(dst) = self.active_bot_draft_mut() {
+                    if is_alt {
                         delete_prev_word(dst)
                     } else {
                         pop_last_char(dst)
-                    };
-                    if changed {
-                        cx.notify();
                     }
+                } else {
+                    false
+                };
+                if changed {
+                    self.sync_bot_autosave_from_active_field();
+                    cx.notify();
                 }
                 true
             }
@@ -1313,6 +1587,7 @@ impl ContextInspector {
                     match field {
                         OpenBotInspectorTextField::BotDescription => {
                             self.bot_draft_description.push('\n');
+                            self.sync_bot_autosave_from_active_field();
                         }
                         OpenBotInspectorTextField::BotInstructions => {
                             self.bot_draft_persona.push('\n');
@@ -1397,6 +1672,7 @@ impl ContextInspector {
             if let Some(dst) = self.active_bot_draft_mut() {
                 dst.push_str(txt);
             }
+            self.sync_bot_autosave_from_active_field();
         }
         cx.notify();
         commit
@@ -1440,6 +1716,254 @@ impl ContextInspector {
         self.bot_config_focus = BotConfigFocusField::None;
         self.openbot_text_focus = None;
         self.add_member_search_focused = false;
+    }
+}
+
+pub const BOT_IDENTITY_AUTOSAVE_DEBOUNCE_MS: u64 = 400;
+pub const AGENT_SETTINGS_AUTOSAVE_DEBOUNCE_MS: u64 = BOT_IDENTITY_AUTOSAVE_DEBOUNCE_MS;
+pub const BOT_PROFILE_NAME_MAX_CHARS: usize = 80;
+
+/// Validates an OpenBot Agent/Bot profile display name (`1..=80` non-whitespace chars, `UI-F16`).
+pub fn validate_bot_profile_name(name: &str) -> Result<(), &'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Agent name cannot be empty");
+    }
+    if trimmed.chars().count() > BOT_PROFILE_NAME_MAX_CHARS {
+        return Err("Agent name exceeds 80 character limit");
+    }
+    Ok(())
+}
+
+/// Outcome returned by [`ContextInspector::try_start_new_chat_from_settings`] (`UI-F16-03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewChatFromSettingsOutcome {
+    pub new_chat_busy_toast: bool,
+    pub chat_reset: bool,
+    pub toast_message: Option<&'static str>,
+}
+
+/// Single-source-of-truth `400ms` debounced autosave state for Bot Settings Name/Title/Description (`UI-F16`),
+/// supporting dirty-flush to the previous agent before switching and optimistic rollback on save error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotIdentityAutosaveState {
+    pub active_agent_id: String,
+    pub dirty: bool,
+    pub last_edit_ms: u64,
+    pub debounce_ms: u64,
+    pub committed_name: String,
+    pub committed_bio: String,
+    pub draft_name: String,
+    pub draft_bio: String,
+    pub save_error: Option<String>,
+    pub last_flushed_ms: Option<u64>,
+    pub last_flushed_agent_id: Option<String>,
+    pub last_flushed_name: Option<String>,
+    pub last_flushed_bio: Option<String>,
+    pub flush_count: usize,
+}
+
+impl Default for BotIdentityAutosaveState {
+    fn default() -> Self {
+        Self::new("", "", "")
+    }
+}
+
+impl BotIdentityAutosaveState {
+    pub fn new(
+        agent_id: impl Into<String>,
+        name: impl Into<String>,
+        bio: impl Into<String>,
+    ) -> Self {
+        let name_s = name.into();
+        let bio_s = bio.into();
+        Self {
+            active_agent_id: agent_id.into(),
+            dirty: false,
+            last_edit_ms: 0,
+            debounce_ms: BOT_IDENTITY_AUTOSAVE_DEBOUNCE_MS,
+            committed_name: name_s.clone(),
+            committed_bio: bio_s.clone(),
+            draft_name: name_s,
+            draft_bio: bio_s,
+            save_error: None,
+            last_flushed_ms: None,
+            last_flushed_agent_id: None,
+            last_flushed_name: None,
+            last_flushed_bio: None,
+            flush_count: 0,
+        }
+    }
+
+    pub fn edit_name(&mut self, name: impl Into<String>, now_ms: u64) {
+        self.draft_name = name.into();
+        self.save_error = validate_bot_profile_name(&self.draft_name)
+            .err()
+            .map(str::to_string);
+        self.record_edit(now_ms);
+    }
+
+    pub fn edit_bio(&mut self, bio: impl Into<String>, now_ms: u64) {
+        self.draft_bio = bio.into();
+        self.save_error = None;
+        self.record_edit(now_ms);
+    }
+
+    pub fn record_edit(&mut self, now_ms: u64) {
+        self.dirty = true;
+        self.last_edit_ms = now_ms;
+    }
+
+    pub fn should_flush(&self, now_ms: u64) -> bool {
+        self.dirty && now_ms.saturating_sub(self.last_edit_ms) >= self.debounce_ms
+    }
+
+    pub fn flush_now(&mut self) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Err(err) = validate_bot_profile_name(&self.draft_name) {
+            let err_s = err.to_string();
+            self.on_save_failed(err_s.clone());
+            return Err(err_s);
+        }
+        self.committed_name = self.draft_name.clone();
+        self.committed_bio = self.draft_bio.clone();
+        self.dirty = false;
+        self.save_error = None;
+        self.last_flushed_agent_id = Some(self.active_agent_id.clone());
+        self.last_flushed_name = Some(self.committed_name.clone());
+        self.last_flushed_bio = Some(self.committed_bio.clone());
+        self.flush_count = self.flush_count.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn flush_if_due(&mut self, now_ms: u64) -> bool {
+        if self.should_flush(now_ms) && self.flush_now().is_ok() {
+            self.last_flushed_ms = Some(now_ms);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Strictly flushes any pending edits to the PREVIOUS `active_agent_id` BEFORE replacing
+    /// the active agent state with `(next_id, next_name, next_bio)` (`T2-F16-01`).
+    pub fn flush_before_agent_switch(
+        &mut self,
+        next_id: impl Into<String>,
+        next_name: impl Into<String>,
+        next_bio: impl Into<String>,
+    ) -> bool {
+        let next_id_s = next_id.into();
+        let next_name_s = next_name.into();
+        let next_bio_s = next_bio.into();
+        if self.active_agent_id == next_id_s && !next_id_s.is_empty() {
+            if !self.dirty {
+                self.committed_name = next_name_s.clone();
+                self.committed_bio = next_bio_s.clone();
+                self.draft_name = next_name_s;
+                self.draft_bio = next_bio_s;
+            }
+            return false;
+        }
+        let flushed_prev = if self.dirty && !self.active_agent_id.is_empty() {
+            self.flush_now().is_ok()
+        } else {
+            false
+        };
+        self.active_agent_id = next_id_s;
+        self.committed_name = next_name_s.clone();
+        self.committed_bio = next_bio_s.clone();
+        self.draft_name = next_name_s;
+        self.draft_bio = next_bio_s;
+        self.dirty = false;
+        self.save_error = None;
+        flushed_prev
+    }
+
+    /// Rolls draft fields back to the last committed values and records `save_error` (`T2-F16-04`).
+    pub fn on_save_failed(&mut self, err: impl Into<String>) {
+        self.draft_name = self.committed_name.clone();
+        self.draft_bio = self.committed_bio.clone();
+        self.dirty = false;
+        self.save_error = Some(err.into());
+    }
+}
+
+/// Pure render route resolved by `ContextInspector::render` when hosted inside the unified `SidePanel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextInspectorRenderRoute {
+    Closed,
+    ClassicDrawer,
+    OpenBotBotSettingsRoot,
+    OpenBotBotSubpage(OpenBotSettingsSubpage),
+    OpenBotChannelSettingsRoot,
+    OpenBotChannelSubpage(OpenBotSettingsSubpage),
+    OpenBotContactProfileRoot,
+    OpenBotSharedMediaSubpage,
+}
+
+impl ContextInspector {
+    /// Syncs `ContextInspector` open/embedded state for the unified OpenBot Right `SidePanel` (`UI-F15-01`).
+    pub fn sync_inspector_for_unified_side_panel(&mut self, settings_visible: bool) {
+        self.embedded_in_side_panel = true;
+        if settings_visible {
+            self.open();
+        } else {
+            self.close();
+        }
+    }
+
+    /// Resolves the live OpenBot settings/profile view route (consumed directly by `ContextInspector::render`).
+    pub fn resolve_context_inspector_render_route(&self) -> ContextInspectorRenderRoute {
+        if !self.is_open {
+            return ContextInspectorRenderRoute::Closed;
+        }
+        if !self.embedded_in_side_panel {
+            return ContextInspectorRenderRoute::ClassicDrawer;
+        }
+        if let Some(ob_s) = self.openbot_subpage {
+            if ob_s == OpenBotSettingsSubpage::SharedMedia {
+                return ContextInspectorRenderRoute::OpenBotSharedMediaSubpage;
+            }
+            if self.profile.is_bot {
+                return ContextInspectorRenderRoute::OpenBotBotSubpage(ob_s);
+            }
+            if self.members.is_group_or_channel {
+                return ContextInspectorRenderRoute::OpenBotChannelSubpage(ob_s);
+            }
+            return ContextInspectorRenderRoute::OpenBotSharedMediaSubpage;
+        }
+        if self.profile.is_bot {
+            ContextInspectorRenderRoute::OpenBotBotSettingsRoot
+        } else if self.members.is_group_or_channel {
+            ContextInspectorRenderRoute::OpenBotChannelSettingsRoot
+        } else {
+            ContextInspectorRenderRoute::OpenBotContactProfileRoot
+        }
+    }
+
+    /// Triggers one-click `@handle` copy feedback toast & clipboard action (`UI-F16-02`).
+    pub fn trigger_copy_bot_handle(&mut self) -> Option<String> {
+        let handle = self.profile.username.trim().trim_start_matches('@');
+        if handle.is_empty() {
+            return None;
+        }
+        let full_handle = format!("@{handle}");
+        let msg = format!(
+            "{}: {full_handle}",
+            tr_str(&self.language_id, "已复制", "Copied")
+        );
+        self.copied_feedback = Some(msg.clone());
+        self.pending_action = Some(InspectorAction::CopyText(full_handle));
+        Some(msg)
+    }
+
+    /// Navigates into a bot settings drill-down subpage and returns the updated breadcrumb label (`UI-F16-04`).
+    pub fn open_bot_subpage(&mut self, subpage: OpenBotSettingsSubpage) -> &'static str {
+        self.openbot_subpage = Some(subpage);
+        subpage.title(&self.language_id)
     }
 }
 
@@ -1490,18 +2014,18 @@ impl Render for ContextInspector {
                 }
             };
 
-            let body: AnyElement = if let Some(ob_s) = ob_sub {
-                if ob_s == OpenBotSettingsSubpage::SharedMedia {
-                    render_shared_media_panel(&self.shared_media, pal, lang, cx)
-                } else if self.profile.is_bot {
-                    render_openbot_bot_subpage(self, ob_s, pal, lang, cx)
-                } else if self.members.is_group_or_channel {
-                    render_openbot_channel_subpage(self, ob_s, pal, lang, cx)
-                } else {
+            let route = self.resolve_context_inspector_render_route();
+            let body: AnyElement = match route {
+                ContextInspectorRenderRoute::OpenBotSharedMediaSubpage => {
                     render_shared_media_panel(&self.shared_media, pal, lang, cx)
                 }
-            } else if self.profile.is_bot {
-                match subpage {
+                ContextInspectorRenderRoute::OpenBotBotSubpage(ob_s) => {
+                    render_openbot_bot_subpage(self, ob_s, pal, lang, cx)
+                }
+                ContextInspectorRenderRoute::OpenBotChannelSubpage(ob_s) => {
+                    render_openbot_channel_subpage(self, ob_s, pal, lang, cx)
+                }
+                ContextInspectorRenderRoute::OpenBotBotSettingsRoot => match subpage {
                     InspectorSubpage::Main => render_openbot_bot_settings_root(self, pal, lang, cx),
                     InspectorSubpage::ComputersList => {
                         render_bot_computers_subpage(self, pal, lang, cx)
@@ -1509,11 +2033,15 @@ impl Render for ContextInspector {
                     InspectorSubpage::BotConfigEditor => {
                         render_bot_config_editor(self, pal, lang, cx)
                     }
+                },
+                ContextInspectorRenderRoute::OpenBotChannelSettingsRoot => {
+                    render_openbot_channel_settings_root(self, pal, lang, cx)
                 }
-            } else if self.members.is_group_or_channel {
-                render_openbot_channel_settings_root(self, pal, lang, cx)
-            } else {
-                render_openbot_contact_profile_root(self, pal, lang, cx)
+                ContextInspectorRenderRoute::OpenBotContactProfileRoot
+                | ContextInspectorRenderRoute::Closed
+                | ContextInspectorRenderRoute::ClassicDrawer => {
+                    render_openbot_contact_profile_root(self, pal, lang, cx)
+                }
             };
 
             return div()
@@ -2223,5 +2751,37 @@ mod tests {
         insp.channel_archived = true;
         insp.channel_draft_name = "Archived Group".to_string();
         assert!(!insp.commit_channel_identity_draft());
+    }
+
+    #[std::prelude::v1::test]
+    fn commit_channel_identity_draft_reverts_blank_name_and_blocks_over_limit_fields() {
+        let mut insp = ContextInspector::new();
+        insp.profile.name = "Launch War Room".to_string();
+        insp.channel_draft_name = "   ".to_string();
+        insp.channel_draft_instructions = "Keep it crisp".to_string();
+        assert!(!insp.commit_channel_identity_draft());
+        // Blank name blur must revert draft to committed profile.name and never queue a save
+        assert_eq!(insp.channel_draft_name, "Launch War Room");
+        assert!(insp.pending_openbot_action.is_none());
+        assert!(insp.channel_validation_error.is_some());
+
+        // > 80 UTF-16 code units name blocked
+        insp.channel_draft_name = "x".repeat(81);
+        assert!(!insp.commit_channel_identity_draft());
+        assert!(insp.pending_openbot_action.is_none());
+        assert!(insp.channel_validation_error.is_some());
+
+        // > 2000 UTF-16 code units instructions blocked
+        insp.channel_draft_name = "Launch War Room".to_string();
+        insp.channel_draft_instructions = "z".repeat(2001);
+        assert!(!insp.commit_channel_identity_draft());
+        assert!(insp.pending_openbot_action.is_none());
+        assert!(insp.channel_validation_error.is_some());
+
+        // Valid commit succeeds and clears validation error
+        insp.channel_draft_instructions = "z".repeat(2000);
+        assert!(insp.commit_channel_identity_draft());
+        assert!(insp.pending_openbot_action.is_some());
+        assert!(insp.channel_validation_error.is_none());
     }
 }

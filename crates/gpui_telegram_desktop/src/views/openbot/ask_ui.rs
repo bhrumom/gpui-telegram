@@ -29,6 +29,9 @@ pub const CONFIRM_HOLD_MIN_MS: u32 = UI_BLOCK_LIMITS.hold_min_ms;
 pub const CONFIRM_HOLD_MAX_MS: u32 = UI_BLOCK_LIMITS.hold_max_ms;
 /// Default credit threshold above which media generation prompts for approval (`50` credits).
 pub const DEFAULT_MEDIA_APPROVAL_CREDITS: u64 = 50;
+/// Canonical `UiBlockCard` maximum width (`min(540px, 100%)`, `UI-F10-04`).
+pub const UI_BLOCK_CARD_MAX_WIDTH_PX: f32 = 540.0;
+pub const UI_BLOCK_CARD_WIDTH_EXPR: &str = "min(540px, 100%)";
 
 const RESERVED_LEGACY_IDS: [&str; 4] = [
     "botId",
@@ -1168,7 +1171,7 @@ pub fn render_ui_block_card(state: &UiBlockCardState, palette: &OpenBotPalette) 
 
     let mut card = div()
         .w_full()
-        .max_w(px(520.0))
+        .max_w(px(UI_BLOCK_CARD_MAX_WIDTH_PX))
         .rounded(px(14.0))
         .bg(surface)
         .border_1()

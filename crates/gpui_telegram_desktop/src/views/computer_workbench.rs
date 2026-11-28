@@ -957,6 +957,13 @@ impl ComputerWorkbench {
     }
 
     pub fn terminal_text_and_preedit(&self, cx: &App) -> (String, Option<String>) {
+        if self.is_interactive_pty_focused(cx) {
+            if let Some(term) = self.terminal_view.as_ref() {
+                if let Some(pre) = term.read(cx).ime_preedit.clone() {
+                    return (self.terminal_draft.clone(), Some(pre));
+                }
+            }
+        }
         if let Some(ctrl) = self.terminal_input.as_ref() {
             return ctrl.read(cx).text_and_preedit(self.terminal_draft.clone());
         }

@@ -11,6 +11,7 @@ use crate::views::content_hub::apple_primitives::{
     apple_grouped_card, cover_artwork_box, creation_kind_accent, creation_kind_label,
     empty_state_card_shell, filter_pill, openbot_page_header, openbot_primary_cta_btn,
     openbot_secondary_btn, render_editable_field_box, review_status_badge,
+    OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH,
 };
 use crate::views::content_hub::publish_review_modal::ReviewerAccessState;
 use crate::views::content_hub::{
@@ -546,7 +547,7 @@ pub fn render_my_creations_view(
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(960.0))
+                        .max_w(px(OPENBOT_MARKETPLACE_CONTENT_MAX_WIDTH))
                         .mx_auto()
                         .p(px(24.0))
                         .flex()

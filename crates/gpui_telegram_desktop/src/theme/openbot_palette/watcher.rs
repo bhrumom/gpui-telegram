@@ -619,12 +619,12 @@ impl AppearancePreferenceStore {
         }
         if let Some(Some(ref font)) = patch.interface_font {
             if !is_valid_app_font_family(font) {
-                return Err(ThemePaletteError::InvalidName(font.clone()));
+                return Err(ThemePaletteError::InvalidFontFamily(font.clone()));
             }
         }
         if let Some(Some(ref font)) = patch.code_font {
             if !is_valid_app_font_family(font) {
-                return Err(ThemePaletteError::InvalidName(font.clone()));
+                return Err(ThemePaletteError::InvalidFontFamily(font.clone()));
             }
         }
 
