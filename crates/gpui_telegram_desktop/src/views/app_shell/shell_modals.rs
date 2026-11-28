@@ -171,8 +171,37 @@ fn restore_settings_advanced_proxy(
     });
 }
 
+fn sync_magpie_app_proxy_override(cfg: Option<&ClientProxyConfig>) {
+    let override_cfg = cfg.and_then(|c| {
+        let scheme = match c.proxy_type {
+            ClientProxyType::Direct => return None,
+            ClientProxyType::Http => "http",
+            ClientProxyType::Socks5 => "socks5h",
+        };
+        let host = c.host.trim();
+        if host.is_empty() || c.port == 0 {
+            return None;
+        }
+        let formatted_host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let url = match c.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(user) => {
+                let pass = c.password.as_deref().unwrap_or("");
+                format!("{scheme}://{user}:{pass}@{formatted_host}:{}", c.port)
+            }
+            None => format!("{scheme}://{formatted_host}:{}", c.port),
+        };
+        Some(magpie_gateway::SystemProxyConfig::from_all_proxy_url(url))
+    });
+    magpie_gateway::set_app_proxy_override(override_cfg);
+}
+
 impl AppShell {
     pub(crate) fn sync_settings_advanced_to_active_proxy(&mut self, cx: &mut Context<Self>) {
+        sync_magpie_app_proxy_override(self.client.http_client.proxy().as_ref());
         let snapshot = active_client_proxy_snapshot(&self.client);
         restore_settings_advanced_proxy(self, snapshot, cx);
     }
@@ -1056,6 +1085,7 @@ impl AppShell {
                                         });
                                     });
                                     if let Some(ref cfg) = proxy_cfg {
+                                        sync_magpie_app_proxy_override(Some(cfg));
                                         s.window_runtime.set_connection_status(
                                             BannerConnectionStatus::Connecting,
                                             Some(cfg.display_endpoint()),
@@ -1311,6 +1341,7 @@ impl AppShell {
                             }
                             SelectProxyOutcome::Ok => {
                                 if proxy_id == 0 {
+                                    sync_magpie_app_proxy_override(None);
                                     s.settings_router.update(cx, |sr, scx| {
                                         let sa = sr.ensure_advanced(scx);
                                         sa.update(scx, |sa, sa_cx| {
@@ -1328,6 +1359,7 @@ impl AppShell {
                                     }
                                 } else {
                                     if let Some(ref cfg) = activated_cfg {
+                                        sync_magpie_app_proxy_override(Some(cfg));
                                         s.window_runtime.set_connection_status(
                                             BannerConnectionStatus::Connecting,
                                             Some(cfg.display_endpoint()),

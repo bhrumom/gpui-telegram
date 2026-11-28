@@ -546,10 +546,11 @@ pub async fn verify_discovered_subscriptions(
     if items.is_empty() {
         return HashMap::new();
     }
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(4))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    magpie_gateway::invalidate_system_proxy_cache();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(6)),
+        None,
+    );
     let mut join_set = tokio::task::JoinSet::new();
     for item in items.iter().cloned() {
         let http_cl = http.clone();
@@ -882,7 +883,10 @@ async fn sync_local_subscriptions_to_server_inner(
         });
     }
 
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
     let sync_url = format!(
         "{}/api/v1/hermes/magpie/subscriptions/sync",
         base_url.trim_end_matches('/')
@@ -919,6 +923,12 @@ async fn sync_local_subscriptions_to_server_inner(
                                     s.unavailable_reason.clone().unwrap_or_default(),
                                 ),
                             );
+                        } else if target_is_remote
+                            && local_health.get(&s.id).is_some_and(|h| {
+                                !h.usable && h.error_code.as_deref() == Some("unreachable")
+                            })
+                        {
+                            local_health.insert(s.id.clone(), LocalSubscriptionHealth::usable());
                         }
                     }
                 }
@@ -1115,7 +1125,10 @@ async fn activate_subscription_with_local_fallback_inner(
     local_items: &[ClientSubscriptionSyncItem],
 ) -> Result<SubscriptionActivationOutcome, String> {
     let pinned = pinned_epoch.map(|e| (client.as_ref(), e));
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
     let act_url = format!(
         "{}/api/v1/hermes/magpie/subscriptions/{}/activate",
         base_url.trim_end_matches('/'),
@@ -1241,7 +1254,10 @@ async fn fetch_live_models_catalog_inner(
     force_refresh: bool,
 ) -> Result<CompactModelsCatalog, String> {
     check_pinned_epoch(pinned, token)?;
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
     let cache_path = local_models_dev_cache_path();
 
     // 1. Try fast server-side catalog proxy (~15 KB, <100ms on cloud VM)
@@ -1340,7 +1356,10 @@ async fn fetch_models_for_subscription_live_inner(
     item: &ClientSubscriptionSyncItem,
 ) -> Result<LiveModelsFetchOutcome, String> {
     check_pinned_epoch(pinned, token)?;
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
     let bearer_opt = resolve_fresh_bearer_token(&http, item).await.ok();
 
     check_pinned_epoch(pinned, token)?;
@@ -1430,7 +1449,10 @@ async fn refresh_legacy_provider_token_once_inner(
         .into_iter()
         .find(|i| i.account.id == sub_id)
         .ok_or_else(|| format!("Local subscription '{sub_id}' no longer present"))?;
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
     let bearer = resolve_fresh_bearer_token(&http, &matched).await?;
     check_pinned_epoch(pinned, token)?;
     let req = build_legacy_save_provider_request(&matched, bearer, model_override, false);
@@ -1518,6 +1540,49 @@ pub fn discover_all_local_subscriptions_in_home() -> Vec<ClientSubscriptionSyncI
     discover_syncable_subscriptions_in_home(&home, codex_override.as_deref(), false)
 }
 
+fn apply_unavailable_override_to_magpie_state(
+    state: &mut Option<MagpieStateDto>,
+    target_id: &str,
+    code: Option<&str>,
+    reason: Option<&str>,
+) {
+    let Some(st) = state.as_mut() else {
+        return;
+    };
+    let clean_code = code
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_reason = reason
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    for s in &mut st.subscriptions {
+        if s.id == target_id {
+            s.usable = false;
+            s.active = false;
+            if clean_code.is_some() {
+                s.unavailable_code = clean_code.clone();
+            }
+            if clean_reason.is_some() {
+                s.unavailable_reason = clean_reason.clone();
+            }
+        }
+    }
+    for p in &mut st.providers {
+        if p.provider_id == target_id {
+            p.usable = false;
+            p.is_active = false;
+            if clean_code.is_some() {
+                p.unavailable_code = clean_code.clone();
+            }
+            if clean_reason.is_some() {
+                p.unavailable_reason = clean_reason.clone();
+            }
+        }
+    }
+}
+
 /// Force-refreshes local & server credentials for `target_id` (optionally matching by `kind_hint`
 /// when a user re-logged into a different account email for the same subscription family),
 /// verifies availability live, and atomically activates it when usable.
@@ -1530,6 +1595,7 @@ pub async fn refresh_and_activate_provider_or_subscription_pinned(
     kind_hint: Option<SubscriptionKind>,
     model_override: Option<&str>,
 ) -> Result<ProviderRefreshOutcome, String> {
+    magpie_gateway::invalidate_system_proxy_cache();
     client
         .ensure_pinned_session(expected_epoch, token)
         .map_err(|e| format!("Session changed before provider refresh: {e}"))?;
@@ -1572,29 +1638,47 @@ pub async fn refresh_and_activate_provider_or_subscription_pinned(
 
     if let Some(local_item) = matched_local {
         let resolved_id = local_item.account.id.clone();
+        let is_remote_server = !is_loopback_server_url(base_url);
         if let Some(h) = local_health.get(&resolved_id).filter(|h| !h.usable).cloned() {
-            // Still sync so server records the fresh health status cleanly.
-            let sync_outcome = sync_local_subscriptions_to_server_pinned(
-                client,
-                expected_epoch,
-                base_url,
-                token,
-                local_items,
-                false,
-            )
-            .await?;
-            return Ok(ProviderRefreshOutcome {
-                provider_id: resolved_id,
-                usable: false,
-                activated: false,
-                active_model: None,
-                unavailable_code: h.error_code,
-                unavailable_reason: h.reason,
-                state: sync_outcome.state,
-                local_items: sync_outcome.local_items,
-                local_health: sync_outcome.local_health,
-                used_legacy_fallback: sync_outcome.used_legacy_fallback,
-            });
+            // If connected to a remote cloud server and the local machine only failed with a
+            // network reachability error (e.g. Mac without proxy reaching oauth2.googleapis.com),
+            // still upload fresh credentials and let the remote server perform authoritative live
+            // verification & activation. Definitive auth failures (invalid_grant/401/expired)
+            // and loopback servers always stay strictly blocked here.
+            let allow_remote_server_verify =
+                is_remote_server && h.error_code.as_deref() == Some("unreachable");
+            if !allow_remote_server_verify {
+                let mut sync_outcome = sync_local_subscriptions_to_server_pinned(
+                    client,
+                    expected_epoch,
+                    base_url,
+                    token,
+                    local_items,
+                    false,
+                )
+                .await?;
+                apply_unavailable_override_to_magpie_state(
+                    &mut sync_outcome.state,
+                    &resolved_id,
+                    h.error_code.as_deref(),
+                    h.reason.as_deref(),
+                );
+                sync_outcome
+                    .local_health
+                    .insert(resolved_id.clone(), h.clone());
+                return Ok(ProviderRefreshOutcome {
+                    provider_id: resolved_id,
+                    usable: false,
+                    activated: false,
+                    active_model: None,
+                    unavailable_code: h.error_code,
+                    unavailable_reason: h.reason,
+                    state: sync_outcome.state,
+                    local_items: sync_outcome.local_items,
+                    local_health: sync_outcome.local_health,
+                    used_legacy_fallback: sync_outcome.used_legacy_fallback,
+                });
+            }
         }
 
         let sync_outcome = sync_local_subscriptions_to_server_pinned(
@@ -1640,11 +1724,17 @@ pub async fn refresh_and_activate_provider_or_subscription_pinned(
                     resolved_id.clone(),
                     LocalSubscriptionHealth::unavailable(code, err.clone()),
                 );
-                let refreshed_state = client
+                let mut refreshed_state = client
                     .hermes_magpie_state_with_token(token, expected_epoch)
                     .await
                     .ok()
                     .or(sync_outcome.state);
+                apply_unavailable_override_to_magpie_state(
+                    &mut refreshed_state,
+                    &resolved_id,
+                    Some(code),
+                    Some(&err),
+                );
                 Ok(ProviderRefreshOutcome {
                     provider_id: resolved_id,
                     usable: false,
@@ -2112,5 +2202,52 @@ mod tests {
             assert_eq!(dto.unavailable_code.as_deref(), Some("oauth_invalid_grant"));
             assert!(dto.unavailable_reason.as_deref().is_some_and(|s| s.contains("invalid_grant")));
         });
+    }
+
+    #[test]
+    fn apply_unavailable_override_prevents_contradictory_active_card_state() {
+        use gpui_telegram_client::net::hermes_client::{MagpieProviderDto, MagpieSubscriptionDto};
+
+        let mut state = Some(MagpieStateDto {
+            active_provider: "google_vertex:user@gmail.com".to_string(),
+            active_model: "gemini-2.5-flash".to_string(),
+            subscriptions: vec![MagpieSubscriptionDto {
+                id: "google_vertex:user@gmail.com".to_string(),
+                kind: "google_vertex".to_string(),
+                label: "Google Vertex AI".to_string(),
+                active: true,
+                usable: true,
+                ..Default::default()
+            }],
+            providers: vec![MagpieProviderDto {
+                provider_id: "google_vertex:user@gmail.com".to_string(),
+                name: "Google Vertex AI".to_string(),
+                is_active: true,
+                usable: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        apply_unavailable_override_to_magpie_state(
+            &mut state,
+            "google_vertex:user@gmail.com",
+            Some("unreachable"),
+            Some("无法连接 Google 认证服务器"),
+        );
+
+        let st = state.expect("state preserved");
+        assert!(!st.subscriptions[0].usable);
+        assert!(!st.subscriptions[0].active);
+        assert_eq!(
+            st.subscriptions[0].unavailable_code.as_deref(),
+            Some("unreachable")
+        );
+        assert_eq!(
+            st.subscriptions[0].unavailable_reason.as_deref(),
+            Some("无法连接 Google 认证服务器")
+        );
+        assert!(!st.providers[0].usable);
+        assert!(!st.providers[0].is_active);
     }
 }

@@ -44,7 +44,10 @@ async fn http_fetch_subscriptions(
         .ensure_pinned_session(expected_epoch, token)
         .map_err(|e| format!("Session changed before subscriptions fetch: {e}"))?;
     let url = format!("{}/api/v1/hermes/magpie/subscriptions", base_url.trim_end_matches('/'));
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(15)),
+    );
     let resp = http
         .get(&url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))

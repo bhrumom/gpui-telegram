@@ -622,7 +622,7 @@ impl ProviderRuntimeManager {
             }
         }
 
-        let http_client = reqwest::Client::builder()
+        let http_client = magpie_gateway::build_proxy_aware_http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(COMPLETION_TIMEOUT_MS))
             .build()
@@ -917,7 +917,7 @@ impl ProviderRuntimeManager {
         &self,
         extra_urls: &[String],
     ) -> RuntimeResult<Vec<DetectedModelServer>> {
-        let probe_client = reqwest::Client::builder()
+        let probe_client = magpie_gateway::build_proxy_aware_http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(SCAN_TIMEOUT_MS))
             .build()

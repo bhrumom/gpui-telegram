@@ -682,6 +682,27 @@ impl SettingsAiProvidersSections {
         self.error_message = error;
     }
 
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+        self.error_message = None;
+        self.probe_result = None;
+    }
+
+    /// Triggers a targeted refresh & reactivation for the currently inspected subscription or
+    /// provider (or scans all subscriptions when on the overview page), clearing stale errors.
+    pub fn trigger_banner_refresh_action(&mut self) {
+        self.error_message = None;
+        if let Some(sub_id) = self.selected_subscription_detail_id.clone() {
+            let mdl = self.selected_subscription_models.get(&sub_id).cloned();
+            self.trigger_refresh_and_activate(&sub_id, mdl);
+        } else if let Some(pid) = self.editing_existing_provider_id.clone() {
+            self.trigger_refresh_and_activate(&pid, None);
+        } else {
+            self.loading = true;
+            self.pending_event = Some(SettingsAiProvidersEvent::ScanSubscriptions);
+        }
+    }
+
     fn current_preset(&self) -> Option<&MagpiePresetDto> {
         let pid = self.selected_preset_id.as_deref()?;
         self.state
@@ -823,12 +844,17 @@ impl SettingsAiProvidersSections {
 
     /// Opens the drill-down detail view for a connected local/server subscription.
     pub fn open_subscription_detail(&mut self, sub_id: &str) {
+        let switched_target = self.selected_subscription_detail_id.as_deref() != Some(sub_id);
         self.tab = AiProvidersTab::Overview;
         self.default_provider_dropdown_open = false;
         self.editor_open = false;
         self.editing_existing_provider_id = None;
         self.selected_subscription_detail_id = Some(sub_id.to_string());
         self.active_field = AiProviderField::None;
+        if switched_target {
+            self.error_message = None;
+            self.probe_result = None;
+        }
     }
 
     /// Returns from any provider detail or editor sub-view back to the main OpenBot Providers list.
@@ -838,6 +864,7 @@ impl SettingsAiProvidersSections {
         self.selected_subscription_detail_id = None;
         self.default_provider_dropdown_open = false;
         self.active_field = AiProviderField::None;
+        self.error_message = None;
     }
 
     /// Progressive Escape handler for OpenBot Providers: closes dropdown -> exits detail/editor -> clears search.
@@ -1364,72 +1391,186 @@ impl SettingsAiProvidersSections {
             )
     }
 
-    fn render_status_banners(&self, pal: TdesktopThemePalette) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .when_some(self.error_message.clone(), |el, err| {
-                el.child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.14))
-                        .border_1()
-                        .border_color(rgb(pal.danger))
-                        .text_xs()
-                        .text_color(rgb(pal.danger))
-                        .child(err),
-                )
-            })
-            .when_some(self.status_message.clone(), |el, msg| {
-                el.child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.14))
-                        .border_1()
-                        .border_color(rgb(pal.success))
-                        .text_xs()
-                        .text_color(rgb(pal.success))
-                        .child(msg),
-                )
-            })
-            .when_some(self.probe_result.clone(), |el, p| {
-                let ok = p.ok;
-                let col = if ok { pal.success } else { pal.danger };
-                let text = if ok {
-                    format!(
-                        "Probe OK: {} ({}) · {} ms — {}",
-                        p.provider_id,
-                        p.model,
-                        p.latency_ms,
-                        p.reply_preview.unwrap_or_default()
+    fn render_status_banners(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let danger_hover = TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.24);
+        let danger_border = TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.48);
+        let success_hover = TdesktopThemePalette::rgba_with_alpha(pal.success, 0.24);
+
+        let mut col = div().flex().flex_col().gap(px(6.0));
+
+        if let Some(err) = self.error_message.clone() {
+            let is_busy = self.loading || !self.refreshing_provider_ids.is_empty();
+            col = col.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.14))
+                    .border_1()
+                    .border_color(rgb(pal.danger))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(pal.danger))
+                            .child(err),
                     )
-                } else {
-                    format!(
-                        "Probe Failed: {} ({}) · {}",
-                        p.provider_id,
-                        p.model,
-                        p.error.unwrap_or_else(|| "error".to_string())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .id("magpie-status-banner-refresh-btn")
+                                    .cursor_pointer()
+                                    .h(px(26.0))
+                                    .px(px(9.0))
+                                    .rounded(px(6.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
+                                    .border_1()
+                                    .border_color(danger_border)
+                                    .hover(move |s| s.bg(danger_hover))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(pal.danger))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.trigger_banner_refresh_action();
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if is_busy {
+                                        tr_str(lang, "刷新中…", "Refreshing…")
+                                    } else {
+                                        tr_str(lang, "刷新激活", "Refresh & Activate")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("magpie-status-banner-dismiss-err-btn")
+                                    .cursor_pointer()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded(px(5.0))
+                                    .hover(move |s| s.bg(danger_hover))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(pal.danger))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.error_message = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    ),
+            );
+        }
+
+        if let Some(msg) = self.status_message.clone() {
+            col = col.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.success, 0.14))
+                    .border_1()
+                    .border_color(rgb(pal.success))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(pal.success))
+                            .child(msg),
                     )
-                };
-                el.child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(col, 0.14))
-                        .border_1()
-                        .border_color(rgb(col))
-                        .text_xs()
-                        .text_color(rgb(col))
-                        .child(text),
+                    .child(
+                        div()
+                            .id("magpie-status-banner-dismiss-ok-btn")
+                            .cursor_pointer()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded(px(5.0))
+                            .hover(move |s| s.bg(success_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.0))
+                            .text_color(rgb(pal.success))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.status_message = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            );
+        }
+
+        if let Some(p) = self.probe_result.clone() {
+            let ok = p.ok;
+            let col_rgb = if ok { pal.success } else { pal.danger };
+            let text = if ok {
+                format!(
+                    "Probe OK: {} ({}) · {} ms — {}",
+                    p.provider_id,
+                    p.model,
+                    p.latency_ms,
+                    p.reply_preview.unwrap_or_default()
                 )
-            })
-            .into_any_element()
+            } else {
+                format!(
+                    "Probe Failed: {} ({}) · {}",
+                    p.provider_id,
+                    p.model,
+                    p.error.unwrap_or_else(|| "error".to_string())
+                )
+            };
+            col = col.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(8.0))
+                    .bg(TdesktopThemePalette::rgba_with_alpha(col_rgb, 0.14))
+                    .border_1()
+                    .border_color(rgb(col_rgb))
+                    .text_xs()
+                    .text_color(rgb(col_rgb))
+                    .child(text),
+            );
+        }
+
+        col.into_any_element()
     }
 
     fn openbot_card_bg(pal: TdesktopThemePalette) -> Rgba {
@@ -2165,9 +2306,48 @@ impl SettingsAiProvidersSections {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
+                            .justify_end()
                             .gap(px(8.0))
                             .flex_shrink_0()
+                            .when(is_usable, |row| {
+                                let pid = sub_id_refresh_card.clone();
+                                let mdl = selected_model_for_card_refresh.clone();
+                                row.child(
+                                    div()
+                                        .id("magpie-sub-detail-header-refresh-btn")
+                                        .cursor_pointer()
+                                        .h(px(32.0))
+                                        .px(px(11.0))
+                                        .rounded(px(8.0))
+                                        .bg(ob.bg_control())
+                                        .border_1()
+                                        .border_color(border_strong)
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text_sec)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.trigger_refresh_and_activate(
+                                                    &pid,
+                                                    mdl.clone(),
+                                                );
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(if is_refreshing_this {
+                                            tr_str(lang, "刷新中…", "Refreshing…")
+                                        } else {
+                                            tr_str(lang, "刷新激活", "Refresh")
+                                        }),
+                                )
+                            })
                             .when(is_usable && recovery.supports_browser_relogin, |row| {
                                 let pid = sub_id_reauth_active.clone();
                                 let kind = sub_kind_reauth_active.clone();
@@ -5125,7 +5305,9 @@ impl Render for SettingsAiProvidersSections {
                             }),
                     ),
             )
-            .when(has_banners, |col| col.child(self.render_status_banners(pal)))
+            .when(has_banners, |col| {
+                col.child(self.render_status_banners(pal, &lang, cx))
+            })
             .child(match self.tab {
                 AiProvidersTab::Overview => self.render_overview_tab(pal, &lang, cx),
                 AiProvidersTab::Routing => self.render_routing_tab(pal, &lang, cx),
@@ -5716,5 +5898,61 @@ mod tests {
             view.selected_subscription_detail_id.as_deref(),
             Some("codex:expired@example.com")
         );
+    }
+
+    #[std::prelude::v1::test]
+    fn banner_refresh_action_targets_active_detail_and_clears_stale_error() {
+        let pal = TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x5288C1, 14, 12);
+        let mut view = SettingsAiProvidersSections::new_live(pal, "zh-CN");
+
+        // 1. On a subscription detail page, banner refresh emits RefreshAndActivateProvider
+        // for that subscription (preserving chosen model) and clears the stale error banner.
+        view.open_subscription_detail("google_vertex:user@gmail.com");
+        view.select_subscription_model("google_vertex:user@gmail.com", "gemini-2.5-pro");
+        view.set_status(
+            None,
+            Some("无法连接 Google 认证服务器 (oauth2.googleapis.com)".to_string()),
+        );
+        assert!(view.error_message.is_some());
+
+        view.trigger_banner_refresh_action();
+        assert!(view.error_message.is_none());
+        assert!(matches!(
+            view.take_event(),
+            Some(SettingsAiProvidersEvent::RefreshAndActivateProvider {
+                ref provider_id,
+                ref model,
+            }) if provider_id == "google_vertex:user@gmail.com"
+                && model.as_deref() == Some("gemini-2.5-pro")
+        ));
+
+        // 2. Switching to another subscription or closing detail view clears stale error_message,
+        // while re-opening the same subscription preserves its error context.
+        view.set_status(None, Some("old vertex error".to_string()));
+        view.open_subscription_detail("google_vertex:user@gmail.com");
+        assert_eq!(view.error_message.as_deref(), Some("old vertex error"));
+
+        view.open_subscription_detail("codex:user@example.com");
+        assert!(view.error_message.is_none());
+
+        view.set_status(None, Some("codex error".to_string()));
+        view.close_detail_view();
+        assert!(view.error_message.is_none());
+
+        // 3. On overview (no detail open), banner refresh triggers ScanSubscriptions
+        view.set_status(None, Some("network error".to_string()));
+        view.trigger_banner_refresh_action();
+        assert!(view.error_message.is_none());
+        assert!(matches!(
+            view.take_event(),
+            Some(SettingsAiProvidersEvent::ScanSubscriptions)
+        ));
+
+        // 4. clear_status resets status, error, and probe_result
+        view.set_status(Some("ok".to_string()), Some("err".to_string()));
+        view.clear_status();
+        assert!(view.status_message.is_none());
+        assert!(view.error_message.is_none());
+        assert!(view.probe_result.is_none());
     }
 }

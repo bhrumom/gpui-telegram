@@ -1120,7 +1120,7 @@ pub struct FallbackTarget {
 pub struct ProviderRouter {
     inner: Arc<Mutex<ProviderRouterState>>,
     route_metrics: Arc<Mutex<RouteRuntimeMetrics>>,
-    http_client: reqwest::Client,
+    http_client: Arc<std::sync::RwLock<reqwest::Client>>,
     vertex_managers: Arc<Mutex<HashMap<String, (Arc<VertexTokenManager>, bool)>>>,
     codex_managers: Arc<Mutex<HashMap<String, Arc<CodexTokenManager>>>>,
 }
@@ -1543,11 +1543,7 @@ impl ProviderRouter {
             },
         );
 
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .user_agent("hermes-rust/1.0")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let http_client = Arc::new(std::sync::RwLock::new(Self::build_http_client()));
 
         Self {
             inner: Arc::new(Mutex::new(ProviderRouterState {
@@ -1572,6 +1568,32 @@ impl ProviderRouter {
             vertex_managers: Arc::new(Mutex::new(HashMap::new())),
             codex_managers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn build_http_client() -> reqwest::Client {
+        magpie_gateway::build_proxy_aware_http_client_builder()
+            .connect_timeout(Duration::from_secs(15))
+            .user_agent("hermes-rust/1.0")
+            .build()
+            .unwrap_or_else(|_| {
+                magpie_gateway::build_proxy_aware_http_client(Some(Duration::from_secs(15)), None)
+            })
+    }
+
+    /// Returns a cloned handle to the current proxy-aware HTTP client.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http_client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Invalidates the OS system-proxy cache and rebuilds the HTTP client pool so proxy
+    /// toggles (Clash/Surge/VPN) take effect immediately without restarting the app.
+    pub fn refresh_http_client(&self) {
+        magpie_gateway::invalidate_system_proxy_cache();
+        let fresh = Self::build_http_client();
+        *self.http_client.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 
     /// Discovers API keys, `.env` files, and local Codex/Magpie gateways & subscriptions without hardcoding credentials.
@@ -2585,9 +2607,10 @@ impl ProviderRouter {
             if force {
                 mgr.invalidate_cached_token();
             }
+            let http = self.http_client();
             let refresh_res = tokio::time::timeout(
                 Duration::from_secs(8),
-                mgr.get_or_refresh_token(&self.http_client, now_ms),
+                mgr.get_or_refresh_token(&http, now_ms),
             )
             .await;
             return match refresh_res {
@@ -2648,9 +2671,10 @@ impl ProviderRouter {
                     }
                     return ProviderAvailabilityStatus::usable_at(now_ms);
                 }
+                let http = self.http_client();
                 let refresh_res = tokio::time::timeout(
                     Duration::from_secs(8),
-                    mgr.get_or_refresh_token(&self.http_client, now_ms),
+                    mgr.get_or_refresh_token(&http, now_ms),
                 )
                 .await;
                 return match refresh_res {
@@ -2739,7 +2763,8 @@ impl ProviderRouter {
         // - 404/405/501 => endpoint reachable, relay doesn't implement /models (keep usable)
         // - connection/DNS/timeout error => unreachable (mark unavailable!)
         let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-        let mut req_builder = self.http_client.get(&models_url);
+        let http = self.http_client();
+        let mut req_builder = http.get(&models_url);
         match cfg.api_mode {
             ApiMode::AnthropicMessages => {
                 if let Some(ref k) = api_key {
@@ -2857,6 +2882,7 @@ impl ProviderRouter {
         activate: bool,
         model_override: Option<&str>,
     ) -> (String, ProviderAvailabilityStatus, bool) {
+        self.refresh_http_client();
         if rescan_local {
             let _ = self.refresh_local_subscriptions();
         }
@@ -4705,10 +4731,11 @@ impl ProviderRouter {
                 }
             };
             let base_url = base_url_override.as_deref().unwrap_or(&cfg.base_url);
+            let http = self.http_client();
             let res = match cfg.api_mode {
                 ApiMode::ChatCompletions => {
                     execute_chat_completions(
-                        &self.http_client,
+                        &http,
                         cfg,
                         base_url,
                         &api_key,
@@ -4730,7 +4757,7 @@ impl ProviderRouter {
                 }
                 ApiMode::AnthropicMessages => {
                     execute_anthropic_messages(
-                        &self.http_client,
+                        &http,
                         cfg,
                         base_url,
                         &api_key,
@@ -4741,7 +4768,7 @@ impl ProviderRouter {
                 }
                 ApiMode::GeminiGenerateContent => {
                     execute_gemini_generate_content(
-                        &self.http_client,
+                        &http,
                         cfg,
                         base_url,
                         &api_key,
@@ -4811,10 +4838,11 @@ impl ProviderRouter {
         let needs_preemptive_refresh = active_token.trim().is_empty()
             || extract_jwt_exp_ms(&active_token).is_some_and(|exp| exp <= now_ms + 60_000);
 
+        let http = self.http_client();
         if needs_preemptive_refresh {
             if let Some(ref mgr) = codex_mgr {
                 let refreshed = mgr
-                    .get_or_refresh_token(&self.http_client, now_ms)
+                    .get_or_refresh_token(&http, now_ms)
                     .await
                     .map_err(|e| {
                         ProviderError::Authentication(format!(
@@ -4836,7 +4864,7 @@ impl ProviderRouter {
         }
 
         let first_res = execute_codex_responses(
-            &self.http_client,
+            &http,
             cfg,
             base_url,
             &active_token,
@@ -4851,7 +4879,7 @@ impl ProviderRouter {
                     mgr.invalidate_cached_token();
                     let now_retry = Utc::now().timestamp_millis();
                     let refreshed = mgr
-                        .get_or_refresh_token(&self.http_client, now_retry)
+                        .get_or_refresh_token(&http, now_retry)
                         .await
                         .map_err(|e| {
                             ProviderError::Authentication(format!(
@@ -4869,7 +4897,7 @@ impl ProviderRouter {
                         }
                     }
                     return execute_codex_responses(
-                        &self.http_client,
+                        &http,
                         cfg,
                         base_url,
                         &refreshed,
@@ -4892,12 +4920,13 @@ impl ProviderRouter {
         request: &ProviderRequest,
         stream_tx: Option<&mpsc::Sender<ProviderStreamEvent>>,
     ) -> Result<ProviderResponse, ProviderError> {
+        let http = self.http_client();
         let now_ms = Utc::now().timestamp_millis();
         let token_mgr = self.get_or_create_vertex_manager(&cfg.id, cfg);
         let mut token = if !api_key.trim().is_empty() {
             api_key.trim().to_string()
         } else if let Some(ref mgr) = token_mgr {
-            mgr.get_or_refresh_token(&self.http_client, now_ms)
+            mgr.get_or_refresh_token(&http, now_ms)
                 .await
                 .map_err(|e| {
                     ProviderError::Authentication(format!(
@@ -4958,8 +4987,7 @@ impl ProviderRouter {
         let payload = build_gemini_generate_content_payload(&unified);
 
         let send_vertex_request = |bearer: &str| {
-            let mut builder = self
-                .http_client
+            let mut builder = http
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .bearer_auth(bearer)
@@ -4996,7 +5024,7 @@ impl ProviderRouter {
                 if let Some(ref mgr) = token_mgr {
                     mgr.invalidate_cached_token();
                     token = mgr
-                        .get_or_refresh_token(&self.http_client, Utc::now().timestamp_millis())
+                        .get_or_refresh_token(&http, Utc::now().timestamp_millis())
                         .await
                         .map_err(|e| {
                             ProviderError::Authentication(format!(
@@ -11532,7 +11560,8 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
         router.register_provider(cfg.clone());
 
         let mgr = router.get_or_create_vertex_manager("google_vertex_refresh_test", &cfg).unwrap();
-        let token = mgr.get_or_refresh_token(&router.http_client, Utc::now().timestamp_millis()).await.unwrap();
+        let http = router.http_client();
+        let token = mgr.get_or_refresh_token(&http, Utc::now().timestamp_millis()).await.unwrap();
 
         let _ = srv.join();
         assert_eq!(token, "ya29.mock-refreshed-oauth-token-555");

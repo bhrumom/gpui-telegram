@@ -672,12 +672,12 @@ pub async fn run_codex_pkce_oauth_login(
         open_external_url_in_system_browser(&auth_url).map_err(ReauthError::Failed)?;
     }
 
+    magpie_gateway::invalidate_system_proxy_cache();
     let deadline = tokio::time::Instant::now() + opts.timeout;
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(20)),
+    );
 
     loop {
         let now = tokio::time::Instant::now();

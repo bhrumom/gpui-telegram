@@ -3,6 +3,7 @@
 //! wire translation, and deep-link / `.env` importers.
 
 pub mod gateway;
+pub mod http_proxy;
 pub mod import;
 pub mod masking;
 pub mod models_catalog;
@@ -16,6 +17,13 @@ pub use gateway::{
     create_gateway_router, handle_chat_completions, handle_messages, handle_models, handle_quotas,
     handle_responses, handle_usage, GatewayServer, GatewayServerHandle, GatewayState, QuotasView,
     UsageResponseView,
+};
+pub use http_proxy::{
+    build_proxy_aware_http_client, build_proxy_aware_http_client_builder,
+    current_effective_proxy_config, format_proxy_endpoint, host_matches_no_proxy,
+    invalidate_system_proxy_cache, parse_macos_scutil_proxy_output, parse_proxy_config_from_env,
+    parse_windows_proxy_settings, parse_windows_reg_query_output, resolve_proxy_url_for_target,
+    set_app_proxy_override, SystemProxyConfig,
 };
 pub use import::{parse_dotenv_providers, parse_magpie_import_link, ImportError, ImportedProviderSpec};
 pub use masking::{

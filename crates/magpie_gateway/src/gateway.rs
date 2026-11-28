@@ -61,7 +61,10 @@ impl GatewayState {
             masking: None,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::default())),
             provider_endpoints: Arc::new(RwLock::new(HashMap::new())),
-            http_client: reqwest::Client::new(),
+            http_client: crate::build_proxy_aware_http_client(
+                Some(std::time::Duration::from_secs(15)),
+                None,
+            ),
             default_provider_id: default_provider_id.into(),
             custom_handler: None,
         }

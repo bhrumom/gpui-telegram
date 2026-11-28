@@ -911,7 +911,10 @@ pub async fn magpie_models_catalog_get(
     Query(q): Query<ModelsCatalogQuery>,
 ) -> Response {
     let cache_path = std::env::temp_dir().join("fabushi_models_dev_catalog_cache.json");
-    let http = reqwest::Client::new();
+    let http = magpie_gateway::build_proxy_aware_http_client(
+        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(20)),
+    );
     match magpie_gateway::fetch_models_dev_catalog(&http, Some(&cache_path), q.refresh).await {
         Ok(catalog) => (StatusCode::OK, Json(catalog)).into_response(),
         Err(err) => err_resp(
