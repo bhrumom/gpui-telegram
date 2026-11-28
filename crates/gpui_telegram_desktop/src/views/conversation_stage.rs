@@ -419,6 +419,17 @@ impl RoomAgentLiveState {
     }
 }
 
+/// Mutually-exclusive thinking indicator mode for `ConversationStage` so the transcript never
+/// renders both `stage-sand-activity-line` and `stage-bot-thinking-indicator` simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageThinkingPresentation {
+    None,
+    /// Multi-agent room floor indicator (`stage-sand-activity-line`), merged with active bot detail.
+    RoomFloor,
+    /// Single-bot thinking indicator (`stage-bot-thinking-indicator`) with plush avatar & live steps.
+    BotActivity,
+}
+
 /// Interactive stage-level intents emitted by `ConversationStage` to `AppShell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageAction {
@@ -971,6 +982,109 @@ impl ConversationStage {
         self.room_agent_states
             .get(&cid)
             .filter(|st| st.is_active(now_ms))
+    }
+
+    /// Resolves which single thinking indicator (if any) should be rendered in the transcript.
+    /// Guarantees `stage-sand-activity-line` and `stage-bot-thinking-indicator` never render together.
+    pub fn resolve_thinking_presentation(&self, now_ms: i64) -> StageThinkingPresentation {
+        let has_bot_activity = (self.is_bot_chat || self.is_group_chat)
+            && !self.bot_activity_state.is_empty()
+            && !self.bot_activity_state.eq_ignore_ascii_case("idle");
+        let has_room_live = self.active_room_agent_state(now_ms).is_some();
+
+        match (has_room_live, has_bot_activity) {
+            (true, _) if self.is_group_chat => StageThinkingPresentation::RoomFloor,
+            (_, true) => StageThinkingPresentation::BotActivity,
+            (true, false) => StageThinkingPresentation::RoomFloor,
+            (false, false) => StageThinkingPresentation::None,
+        }
+    }
+
+    /// Resolves a raw `AgentFloorChanged.current_speaker` string (such as legacy `"bot_600001"` or
+    /// an internal `agent_id`) into a human-readable display name.
+    pub fn resolve_floor_speaker_label(&self, raw: Option<&str>) -> String {
+        let is_zh = self.lang_id.starts_with("zh");
+        let default_label = || {
+            if is_zh {
+                "AI 智能体".to_string()
+            } else {
+                "AI Agent".to_string()
+            }
+        };
+        let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return default_label();
+        };
+        if let Some(ref fab) = self.active_fabushi_bot {
+            let matches_raw_id = trimmed
+                .strip_prefix("bot_")
+                .and_then(|s| s.parse::<i64>().ok())
+                .is_some_and(|id| id == fab.bot_user_id);
+            let matches_agent_key = trimmed.eq_ignore_ascii_case(&fab.agent_id)
+                || trimmed.eq_ignore_ascii_case(&fab.username);
+            if matches_raw_id || matches_agent_key {
+                let dn = fab.display_name.trim();
+                if !dn.is_empty() {
+                    return dn.to_string();
+                }
+            }
+        }
+        // Fallback for older servers sending raw `bot_<id>` in a 1:1 bot chat
+        if !self.is_group_chat
+            && trimmed
+                .strip_prefix("bot_")
+                .and_then(|s| s.parse::<i64>().ok())
+                .is_some()
+        {
+            let title = self.chat_title.trim();
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    /// Formats the active bot activity status label (`tool` / `writing` / `thinking`) for UI display.
+    pub fn format_bot_activity_label(&self) -> String {
+        let is_zh = self.lang_id.starts_with("zh");
+        match self.bot_activity_state.as_str() {
+            "tool" => self
+                .bot_activity_detail
+                .as_deref()
+                .map(|t| {
+                    if is_zh {
+                        format!("正在使用 {t}…")
+                    } else {
+                        format!("Using {t}…")
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if is_zh {
+                        "正在执行工具…".to_string()
+                    } else {
+                        "Running tool…".to_string()
+                    }
+                }),
+            "writing" => self
+                .bot_activity_detail
+                .clone()
+                .unwrap_or_else(|| {
+                    if is_zh {
+                        "正在回复…".to_string()
+                    } else {
+                        "Writing…".to_string()
+                    }
+                }),
+            _ => self
+                .bot_activity_detail
+                .clone()
+                .unwrap_or_else(|| {
+                    if is_zh {
+                        "正在思考…".to_string()
+                    } else {
+                        "Thinking…".to_string()
+                    }
+                }),
+        }
     }
 
     pub fn sync_pending_tool_approvals(&mut self, requests: Vec<PendingToolApproval>) {
@@ -2177,18 +2291,20 @@ impl Render for ConversationStage {
                     })
                     .children(message_rows)
                     .when_some(
-                        self.active_room_agent_state(stage_now_ms() as i64).cloned(),
+                        {
+                            let now_ms = stage_now_ms() as i64;
+                            (self.resolve_thinking_presentation(now_ms)
+                                == StageThinkingPresentation::RoomFloor)
+                                .then(|| self.active_room_agent_state(now_ms).cloned())
+                                .flatten()
+                        },
                         |el, live| {
                             let is_dark = self.palette.mode.is_dark();
                             let ob = self.palette.openbot_palette();
                             let lang = self.lang_id.as_str();
                             let is_zh = lang.starts_with("zh");
-                            let speaker_name = live
-                                .current_speaker
-                                .clone()
-                                .unwrap_or_else(|| {
-                                    if is_zh { "AI 智能体".to_string() } else { "AI Agent".to_string() }
-                                });
+                            let speaker_name =
+                                self.resolve_floor_speaker_label(live.current_speaker.as_deref());
                             let seed_hash = speaker_name
                                 .bytes()
                                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
@@ -2200,18 +2316,24 @@ impl Render for ConversationStage {
                                 .bot_activity_started_at_ms
                                 .map(|s| stage_now_ms().saturating_sub(s) / 1000)
                                 .unwrap_or(0);
-                            let status_suffix = if is_zh {
+                            let has_live_bot_activity = !self.bot_activity_state.is_empty()
+                                && !self.bot_activity_state.eq_ignore_ascii_case("idle");
+                            let status_suffix = if has_live_bot_activity {
+                                self.format_bot_activity_label()
+                            } else if is_zh {
                                 "正在思考…".to_string()
                             } else {
                                 "is thinking…".to_string()
                             };
                             let mut workers: Vec<String> = vec![speaker_name.clone()];
                             if let Some((ref from_a, ref to_a, _, _)) = live.last_handoff {
-                                if !workers.iter().any(|w| w == from_a) {
-                                    workers.push(from_a.clone());
+                                let from_label = self.resolve_floor_speaker_label(Some(from_a));
+                                let to_label = self.resolve_floor_speaker_label(Some(to_a));
+                                if !workers.iter().any(|w| w == &from_label) {
+                                    workers.push(from_label);
                                 }
-                                if !workers.iter().any(|w| w == to_a) {
-                                    workers.push(to_a.clone());
+                                if !workers.iter().any(|w| w == &to_label) {
+                                    workers.push(to_label);
                                 }
                             }
                             let avatar_stack = div()
@@ -2309,50 +2431,10 @@ impl Render for ConversationStage {
                         },
                     )
                     .when(
-                        (self.is_bot_chat || self.is_group_chat)
-                            && !self.bot_activity_state.is_empty()
-                            && !self.bot_activity_state.eq_ignore_ascii_case("idle"),
+                        self.resolve_thinking_presentation(stage_now_ms() as i64)
+                            == StageThinkingPresentation::BotActivity,
                         |el| {
-                            let is_zh = self.lang_id.starts_with("zh");
-                            let status_label = match self.bot_activity_state.as_str() {
-                                "tool" => self
-                                    .bot_activity_detail
-                                    .as_deref()
-                                    .map(|t| {
-                                        if is_zh {
-                                            format!("正在使用 {t}…")
-                                        } else {
-                                            format!("Using {t}…")
-                                        }
-                                    })
-                                    .unwrap_or_else(|| {
-                                        if is_zh {
-                                            "正在执行工具…".to_string()
-                                        } else {
-                                            "Running tool…".to_string()
-                                        }
-                                    }),
-                                "writing" => self
-                                    .bot_activity_detail
-                                    .clone()
-                                    .unwrap_or_else(|| {
-                                        if is_zh {
-                                            "正在回复…".to_string()
-                                        } else {
-                                            "Writing…".to_string()
-                                        }
-                                    }),
-                                _ => self
-                                    .bot_activity_detail
-                                    .clone()
-                                    .unwrap_or_else(|| {
-                                        if is_zh {
-                                            "正在思考…".to_string()
-                                        } else {
-                                            "Thinking…".to_string()
-                                        }
-                                    }),
-                            };
+                            let status_label = self.format_bot_activity_label();
                             if is_apple {
                                 let ob = self.palette.openbot_palette();
                                 let (mood, act) =

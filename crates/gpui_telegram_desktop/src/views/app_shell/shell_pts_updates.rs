@@ -1316,7 +1316,40 @@ impl AppShell {
                 if target_chat_u64 > 0 {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let lang = self.active_lang_id();
-                    let sidebar_indicator = current_speaker.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|sp| {
+                    let resolved_speaker = current_speaker
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|sp| {
+                            if sp
+                                .strip_prefix("bot_")
+                                .and_then(|n| n.parse::<i64>().ok())
+                                .is_some()
+                            {
+                                let stage_ref = self.stage.read(cx);
+                                if stage_ref.active_chat_id == Some(target_chat_u64) {
+                                    let resolved = stage_ref.resolve_floor_speaker_label(Some(sp));
+                                    if resolved != sp {
+                                        return resolved;
+                                    }
+                                }
+                                if let Some(dlg) = self
+                                    .sidebar
+                                    .read(cx)
+                                    .dialogs
+                                    .iter()
+                                    .find(|d| d.id == target_chat_u64 && !d.peer_name.trim().is_empty())
+                                {
+                                    if !dlg.folder.eq_ignore_ascii_case("Groups")
+                                        && !dlg.folder.eq_ignore_ascii_case("Channels")
+                                    {
+                                        return dlg.peer_name.trim().to_string();
+                                    }
+                                }
+                            }
+                            sp.to_string()
+                        });
+                    let sidebar_indicator = resolved_speaker.as_deref().map(|sp| {
                         if queued_count > 0 {
                             if lang.starts_with("zh") {
                                 format!("{sp} 正在发言 (+{queued_count} 排队)")
@@ -1332,7 +1365,7 @@ impl AppShell {
                     self.stage.update(cx, |st, st_cx| {
                         st.on_agent_floor_changed(
                             target_chat_u64,
-                            current_speaker.clone(),
+                            resolved_speaker.clone(),
                             queued_count,
                             loop_hops,
                             now_ms,

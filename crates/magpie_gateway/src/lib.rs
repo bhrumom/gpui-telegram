@@ -37,7 +37,7 @@ pub use protocol::{
     encode_openai_chat_chunk, encode_openai_done, inbound_anthropic_to_unified,
     inbound_chat_completions_to_unified, inbound_responses_to_unified,
     parse_anthropic_response_json, parse_anthropic_sse_event, parse_chat_completions_response_json,
-    parse_gemini_response_json, parse_gemini_sse_chunk, parse_gemini_sse_data,
+    is_cloudcode_pa_url, parse_gemini_response_json, parse_gemini_sse_chunk, parse_gemini_sse_data,
     parse_openai_sse_chunk, parse_responses_response_json, resolve_anthropic_messages_url,
     resolve_gemini_endpoint_url, unified_to_anthropic_json, unified_to_anthropic_request_json,
     unified_to_chat_completions_json, unified_to_chat_completions_request_json,
@@ -54,11 +54,12 @@ pub use routing::{
 };
 pub use subscriptions::{
     decode_jwt_payload, default_models_for_subscription_kind, discover_subscriptions_in_home,
-    discover_syncable_subscriptions_in_home, extract_jwt_exp_ms, is_loopback_server_url, is_sensitive_header_name,
-    parse_gcloud_config_default, parse_magpie_logins, parse_magpie_providers,
-    parse_vertex_adc_credentials, redact_header_value, redact_oauth_error_body, scan_claude_dirs,
-    scan_gemini_dirs, scan_magpie_dir, scan_vertex_adc, CachedVertexToken,
-    ClientSubscriptionSyncItem, CodexOAuthCredentials, CodexTokenManager,
+    discover_syncable_subscriptions_in_home, extract_jwt_exp_ms,
+    is_cross_device_syncable_subscription, is_local_proxy_model_alias, is_loopback_server_url,
+    is_sensitive_header_name, parse_gcloud_config_default, parse_magpie_logins,
+    parse_magpie_providers, parse_vertex_adc_credentials, redact_header_value,
+    redact_oauth_error_body, scan_claude_dirs, scan_gemini_dirs, scan_magpie_dir, scan_vertex_adc,
+    CachedVertexToken, ClientSubscriptionSyncItem, CodexOAuthCredentials, CodexTokenManager,
     GoogleOAuthTokenResponse, SubscriptionAccount, SubscriptionKind, SubscriptionRegistry,
     TokenRefreshError, VertexAdcCredentials, VertexTokenManager, DEFAULT_CODEX_CLIENT_ID,
     DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS, GOOGLE_OAUTH2_TOKEN_URL, OPENAI_OAUTH2_TOKEN_URL,
@@ -2003,5 +2004,57 @@ account = fallback-account@example.com
 
         assert_eq!(total_lines, 1000, "Expected exactly 1000 physical JSONL lines");
         assert_eq!(parsed_count, 1000, "Expected 1000 successfully parsed records");
+    }
+
+    #[test]
+    fn test_cloudcode_pa_url_resolution_and_response_envelope_unwrapping() {
+        assert!(is_cloudcode_pa_url("https://cloudcode-pa.googleapis.com/v1internal"));
+        assert!(!is_cloudcode_pa_url("https://generativelanguage.googleapis.com/v1beta"));
+
+        assert_eq!(
+            resolve_gemini_endpoint_url(
+                "https://cloudcode-pa.googleapis.com/v1internal",
+                "gemini-2.5-pro",
+                true
+            ),
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            resolve_gemini_endpoint_url(
+                "https://cloudcode-pa.googleapis.com/v1internal",
+                "gemini-2.5-pro",
+                false
+            ),
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        );
+        assert_eq!(
+            resolve_gemini_endpoint_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini-2.5-pro",
+                true
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+
+        let wrapped_json = json!({
+            "response": {
+                "candidates": [{
+                    "content": { "role": "model", "parts": [{ "text": "Hello from Cloud Code Assist" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 7, "totalTokenCount": 12 }
+            }
+        })
+        .to_string();
+        let parsed = parse_gemini_response_json("gemini_code_assist:test", "gemini-2.5-pro", &wrapped_json)
+            .expect("parse wrapped response json");
+        assert_eq!(parsed.content, "Hello from Cloud Code Assist");
+        assert_eq!(parsed.usage.total_tokens, 12);
+
+        let sse_line = format!("data: {wrapped_json}");
+        let delta = parse_gemini_sse_data(&sse_line, 0)
+            .expect("parse wrapped sse")
+            .expect("some delta");
+        assert_eq!(delta.text_delta, "Hello from Cloud Code Assist");
     }
 }

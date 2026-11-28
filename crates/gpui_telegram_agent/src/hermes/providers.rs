@@ -1,7 +1,8 @@
 use crate::computer::{parse_cloud_credentials_from_prompt, redact_cloud_secrets};
 use chrono::Utc;
 pub use magpie_gateway::{
-    all_presets, discover_syncable_subscriptions_in_home, find_preset, is_loopback_server_url,
+    all_presets, discover_syncable_subscriptions_in_home, find_preset,
+    is_cross_device_syncable_subscription, is_local_proxy_model_alias, is_loopback_server_url,
     parse_dotenv_providers, parse_magpie_import_link, parse_vertex_adc_credentials,
     resolve_preset_endpoints, ClientSubscriptionSyncItem, CodexOAuthCredentials, CodexTokenManager,
     MaskResult, MaskingAction, MaskingConfig, MaskingEngine, MaskingHit, ProtocolKind,
@@ -11,9 +12,10 @@ pub use magpie_gateway::{
 };
 use magpie_gateway::{
     build_gemini_generate_content_payload, discover_subscriptions_in_home, extract_jwt_exp_ms,
-    parse_gemini_response_json, parse_gemini_sse_data, parse_retry_after_header,
-    resolve_anthropic_messages_url, resolve_gemini_endpoint_url, resolve_group_targets,
-    UnifiedMessage, UnifiedRequest, UnifiedRole, UnifiedToolCall, UnifiedToolSpec,
+    is_cloudcode_pa_url, parse_gemini_response_json, parse_gemini_sse_data,
+    parse_retry_after_header, resolve_anthropic_messages_url, resolve_gemini_endpoint_url,
+    resolve_group_targets, UnifiedMessage, UnifiedRequest, UnifiedRole, UnifiedToolCall,
+    UnifiedToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1011,6 +1013,138 @@ pub struct ProviderRouterState {
     pub synced_vertex_adcs: HashMap<String, VertexAdcCredentials>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub synced_codex_oauths: HashMap<String, CodexOAuthCredentials>,
+}
+
+/// Returns `true` when `p` is safe to sync across devices (or to a remote server).
+/// Blocks loopback-only local proxies (`127.0.0.1` / `localhost` / `[::1]`), OpenAI Codex rotating
+/// OAuth (`CodexResponses` / `codex:*` / `magpie_codex:*`), ephemeral Gemini/Antigravity/Grok/Copilot
+/// OAuth sessions, and Claude `.credentials.json` / `sk-ant-oat*` OAuth tokens.
+pub fn is_provider_cross_device_syncable(p: &ProviderConfig) -> bool {
+    if p.id == "local_hermes" || p.api_mode == ApiMode::LocalHermes {
+        return true;
+    }
+    if !p.base_url.trim().is_empty() && is_loopback_server_url(&p.base_url) {
+        return false;
+    }
+    if !p.base_url.trim().is_empty() && is_cloudcode_pa_url(&p.base_url) {
+        return false;
+    }
+    if p.api_mode == ApiMode::CodexResponses {
+        return false;
+    }
+    if p.is_subscription && is_local_proxy_model_alias(&p.default_model) {
+        return false;
+    }
+    let id_lower = p.id.to_ascii_lowercase();
+    if id_lower == "codex_oauth"
+        || id_lower == "magpie_local"
+        || id_lower.starts_with("codex:")
+        || id_lower.starts_with("magpie_codex:")
+        || id_lower.starts_with("magpie_gemini:")
+        || id_lower.starts_with("gemini_code_assist:")
+        || id_lower.starts_with("gemini_jetski:")
+        || id_lower.starts_with("antigravity:")
+        || id_lower.starts_with("grok_supergrok:")
+        || id_lower.starts_with("github_copilot:")
+    {
+        return false;
+    }
+    if id_lower.starts_with("claude_code:") {
+        if id_lower != "claude_code:settings" {
+            return false;
+        }
+        if is_local_proxy_model_alias(&p.default_model) {
+            return false;
+        }
+        let has_oauth_tok = p
+            .credentials
+            .entries
+            .iter()
+            .any(|e| e.api_key.trim().starts_with("sk-ant-oat"));
+        if has_oauth_tok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` when a `SubscriptionAccount` record is safe for cross-device / remote sync.
+pub fn is_subscription_account_cross_device_syncable(sub: &SubscriptionAccount) -> bool {
+    if sub.base_url.as_deref().is_some_and(is_loopback_server_url) {
+        return false;
+    }
+    if sub.base_url.as_deref().is_some_and(is_cloudcode_pa_url) {
+        return false;
+    }
+    if sub
+        .default_model
+        .as_deref()
+        .is_some_and(is_local_proxy_model_alias)
+    {
+        return false;
+    }
+    match sub.kind {
+        SubscriptionKind::GoogleVertex => true,
+        SubscriptionKind::ClaudeCode => {
+            let tok = sub.access_token.as_deref().map(str::trim).unwrap_or("");
+            let is_settings = sub.id == "claude_code:settings"
+                || sub.source_path.ends_with("settings.json");
+            let is_oauth = tok.starts_with("sk-ant-oat")
+                || sub.expires_at_ms.is_some()
+                || sub.source_path.ends_with(".credentials.json");
+            is_settings && !is_oauth
+        }
+        SubscriptionKind::CodexChatGpt
+        | SubscriptionKind::GeminiCodeAssist
+        | SubscriptionKind::Antigravity
+        | SubscriptionKind::GrokSuperGrok
+        | SubscriptionKind::GitHubCopilot => false,
+    }
+}
+
+/// Produces a sanitized copy of `ProviderRouterState` suitable for E2EE cross-device vault push/pull,
+/// stripping loopback-only local proxies, rotating Codex/Claude OAuth sessions, and ephemeral CLI
+/// tokens while preserving static API-key providers and reusable Google Vertex ADC credentials.
+pub fn sanitize_router_state_for_cross_device(
+    state: &ProviderRouterState,
+) -> ProviderRouterState {
+    let mut clean = state.clone();
+    let removed_ids: std::collections::HashSet<String> = clean
+        .providers
+        .iter()
+        .filter(|(_, p)| !is_provider_cross_device_syncable(p))
+        .map(|(id, _)| id.clone())
+        .collect();
+    clean.providers.retain(|id, _| !removed_ids.contains(id));
+    for p in clean.providers.values_mut() {
+        p.headers.remove("x-adc-source-path");
+        p.headers.remove("x-codex-source-path");
+    }
+    clean.subscriptions.retain(|s| {
+        !removed_ids.contains(&s.id) && is_subscription_account_cross_device_syncable(s)
+    });
+    clean.synced_codex_oauths.clear();
+    clean
+        .synced_vertex_adcs
+        .retain(|id, _| !removed_ids.contains(id));
+    clean
+        .fallback_chain
+        .retain(|t| !removed_ids.contains(&t.provider_id));
+    if removed_ids.contains(&clean.active_provider_id) {
+        if let Some((next_id, next_model)) = clean
+            .providers
+            .values()
+            .find(|p| ProviderRouter::is_provider_usable(&clean, p))
+            .map(|p| (p.id.clone(), p.default_model.clone()))
+        {
+            clean.active_provider_id = next_id;
+            clean.active_model = next_model;
+        } else {
+            clean.active_provider_id = "local_hermes".to_string();
+            clean.active_model = "hermes-local-v1".to_string();
+        }
+    }
+    clean
 }
 
 impl Default for ProviderRouter {
@@ -2044,9 +2178,11 @@ impl ProviderRouter {
         {
             let guard = self.codex_managers.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(existing) = guard.get(provider_id).cloned() {
-                let is_stale = disk_mgr
-                    .as_ref()
-                    .is_some_and(|dm| dm.refresh_token() != existing.refresh_token());
+                let is_stale = disk_mgr.as_ref().is_some_and(|dm| {
+                    let disk_rt = dm.refresh_token();
+                    disk_rt != existing.initial_refresh_token()
+                        && disk_rt != existing.refresh_token()
+                });
                 if !is_stale {
                     return Some(existing);
                 }
@@ -2440,6 +2576,56 @@ impl ProviderRouter {
             accounts: snap.subscriptions,
             scanned_at_ms: now_ms,
         }
+    }
+
+    /// Prunes previously-synced subscription providers that are not safe for cross-device / remote
+    /// reuse (local loopback proxies, rotating Codex/Claude OAuth, ephemeral Gemini/Grok/Copilot
+    /// sessions) while preserving static API-key providers and reusable Vertex ADC credentials.
+    pub fn prune_non_cross_device_subscriptions(&self) -> usize {
+        let removed_ids: Vec<String>;
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let before = guard.providers.len();
+            let to_remove: std::collections::HashSet<String> = guard
+                .providers
+                .iter()
+                .filter(|(_, p)| p.is_subscription && !is_provider_cross_device_syncable(p))
+                .map(|(id, _)| id.clone())
+                .collect();
+            removed_ids = to_remove.iter().cloned().collect();
+            guard.providers.retain(|id, _| !to_remove.contains(id));
+            guard.subscriptions.retain(|s| {
+                !to_remove.contains(&s.id) && is_subscription_account_cross_device_syncable(s)
+            });
+            guard.synced_codex_oauths.clear();
+            guard
+                .fallback_chain
+                .retain(|t| !to_remove.contains(&t.provider_id));
+            if to_remove.contains(&guard.active_provider_id) {
+                if let Some((next_id, next_model)) = guard
+                    .providers
+                    .values()
+                    .find(|p| Self::is_provider_usable(&guard, p))
+                    .map(|p| (p.id.clone(), p.default_model.clone()))
+                {
+                    guard.active_provider_id = next_id;
+                    guard.active_model = next_model;
+                } else {
+                    guard.active_provider_id = "local_hermes".to_string();
+                    guard.active_model = "hermes-local-v1".to_string();
+                }
+            }
+            let _ = before;
+        }
+        if !removed_ids.is_empty() {
+            if let Ok(mut cm) = self.codex_managers.lock() {
+                for id in &removed_ids {
+                    cm.remove(id);
+                }
+            }
+            self.rebuild_default_fallback_chain();
+        }
+        removed_ids.len()
     }
 
     pub fn find_best_available_subscription(&self) -> Option<String> {
@@ -2919,11 +3105,15 @@ impl ProviderRouter {
 
         let targets_len = active_targets.len();
         let mut errors = Vec::new();
+        let mut auth_failed_providers = std::collections::HashSet::<String>::new();
         for (provider_id, model, strategy, reason) in active_targets {
             if stream_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
                 return Err(ProviderError::Transport(
                     "Stream client disconnected".to_string(),
                 ));
+            }
+            if auth_failed_providers.contains(&provider_id) {
+                continue;
             }
             let Some(cfg) = self
                 .inner
@@ -3100,6 +3290,9 @@ impl ProviderRouter {
                         return Err(err);
                     }
                     self.record_route_failure(&provider_id, &model, &err);
+                    if matches!(err, ProviderError::Authentication(_)) {
+                        auth_failed_providers.insert(provider_id.clone());
+                    }
                     // Do not concatenate a fallback provider's stream onto already-emitted partial output.
                     if emitted_to_caller.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(err);
@@ -5410,6 +5603,91 @@ async fn send_stream_event(
     Ok(())
 }
 
+fn strip_html_blocks_case_insensitive(input: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    while cursor < input.len() {
+        let Some(rel_start) = lower[cursor..].find(&open) else {
+            out.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + rel_start;
+        out.push_str(&input[cursor..start]);
+        if let Some(rel_end) = lower[start..].find(&close) {
+            cursor = start + rel_end + close.len();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Condenses raw HTML upstream error pages (e.g. Google/Cloudflare 404/502 HTML with inline CSS)
+/// into a concise single-line summary while preserving structured JSON error messages intact.
+pub fn summarize_http_error_body(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let looks_html = lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || (lower.contains("<html") && lower.contains("</html>"))
+        || (lower.contains("<title>") && lower.contains("<style"));
+
+    if !looks_html {
+        let max_chars = 600;
+        if trimmed.chars().count() > max_chars {
+            let truncated: String = trimmed.chars().take(max_chars).collect();
+            return format!("{truncated}...");
+        }
+        return trimmed.to_string();
+    }
+
+    let no_style = strip_html_blocks_case_insensitive(trimmed, "style");
+    let no_script = strip_html_blocks_case_insensitive(&no_style, "script");
+    let mut text = String::with_capacity(no_script.len().min(512));
+    let mut in_tag = false;
+    let mut last_space = true;
+    for ch in no_script.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                if !last_space {
+                    text.push(' ');
+                    last_space = true;
+                }
+            }
+            '>' => {
+                in_tag = false;
+            }
+            c if !in_tag => {
+                if c.is_whitespace() {
+                    if !last_space {
+                        text.push(' ');
+                        last_space = true;
+                    }
+                } else {
+                    text.push(c);
+                    last_space = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let cleaned = text.trim();
+    let max_chars = 240;
+    if cleaned.chars().count() > max_chars {
+        let truncated: String = cleaned.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    } else {
+        cleaned.to_string()
+    }
+}
+
 async fn check_http_error(resp: reqwest::Response) -> Result<reqwest::Response, ProviderError> {
     let status = resp.status();
     if status.is_success() {
@@ -5420,11 +5698,12 @@ async fn check_http_error(resp: reqwest::Response) -> Result<reqwest::Response, 
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_retry_after_header);
-    let body = tokio::time::timeout(Duration::from_secs(3), resp.text())
+    let raw_body = tokio::time::timeout(Duration::from_secs(3), resp.text())
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
+    let body = summarize_http_error_body(&raw_body);
     let code = status.as_u16();
     if code == 401 || code == 403 {
         return Err(ProviderError::Authentication(format!("HTTP {code}: {body}")));
@@ -7377,13 +7656,42 @@ async fn execute_gemini_generate_content(
     let wire_req = prepare_wire_request(cfg, base_url, api_key, request);
     let url = resolve_gemini_endpoint_url(base_url, &wire_req.model, request.stream);
     let unified = provider_request_to_unified(&wire_req);
-    let payload = build_gemini_generate_content_payload(&unified);
+    let inner_payload = build_gemini_generate_content_payload(&unified);
+    let is_cloudcode_pa = is_cloudcode_pa_url(base_url);
+    let payload = if is_cloudcode_pa {
+        let clean_model = wire_req
+            .model
+            .trim()
+            .strip_prefix("models/")
+            .unwrap_or(wire_req.model.trim());
+        let mut env = serde_json::Map::new();
+        env.insert("model".to_string(), Value::String(clean_model.to_string()));
+        if let Some(proj) = cfg
+            .headers
+            .get("x-goog-user-project")
+            .cloned()
+            .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
+            .or_else(|| std::env::var("CLOUDSDK_CORE_PROJECT").ok())
+            .filter(|s| !s.trim().is_empty())
+        {
+            env.insert("project".to_string(), Value::String(proj));
+        }
+        env.insert("request".to_string(), inner_payload);
+        Value::Object(env)
+    } else {
+        inner_payload
+    };
 
     let mut builder = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
-    if !api_key.trim().is_empty() {
-        builder = builder.header("x-goog-api-key", api_key.trim());
+    let trimmed_key = api_key.trim();
+    if !trimmed_key.is_empty() {
+        if is_cloudcode_pa || trimmed_key.starts_with("ya29.") {
+            builder = builder.bearer_auth(trimmed_key);
+        } else {
+            builder = builder.header("x-goog-api-key", trimmed_key);
+        }
     }
     if request.stream {
         builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
@@ -10405,5 +10713,266 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
             snap.fallback_chain.iter().any(|t| t.provider_id == "anthropic"),
             "backed subscription should remain eligible as a fallback target"
         );
+    }
+
+    #[test]
+    fn test_summarize_http_error_body_strips_html_and_preserves_json() {
+        let google_404 = r#"<!DOCTYPE html>
+<html lang=en>
+  <meta charset=utf-8>
+  <title>Error 404 (Not Found)!!1</title>
+  <style>*{margin:0;padding:0}body{background:url(//www.google.com/images/errors/robot.png)}</style>
+  <p><b>404.</b> <ins>That's an error.</ins>
+  <p>The requested URL <code>/v1internal/models/gemini-2.5-pro:streamGenerateContent?alt=sse</code> was not found on this server.
+</html>"#;
+        let clean = summarize_http_error_body(google_404);
+        assert!(!clean.contains("<style"), "CSS style tag leaked: {clean}");
+        assert!(!clean.contains("margin:0"), "CSS rules leaked: {clean}");
+        assert!(clean.contains("Error 404 (Not Found)"), "title missing: {clean}");
+        assert!(clean.contains("was not found on this server"), "message missing: {clean}");
+
+        let json_err = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        assert_eq!(summarize_http_error_body(json_err), json_err);
+    }
+
+    #[test]
+    fn test_sanitize_router_state_and_prune_strip_loopback_and_rotating_oauth() {
+        let router = ProviderRouter::new();
+
+        // Keep: static remote API key provider
+        let static_openai = ProviderConfig::openai_compatible(
+            "openai_static",
+            "OpenAI Static",
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            "sk-static-123",
+        );
+        router.register_provider(static_openai);
+
+        // Drop: loopback proxy
+        let mut local_proxy = ProviderConfig::openai_compatible(
+            "claude_code:settings",
+            "Claude Code (Settings)",
+            "http://127.0.0.1:3425/anthropic",
+            "codex/gpt-6.1-sol",
+            "local-proxy-tok",
+        );
+        local_proxy.api_mode = ApiMode::AnthropicMessages;
+        local_proxy.is_subscription = true;
+        router.register_provider(local_proxy);
+
+        // Drop: rotating Codex OAuth
+        let mut codex = ProviderConfig::openai_compatible(
+            "magpie_codex:abc123",
+            "Magpie Codex",
+            "https://chatgpt.com/backend-api/codex",
+            "codex-mini-latest",
+            "eyJ-expired",
+        );
+        codex.api_mode = ApiMode::CodexResponses;
+        codex.is_subscription = true;
+        router.register_provider(codex);
+
+        // Drop: ephemeral Gemini Code Assist
+        let mut gem = ProviderConfig::openai_compatible(
+            "magpie_gemini:def456",
+            "Magpie Gemini",
+            "https://cloudcode-pa.googleapis.com/v1internal",
+            "gemini-2.5-pro",
+            "ya29.ephemeral",
+        );
+        gem.api_mode = ApiMode::GeminiGenerateContent;
+        gem.is_subscription = true;
+        router.register_provider(gem);
+
+        let _ = router.set_active("magpie_codex:abc123", Some("codex-mini-latest"));
+
+        let sanitized = sanitize_router_state_for_cross_device(&router.snapshot());
+        assert!(sanitized.providers.contains_key("openai_static"));
+        assert!(!sanitized.providers.contains_key("claude_code:settings"));
+        assert!(!sanitized.providers.contains_key("magpie_codex:abc123"));
+        assert!(!sanitized.providers.contains_key("magpie_gemini:def456"));
+        assert!(sanitized.synced_codex_oauths.is_empty());
+        assert_eq!(sanitized.active_provider_id, "openai_static");
+
+        let pruned = router.prune_non_cross_device_subscriptions();
+        assert_eq!(pruned, 3);
+        let after = router.snapshot();
+        assert!(after.providers.contains_key("openai_static"));
+        assert!(!after.providers.contains_key("magpie_codex:abc123"));
+        assert_eq!(after.active_provider_id, "openai_static");
+    }
+
+    #[tokio::test]
+    async fn test_auth_error_short_circuits_remaining_models_on_same_provider() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let primary_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backup_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p_hits = Arc::clone(&primary_hits);
+        let b_hits = Arc::clone(&backup_hits);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let p_hits = Arc::clone(&p_hits);
+                let b_hits = Arc::clone(&b_hits);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.contains("/primary/") {
+                        p_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = r#"{"error":{"message":"invalid api key"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else {
+                        b_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = r#"{"id":"cmpl_ok","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"backup-succeeded"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+
+        let mut broken_primary = ProviderConfig::openai_compatible(
+            "broken_primary",
+            "Broken Primary",
+            format!("http://{addr}/primary/v1"),
+            "model-1",
+            "sk-expired",
+        );
+        broken_primary.fallback_models = vec![
+            "model-2".to_string(),
+            "model-3".to_string(),
+            "model-4".to_string(),
+            "model-5".to_string(),
+        ];
+        router.register_provider(broken_primary);
+
+        let healthy_backup = ProviderConfig::openai_compatible(
+            "healthy_backup",
+            "Healthy Backup",
+            format!("http://{addr}/backup/v1"),
+            "gpt-4o-mini",
+            "sk-valid",
+        );
+        router.register_provider(healthy_backup);
+        let _ = router.set_active("broken_primary", Some("model-1"));
+        router.set_fallback_chain(vec![FallbackTarget {
+            provider_id: "healthy_backup".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        }]);
+
+        let req = ProviderRequest {
+            model: String::new(),
+            system_tiers: Vec::new(),
+            messages: vec![ProviderChatMessage::user("hi")],
+            tools: Vec::new(),
+            temperature: Some(0.2),
+            max_tokens: Some(64),
+            thinking_budget_tokens: None,
+            stream: false,
+            metadata: Value::Null,
+        };
+        let resp = router.complete(req, None).await.expect("backup should succeed");
+        assert_eq!(resp.provider_id, "healthy_backup");
+        assert_eq!(resp.content, "backup-succeeded");
+        assert_eq!(
+            primary_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "authentication failure on broken_primary must short-circuit its 4 remaining fallback models"
+        );
+        assert_eq!(backup_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cloudcode_pa_v1internal_request_envelope_and_bearer_auth() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let cap_clone = Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 32768];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            *cap_clone.lock().unwrap() = req;
+            let sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"cloudcode-ok\"}]},\"finishReason\":\"STOP\"}]}}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+        let mut cfg = ProviderConfig::openai_compatible(
+            "local_cloudcode",
+            "Local Cloud Code",
+            format!("http://{addr}/v1internal"),
+            "gemini-2.5-pro",
+            "ya29.test-oauth-bearer",
+        );
+        cfg.api_mode = ApiMode::GeminiGenerateContent;
+        router.register_provider(cfg);
+        let _ = router.set_active("local_cloudcode", Some("gemini-2.5-pro"));
+
+        let req = ProviderRequest {
+            model: "gemini-2.5-pro".to_string(),
+            system_tiers: Vec::new(),
+            messages: vec![ProviderChatMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: Some(0.2),
+            max_tokens: Some(64),
+            thinking_budget_tokens: None,
+            stream: true,
+            metadata: Value::Null,
+        };
+        let resp = router.complete(req, None).await.expect("cloudcode request should succeed");
+        assert_eq!(resp.content, "cloudcode-ok");
+
+        let raw = captured.lock().unwrap().clone();
+        assert!(
+            raw.starts_with("POST /v1internal:streamGenerateContent?alt=sse"),
+            "expected /v1internal:streamGenerateContent?alt=sse without /models/: {raw}"
+        );
+        assert!(
+            raw.to_ascii_lowercase().contains("authorization: bearer ya29.test-oauth-bearer"),
+            "expected Authorization: Bearer header for cloudcode-pa: {raw}"
+        );
+        assert!(
+            !raw.to_ascii_lowercase().contains("x-goog-api-key"),
+            "must not send x-goog-api-key for cloudcode-pa OAuth token: {raw}"
+        );
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let parsed_body: Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(parsed_body["model"].as_str(), Some("gemini-2.5-pro"));
+        assert!(parsed_body["request"]["contents"].is_array());
     }
 }

@@ -4932,6 +4932,51 @@ fn deliver_proactive_message_raw(
     }
 }
 
+pub(crate) fn resolve_floor_speaker_display_name(state: &AppState, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(id_str) = trimmed.strip_prefix("bot_") {
+        if let Ok(bid) = id_str.parse::<i64>() {
+            if let Ok(Some(rec)) = state.db.get_bot_by_user_id(bid) {
+                let dn = rec.display_name.trim();
+                if !dn.is_empty() {
+                    return dn.to_string();
+                }
+            }
+            if let Ok(Some(u)) = state.db.get_user(UserId(bid as u64)) {
+                let fn_trim = u.first_name.trim();
+                if !fn_trim.is_empty() {
+                    return fn_trim.to_string();
+                }
+                if let Some(un) = u.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    return un.to_string();
+                }
+            }
+            if let Some(inst) = state.fabushi_bots.get_by_user_id(bid) {
+                let name = inst.profile().name;
+                if !name.trim().is_empty() {
+                    return name.trim().to_string();
+                }
+            }
+        }
+    }
+    if let Some(inst) = state.fabushi_bots.get_by_agent_id_or_username(trimmed) {
+        if let Ok(Some(rec)) = state.db.get_bot_by_user_id(inst.bot_user_id) {
+            let dn = rec.display_name.trim();
+            if !dn.is_empty() {
+                return dn.to_string();
+            }
+        }
+        let name = inst.profile().name;
+        if !name.trim().is_empty() {
+            return name.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 pub(crate) fn broadcast_agent_floor_changed(
     state: &AppState,
     chat_id: ChatId,
@@ -4939,12 +4984,15 @@ pub(crate) fn broadcast_agent_floor_changed(
     queued_count: usize,
     loop_hops: u32,
 ) {
+    let resolved_speaker = current_speaker
+        .map(|s| resolve_floor_speaker_display_name(state, &s))
+        .filter(|s| !s.trim().is_empty());
     if let Ok((_, pts_update)) = state.pts_engine.advance_pts(
         chat_id,
         0,
         gpui_telegram_proto::sync::UpdateEvent::AgentFloorChanged {
             chat_id,
-            current_speaker,
+            current_speaker: resolved_speaker,
             queued_count,
             loop_hops,
         },

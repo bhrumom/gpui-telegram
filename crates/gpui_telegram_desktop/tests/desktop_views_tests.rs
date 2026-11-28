@@ -1971,6 +1971,65 @@ fn test_stage_set_chat_clears_toast_banner_active_fabushi_bot_and_room_agent_sta
     assert!(stage.room_agent_states.is_empty());
 }
 
+#[test]
+fn test_stage_thinking_presentation_deduplicates_animations_and_resolves_bot_id_speaker() {
+    use gpui_telegram_desktop::views::conversation_stage::StageThinkingPresentation;
+    use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+
+    let mut stage = ConversationStage::new();
+    stage.lang_id = "zh-CN".to_string();
+    stage.set_chat(601_000_001, "全球法布施", "bot", "法", 0xEC4899);
+    stage.is_bot_chat = true;
+    stage.is_group_chat = false;
+    stage.set_active_fabushi_bot(Some(FabushiBotSummaryDto {
+        bot_user_id: 600_001,
+        agent_id: "fabushi_600001".to_string(),
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施".to_string(),
+        ..Default::default()
+    }));
+
+    // Idle -> None
+    assert_eq!(
+        stage.resolve_thinking_presentation(10_000),
+        StageThinkingPresentation::None
+    );
+
+    // 1:1 bot chat receiving BOTH AgentFloorChanged("bot_600001") and BotActivityChanged("正在理解请求...")
+    // MUST render strictly ONE indicator (BotActivity), never both stacked!
+    stage.on_agent_floor_changed(601_000_001, Some("bot_600001".to_string()), 0, 1, 10_000);
+    stage.set_bot_activity("thinking", Some("正在理解请求...".to_string()));
+    assert_eq!(
+        stage.resolve_thinking_presentation(11_000),
+        StageThinkingPresentation::BotActivity
+    );
+    assert_eq!(stage.format_bot_activity_label(), "正在理解请求...");
+    assert_eq!(
+        stage.resolve_floor_speaker_label(Some("bot_600001")),
+        "全球法布施"
+    );
+
+    // If only floor state is active (before BotActivityChanged arrives), RoomFloor renders alone with resolved name
+    stage.set_bot_activity("idle", None);
+    assert_eq!(
+        stage.resolve_thinking_presentation(11_000),
+        StageThinkingPresentation::RoomFloor
+    );
+
+    // Group chat receiving BOTH AgentFloorChanged and BotActivityChanged
+    // MUST render strictly ONE indicator (RoomFloor, merged with activity detail)
+    stage.set_chat(900_001, "测试群聊", "3 members", "群", 0x2AABEE);
+    stage.is_group_chat = true;
+    stage.is_bot_chat = false;
+    stage.on_agent_floor_changed(900_001, Some("全球法布施".to_string()), 1, 1, 20_000);
+    stage.set_bot_activity("tool", Some("web_search".to_string()));
+    assert_eq!(
+        stage.resolve_thinking_presentation(21_000),
+        StageThinkingPresentation::RoomFloor
+    );
+    assert_eq!(stage.format_bot_activity_label(), "正在使用 web_search…");
+}
+
 mod m1_headless_gpui {
     use futures::FutureExt;
     use gpui::{App, AppContext, Application, AsyncApp};

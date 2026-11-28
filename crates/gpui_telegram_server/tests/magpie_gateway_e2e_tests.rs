@@ -1335,13 +1335,54 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     )
     .unwrap();
 
-    // Desktop client discovers subscriptions locally for a remote server
+    let claude_dir = client_home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        json!({
+            "model": "claude-sonnet-4-20250514",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com/v1",
+                "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-static-remote-sync"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Desktop client discovers subscriptions locally for a remote server:
+    // Vertex ADC + static remote Claude API key are included; rotating Codex OAuth / loopback proxy are excluded.
     let synced_items = magpie_gateway::discover_syncable_subscriptions_in_home(
         client_home.path(),
         Some(&codex_dir),
         true,
     );
-    assert!(synced_items.len() >= 2, "expected Vertex + Codex discovered locally");
+    assert_eq!(
+        synced_items.len(),
+        2,
+        "expected Vertex ADC + static remote Claude key only (rotating Codex OAuth must be excluded): {synced_items:?}"
+    );
+    assert!(
+        synced_items
+            .iter()
+            .all(|i| i.account.kind != magpie_gateway::SubscriptionKind::CodexChatGpt),
+        "rotating Codex OAuth must NOT be included in remote sync discovery"
+    );
+
+    // Also include a raw local-only Codex item in the POST payload to prove the server itself
+    // enforces the cross-device sync policy even against older clients!
+    let mut payload_items = synced_items.clone();
+    let local_only_items = magpie_gateway::discover_syncable_subscriptions_in_home(
+        client_home.path(),
+        Some(&codex_dir),
+        false,
+    );
+    if let Some(local_codex) = local_only_items
+        .into_iter()
+        .find(|i| i.account.kind == magpie_gateway::SubscriptionKind::CodexChatGpt)
+    {
+        payload_items.push(local_codex);
+    }
 
     // Delete the client's temp home BEFORE posting to server to prove the server NEVER relies
     // on reading client local disk paths!
@@ -1354,13 +1395,14 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
         "/api/v1/hermes/magpie/subscriptions/sync",
         Some(&tok),
         Some(json!({
-            "subscriptions": synced_items,
+            "subscriptions": payload_items,
             "auto_activate": true
         })),
     )
     .await;
     assert_eq!(st_sync, StatusCode::OK, "POST subscriptions/sync: {sync_val}");
     assert_eq!(sync_val["ok"].as_bool(), Some(true));
+    assert_eq!(sync_val["synced_count"].as_u64(), Some(2));
     assert_eq!(sync_val["has_active_subscription"].as_bool(), Some(true));
     assert_eq!(sync_val["needs_provider_selection"].as_bool(), Some(false));
 
@@ -1369,6 +1411,7 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
     assert!(!sync_text.contains("vertex-super-secret-xyz"));
     assert!(!sync_text.contains("vertex-refresh-secret-abc"));
     assert!(!sync_text.contains("codex-refresh-secret-999"));
+    assert!(!sync_text.contains("sk-ant-api03-static-remote-sync"));
     assert!(!sync_text.contains(mock_jwt));
 
     // Verify Vertex AI was auto-activated strictly in this user's router (NOT global router)
@@ -1399,30 +1442,31 @@ async fn test_e2e_client_subscriptions_sync_registers_remote_token_managers_and_
         "in-memory VertexTokenManager must be registered and retained without local ADC disk path"
     );
 
-    // Verify Codex was normalized away from 127.0.0.1:3425 and its CodexTokenManager is registered
+    // Verify rotating Codex OAuth was NOT ingested on the remote server
     let codex_id = "codex:desktop_codex@example.com";
-    let c_cfg = snap.providers.get(codex_id).expect("synced codex provider config");
-    assert_eq!(c_cfg.base_url, "https://chatgpt.com/backend-api/codex");
-    assert!(!c_cfg.headers.contains_key("x-codex-source-path"));
     assert!(
-        user_provs
-            .get_or_create_codex_manager(codex_id, c_cfg)
-            .is_some(),
-        "in-memory CodexTokenManager must be registered without local auth.json disk path"
+        !snap.providers.contains_key(codex_id),
+        "remote server must reject rotating Codex OAuth from /subscriptions/sync"
     );
+    assert!(snap.synced_codex_oauths.is_empty());
 
-    // Verify activating the synced Codex subscription works over HTTP
+    // Verify activating the synced static remote Claude API-key subscription works over HTTP
+    let claude_id = "claude_code:settings";
+    assert!(snap.providers.contains_key(claude_id));
     let (st_act, act_val) = http_json(
         &router,
         "POST",
-        &format!("/api/v1/hermes/magpie/subscriptions/{codex_id}/activate"),
+        &format!("/api/v1/hermes/magpie/subscriptions/{claude_id}/activate"),
         Some(&tok),
-        Some(json!({ "model": "gpt-4o" })),
+        Some(json!({ "model": "claude-sonnet-4-20250514" })),
     )
     .await;
-    assert_eq!(st_act, StatusCode::OK, "activate synced codex: {act_val}");
-    assert_eq!(act_val["active_provider_id"].as_str(), Some(codex_id));
-    assert_eq!(act_val["active_model"].as_str(), Some("gpt-4o"));
+    assert_eq!(st_act, StatusCode::OK, "activate synced static claude key: {act_val}");
+    assert_eq!(act_val["active_provider_id"].as_str(), Some(claude_id));
+    assert_eq!(
+        act_val["active_model"].as_str(),
+        Some("claude-sonnet-4-20250514")
+    );
 }
 
 #[tokio::test]

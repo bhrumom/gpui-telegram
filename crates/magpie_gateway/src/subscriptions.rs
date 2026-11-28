@@ -517,7 +517,8 @@ impl VertexTokenManager {
 
 /// Thread-safe Codex / ChatGPT OAuth2 Token Manager for refreshing expired `auth.json` sessions.
 pub struct CodexTokenManager {
-    refresh_token: String,
+    initial_refresh_token: String,
+    refresh_token: std::sync::RwLock<String>,
     client_id: String,
     token_url: String,
     cache: std::sync::RwLock<Option<CachedVertexToken>>,
@@ -530,8 +531,10 @@ impl CodexTokenManager {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| OPENAI_OAUTH2_TOKEN_URL.to_string());
+        let rt = refresh_token.into();
         Self {
-            refresh_token: refresh_token.into(),
+            initial_refresh_token: rt.clone(),
+            refresh_token: std::sync::RwLock::new(rt),
             client_id: DEFAULT_CODEX_CLIENT_ID.to_string(),
             token_url,
             cache: std::sync::RwLock::new(None),
@@ -612,8 +615,17 @@ impl CodexTokenManager {
         self
     }
 
-    pub fn refresh_token(&self) -> &str {
-        &self.refresh_token
+    /// Initial refresh token loaded when this manager was constructed (used to detect external re-login on disk).
+    pub fn initial_refresh_token(&self) -> &str {
+        &self.initial_refresh_token
+    }
+
+    /// Latest active refresh token (reflects any OpenAI single-use refresh token rotation).
+    pub fn refresh_token(&self) -> String {
+        self.refresh_token
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| self.initial_refresh_token.clone())
     }
 
     pub fn client_id(&self) -> &str {
@@ -670,13 +682,14 @@ impl CodexTokenManager {
         &self,
         client: &reqwest::Client,
     ) -> Result<GoogleOAuthTokenResponse, TokenRefreshError> {
-        if self.refresh_token.trim().is_empty() {
+        let current_rt = self.refresh_token();
+        if current_rt.trim().is_empty() {
             return Err(TokenRefreshError::MissingCredentials);
         }
         let form = vec![
             ("grant_type", "refresh_token".to_string()),
             ("client_id", self.client_id.clone()),
-            ("refresh_token", self.refresh_token.clone()),
+            ("refresh_token", current_rt),
         ];
         let resp = client.post(&self.token_url).form(&form).send().await?;
         let status = resp.status();
@@ -691,6 +704,11 @@ impl CodexTokenManager {
             .map_err(|e| TokenRefreshError::Parse(format!("{e}: {}", redact_oauth_error_body(&body))))?;
         let access_token = non_empty_str(val.get("access_token"))
             .ok_or_else(|| TokenRefreshError::Parse("Missing access_token in Codex refresh response".to_string()))?;
+        if let Some(rotated_rt) = non_empty_str(val.get("refresh_token")) {
+            if let Ok(mut guard) = self.refresh_token.write() {
+                *guard = rotated_rt;
+            }
+        }
         let expires_in = val.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
         let token_type = non_empty_str(val.get("token_type")).unwrap_or_else(|| "Bearer".to_string());
         let scope = non_empty_str(val.get("scope"));
@@ -2010,13 +2028,89 @@ fn build_available_models(
     out
 }
 
-/// Discovers local subscriptions under `home` and enriches them with unredacted tokens and
-/// refreshable OAuth credentials suitable for syncing from the desktop client to the backend server.
+/// Returns `true` when `model` is a local Magpie/gateway routing alias (e.g. `codex/...`, `auto/...`)
+/// that cannot be executed directly against an upstream public API.
+pub fn is_local_proxy_model_alias(model: &str) -> bool {
+    let trimmed = model.trim().to_ascii_lowercase();
+    trimmed.starts_with("codex/") || trimmed.starts_with("auto/")
+}
+
+/// Returns `true` ONLY for subscription items whose credentials can safely be reused across
+/// devices or on a remote server without breaking sessions or leaking loopback-only proxy configs.
 ///
-/// When `target_is_remote` is `true`, loopback proxy URLs (e.g. `http://127.0.0.1:3425/...` written
-/// by Magpie into `~/.codex/config.toml`) and Magpie-specific model prefixes (`codex/...`,
-/// `auto/...`) are normalized to direct upstream endpoints so a remote cloud server can invoke the
-/// upstream AI APIs directly.
+/// Explicitly **blocked** from cross-device / remote sync:
+/// - Any local loopback proxy (`127.0.0.1`, `localhost`, `[::1]`) or local proxy model alias (`codex/*`, `auto/*`).
+/// - OpenAI Codex / ChatGPT OAuth (`CodexChatGpt`), whose single-use rotating refresh tokens trigger
+///   mutual invalidation and reuse-detection session revocation across devices.
+/// - Ephemeral / device-bound OAuth sessions (`GeminiCodeAssist`, `Antigravity`, `GrokSuperGrok`,
+///   `GitHubCopilot`, and Claude Code `.credentials.json` / `sk-ant-oat*` OAuth tokens).
+///
+/// Explicitly **allowed**:
+/// - Reusable Google Vertex AI ADC (`GoogleVertex`) with valid non-loopback endpoint.
+/// - Static Anthropic API keys configured in `~/.claude/settings.json` with a non-loopback endpoint.
+pub fn is_cross_device_syncable_subscription(item: &ClientSubscriptionSyncItem) -> bool {
+    let acc = &item.account;
+    if !acc.active {
+        return false;
+    }
+    if acc.base_url.as_deref().is_some_and(is_loopback_server_url) {
+        return false;
+    }
+    if acc
+        .base_url
+        .as_deref()
+        .is_some_and(crate::protocol::is_cloudcode_pa_url)
+    {
+        return false;
+    }
+    if acc
+        .default_model
+        .as_deref()
+        .is_some_and(is_local_proxy_model_alias)
+    {
+        return false;
+    }
+
+    match acc.kind {
+        SubscriptionKind::GoogleVertex => {
+            item.vertex_adc.is_some()
+                || item
+                    .access_token
+                    .as_deref()
+                    .or(acc.access_token.as_deref())
+                    .is_some_and(|t| !t.trim().is_empty())
+        }
+        SubscriptionKind::ClaudeCode => {
+            let tok = item
+                .access_token
+                .as_deref()
+                .or(acc.access_token.as_deref())
+                .map(str::trim)
+                .unwrap_or("");
+            let is_settings_source =
+                acc.id == "claude_code:settings" || acc.source_path.ends_with("settings.json");
+            let is_oauth_token = tok.starts_with("sk-ant-oat")
+                || acc.expires_at_ms.is_some()
+                || acc.source_path.ends_with(".credentials.json");
+            is_settings_source && !is_oauth_token && !tok.is_empty()
+        }
+        SubscriptionKind::CodexChatGpt
+        | SubscriptionKind::GeminiCodeAssist
+        | SubscriptionKind::Antigravity
+        | SubscriptionKind::GrokSuperGrok
+        | SubscriptionKind::GitHubCopilot => false,
+    }
+}
+
+/// Discovers local subscriptions under `home` and enriches them with unredacted tokens and
+/// refreshable credentials.
+///
+/// When `target_is_remote` is `true`, only cross-device-safe credentials (verified via
+/// [`is_cross_device_syncable_subscription`]) are returned: local loopback proxies (e.g.
+/// `http://127.0.0.1:3425/...`) and non-reusable rotating/ephemeral OAuth sessions (such as
+/// Codex OAuth, Claude `.credentials.json` OAuth, Gemini Code Assist, Antigravity, Grok, Copilot)
+/// are strictly excluded so they are never rewritten against wrong upstream hosts or mutually
+/// revoked across devices.
 pub fn discover_syncable_subscriptions_in_home(
     home: &Path,
     codex_home_override: Option<&Path>,
@@ -2060,53 +2154,8 @@ pub fn discover_syncable_subscriptions_in_home(
             }
             SubscriptionKind::CodexChatGpt => {
                 codex_oauth = read_codex_oauth_for_account(&acc, home, codex_home_override);
-                if target_is_remote {
-                    let is_loopback_base = acc
-                        .base_url
-                        .as_deref()
-                        .is_some_and(is_loopback_server_url);
-                    if is_loopback_base {
-                        acc.base_url = Some("https://chatgpt.com/backend-api/codex".to_string());
-                        raw_headers.retain(|k, _| {
-                            !k.eq_ignore_ascii_case("x-openai-actor-authorization")
-                        });
-                        acc.headers.retain(|k, _| {
-                            !k.eq_ignore_ascii_case("x-openai-actor-authorization")
-                        });
-                        if let Some(ref model) = acc.default_model {
-                            let m = model.trim();
-                            if m.starts_with("codex/") || m.starts_with("auto/") {
-                                acc.default_model = Some("codex-mini-latest".to_string());
-                            }
-                        }
-                    }
-                    // If the account only existed because of a local Magpie proxy without any token
-                    // or refresh token, it cannot execute from a remote server.
-                    if access_token.is_none() && codex_oauth.is_none() {
-                        acc.active = false;
-                    }
-                }
-            }
-            SubscriptionKind::ClaudeCode => {
-                if target_is_remote
-                    && acc
-                        .base_url
-                        .as_deref()
-                        .is_some_and(is_loopback_server_url)
-                {
-                    acc.base_url = Some("https://api.anthropic.com/v1".to_string());
-                }
             }
             _ => {}
-        }
-
-        // Skip entries that have no usable credential at all when syncing to a remote server
-        if target_is_remote
-            && access_token.is_none()
-            && vertex_adc.is_none()
-            && codex_oauth.is_none()
-        {
-            continue;
         }
 
         let extra_models: &[String] = match acc.kind {
@@ -2118,7 +2167,7 @@ pub fn discover_syncable_subscriptions_in_home(
         let available_models =
             build_available_models(acc.kind, acc.default_model.as_deref(), extra_models);
 
-        items.push(ClientSubscriptionSyncItem {
+        let sync_item = ClientSubscriptionSyncItem {
             account: acc,
             access_token,
             raw_headers,
@@ -2126,7 +2175,13 @@ pub fn discover_syncable_subscriptions_in_home(
             codex_oauth,
             region_id,
             available_models,
-        });
+        };
+
+        if target_is_remote && !is_cross_device_syncable_subscription(&sync_item) {
+            continue;
+        }
+
+        items.push(sync_item);
     }
 
     dedup_syncable_items(items)
@@ -2301,9 +2356,54 @@ http_headers = { "x-openai-actor-authorization" = "magpie" }
         )
         .unwrap();
 
-        let items = discover_syncable_subscriptions_in_home(&tmp, Some(&codex_dir), true);
+        let claude_dir = tmp.join(".claude");
+        let gemini_dir = tmp.join(".gemini");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&gemini_dir).unwrap();
 
-        let vertex_items: Vec<_> = items
+        // Local loopback proxy in ~/.claude/settings.json (must NEVER be rewritten to api.anthropic.com)
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::json!({
+                "model": "codex/gpt-6.1-sol",
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3425/anthropic",
+                    "ANTHROPIC_AUTH_TOKEN": "local-magpie-proxy-token"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Rotating Claude OAuth in ~/.claude/.credentials.json (must NOT be synced remotely)
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-secret",
+                    "refreshToken": "sk-ant-ort01-secret",
+                    "expiresAt": 4102444800000i64
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Ephemeral Gemini Code Assist OAuth (must NOT be synced remotely)
+        std::fs::write(
+            gemini_dir.join("oauth_creds.json"),
+            serde_json::json!({
+                "access_token": "ya29.gemini-ephemeral",
+                "refresh_token": "1//gemini-rt",
+                "expiry_date": 4102444800000i64,
+                "email": "dev@gemini.test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 1. Remote sync MUST exclude loopback proxies and non-reusable rotating/ephemeral OAuth
+        let remote_items = discover_syncable_subscriptions_in_home(&tmp, Some(&codex_dir), true);
+
+        let vertex_items: Vec<_> = remote_items
             .iter()
             .filter(|i| i.account.kind == SubscriptionKind::GoogleVertex)
             .collect();
@@ -2326,35 +2426,129 @@ http_headers = { "x-openai-actor-authorization" = "magpie" }
             vertex_item.account.label
         );
 
-        let codex_item = items
-            .iter()
-            .find(|i| i.account.id == "codex:user@codex.test")
-            .expect("codex item discovered");
-        assert_eq!(
-            codex_item.account.base_url.as_deref(),
-            Some("https://chatgpt.com/backend-api/codex"),
-            "remote sync must normalize loopback Magpie proxy URL to direct upstream Codex URL"
-        );
-        assert_eq!(
-            codex_item.account.default_model.as_deref(),
-            Some("codex-mini-latest"),
-            "remote sync must normalize Magpie-prefixed model alias"
+        assert!(
+            remote_items
+                .iter()
+                .all(|i| i.account.kind != SubscriptionKind::CodexChatGpt),
+            "rotating Codex OAuth must NOT be synced to remote servers or across devices: {remote_items:?}"
         );
         assert!(
-            !codex_item
-                .raw_headers
-                .contains_key("x-openai-actor-authorization")
+            remote_items
+                .iter()
+                .all(|i| i.account.kind != SubscriptionKind::GeminiCodeAssist),
+            "ephemeral Gemini Code Assist OAuth must NOT be synced remotely: {remote_items:?}"
         );
+        assert!(
+            remote_items
+                .iter()
+                .all(|i| i.account.kind != SubscriptionKind::ClaudeCode),
+            "loopback Claude proxy and rotating Claude OAuth must NOT be synced remotely: {remote_items:?}"
+        );
+
+        // 2. Local-only discovery (target_is_remote == false) still discovers local Codex & Claude for this device
+        let local_items = discover_syncable_subscriptions_in_home(&tmp, Some(&codex_dir), false);
+        let codex_item = local_items
+            .iter()
+            .find(|i| i.account.id == "codex:user@codex.test")
+            .expect("codex item still discovered for local-only use");
         assert_eq!(
             codex_item.codex_oauth.as_ref().map(|c| c.refresh_token.as_str()),
             Some("rt-codex-secret-777")
         );
 
-        let dbg_all = format!("{items:?}");
+        // 3. Static remote API key in ~/.claude/settings.json IS allowed for cross-device / remote sync
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::json!({
+                "model": "claude-sonnet-4-20250514",
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-ant-api03-static-key"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let remote_with_static_key =
+            discover_syncable_subscriptions_in_home(&tmp, Some(&codex_dir), true);
+        let static_claude = remote_with_static_key
+            .iter()
+            .find(|i| i.account.id == "claude_code:settings")
+            .expect("static remote Anthropic API key in settings.json must remain syncable");
+        assert_eq!(
+            static_claude.account.base_url.as_deref(),
+            Some("https://api.anthropic.com/v1")
+        );
+        assert!(
+            remote_with_static_key
+                .iter()
+                .all(|i| i.account.id != "claude_code:default"),
+            "Claude .credentials.json OAuth must stay excluded"
+        );
+
+        let dbg_all = format!("{local_items:?}");
         assert!(!dbg_all.contains("csec-secret-999"));
         assert!(!dbg_all.contains("rt-vertex-secret-888"));
         assert!(!dbg_all.contains("rt-codex-secret-777"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_codex_token_manager_persists_rotated_refresh_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen_rts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen_clone = std::sync::Arc::clone(&seen_rts);
+
+            tokio::spawn(async move {
+                for step in 0..2 {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body_part = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    seen_clone.lock().unwrap().push(body_part.to_string());
+                    let resp_body = if step == 0 {
+                        r#"{"access_token":"tok_1","refresh_token":"rt_rotated_2","expires_in":3600,"token_type":"Bearer"}"#
+                    } else {
+                        r#"{"access_token":"tok_2","refresh_token":"rt_rotated_3","expires_in":3600,"token_type":"Bearer"}"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+
+            let client = reqwest::Client::new();
+            let mgr = CodexTokenManager::new("rt_initial_1")
+                .with_token_url(format!("http://{addr}/oauth/token"));
+            assert_eq!(mgr.initial_refresh_token(), "rt_initial_1");
+            assert_eq!(mgr.refresh_token(), "rt_initial_1");
+
+            let t1 = mgr.get_or_refresh_token(&client, 1_000).await.unwrap();
+            assert_eq!(t1, "tok_1");
+            assert_eq!(mgr.refresh_token(), "rt_rotated_2");
+            assert_eq!(mgr.initial_refresh_token(), "rt_initial_1");
+
+            mgr.invalidate_cached_token();
+            let t2 = mgr.get_or_refresh_token(&client, 2_000).await.unwrap();
+            assert_eq!(t2, "tok_2");
+            assert_eq!(mgr.refresh_token(), "rt_rotated_3");
+
+            let bodies = seen_rts.lock().unwrap();
+            assert!(bodies[0].contains("refresh_token=rt_initial_1"));
+            assert!(bodies[1].contains("refresh_token=rt_rotated_2"));
+        });
     }
 }

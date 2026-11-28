@@ -122,7 +122,19 @@ pub fn resolve_anthropic_messages_url(base_url: &str) -> String {
     format!("{trimmed}/v1/messages")
 }
 
-/// Normalize a Gemini API base URL and resolve `{base}/models/{model}:(stream)generateContent`.
+/// Returns `true` when `base_url` targets Google Cloud Code Assist's internal endpoint
+/// (`cloudcode-pa.googleapis.com` or a `/v1internal` base path), which expects
+/// `{base}:(stream)GenerateContent` with a `{model, request}` envelope instead of
+/// `{base}/models/{model}:(stream)GenerateContent`.
+pub fn is_cloudcode_pa_url(base_url: &str) -> bool {
+    let lower = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    lower.contains("cloudcode-pa.googleapis.com")
+        || lower.ends_with("/v1internal")
+        || lower.contains("/v1internal:")
+}
+
+/// Normalize a Gemini API base URL and resolve `{base}/models/{model}:(stream)generateContent`
+/// (or `{base}:(stream)GenerateContent` for Cloud Code Assist `/v1internal` endpoints).
 pub fn resolve_gemini_endpoint_url(base_url: &str, model: &str, stream: bool) -> String {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if !base.is_empty() && !base.contains("://") {
@@ -133,6 +145,22 @@ pub fn resolve_gemini_endpoint_url(base_url: &str, model: &str, stream: bool) ->
     }
     if let Some(idx) = base.find("/models") {
         base = base[..idx].trim_end_matches('/').to_string();
+    }
+    if is_cloudcode_pa_url(&base) {
+        if let Some(colon_idx) = base.rfind(':') {
+            let after_scheme = base.find("://").map(|i| i + 3).unwrap_or(0);
+            if colon_idx > after_scheme && base[colon_idx..].contains("GenerateContent") {
+                base = base[..colon_idx].to_string();
+            }
+        }
+        if !base.to_ascii_lowercase().contains("/v1internal") {
+            base.push_str("/v1internal");
+        }
+        return if stream {
+            format!("{base}:streamGenerateContent?alt=sse")
+        } else {
+            format!("{base}:generateContent")
+        };
     }
     // If bare host with empty path (e.g. https://generativelanguage.googleapis.com or bare proxy host), add /v1beta.
     if let Some(scheme_idx) = base.find("://") {
@@ -566,6 +594,16 @@ fn extract_gemini_parts(val: &Value, call_counter: usize) -> (String, String, Ve
     (text, thinking, tool_calls, finish_reason)
 }
 
+/// Unwrap Cloud Code Assist's `{"response": { ... }}` envelope when present.
+fn unwrap_gemini_envelope(val: &Value) -> &Value {
+    if val.get("candidates").is_none() {
+        if let Some(inner) = val.get("response").filter(|r| r.is_object()) {
+            return inner;
+        }
+    }
+    val
+}
+
 /// Parse a non-streaming Gemini `generateContent` JSON response into `UnifiedResponse`.
 pub fn parse_gemini_response_json(
     provider_id: &str,
@@ -574,11 +612,12 @@ pub fn parse_gemini_response_json(
 ) -> Result<UnifiedResponse, ProtocolError> {
     let val: Value = serde_json::from_str(body)
         .map_err(|e| ProtocolError::InvalidJson(format!("Gemini response JSON: {e}")))?;
-    if let Some(msg) = extract_gemini_error(&val) {
+    let payload = unwrap_gemini_envelope(&val);
+    if let Some(msg) = extract_gemini_error(&val).or_else(|| extract_gemini_error(payload)) {
         return Err(ProtocolError::Upstream(msg));
     }
-    let (content, thinking, tool_calls, finish_opt) = extract_gemini_parts(&val, 0);
-    let usage = parse_gemini_usage(&val).unwrap_or_default();
+    let (content, thinking, tool_calls, finish_opt) = extract_gemini_parts(payload, 0);
+    let usage = parse_gemini_usage(payload).unwrap_or_default();
     let finish_reason = if !tool_calls.is_empty() {
         "tool_calls".to_string()
     } else {
@@ -622,12 +661,13 @@ pub fn parse_gemini_sse_data(
     }
     let val: Value = serde_json::from_str(data)
         .map_err(|e| ProtocolError::InvalidJson(format!("Gemini SSE JSON: {e}")))?;
-    if let Some(msg) = extract_gemini_error(&val) {
+    let payload = unwrap_gemini_envelope(&val);
+    if let Some(msg) = extract_gemini_error(&val).or_else(|| extract_gemini_error(payload)) {
         return Err(ProtocolError::Upstream(msg));
     }
     let (text_delta, thinking_delta, tool_calls, finish_reason) =
-        extract_gemini_parts(&val, call_counter);
-    let usage = parse_gemini_usage(&val);
+        extract_gemini_parts(payload, call_counter);
+    let usage = parse_gemini_usage(payload);
     Ok(Some(GeminiSseDelta {
         text_delta,
         thinking_delta,

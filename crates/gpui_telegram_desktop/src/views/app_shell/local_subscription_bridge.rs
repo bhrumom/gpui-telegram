@@ -22,14 +22,17 @@ use std::sync::Arc;
 use bot_browser::e2ee_sync::AiOauthVaultBundle;
 use chrono::Utc;
 use gpui_telegram_agent::fabushi_bot::FabushiBotHost;
-use gpui_telegram_agent::hermes::providers::{ApiMode, ProviderRouter, ProviderRouterState};
+use gpui_telegram_agent::hermes::providers::{
+    sanitize_router_state_for_cross_device, ApiMode, ProviderRouter, ProviderRouterState,
+};
 use gpui_telegram_client::net::hermes_client::{MagpieSaveProviderRequest, MagpieStateDto};
 use gpui_telegram_client::TelegramClient;
 use magpie_gateway::{
     default_models_for_subscription_kind, discover_syncable_subscriptions_in_home,
     extract_jwt_exp_ms, fetch_live_upstream_models, fetch_models_dev_catalog,
-    is_loopback_server_url, merge_discovered_models, ClientSubscriptionSyncItem, CodexTokenManager,
-    CompactModelsCatalog, SubscriptionKind, VertexTokenManager, DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS,
+    is_cross_device_syncable_subscription, is_loopback_server_url, merge_discovered_models,
+    ClientSubscriptionSyncItem, CodexTokenManager, CompactModelsCatalog, SubscriptionKind,
+    VertexTokenManager, DEFAULT_TOKEN_REFRESH_LEAD_TIME_MS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -428,7 +431,16 @@ async fn sync_local_subscriptions_to_server_inner(
     auto_activate: bool,
 ) -> Result<LocalSubscriptionSyncOutcome, String> {
     let pinned = pinned_epoch.map(|e| (client.as_ref(), e));
-    if items.is_empty() {
+    let target_is_remote = !is_loopback_server_url(base_url);
+    let items: Vec<ClientSubscriptionSyncItem> = if target_is_remote {
+        items
+            .into_iter()
+            .filter(is_cross_device_syncable_subscription)
+            .collect()
+    } else {
+        items
+    };
+    if items.is_empty() && !target_is_remote {
         check_pinned_epoch(pinned, token)?;
         let state = client.hermes.magpie_state(token).await.ok();
         return Ok(LocalSubscriptionSyncOutcome {
@@ -952,17 +964,24 @@ pub fn discovered_subscriptions_fingerprint(items: &[ClientSubscriptionSyncItem]
     format!("{digest:x}")
 }
 
-/// Builds a client-side E2EE `AiOauthVaultBundle` containing discovered AI subscriptions and
-/// optional local `ProviderRouterState`.
+/// Builds a client-side E2EE `AiOauthVaultBundle` containing cross-device-safe AI subscriptions
+/// and a sanitized `ProviderRouterState` (stripping loopback proxies and rotating/ephemeral OAuth).
 pub fn build_ai_oauth_vault_bundle(
     items: &[ClientSubscriptionSyncItem],
     router: Option<&ProviderRouter>,
 ) -> Result<AiOauthVaultBundle, String> {
-    let subscriptions_json = serde_json::to_value(items)
+    let syncable_items: Vec<&ClientSubscriptionSyncItem> = items
+        .iter()
+        .filter(|i| is_cross_device_syncable_subscription(i))
+        .collect();
+    let subscriptions_json = serde_json::to_value(&syncable_items)
         .map_err(|e| format!("Failed serializing discovered subscriptions: {e}"))?;
     let providers_json = match router {
-        Some(r) => serde_json::to_value(r.snapshot())
-            .map_err(|e| format!("Failed serializing provider router snapshot: {e}"))?,
+        Some(r) => {
+            let clean = sanitize_router_state_for_cross_device(&r.snapshot());
+            serde_json::to_value(clean)
+                .map_err(|e| format!("Failed serializing provider router snapshot: {e}"))?
+        }
         None => serde_json::Value::Null,
     };
     Ok(AiOauthVaultBundle {
@@ -1018,7 +1037,8 @@ pub fn hydrate_local_subscriptions_into_fabushi(
 }
 
 /// Hydrates a decrypted `AiOauthVaultBundle` into the desktop's in-process `FabushiBotHost`
-/// for `user_id` (or global base router when `user_id` is `None`).
+/// for `user_id` (or global base router when `user_id` is `None`), stripping any legacy
+/// loopback proxies or rotating/ephemeral OAuth entries pulled from older vault snapshots.
 pub fn hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
     host: &FabushiBotHost,
     bundle: &AiOauthVaultBundle,
@@ -1028,9 +1048,10 @@ pub fn hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
     let core = host.core_engine();
     let normalized_uid = user_id.map(str::trim).filter(|s| !s.is_empty());
     if !bundle.providers_json.is_null() {
-        if let Ok(router_state) =
+        if let Ok(raw_router_state) =
             serde_json::from_value::<ProviderRouterState>(bundle.providers_json.clone())
         {
+            let router_state = sanitize_router_state_for_cross_device(&raw_router_state);
             let usable_provider_count = router_state
                 .providers
                 .values()
@@ -1051,7 +1072,6 @@ pub fn hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
                             .as_deref()
                             .is_some_and(|t| !t.trim().is_empty())
                             || router_state.synced_vertex_adcs.contains_key(&s.id)
-                            || router_state.synced_codex_oauths.contains_key(&s.id)
                             || router_state.providers.get(&s.id).is_some_and(|p| {
                                 p.enabled && (!p.credentials.is_empty() || p.no_key_required)
                             }))
@@ -1069,9 +1089,13 @@ pub fn hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
             }
         }
     }
-    if let Ok(items) =
+    if let Ok(raw_items) =
         serde_json::from_value::<Vec<ClientSubscriptionSyncItem>>(bundle.subscriptions_json.clone())
     {
+        let items: Vec<ClientSubscriptionSyncItem> = raw_items
+            .into_iter()
+            .filter(is_cross_device_syncable_subscription)
+            .collect();
         if !items.is_empty() {
             let sub_count =
                 hydrate_local_subscriptions_into_fabushi_for_user(host, &items, normalized_uid);

@@ -694,17 +694,23 @@ pub struct MagpieSubscriptionsSyncRequest {
 }
 
 /// POST /api/v1/hermes/magpie/subscriptions/sync
-/// Accepts client-discovered local AI subscriptions (Vertex AI ADC, Codex, Claude, Gemini, etc.),
-/// registers their in-memory token managers & provider configs strictly inside the authenticated
-/// user's isolated `ProviderRouter`, persists encrypted at rest, and returns sanitized state.
+/// Accepts cross-device-safe client-discovered AI subscriptions (e.g. Vertex AI ADC, static
+/// remote API keys), rejects loopback proxies and rotating/ephemeral OAuth sessions, prunes any
+/// legacy non-cross-device subscription entries, persists encrypted at rest, and returns sanitized state.
 pub async fn magpie_subscriptions_sync(
     auth: AuthBearer,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MagpieSubscriptionsSyncRequest>,
 ) -> Response {
-    let synced_count = req.subscriptions.len();
+    let syncable: Vec<ClientSubscriptionSyncItem> = req
+        .subscriptions
+        .into_iter()
+        .filter(magpie_gateway::is_cross_device_syncable_subscription)
+        .collect();
+    let synced_count = syncable.len();
     let router = user_router(&state, auth.user_id);
-    let reg = router.ingest_client_subscriptions(req.subscriptions, req.auto_activate);
+    router.prune_non_cross_device_subscriptions();
+    let reg = router.ingest_client_subscriptions(syncable, req.auto_activate);
     persist_user_router(&state, auth.user_id);
     let subscriptions: Vec<SubscriptionAccount> = reg
         .accounts

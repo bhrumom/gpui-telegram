@@ -452,3 +452,91 @@ fn composer_chinese_text_does_not_open_sticker_popup_and_allows_enter_send() {
         "Actual emoji '😀' should still open Sticker suggestions"
     );
 }
+
+#[test]
+fn e2ee_vault_bundle_excludes_loopback_proxies_and_rotating_oauth_on_push_and_pull() {
+    use bot_browser::e2ee_sync::AiOauthVaultBundle;
+    use gpui_telegram_agent::fabushi_bot::FabushiBotHost;
+    use gpui_telegram_agent::hermes::providers::{ApiMode, ProviderConfig, ProviderRouter};
+    use gpui_telegram_desktop::views::app_shell::local_subscription_bridge::{
+        build_ai_oauth_vault_bundle, hydrate_ai_oauth_vault_bundle_into_fabushi_for_user,
+    };
+
+    // 1. Push side: build_ai_oauth_vault_bundle must strip Codex rotating OAuth, loopback Claude proxy,
+    // and ephemeral Gemini Code Assist while keeping static API key & Vertex ADC.
+    let router = ProviderRouter::new();
+    router.register_provider(ProviderConfig::openai_compatible(
+        "openai_static",
+        "OpenAI Static",
+        "https://api.openai.com/v1",
+        "gpt-4o",
+        "sk-static-cross-device",
+    ));
+    let mut loopback_claude = ProviderConfig::openai_compatible(
+        "claude_code:settings",
+        "Claude Code (Settings)",
+        "http://127.0.0.1:3425/anthropic",
+        "codex/gpt-6.1-sol",
+        "local-proxy-token",
+    );
+    loopback_claude.api_mode = ApiMode::AnthropicMessages;
+    loopback_claude.is_subscription = true;
+    router.register_provider(loopback_claude);
+
+    let mut codex_cfg = ProviderConfig::openai_compatible(
+        "magpie_codex:team007",
+        "Codex",
+        "https://chatgpt.com/backend-api/codex",
+        "codex-mini-latest",
+        "eyJ-codex",
+    );
+    codex_cfg.api_mode = ApiMode::CodexResponses;
+    codex_cfg.is_subscription = true;
+    router.register_provider(codex_cfg);
+    let _ = router.set_active("magpie_codex:team007", Some("codex-mini-latest"));
+
+    let mut gemini_item = sample_codex_item();
+    gemini_item.account.id = "magpie_gemini:abc".to_string();
+    gemini_item.account.kind = SubscriptionKind::GeminiCodeAssist;
+    gemini_item.account.base_url = Some("https://cloudcode-pa.googleapis.com/v1internal".to_string());
+
+    let bundle = build_ai_oauth_vault_bundle(
+        &[sample_vertex_item(), sample_codex_item(), gemini_item.clone()],
+        Some(&router),
+    )
+    .expect("build vault bundle");
+
+    let subs: Vec<ClientSubscriptionSyncItem> =
+        serde_json::from_value(bundle.subscriptions_json.clone()).unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].account.id, "google_vertex:dev@vertex.test");
+
+    let providers_text = bundle.providers_json.to_string();
+    assert!(providers_text.contains("openai_static"));
+    assert!(!providers_text.contains("magpie_codex:team007"));
+    assert!(!providers_text.contains("claude_code:settings"));
+    assert!(!providers_text.contains("127.0.0.1:3425"));
+
+    // 2. Pull side: even a legacy vault bundle uploaded by an older client containing raw
+    // Codex OAuth + loopback proxy + Gemini Code Assist must be sanitized on hydrate!
+    let legacy_bundle = AiOauthVaultBundle {
+        providers_json: serde_json::to_value(router.snapshot()).unwrap(),
+        subscriptions_json: serde_json::to_value(vec![sample_codex_item(), gemini_item]).unwrap(),
+        updated_at_ms: 1_700_000_000_000,
+    };
+    let host_b = FabushiBotHost::new_unified_ephemeral("hermes-local-v1").unwrap();
+    let cnt = hydrate_ai_oauth_vault_bundle_into_fabushi_for_user(
+        &host_b,
+        &legacy_bundle,
+        Some("2002"),
+    )
+    .expect("hydrate sanitized legacy bundle");
+    assert!(cnt >= 1);
+    let snap_b = host_b.core_engine().providers_for_user("2002").snapshot();
+    assert!(snap_b.providers.contains_key("openai_static"));
+    assert!(!snap_b.providers.contains_key("magpie_codex:team007"));
+    assert!(!snap_b.providers.contains_key("claude_code:settings"));
+    assert!(!snap_b.providers.contains_key("magpie_gemini:abc"));
+    assert!(snap_b.synced_codex_oauths.is_empty());
+    assert_eq!(snap_b.active_provider_id, "openai_static");
+}
