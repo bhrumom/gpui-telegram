@@ -4,8 +4,8 @@ use crate::i18n::tr_str;
 use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_section_header,
-    settings_subsection_title, settings_toggle_row,
+    settings_action_row, settings_action_row_desc, settings_container, settings_group_card,
+    settings_section_block, settings_toggle_row,
 };
 use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::*;
@@ -81,31 +81,73 @@ impl Render for SettingsNotificationsSections {
         };
 
         settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::Speaker, tr_str(lang, "通知与声音", "Notifications and Sounds"), None, pal))
-                .child(settings_toggle_row(IconName::ContactsUsers, tr_str(lang, "私聊通知", "Private Chats"), None, self.private_chats_enabled, pal, Self::toggle_private_chats, cx))
-                .child(settings_toggle_row(IconName::GroupUsers, tr_str(lang, "群组通知", "Groups"), None, self.groups_enabled, pal, Self::toggle_groups, cx))
-                .child(settings_toggle_row(IconName::ChannelMegaphone, tr_str(lang, "频道通知", "Channels"), None, self.channels_enabled, pal, Self::toggle_channels, cx))
-                .child(settings_toggle_row(IconName::Speaker, tr_str(lang, "提示音", "Play Sound"), None, self.sound_enabled, pal, Self::toggle_sound, cx)))
-            .child(settings_card(pal)
-                .child(settings_subsection_title(tr_str(lang, "角标与闪烁", "Badge Counter"), pal))
-                .child(settings_toggle_row(IconName::Mute, tr_str(lang, "包含已静音对话", "Include Muted Chats"), None, self.include_muted_in_badge, pal, Self::toggle_badge_include_muted, cx))
-                .child(settings_action_row(IconName::ArchivedChats, tr_str(lang, "角标计数方式", "Count Unread"), badge_label, pal, false, |this| {
-                    let next = match this.badge_count_type {
-                        BadgeCountType::CountMessages => BadgeCountType::CountChats,
-                        BadgeCountType::CountChats => BadgeCountType::CountMessages,
-                    };
-                    this.set_badge_count_type(next);
-                }, cx))
-                .child(settings_toggle_row(IconName::SettingsGear, tr_str(lang, "任务栏闪烁提醒", "Flash Taskbar Icon"), None, self.flash_taskbar_icon, pal, Self::toggle_flash_taskbar, cx)))
-            .child(settings_card(pal)
-                .child(settings_subsection_title(tr_str(lang, "高级通知设置", "Advanced Notifications"), pal))
-                .child(settings_action_row(IconName::HeartReaction, tr_str(lang, "回应与动态通知", "Reaction Notifications"), "›", pal, false, |this| {
-                    this.pending_nav_section = Some(SettingsSectionType::NotificationsReactions);
-                }, cx))
-                .child(settings_action_row(IconName::ContactsUsers, tr_str(lang, "对话分类与例外管理", "Chat Type Overrides & Exceptions"), "›", pal, false, |this| {
-                    this.pending_nav_section = Some(SettingsSectionType::NotificationsType);
-                }, cx)))
+            .child(settings_section_block(
+                tr_str(lang, "通知范围", "What you hear"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_toggle_row(IconName::ContactsUsers, tr_str(lang, "私聊通知", "Private Chats"), None, self.private_chats_enabled, pal, Self::toggle_private_chats, cx),
+                        settings_toggle_row(IconName::GroupUsers, tr_str(lang, "群组通知", "Groups"), None, self.groups_enabled, pal, Self::toggle_groups, cx),
+                        settings_toggle_row(IconName::ChannelMegaphone, tr_str(lang, "频道通知", "Channels"), None, self.channels_enabled, pal, Self::toggle_channels, cx),
+                        settings_toggle_row(IconName::Speaker, tr_str(lang, "提示音", "Play Sound"), None, self.sound_enabled, pal, Self::toggle_sound, cx),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(lang, "角标与提醒", "Badge & Alerts"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_toggle_row(IconName::Mute, tr_str(lang, "包含已静音对话", "Include Muted Chats"), None, self.include_muted_in_badge, pal, Self::toggle_badge_include_muted, cx),
+                        settings_action_row(IconName::ArchivedChats, tr_str(lang, "角标计数方式", "Count Unread"), badge_label, pal, false, |this| {
+                            let next = match this.badge_count_type {
+                                BadgeCountType::CountMessages => BadgeCountType::CountChats,
+                                BadgeCountType::CountChats => BadgeCountType::CountMessages,
+                            };
+                            this.set_badge_count_type(next);
+                        }, cx),
+                        settings_toggle_row(IconName::SettingsGear, tr_str(lang, "任务栏闪烁提醒", "Flash Taskbar Icon"), None, self.flash_taskbar_icon, pal, Self::toggle_flash_taskbar, cx),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(lang, "更多规则", "More Rules"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row_desc(
+                            Some(IconName::HeartReaction),
+                            tr_str(lang, "回应与动态通知", "Reaction Alerts"),
+                            Some(tr_str(lang, "控制消息和动态表情回应的通知与提示音。", "Manage alerts for emoji reactions on messages and stories.")),
+                            "",
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_nav_section = Some(SettingsSectionType::NotificationsReactions);
+                            },
+                            cx,
+                        ),
+                        settings_action_row_desc(
+                            Some(IconName::ContactsUsers),
+                            tr_str(lang, "分类通知与例外管理", "Notification Scope & Exceptions"),
+                            Some(tr_str(lang, "微调消息预览与单个对话的静音例外。", "Fine-tune message previews and per-chat exceptions.")),
+                            "",
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_nav_section = Some(SettingsSectionType::NotificationsType);
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
             .into_any_element()
     }
 }

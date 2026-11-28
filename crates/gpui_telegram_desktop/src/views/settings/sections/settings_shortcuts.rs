@@ -1,10 +1,10 @@
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use crate::i18n::tr_str;
 use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
-    settings_toggle_row,
+    settings_container, settings_group_card, settings_section_block, settings_toggle_row,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,8 +88,10 @@ impl Default for SettingsShortcutsSections {
 
 impl Render for SettingsShortcutsSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
+        let hover_ctrl = ob.bg_control_hover();
         let q = self.search_query.to_lowercase();
         let shortcuts: Vec<ShortcutEntry> = self.shortcuts.iter()
             .filter(|s| {
@@ -107,35 +109,109 @@ impl Render for SettingsShortcutsSections {
             ("cmd", tr_str(&lang, "组合键", "Cmd/Ctrl"), "Ctrl"),
         ];
 
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::SettingsGear, tr_str(&lang, "键盘快捷键", "Keyboard Shortcuts"), Some(tr_str(&lang, "快速对话跳转、全局搜索与锁屏快捷键", "Quick navigation and window bindings")), pal.clone()))
-            .child(settings_card(pal.clone()).child(settings_toggle_row(
-                IconName::SettingsGear,
-                tr_str(&lang, "启用自定义工作区快捷键", "Enable Workspace Shortcuts"),
-                None,
-                self.shortcuts_enabled,
-                pal.clone(),
-                Self::toggle_shortcuts_enabled,
-                cx,
-            )))
-            .child(div().flex().flex_row().gap(px(6.0)).children(filters.into_iter().map(|(flt, label, tag)| {
+        let filter_bar = div()
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children(filters.into_iter().map(|(flt, label, tag)| {
                 let active = self.search_query == flt;
-                div().px(px(10.0)).py(px(5.0)).rounded(px(6.0)).bg(rgb(if active { pal.accent } else { pal.card_bg })).border_1().border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                    .text_xs().text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                        this.search_query = flt.to_string();
-                        this.selected_filter = if flt.is_empty() { None } else { Some(tag) };
-                        this.pending_sync = true;
-                        cx.notify();
-                    }))
+                div()
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(ob.surface_light()))
+                    .when(!active, |el| el.hover(move |s| s.bg(hover_ctrl)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if active { ob.text_on_light() } else { ob.text_secondary() })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.search_query = flt.to_string();
+                            this.selected_filter = if flt.is_empty() { None } else { Some(tag) };
+                            this.pending_sync = true;
+                            cx.notify();
+                        }),
+                    )
                     .child(label)
-            })))
-            .child(settings_subsection_title(tr_str(&lang, "已启用快捷键", "Active Bindings"), pal.clone()))
-            .child(settings_card(pal.clone()).children(shortcuts.into_iter().map(|sc| {
+            }));
+
+        let binding_rows: Vec<AnyElement> = shortcuts
+            .into_iter()
+            .map(|sc| {
                 let desc = Self::localized_description(&sc, &lang).to_string();
-                div().flex().flex_row().justify_between().items_center().px(px(10.0)).py(px(6.0))
-                    .child(div().text_sm().text_color(rgb(if self.shortcuts_enabled { pal.text_primary } else { pal.text_secondary })).child(desc))
-                    .child(div().px(px(8.0)).py(px(3.0)).rounded(px(5.0)).bg(rgb(pal.input_bg)).border_1().border_color(rgb(pal.border_fg)).text_xs().font_family("monospace").text_color(rgb(pal.text_primary)).child(sc.key_sequence))
-            })))
+                div()
+                    .w_full()
+                    .min_h(px(48.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .text_color(if self.shortcuts_enabled {
+                                ob.text_primary()
+                            } else {
+                                ob.text_muted()
+                            })
+                            .child(desc),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .bg(ob.bg_control())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .text_size(px(11.5))
+                            .font_family("monospace")
+                            .text_color(ob.text_primary())
+                            .child(sc.key_sequence),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(&lang, "工作区快捷键", "Workspace Shortcuts"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![settings_toggle_row(
+                        IconName::TerminalMcp,
+                        tr_str(&lang, "启用工作区快捷键", "Enable workspace shortcuts"),
+                        Some(tr_str(&lang, "关闭后仅保留系统默认编辑快捷键。", "When off, only standard OS editing keys remain active.")),
+                        self.shortcuts_enabled,
+                        pal,
+                        Self::toggle_shortcuts_enabled,
+                        cx,
+                    )],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "按键绑定", "Key Bindings"),
+                None,
+                pal,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(div().flex().justify_start().child(filter_bar))
+                    .child(settings_group_card(pal, binding_rows)),
+            ))
     }
 }

@@ -5,8 +5,8 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::boxes::passcode_box::PasscodeBox;
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_info_row,
-    settings_section_header, settings_subsection_title,
+    settings_action_row, settings_container, settings_group_card, settings_info_row,
+    settings_section_block,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -187,63 +187,103 @@ impl Default for SettingsLocalPasscodeSections {
 
 impl Render for SettingsLocalPasscodeSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
+        if !self.is_visible {
+            return div().into_any_element();
+        }
         let pal = self.palette;
         let lang = &self.language_id;
 
-        settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::Lock, tr_str(lang, "本地锁定密码", "Passcode Lock"), None, pal))
-                .child(settings_info_row(tr_str(lang, "密码状态", "Status"), if self.has_passcode { tr_str(lang, "已开启", "Enabled") } else { tr_str(lang, "已关闭", "Disabled") }, pal))
-                .child(settings_action_row(
-                    IconName::Lock,
-                    if self.has_passcode {
-                        tr_str(lang, "修改本地密码", "Change Passcode")
-                    } else {
-                        tr_str(lang, "开启本地密码锁", "Turn On Passcode")
-                    },
-                    "",
-                    pal,
-                    false,
-                    |this| {
-                        this.pending_open_passcode_box = true;
-                    },
-                    cx,
-                ))
-                .when(self.has_passcode, |el| {
-                    el.child(settings_action_row(
-                        IconName::DeleteTrash,
-                        tr_str(lang, "关闭本地密码锁", "Turn Off Passcode"),
-                        "",
-                        pal,
-                        true,
-                        |this| {
-                            this.has_passcode = false;
-                            this.passcode_hash = None;
-                            this.is_locked = false;
-                            this.pending_disable_passcode = true;
-                            this.pending_prefs_sync = true;
-                        },
-                        cx,
-                    ))
-                })
-                .child(settings_action_row(IconName::ClockSending, tr_str(lang, "自动锁定超时", "Auto-Lock"), self.auto_lock.display_name_localized(lang), pal, false, |this| {
-                    this.auto_lock = match this.auto_lock {
-                        AutoLockTimeout::Disabled => AutoLockTimeout::In1Min,
-                        AutoLockTimeout::In1Min => AutoLockTimeout::In5Mins,
-                        AutoLockTimeout::In5Mins => AutoLockTimeout::In1Hour,
-                        AutoLockTimeout::In1Hour => AutoLockTimeout::In5Hours,
-                        AutoLockTimeout::In5Hours => AutoLockTimeout::Disabled,
-                    };
+        let mut passcode_rows: Vec<AnyElement> = vec![
+            settings_info_row(
+                tr_str(lang, "密码状态", "Status"),
+                if self.has_passcode {
+                    tr_str(lang, "已开启", "Enabled")
+                } else {
+                    tr_str(lang, "已关闭", "Disabled")
+                },
+                pal,
+            ),
+            settings_action_row(
+                IconName::Lock,
+                if self.has_passcode {
+                    tr_str(lang, "修改本地密码", "Change Passcode")
+                } else {
+                    tr_str(lang, "开启本地密码锁", "Turn On Passcode")
+                },
+                "",
+                pal,
+                false,
+                |this| {
+                    this.pending_open_passcode_box = true;
+                },
+                cx,
+            ),
+        ];
+        if self.has_passcode {
+            passcode_rows.push(settings_action_row(
+                IconName::DeleteTrash,
+                tr_str(lang, "关闭本地密码锁", "Turn Off Passcode"),
+                "",
+                pal,
+                true,
+                |this| {
+                    this.has_passcode = false;
+                    this.passcode_hash = None;
+                    this.is_locked = false;
+                    this.pending_disable_passcode = true;
                     this.pending_prefs_sync = true;
-                }, cx))
-                .when(self.has_passcode, |el| {
-                    el.child(settings_subsection_title(tr_str(lang, "锁屏控制", "Controls"), pal))
-                        .child(settings_action_row(IconName::Lock, tr_str(lang, "立即锁定", "Lock App"), &self.countdown.formatted_text(), pal, false, |this| {
-                            this.is_locked = true;
-                            this.pending_lock_now = true;
-                        }, cx))
-                }))
+                },
+                cx,
+            ));
+        }
+        passcode_rows.push(settings_action_row(
+            IconName::ClockSending,
+            tr_str(lang, "自动锁定超时", "Auto-Lock"),
+            self.auto_lock.display_name_localized(lang),
+            pal,
+            false,
+            |this| {
+                this.auto_lock = match this.auto_lock {
+                    AutoLockTimeout::Disabled => AutoLockTimeout::In1Min,
+                    AutoLockTimeout::In1Min => AutoLockTimeout::In5Mins,
+                    AutoLockTimeout::In5Mins => AutoLockTimeout::In1Hour,
+                    AutoLockTimeout::In1Hour => AutoLockTimeout::In5Hours,
+                    AutoLockTimeout::In5Hours => AutoLockTimeout::Disabled,
+                };
+                this.pending_prefs_sync = true;
+            },
+            cx,
+        ));
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(lang, "本地锁定密码", "Passcode Lock"),
+                None,
+                pal,
+                settings_group_card(pal, passcode_rows),
+            ))
+            .when(self.has_passcode, |el| {
+                el.child(settings_section_block(
+                    tr_str(lang, "锁屏控制", "Controls"),
+                    None,
+                    pal,
+                    settings_group_card(
+                        pal,
+                        vec![settings_action_row(
+                            IconName::Lock,
+                            tr_str(lang, "立即锁定", "Lock App"),
+                            &self.countdown.formatted_text(),
+                            pal,
+                            false,
+                            |this| {
+                                this.is_locked = true;
+                                this.pending_lock_now = true;
+                            },
+                            cx,
+                        )],
+                    ),
+                ))
+            })
             .into_any_element()
     }
 }

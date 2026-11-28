@@ -1,13 +1,13 @@
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::IconName;
 use crate::theme::palette::{
     ACCENT_SWATCHES, TdesktopThemeMode, TdesktopThemePalette, WALLPAPER_PRESETS,
 };
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
-    settings_toggle_row,
+    settings_card, settings_container, settings_group_card, settings_section_block,
+    settings_static_row, settings_toggle_row,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,59 +177,373 @@ fn wallpaper_label_ink(bg_hex: u32) -> u32 {
 
 impl Render for SettingsChatSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let rad = self.bubble_radius as f32;
+        let hover_ctrl = ob.bg_control_hover();
         let presets = [ChatThemePreset::Night, ChatThemePreset::Tinted, ChatThemePreset::Day, ChatThemePreset::Classic];
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::NightMoon, tr_str(&lang, "聊天设置", "Chat Settings"), Some(&format!("{} pt · {}", self.font_size, self.theme_name_localized(&lang))), pal.clone()))
+
+        let preview_box = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(16.0))
+            .rounded(px(12.0))
+            .bg(rgb(pal.wallpaper_top))
+            .border_1()
+            .border_color(ob.frame_card_border())
             .child(
-                div().flex().flex_col().gap(px(8.0)).p(px(14.0)).rounded(px(10.0)).bg(rgb(pal.wallpaper_top)).border_1().border_color(rgb(pal.border_fg))
-                    .child(div().flex().justify_start().child(div().px(px(12.0)).py(px(8.0)).rounded(px(pal.scaled_px(rad))).bg(rgb(pal.msg_in_bg)).text_color(rgb(pal.text_primary)).text_size(px(pal.scaled_px(self.font_size as f32))).child(tr_str(&lang, "早上好！新版聊天界面体验怎么样？", "Good morning! How is the new update?"))))
-                    .child(div().flex().justify_end().child(div().px(px(12.0)).py(px(8.0)).rounded(px(pal.scaled_px(rad))).bg(rgb(pal.msg_out_bg)).text_color(rgb(pal.text_primary)).text_size(px(pal.scaled_px(self.font_size as f32))).child(tr_str(&lang, "原生丝滑，在任何主题下都非常清晰。", "Clean, native, and readable in every theme.")))),
+                div().flex().justify_start().child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(pal.scaled_px(rad)))
+                        .bg(rgb(pal.msg_in_bg))
+                        .text_color(rgb(pal.text_primary))
+                        .text_size(px(pal.scaled_px(self.font_size as f32)))
+                        .child(tr_str(&lang, "早上好！新版界面简洁清爽了许多。", "Good morning! The new layout feels super clean.")),
+                ),
             )
-            .child(settings_subsection_title(tr_str(&lang, "颜色主题与强调色", "Color Theme & Accent"), pal.clone()))
             .child(
-                settings_card(pal.clone())
-                    .child(div().flex().flex_row().gap(px(8.0)).children(presets.into_iter().map(|preset| {
-                        let active = preset == self.theme_preset;
-                        let preset_label = match preset {
-                            ChatThemePreset::Night => tr_str(&lang, "夜间", "Night"),
-                            ChatThemePreset::Tinted => tr_str(&lang, "暗调", "Tinted"),
-                            ChatThemePreset::Day => tr_str(&lang, "日间", "Day"),
-                            ChatThemePreset::Classic => tr_str(&lang, "经典", "Classic"),
-                        };
-                        div().flex_1().py(px(8.0)).rounded(px(8.0)).flex().items_center().justify_center().bg(rgb(if active { pal.accent } else { pal.input_bg })).text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { this.set_theme_preset(preset); cx.notify(); })).child(preset_label)
-                    })))
-                    .child(div().pt(px(6.0)).flex().flex_row().items_center().gap(px(8.0)).children(ACCENT_SWATCHES.iter().map(|sw| {
-                        let sel = sw.hex == self.accent_color;
-                        div().size(px(24.0)).rounded_full().bg(rgb(sw.hex)).border_2().border_color(rgb(if sel { pal.text_primary } else { pal.card_bg })).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener({ let hex = sw.hex; move |this, _, _, cx| { this.set_accent_color(hex); cx.notify(); } }))
-                    }))),
-            )
-            .child(settings_subsection_title(tr_str(&lang, "聊天背景与字体", "Wallpaper & Typography"), pal.clone()))
+                div().flex().justify_end().child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(pal.scaled_px(rad)))
+                        .bg(rgb(pal.msg_out_bg))
+                        .text_color(rgb(pal.text_primary))
+                        .text_size(px(pal.scaled_px(self.font_size as f32)))
+                        .child(tr_str(&lang, "原生丝滑，任何主题下都清晰易读。", "Native, crisp, and readable in every theme.")),
+                ),
+            );
+
+        let theme_segmented = div()
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children(presets.into_iter().map(|preset| {
+                let active = preset == self.theme_preset;
+                let preset_label = match preset {
+                    ChatThemePreset::Night => tr_str(&lang, "夜间", "Night"),
+                    ChatThemePreset::Tinted => tr_str(&lang, "暗调", "Tinted"),
+                    ChatThemePreset::Day => tr_str(&lang, "日间", "Day"),
+                    ChatThemePreset::Classic => tr_str(&lang, "经典", "Classic"),
+                };
+                div()
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(ob.surface_light()))
+                    .when(!active, |el| el.hover(move |s| s.bg(hover_ctrl)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if active { ob.text_on_light() } else { ob.text_secondary() })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_theme_preset(preset);
+                            cx.notify();
+                        }),
+                    )
+                    .child(preset_label)
+            }));
+
+        let accent_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .children(ACCENT_SWATCHES.iter().map(|sw| {
+                let sel = sw.hex == self.accent_color;
+                div()
+                    .size(px(22.0))
+                    .rounded_full()
+                    .bg(rgb(sw.hex))
+                    .border_2()
+                    .border_color(if sel { ob.text_primary() } else { ob.border_hairline() })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let hex = sw.hex;
+                            move |this, _, _, cx| {
+                                this.set_accent_color(hex);
+                                cx.notify();
+                            }
+                        }),
+                    )
+            }));
+
+        let wallpaper_strip = settings_card(pal)
+            .py(px(12.0))
             .child(
-                settings_card(pal.clone())
-                    .child(div().flex().flex_row().flex_wrap().gap(px(6.0)).children(WALLPAPER_PRESETS.iter().map(|wp| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(6.0))
+                    .children(WALLPAPER_PRESETS.iter().map(|wp| {
                         let sel = wp.id == self.wallpaper_name || wp.name == self.wallpaper_name;
                         let label_ink = wallpaper_label_ink(wp.top_hex);
-                        div().px(px(10.0)).py(px(5.0)).rounded(px(6.0)).bg(rgb(wp.top_hex)).border_1().border_color(rgb(if sel { pal.accent } else { pal.border_fg })).text_xs().font_weight(FontWeight::MEDIUM).text_color(rgb(label_ink)).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener({ let id = wp.id; move |this, _, _, cx| { this.set_wallpaper(id); cx.notify(); } })).child(wp.name)
-                    })))
-                    .child(div().pt(px(6.0)).flex().flex_row().items_center().justify_between().child(div().text_sm().text_color(rgb(pal.text_primary)).child(format!("{}: {} pt", tr_str(&lang, "字体大小", "Text Size"), self.font_size))).child(div().flex().flex_row().gap(px(6.0))
-                        .child(div().px(px(10.0)).py(px(4.0)).rounded(px(6.0)).bg(rgb(pal.input_bg)).text_color(rgb(pal.text_primary)).cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.set_font_size(this.font_size.saturating_sub(1)); cx.notify(); })).child("-"))
-                        .child(div().px(px(10.0)).py(px(4.0)).rounded(px(6.0)).bg(rgb(pal.input_bg)).text_color(rgb(pal.text_primary)).cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.set_font_size(this.font_size + 1); cx.notify(); })).child("+"))))
-                    .child(div().pt(px(4.0)).flex().flex_row().items_center().justify_between().child(div().text_sm().text_color(rgb(pal.text_primary)).child(format!("{}: {} px", tr_str(&lang, "气泡圆角", "Bubble Corners"), self.bubble_radius))).child(div().flex().flex_row().gap(px(6.0))
-                        .child(div().px(px(10.0)).py(px(4.0)).rounded(px(6.0)).bg(rgb(pal.input_bg)).text_color(rgb(pal.text_primary)).cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.set_bubble_radius(this.bubble_radius.saturating_sub(2).max(2)); cx.notify(); })).child("-"))
-                        .child(div().px(px(10.0)).py(px(4.0)).rounded(px(6.0)).bg(rgb(pal.input_bg)).text_color(rgb(pal.text_primary)).cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.set_bubble_radius((this.bubble_radius + 2).min(18)); cx.notify(); })).child("+")))),
+                        div()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(wp.top_hex))
+                            .border_1()
+                            .border_color(if sel { ob.text_primary() } else { ob.border_hairline() })
+                            .text_size(px(12.0))
+                            .font_weight(if sel { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                            .text_color(rgb(label_ink))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let id = wp.id;
+                                    move |this, _, _, cx| {
+                                        this.set_wallpaper(id);
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(wp.name)
+                    })),
+            );
+
+        let font_stepper = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .cursor_pointer()
+                    .w(px(28.0))
+                    .h(px(26.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .hover(move |s| s.bg(hover_ctrl))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_primary())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_font_size(this.font_size.saturating_sub(1));
+                            cx.notify();
+                        }),
+                    )
+                    .child("−"),
             )
-            .child(settings_card(pal.clone())
-                .child(settings_toggle_row(IconName::SendPlane, tr_str(&lang, "回车发送", "Send by Enter"), None, self.send_on_enter, pal.clone(), |this| this.toggle_send_on_enter(), cx))
-                .child(settings_toggle_row(IconName::Sticker, tr_str(&lang, "按表情推荐贴纸", "Suggest Stickers by Emoji"), None, self.suggest_stickers_by_emoji, pal.clone(), |this| { this.suggest_stickers_by_emoji = !this.suggest_stickers_by_emoji; this.chat_prefs_dirty = true; }, cx))
-                .child(settings_toggle_row(IconName::Sticker, tr_str(&lang, "循环播放动态贴纸", "Loop Animated Stickers"), None, self.loop_animated_stickers, pal.clone(), |this| this.toggle_loop_animated_stickers(), cx))
-                .child(settings_toggle_row(IconName::SunDay, tr_str(&lang, "模糊背景", "Blur Wallpaper"), None, self.blur_wallpaper, pal, |this| this.toggle_blur_wallpaper(), cx))
-                .when(false, |el| el.child(tg_icon(IconName::SunDay, 12.0, 0))))
+            .child(
+                div()
+                    .w(px(44.0))
+                    .flex()
+                    .justify_center()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ob.text_primary())
+                    .child(format!("{} pt", self.font_size)),
+            )
+            .child(
+                div()
+                    .cursor_pointer()
+                    .w(px(28.0))
+                    .h(px(26.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .hover(move |s| s.bg(hover_ctrl))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_primary())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_font_size(this.font_size + 1);
+                            cx.notify();
+                        }),
+                    )
+                    .child("+"),
+            );
+
+        let radius_stepper = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .cursor_pointer()
+                    .w(px(28.0))
+                    .h(px(26.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .hover(move |s| s.bg(hover_ctrl))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_primary())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_bubble_radius(this.bubble_radius.saturating_sub(2).max(2));
+                            cx.notify();
+                        }),
+                    )
+                    .child("−"),
+            )
+            .child(
+                div()
+                    .w(px(44.0))
+                    .flex()
+                    .justify_center()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ob.text_primary())
+                    .child(format!("{} px", self.bubble_radius)),
+            )
+            .child(
+                div()
+                    .cursor_pointer()
+                    .w(px(28.0))
+                    .h(px(26.0))
+                    .rounded(px(6.0))
+                    .bg(ob.bg_control())
+                    .border_1()
+                    .border_color(ob.border_hairline())
+                    .hover(move |s| s.bg(hover_ctrl))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(ob.text_primary())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_bubble_radius((this.bubble_radius + 2).min(18));
+                            cx.notify();
+                        }),
+                    )
+                    .child("+"),
+            );
+
+        settings_container(pal)
+            .child(preview_box)
+            .child(settings_section_block(
+                tr_str(&lang, "颜色与主题", "Colors & Theme"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_static_row(
+                            tr_str(&lang, "主题", "Theme"),
+                            Some(tr_str(&lang, "选择浅色或深色配色方案。", "Choose light or dark color scheme.")),
+                            theme_segmented,
+                            pal,
+                        ),
+                        settings_static_row(
+                            tr_str(&lang, "强调色", "Accent color"),
+                            Some(tr_str(&lang, "用于聊天链接、气泡与高亮元素。", "Used for links, bubbles, and highlights.")),
+                            accent_row,
+                            pal,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "聊天背景", "Chat Wallpaper"),
+                None,
+                pal,
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(wallpaper_strip)
+                    .child(settings_group_card(
+                        pal,
+                        vec![settings_toggle_row(
+                            IconName::SunDay,
+                            tr_str(&lang, "模糊背景", "Blur wallpaper"),
+                            Some(tr_str(&lang, "对聊天背景应用柔和毛玻璃模糊。", "Apply a subtle blur to the chat background.")),
+                            self.blur_wallpaper,
+                            pal,
+                            |this| this.toggle_blur_wallpaper(),
+                            cx,
+                        )],
+                    )),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "排版与对话交互", "Typography & Chat"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_static_row(
+                            tr_str(&lang, "字体大小", "Message text size"),
+                            None,
+                            font_stepper,
+                            pal,
+                        ),
+                        settings_static_row(
+                            tr_str(&lang, "气泡圆角", "Bubble corner radius"),
+                            None,
+                            radius_stepper,
+                            pal,
+                        ),
+                        settings_toggle_row(
+                            IconName::SendPlane,
+                            tr_str(&lang, "按 Enter 发送消息", "Send with Enter"),
+                            Some(tr_str(&lang, "关闭后使用 ⌘Enter / Ctrl+Enter 发送。", "When off, use Cmd/Ctrl+Enter to send.")),
+                            self.send_on_enter,
+                            pal,
+                            |this| this.toggle_send_on_enter(),
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::Sticker,
+                            tr_str(&lang, "按表情推荐贴纸", "Suggest stickers by emoji"),
+                            None,
+                            self.suggest_stickers_by_emoji,
+                            pal,
+                            |this| {
+                                this.suggest_stickers_by_emoji = !this.suggest_stickers_by_emoji;
+                                this.chat_prefs_dirty = true;
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::Sticker,
+                            tr_str(&lang, "循环播放动态贴纸", "Loop animated stickers"),
+                            None,
+                            self.loop_animated_stickers,
+                            pal,
+                            |this| this.toggle_loop_animated_stickers(),
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
     }
 }
 

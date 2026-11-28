@@ -4,8 +4,8 @@ use crate::i18n::tr_str;
 use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_info_row,
-    settings_section_header, settings_toggle_row,
+    settings_action_row, settings_container, settings_group_card, settings_info_row,
+    settings_section_block, settings_toggle_row,
 };
 use gpui::*;
 
@@ -69,19 +69,59 @@ impl Render for SettingsNotificationsReactionsSections {
         };
 
         settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::HeartReaction, tr_str(lang, "回应通知", "Reactions Notifications"), None, pal))
-                .child(settings_toggle_row(IconName::HeartReaction, tr_str(lang, "消息回应通知", "Notify About Reactions"), None, self.notify_reactions, pal, Self::toggle_notify_reactions, cx))
-                .child(settings_toggle_row(IconName::Camera, tr_str(lang, "动态回应通知", "Notify About Stories Reactions"), None, self.notify_stories, pal, Self::toggle_notify_stories, cx))
-                .child(settings_action_row(IconName::ContactsUsers, tr_str(lang, "接收范围", "From"), src_label, pal, false, |this| {
-                    let next = match this.source {
-                        ReactionsNotifySource::All => ReactionsNotifySource::Contacts,
-                        ReactionsNotifySource::Contacts => ReactionsNotifySource::All,
-                    };
-                    this.set_source(next);
-                }, cx))
-                .child(settings_toggle_row(IconName::Speaker, tr_str(lang, "回应提示音", "Sound"), None, self.sound_enabled, pal, Self::toggle_sound, cx))
-                .child(settings_info_row(tr_str(lang, "提示音名称", "Tone"), tone_label, pal)))
+            .child(settings_section_block(
+                tr_str(lang, "回应提醒", "Reaction Alerts"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_toggle_row(
+                            IconName::HeartReaction,
+                            tr_str(lang, "消息回应通知", "Notify About Reactions"),
+                            None,
+                            self.notify_reactions,
+                            pal,
+                            Self::toggle_notify_reactions,
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::Camera,
+                            tr_str(lang, "动态回应通知", "Notify About Stories Reactions"),
+                            None,
+                            self.notify_stories,
+                            pal,
+                            Self::toggle_notify_stories,
+                            cx,
+                        ),
+                        settings_action_row(
+                            IconName::ContactsUsers,
+                            tr_str(lang, "接收范围", "From"),
+                            src_label,
+                            pal,
+                            false,
+                            |this| {
+                                let next = match this.source {
+                                    ReactionsNotifySource::All => ReactionsNotifySource::Contacts,
+                                    ReactionsNotifySource::Contacts => ReactionsNotifySource::All,
+                                };
+                                this.set_source(next);
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::Speaker,
+                            tr_str(lang, "回应提示音", "Sound"),
+                            None,
+                            self.sound_enabled,
+                            pal,
+                            Self::toggle_sound,
+                            cx,
+                        ),
+                        settings_info_row(tr_str(lang, "提示音名称", "Tone"), tone_label, pal),
+                    ],
+                ),
+            ))
             .into_any_element()
     }
 }

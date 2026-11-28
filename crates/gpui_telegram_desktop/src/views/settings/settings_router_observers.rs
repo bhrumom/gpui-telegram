@@ -23,18 +23,19 @@ use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::{Context, Entity};
 
 impl SettingsRouter {
-    /// Subscribes to main settings actions (navigation, clipboard copy, interface scale).
+    /// Subscribes to main settings actions (navigation, clipboard copy, interface scale, inline language switch).
     pub(super) fn observe_main(ent: &Entity<SettingsMainSections>, cx: &mut Context<Self>) {
         cx.observe(
             ent,
             |router: &mut SettingsRouter,
              main: Entity<SettingsMainSections>,
              cx: &mut Context<SettingsRouter>| {
-                let (target, copied, scale) = main.update(cx, |m, _| {
+                let (target, copied, scale, lang_code) = main.update(cx, |m, _| {
                     (
                         m.active_section.take(),
                         m.pending_copy_text.take(),
                         m.pending_scale_change.take(),
+                        m.pending_language_code.take(),
                     )
                 });
                 if let Some(txt) = copied {
@@ -44,15 +45,22 @@ impl SettingsRouter {
                     router.preferences.interface_scale_pct = pct;
                     cx.emit(SettingsRouterEvent::UpdateInterfaceScale(pct));
                 }
+                if let Some(code) = lang_code {
+                    router.select_language_code(code, cx);
+                }
                 if let Some(target) = target {
-                    router.navigate_to(target, false, cx);
+                    if target.is_top_level_nav_tab() {
+                        router.select_nav_tab(target, cx);
+                    } else {
+                        router.navigate_to(target, false, cx);
+                    }
                 }
             },
         )
         .detach();
     }
 
-    /// Subscribes to profile editor saves and logout triggers.
+    /// Subscribes to profile editor saves, clipboard copy, membership drill-down, and logout triggers.
     pub(super) fn observe_information(
         ent: &Entity<SettingsInformationSections>,
         cx: &mut Context<Self>,
@@ -62,13 +70,17 @@ impl SettingsRouter {
             |router: &mut SettingsRouter,
              si: Entity<SettingsInformationSections>,
              cx: &mut Context<SettingsRouter>| {
-                let (do_save, do_logout, first_name, last_name, uname, phone, bio) =
+                let (do_save, do_logout, nav_target, copy_text, first_name, last_name, uname, phone, bio) =
                     si.update(cx, |s, _| {
                         let save = std::mem::take(&mut s.pending_save_profile);
                         let logout = std::mem::take(&mut s.pending_logout);
+                        let nav = s.pending_nav_section.take();
+                        let copy = s.pending_copy_text.take();
                         (
                             save,
                             logout,
+                            nav,
+                            copy,
                             s.first_name.clone(),
                             s.last_name.clone(),
                             s.username.clone(),
@@ -76,6 +88,13 @@ impl SettingsRouter {
                             s.bio.clone(),
                         )
                     });
+                if let Some(txt) = copy_text {
+                    cx.emit(SettingsRouterEvent::CopyClipboard(txt));
+                }
+                if let Some(target) = nav_target {
+                    router.navigate_to(target, false, cx);
+                    return;
+                }
                 if do_logout {
                     cx.emit(SettingsRouterEvent::LogoutRequested);
                     return;

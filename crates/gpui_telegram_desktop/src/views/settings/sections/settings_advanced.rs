@@ -4,8 +4,8 @@ use crate::i18n::tr_str;
 use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_info_row,
-    settings_section_header, settings_subsection_title, settings_toggle_row,
+    settings_action_row, settings_action_row_desc, settings_container, settings_group_card,
+    settings_info_row, settings_section_block, settings_toggle_row,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +131,7 @@ impl Default for SettingsAdvancedSections {
 
 impl Render for SettingsAdvancedSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
         let lang = self.language_id.clone();
         let conn_label = match self.proxy_type {
             ProxyType::Direct => tr_str(&lang, "直连 (默认)", "Default (Direct)"),
@@ -169,59 +169,165 @@ impl Render for SettingsAdvancedSections {
             self.update_status_text.clone()
         } else if let Some(ref latest) = self.latest_version {
             if lang.starts_with("zh") {
-                format!("立即安装 v{latest} 并重启")
+                format!("立即安装 v{latest}")
             } else {
-                format!("Install v{latest} & Restart")
+                format!("Install v{latest}")
             }
         } else {
             self.update_status_text.clone()
         };
         let can_apply_now = self.latest_version.is_some() && !self.is_checking_or_downloading;
 
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::SettingsGear, tr_str(&lang, "高级设置", "Advanced"), Some(tr_str(&lang, "版本更新、连接方式、缓存存储与硬件加速", "App updates, connection, storage, and hardware acceleration")), pal.clone()))
-            .child(settings_subsection_title(tr_str(&lang, "版本与软件更新", "Version & App Updates"), pal.clone()))
-            .child(
-                settings_card(pal.clone())
-                    .child(settings_info_row(tr_str(&lang, "当前版本", "Current Version"), &version_badge, pal.clone()))
-                    .child(settings_action_row(
-                        IconName::ClockSending,
-                        &update_action_title,
-                        &update_value_label,
-                        pal.clone(),
-                        false,
-                        move |this| {
-                            if this.is_checking_or_downloading {
-                                return;
-                            }
-                            if can_apply_now {
-                                this.pending_apply_update = true;
-                            } else {
-                                this.pending_check_updates = true;
-                            }
-                        },
-                        cx,
-                    ))
-                    .child(settings_toggle_row(IconName::ClockSending, tr_str(&lang, "自动识别并提示更新", "Automatically Check for Updates"), None, self.auto_update_enabled, pal.clone(), |this| { this.auto_update_enabled = !this.auto_update_enabled; this.pending_prefs_sync = true; }, cx)),
-            )
-            .child(settings_subsection_title(tr_str(&lang, "数据与存储", "Data and Storage"), pal.clone()))
-            .child(
-                settings_card(pal.clone())
-                    .child(settings_action_row(IconName::FileDoc, tr_str(&lang, "管理本地存储", "Manage Local Storage"), "", pal.clone(), false, |this| this.lng_settings_manage_local_storage(), cx))
-                    .child(settings_action_row(IconName::NightMoon, tr_str(&lang, "省电模式", "Power Saving"), "", pal.clone(), false, |this| this.pending_open_power_saving = true, cx))
-                    .child(settings_info_row(tr_str(&lang, "下载路径", "Download Path"), &self.download_path, pal.clone()))
-                    .child(settings_toggle_row(IconName::Paperclip, tr_str(&lang, "每次下载询问保存路径", "Ask Download Path for Each File"), None, self.ask_download_path, pal.clone(), |this| { this.ask_download_path = !this.ask_download_path; this.pending_prefs_sync = true; }, cx))
-                    .child(settings_action_row(IconName::Forward, tr_str(&lang, "导出聊天数据", "Export Chat Data"), "", pal.clone(), false, |this| this.pending_open_export_box = true, cx)),
-            )
-            .child(settings_subsection_title(tr_str(&lang, "连接与系统集成", "Connection & System Integration"), pal.clone()))
-            .child(
-                settings_card(pal.clone())
-                    .child(settings_action_row(IconName::SettingsGear, tr_str(&lang, "连接类型", "Connection Type"), &conn_detail, pal.clone(), false, |this| {
-                        this.pending_open_connection_box = true;
-                    }, cx))
-                    .child(settings_toggle_row(IconName::ComputerDesktop, tr_str(&lang, "硬件加速", "Hardware Acceleration (Metal / OpenGL)"), None, self.opengl_enabled, pal.clone(), |this| { this.opengl_enabled = !this.opengl_enabled; this.pending_prefs_sync = true; }, cx))
-                    .child(settings_toggle_row(IconName::SidebarPanel, tr_str(&lang, "使用系统窗口边框", "Use System Window Frame"), None, self.native_window_frame, pal.clone(), |this| { this.native_window_frame = !this.native_window_frame; this.pending_prefs_sync = true; }, cx))
-                    .child(settings_toggle_row(IconName::ComputerDesktop, tr_str(&lang, "显示托盘图标", "Show Tray Icon"), None, self.tray_icon_enabled, pal, |this| { this.tray_icon_enabled = !this.tray_icon_enabled; this.pending_prefs_sync = true; }, cx)),
-            )
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(&lang, "软件更新", "Updates"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_info_row(tr_str(&lang, "当前版本", "Current Version"), &version_badge, pal),
+                        settings_action_row(
+                            IconName::ArrowUp,
+                            &update_action_title,
+                            &update_value_label,
+                            pal,
+                            false,
+                            move |this| {
+                                if this.is_checking_or_downloading {
+                                    return;
+                                }
+                                if can_apply_now {
+                                    this.pending_apply_update = true;
+                                } else {
+                                    this.pending_check_updates = true;
+                                }
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::ClockSending,
+                            tr_str(&lang, "自动检查更新", "Automatically check for updates"),
+                            None,
+                            self.auto_update_enabled,
+                            pal,
+                            |this| {
+                                this.auto_update_enabled = !this.auto_update_enabled;
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "存储与性能", "Storage & Performance"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row_desc(
+                            Some(IconName::FileDoc),
+                            tr_str(&lang, "数据与存储", "Storage & Cache"),
+                            Some(tr_str(&lang, "查看媒体缓存占用、配额上限并一键清理。", "Inspect media cache usage, quotas, and clear cache.")),
+                            "",
+                            pal,
+                            false,
+                            |this| this.lng_settings_manage_local_storage(),
+                            cx,
+                        ),
+                        settings_action_row_desc(
+                            Some(IconName::SunDay),
+                            tr_str(&lang, "省电模式", "Power Saving"),
+                            Some(tr_str(&lang, "低电量时降低动画和视频自动播放能耗。", "Reduce animations and media autoplay on battery.")),
+                            "",
+                            pal,
+                            false,
+                            |this| this.pending_open_power_saving = true,
+                            cx,
+                        ),
+                        settings_info_row(tr_str(&lang, "下载目录", "Download Path"), &self.download_path, pal),
+                        settings_toggle_row(
+                            IconName::Paperclip,
+                            tr_str(&lang, "每次下载询问保存路径", "Ask download path for each file"),
+                            None,
+                            self.ask_download_path,
+                            pal,
+                            |this| {
+                                this.ask_download_path = !this.ask_download_path;
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_action_row(
+                            IconName::Forward,
+                            tr_str(&lang, "导出聊天数据", "Export Chat Data"),
+                            "",
+                            pal,
+                            false,
+                            |this| this.pending_open_export_box = true,
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "网络与系统", "Network & System"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row(
+                            IconName::CommunityGlobe,
+                            tr_str(&lang, "连接与代理", "Connection & Proxy"),
+                            &conn_detail,
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_open_connection_box = true;
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::ComputerDesktop,
+                            tr_str(&lang, "硬件加速", "Hardware acceleration"),
+                            Some(tr_str(&lang, "使用 Metal / OpenGL 加速界面渲染。", "Use GPU acceleration for smoother rendering.")),
+                            self.opengl_enabled,
+                            pal,
+                            |this| {
+                                this.opengl_enabled = !this.opengl_enabled;
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::SidebarPanel,
+                            tr_str(&lang, "使用系统窗口边框", "Use system window frame"),
+                            None,
+                            self.native_window_frame,
+                            pal,
+                            |this| {
+                                this.native_window_frame = !this.native_window_frame;
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::ComputerDesktop,
+                            tr_str(&lang, "显示托盘图标", "Show tray icon"),
+                            None,
+                            self.tray_icon_enabled,
+                            pal,
+                            |this| {
+                                this.tray_icon_enabled = !this.tray_icon_enabled;
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
     }
 }

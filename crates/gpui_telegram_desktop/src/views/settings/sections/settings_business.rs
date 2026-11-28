@@ -1,11 +1,11 @@
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
+    settings_action_row_desc, settings_container, settings_group_card, settings_section_block,
 };
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusinessToolItem {
@@ -116,30 +116,57 @@ impl Default for SettingsBusinessSections {
 
 impl Render for SettingsBusinessSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let tools = self.tools.clone();
 
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::BotRobot, tr_str(&lang, "商业功能", "Business"), Some(tr_str(&lang, "商业账号专属自动化客服与名片工具", "Tools and automation for business accounts")), pal.clone()))
-            .when_some(self.status_message.clone(), |el, msg| {
-                el.child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.success)).child(msg))
-            })
-            .child(settings_subsection_title(tr_str(&lang, "商业工具列表", "Business Tools"), pal.clone()))
-            .child(settings_card(pal.clone()).children(tools.into_iter().enumerate().map(|(idx, item)| {
+        let rows: Vec<AnyElement> = tools
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| {
                 let active = item.is_configured;
                 let (disp_title, disp_sub) = Self::localized_tool(&item, &lang);
-                let title_str = disp_title.to_string();
-                let sub_str = disp_sub.to_string();
-                div().flex().flex_row().justify_between().items_center().px(px(10.0)).py(px(8.0)).rounded(px(8.0)).cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                let status = if active {
+                    tr_str(&lang, "已启用", "Configured")
+                } else {
+                    tr_str(&lang, "去配置", "Set up")
+                };
+                settings_action_row_desc(
+                    Some(IconName::BotRobot),
+                    disp_title,
+                    Some(disp_sub),
+                    status,
+                    pal,
+                    false,
+                    move |this| {
                         this.toggle_tool(idx);
-                        cx.notify();
-                    }))
-                    .child(div().flex().flex_row().items_center().gap(px(10.0))
-                        .child(tg_icon(IconName::BotRobot, 16.0, pal.accent))
-                        .child(div().flex().flex_col().child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(title_str)).child(div().text_xs().text_color(rgb(pal.text_secondary)).child(sub_str))))
-                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(if active { pal.success } else { pal.text_link })).child(if active { tr_str(&lang, "已启用", "Configured") } else { tr_str(&lang, "去配置", "Set up") }))
-            })))
+                    },
+                    cx,
+                )
+            })
+            .collect();
+
+        settings_container(pal)
+            .when_some(self.status_message.clone(), |el, msg| {
+                el.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(px(pal.scaled_px(12.0)))
+                        .text_color(ob.success())
+                        .child(msg),
+                )
+            })
+            .child(settings_section_block(
+                tr_str(&lang, "商业工具", "Business Tools"),
+                Some(tr_str(
+                    &lang,
+                    "商业账号专属自动化客服与名片工具",
+                    "Tools and automation for business accounts",
+                )),
+                pal,
+                settings_group_card(pal, rows),
+            ))
+            .into_any_element()
     }
 }

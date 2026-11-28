@@ -5,7 +5,7 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_action_row, settings_card, settings_container, settings_empty_state,
-    settings_section_header, settings_subsection_title,
+    settings_group_card, settings_section_block,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -133,30 +133,71 @@ impl Render for SettingsActiveSessionsSections {
         let lang = &self.language_id;
         let has_others = self.sessions.iter().any(|s| !s.is_current);
 
-        settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::ComputerDesktop, tr_str(lang, "活跃设备与会话", "Active Sessions"), Some(tr_str(lang, "当前登录的设备列表", "Devices logged into your account")), pal))
-                .when(has_others, |el| {
-                    el.child(settings_action_row(IconName::DeleteTrash, tr_str(lang, "注销所有其他设备", "Terminate All Other Sessions"), "", pal, true, Self::terminate_all_other, cx))
-                }))
-            .child(settings_card(pal)
-                .child(settings_subsection_title(tr_str(lang, "设备清单", "Devices"), pal))
-                .map(|el| {
-                    if self.sessions.is_empty() {
-                        el.child(settings_empty_state(IconName::ComputerDesktop, tr_str(lang, "暂无活跃设备记录", "No active sessions synced"), pal))
+        let devices_body: AnyElement = if self.sessions.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::ComputerDesktop,
+                    tr_str(lang, "暂无活跃设备记录", "No active sessions synced"),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = self
+                .sessions
+                .clone()
+                .into_iter()
+                .map(|s| {
+                    let h = s.hash;
+                    let title = format!("{} — {}", s.device_model, s.app_name);
+                    let val = if s.is_current {
+                        tr_str(lang, "当前设备", "Current")
                     } else {
-                        el.children(self.sessions.clone().into_iter().map(|s| {
-                            let h = s.hash;
-                            let title = format!("{} — {}", s.device_model, s.app_name);
-                            let val = if s.is_current { tr_str(lang, "当前设备", "Current") } else { tr_str(lang, "注销", "Terminate") };
-                            settings_action_row(IconName::ComputerDesktop, &title, val, pal, !s.is_current, move |this| {
-                                if !s.is_current {
-                                    this.terminate_session(h);
-                                }
-                            }, cx)
-                        }))
-                    }
-                }))
+                        tr_str(lang, "注销", "Terminate")
+                    };
+                    settings_action_row(
+                        IconName::ComputerDesktop,
+                        &title,
+                        val,
+                        pal,
+                        !s.is_current,
+                        move |this| {
+                            if !s.is_current {
+                                this.terminate_session(h);
+                            }
+                        },
+                        cx,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
+        };
+
+        settings_container(pal)
+            .when(has_others, |el| {
+                el.child(settings_section_block(
+                    tr_str(lang, "快捷操作", "Quick Actions"),
+                    None,
+                    pal,
+                    settings_group_card(
+                        pal,
+                        vec![settings_action_row(
+                            IconName::DeleteTrash,
+                            tr_str(lang, "注销所有其他设备", "Terminate All Other Sessions"),
+                            "",
+                            pal,
+                            true,
+                            Self::terminate_all_other,
+                            cx,
+                        )],
+                    ),
+                ))
+            })
+            .child(settings_section_block(
+                tr_str(lang, "已登录设备", "Signed-in Devices"),
+                None,
+                pal,
+                devices_body,
+            ))
             .into_any_element()
     }
 }

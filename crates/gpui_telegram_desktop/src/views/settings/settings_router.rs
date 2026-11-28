@@ -211,11 +211,11 @@ struct SettingsNavSearchRow {
 const SETTINGS_NAV_SEARCH_CATALOG: &[SettingsNavSearchRow] = &[
     SettingsNavSearchRow {
         section: SettingsSectionType::Main,
-        title_en: "General Overview",
-        title_zh: "常规概览",
-        desc_en: "Account summary, workspace preferences and quick links",
-        desc_zh: "账号概览、工作区偏好与快捷入口",
-        keywords: &["general", "overview", "main", "home", "常规", "概览", "主页"],
+        title_en: "General",
+        title_zh: "通用",
+        desc_en: "Language, interface scale, chat folders and default AI provider",
+        desc_zh: "界面语言、界面缩放、对话分组与默认服务商",
+        keywords: &["general", "overview", "main", "home", "scale", "通用", "常规", "缩放", "主页"],
     },
     SettingsNavSearchRow {
         section: SettingsSectionType::Information,
@@ -1094,6 +1094,55 @@ impl SettingsRouter {
         cx.notify();
     }
 
+    /// Switches directly to a top-level left-rail settings tab without piling sibling tabs onto the drill-down back stack.
+    pub fn select_nav_tab(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
+        self.is_open = true;
+        self.nav_search_focused = false;
+        if self.settings_section == SettingsSectionType::Calls && target != SettingsSectionType::Calls {
+            self.stop_mic_test_if_active(cx);
+        }
+        if target != SettingsSectionType::Computers {
+            self.standalone_computers_mode = false;
+        }
+        self.clear_all_preedits(cx);
+        self.settings_stack.clear();
+        let changed = self.settings_section != target;
+        self.settings_section = target;
+        self.last_active_input_key = self.current_active_input_key(cx);
+        if changed {
+            cx.emit(SettingsRouterEvent::Navigated(target));
+        }
+        cx.notify();
+    }
+
+    /// Opens a ranked instant-search hit cleanly: top-level tabs switch directly; sub-pages establish their parent breadcrumb.
+    pub fn open_search_hit(&mut self, target: SettingsSectionType, cx: &mut Context<Self>) {
+        self.nav_search_query.clear();
+        self.nav_search_selected_index = 0;
+        self.nav_search_focused = false;
+        if target.is_top_level_nav_tab() {
+            self.select_nav_tab(target, cx);
+            return;
+        }
+        self.is_open = true;
+        if self.settings_section == SettingsSectionType::Calls && target != SettingsSectionType::Calls {
+            self.stop_mic_test_if_active(cx);
+        }
+        if target != SettingsSectionType::Computers {
+            self.standalone_computers_mode = false;
+        }
+        self.clear_all_preedits(cx);
+        let parent = target.nav_parent();
+        self.settings_stack.clear();
+        if parent != target {
+            self.settings_stack.push(parent);
+        }
+        self.settings_section = target;
+        self.last_active_input_key = self.current_active_input_key(cx);
+        cx.emit(SettingsRouterEvent::Navigated(target));
+        cx.notify();
+    }
+
     /// Unwinds one step in the settings navigation stack or closes settings when already at `Main`.
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) -> bool {
         if self.settings_section == SettingsSectionType::Calls {
@@ -1264,6 +1313,8 @@ impl SettingsRouter {
                 sec.active_field = ProfileEditField::None;
                 sec.pending_save_profile = false;
                 sec.pending_logout = false;
+                sec.pending_nav_section = None;
+                sec.pending_copy_text = None;
                 sec.status_message = None;
             });
         }
@@ -1710,10 +1761,7 @@ impl SettingsRouter {
                         .or_else(|| hits.first())
                     {
                         let target = hit.section;
-                        self.nav_search_query.clear();
-                        self.nav_search_selected_index = 0;
-                        self.nav_search_focused = false;
-                        self.navigate_to(target, false, cx);
+                        self.open_search_hit(target, cx);
                         return Some(true);
                     }
                     return Some(false);
@@ -1907,5 +1955,73 @@ mod tests {
         assert!(broad_hits.len() <= SETTINGS_NAV_SEARCH_LIMIT);
         assert_eq!(broad_hits.len(), SETTINGS_NAV_SEARCH_LIMIT);
         assert!(broad_hits.windows(2).all(|w| w[0].rank <= w[1].rank));
+    }
+
+    #[std::prelude::v1::test]
+    fn openbot_left_nav_has_exactly_10_unique_tabs_and_no_subpage_clutter() {
+        let nav_tabs = super::super::settings_router_render::top_level_settings_nav_sections();
+        assert_eq!(nav_tabs.len(), 10, "OpenBot left rail must stay concise at 10 top-level tabs");
+
+        let mut unique = std::collections::HashSet::new();
+        let mut unique_icons = std::collections::HashSet::new();
+        for &sec in &nav_tabs {
+            assert!(unique.insert(sec), "Duplicate tab in left nav: {sec:?}");
+            assert!(sec.is_top_level_nav_tab(), "Left nav tab must be top-level: {sec:?}");
+            assert_eq!(sec.nav_parent(), sec, "Top-level tab nav_parent must be itself: {sec:?}");
+            assert!(!sec.display_title_localized(true).is_empty());
+            assert!(!sec.display_title_localized(false).is_empty());
+            assert!(!sec.subtitle_localized(true).is_empty());
+            assert!(!sec.subtitle_localized(false).is_empty());
+            assert!(
+                unique_icons.insert(sec.icon_name()),
+                "Each top-level nav tab should have a distinct icon: {sec:?}"
+            );
+        }
+
+        let subpages = [
+            SettingsSectionType::Folders,
+            SettingsSectionType::Language,
+            SettingsSectionType::Search,
+            SettingsSectionType::NotificationsReactions,
+            SettingsSectionType::NotificationsType,
+            SettingsSectionType::BlockedPeers,
+            SettingsSectionType::ActiveSessions,
+            SettingsSectionType::LocalPasscode,
+            SettingsSectionType::Passkeys,
+            SettingsSectionType::GlobalTtl,
+            SettingsSectionType::Websites,
+            SettingsSectionType::LocalStorage,
+            SettingsSectionType::PowerSaving,
+            SettingsSectionType::Premium,
+            SettingsSectionType::Credits,
+            SettingsSectionType::Business,
+        ];
+        for sub in subpages {
+            assert!(
+                !nav_tabs.contains(&sub),
+                "Drill-down subpage {sub:?} must not clutter the left nav rail"
+            );
+            assert!(!sub.is_top_level_nav_tab());
+            let parent = sub.nav_parent();
+            assert!(
+                nav_tabs.contains(&parent),
+                "Subpage {sub:?} nav_parent {parent:?} must be one of the 10 top-level nav tabs"
+            );
+        }
+    }
+
+    #[std::prelude::v1::test]
+    fn general_language_toggle_and_profile_drilldown_state() {
+        let mut general = SettingsMainSections::new_live();
+        assert_eq!(general.pending_language_code, None);
+        general.select_language("zh-CN");
+        assert_eq!(general.pending_language_code, Some("zh-CN"));
+        general.select_language("en-US");
+        assert_eq!(general.pending_language_code, Some("en-US"));
+
+        let mut profile = SettingsInformationSections::new_live();
+        assert_eq!(profile.pending_nav_section, None);
+        profile.pending_nav_section = Some(SettingsSectionType::Premium);
+        assert_eq!(profile.pending_nav_section, Some(SettingsSectionType::Premium));
     }
 }

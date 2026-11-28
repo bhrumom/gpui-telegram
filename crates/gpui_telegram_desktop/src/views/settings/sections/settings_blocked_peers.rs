@@ -5,9 +5,8 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_action_row, settings_card, settings_container, settings_empty_state,
-    settings_section_header,
+    settings_group_card, settings_section_block,
 };
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,26 +87,47 @@ impl Render for SettingsBlockedPeersSections {
         let peers: Vec<BlockedPeerItem> = self.filtered_peers().into_iter().cloned().collect();
 
         let count_desc = if lang.starts_with("zh") {
-            format!("{} 位用户", peers.len())
+            format!("{} 位已屏蔽用户", peers.len())
         } else {
-            format!("{} users", peers.len())
+            format!("{} blocked users", peers.len())
+        };
+
+        let body: AnyElement = if peers.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::ContactsUsers,
+                    tr_str(lang, "暂无屏蔽用户", "No blocked users yet"),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = peers
+                .into_iter()
+                .map(|peer| {
+                    let uid = peer.user_id;
+                    settings_action_row(
+                        IconName::ContactsUsers,
+                        &peer.name,
+                        tr_str(lang, "取消屏蔽", "Unblock"),
+                        pal,
+                        true,
+                        move |this| {
+                            this.unblock_peer(uid);
+                        },
+                        cx,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
         };
 
         settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::Close, tr_str(lang, "已屏蔽用户", "Blocked Users"), Some(&count_desc), pal))
-                .map(|el| {
-                    if peers.is_empty() {
-                        el.child(settings_empty_state(IconName::ContactsUsers, tr_str(lang, "暂无屏蔽用户", "No blocked users yet"), pal))
-                    } else {
-                        el.children(peers.into_iter().map(|peer| {
-                            let uid = peer.user_id;
-                            settings_action_row(IconName::ContactsUsers, &peer.name, tr_str(lang, "取消屏蔽", "Unblock"), pal, true, move |this| {
-                                this.unblock_peer(uid);
-                            }, cx)
-                        }))
-                    }
-                }))
+            .child(settings_section_block(
+                tr_str(lang, "已屏蔽用户", "Blocked Users"),
+                Some(&count_desc),
+                pal,
+                body,
+            ))
             .into_any_element()
     }
 }

@@ -1,9 +1,10 @@
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use crate::i18n::tr_str;
-use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
+    settings_card, settings_container, settings_group_card, settings_section_block,
+    settings_static_row,
 };
 
 pub const K_MEGABYTE: u64 = 1024 * 1024;
@@ -125,41 +126,74 @@ impl Default for SettingsLocalStorageSections {
 
 impl Render for SettingsLocalStorageSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
+        let hover_ctrl = ob.bg_control_hover();
         let total = self.total_bytes();
         let total_display = Self::format_bytes(total);
         let categories = self.categories.clone();
 
         let quota_desc = if lang.starts_with("zh") {
-            format!("上限: {} GB · 保留: {} 周", self.max_cache_gb, self.retention_weeks)
+            format!("上限 {} GB · 保留 {} 周", self.max_cache_gb, self.retention_weeks)
         } else {
-            format!("Limit: {} GB · Keep: {}", self.max_cache_gb, self.lng_weeks())
+            format!("Limit {} GB · Keep {}", self.max_cache_gb, self.lng_weeks())
         };
 
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::FileDoc, tr_str(&lang, "本地存储", "Local Storage"), Some(tr_str(&lang, "管理媒体缓存、清理周期与最大磁盘配额", "Manage media cache, retention, and maximum disk quota")), pal.clone()))
+        let summary_card = settings_card(pal)
+            .py(px(16.0))
+            .gap(px(12.0))
             .child(
-                settings_card(pal.clone())
-                    .child(div().flex().flex_row().justify_between().items_center()
-                        .child(div().flex().flex_col()
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(tr_str(&lang, "已缓存数据总量", "Total Cached Data")))
-                            .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(quota_desc)))
-                        .child(div().text_lg().font_weight(FontWeight::BOLD).text_color(rgb(pal.accent)).child(total_display)))
-                    .child(div().flex().flex_row().h(px(8.0)).w_full().rounded_full().overflow_hidden().bg(rgb(pal.input_bg))
-                        .children(categories.iter().filter(|c| c.bytes > 0).map(|cat| {
-                            let pct = if total > 0 { ((cat.bytes as f32 / total as f32) * 100.0).max(4.0) } else { 0.0 };
-                            div().h_full().w(relative(pct / 100.0)).bg(rgb(cat.color_rgb))
-                        })))
-                    .child(div().flex().justify_end().child(
-                        div().px(px(14.0)).py(px(7.0)).rounded(px(8.0)).bg(rgb(if total == 0 { pal.input_bg } else { pal.danger })).text_xs().font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if total == 0 { pal.text_secondary } else { pal.active_button_fg })).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.start_clearing(); cx.notify(); }))
-                            .child(if self.is_clearing { tr_str(&lang, "缓存已清空", "Cache Cleared") } else { tr_str(&lang, "清空全部缓存", "Clear Entire Cache") }),
-                    )),
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(div().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).text_color(ob.text_primary()).child(tr_str(&lang, "已缓存数据总量", "Total Cached Data")))
+                            .child(div().text_size(px(12.0)).text_color(ob.text_muted()).child(quota_desc)),
+                    )
+                    .child(div().text_size(px(18.0)).font_weight(FontWeight::SEMIBOLD).text_color(ob.text_primary()).child(total_display)),
             )
-            .child(settings_subsection_title(tr_str(&lang, "存储分类统计", "Storage Breakdown"), pal.clone()))
-            .child(settings_card(pal.clone()).children(categories.into_iter().map(|cat| {
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .h(px(8.0))
+                    .w_full()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(ob.bg_control_active())
+                    .children(categories.iter().filter(|c| c.bytes > 0).map(|cat| {
+                        let pct = if total > 0 { ((cat.bytes as f32 / total as f32) * 100.0).max(4.0) } else { 0.0 };
+                        div().h_full().w(relative(pct / 100.0)).bg(rgb(cat.color_rgb))
+                    })),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .cursor_pointer()
+                        .px(px(14.0))
+                        .py(px(7.0))
+                        .rounded(px(8.0))
+                        .bg(if total == 0 { ob.bg_control() } else { ob.danger() })
+                        .border_1()
+                        .border_color(if total == 0 { ob.border_hairline() } else { ob.danger() })
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if total == 0 { ob.text_muted() } else { rgb(0xFFFFFF) })
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.start_clearing(); cx.notify(); }))
+                        .child(if self.is_clearing { tr_str(&lang, "缓存已清空", "Cache Cleared") } else { tr_str(&lang, "清空全部缓存", "Clear Entire Cache") }),
+                ),
+            );
+
+        let breakdown_rows: Vec<AnyElement> = categories
+            .into_iter()
+            .map(|cat| {
                 let size_label = Self::format_bytes(cat.bytes);
                 let cat_label = if lang.starts_with("zh") {
                     match cat.name.as_str() {
@@ -174,37 +208,105 @@ impl Render for SettingsLocalStorageSections {
                 } else {
                     cat.name
                 };
-                div().flex().flex_row().justify_between().items_center().px(px(10.0)).py(px(6.0))
-                    .child(div().flex().flex_row().gap(px(10.0)).items_center()
-                        .child(div().size(px(10.0)).rounded_full().bg(rgb(cat.color_rgb)))
-                        .child(div().text_sm().text_color(rgb(pal.text_primary)).child(cat_label)))
-                    .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(size_label))
-            })))
-            .child(settings_subsection_title(tr_str(&lang, "最大缓存上限", "Maximum Cache Size"), pal.clone()))
-            .child(div().flex().flex_row().gap(px(8.0)).children([5_u64, 16, 32, 64].into_iter().map(|gb| {
+                div()
+                    .w_full()
+                    .min_h(px(46.0))
+                    .px(px(16.0))
+                    .py(px(9.0))
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(10.0))
+                            .items_center()
+                            .child(div().size(px(9.0)).rounded_full().bg(rgb(cat.color_rgb)))
+                            .child(div().text_size(px(13.5)).text_color(ob.text_primary()).child(cat_label)),
+                    )
+                    .child(div().text_size(px(12.5)).text_color(ob.text_muted()).child(size_label))
+                    .into_any_element()
+            })
+            .collect();
+
+        let size_limit_pills = div()
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children([5_u64, 16, 32, 64].into_iter().map(|gb| {
                 let active = self.max_cache_gb == gb;
-                div().flex_1().py(px(8.0)).rounded(px(8.0)).flex().items_center().justify_center()
-                    .bg(rgb(if active { pal.accent } else { pal.card_bg })).border_1().border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                    .text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
+                div()
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(ob.surface_light()))
+                    .when(!active, |el| el.hover(move |s| s.bg(hover_ctrl)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if active { ob.text_on_light() } else { ob.text_secondary() })
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                         this.max_cache_gb = gb;
                         this.pending_prefs_sync = true;
                         cx.notify();
                     }))
-                    .child(format!("{} GB", gb))
-            })))
-            .child(settings_subsection_title(tr_str(&lang, "自动清理周期", "Cache Retention Period"), pal.clone()))
-            .child(div().flex().flex_row().gap(px(8.0)).children([1_u32, 2, 4, 12].into_iter().map(|wk| {
+                    .child(format!("{gb} GB"))
+            }));
+
+        let retention_pills = div()
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children([1_u32, 2, 4, 12].into_iter().map(|wk| {
                 let active = self.retention_weeks == wk;
-                div().flex_1().py(px(8.0)).rounded(px(8.0)).flex().items_center().justify_center()
-                    .bg(rgb(if active { pal.accent } else { pal.card_bg })).border_1().border_color(rgb(if active { pal.accent } else { pal.border_fg }))
-                    .text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
+                div()
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(ob.surface_light()))
+                    .when(!active, |el| el.hover(move |s| s.bg(hover_ctrl)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if active { ob.text_on_light() } else { ob.text_secondary() })
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                         this.retention_weeks = wk;
                         this.pending_prefs_sync = true;
                         cx.notify();
                     }))
-                    .child(if lang.starts_with("zh") { format!("{} 周", wk) } else { format!("{} wk", wk) })
-            })))
+                    .child(if lang.starts_with("zh") { format!("{wk} 周") } else { format!("{wk} wk") })
+            }));
+
+        settings_container(pal)
+            .child(settings_section_block(tr_str(&lang, "缓存概览", "Cache Overview"), None, pal, summary_card))
+            .child(settings_section_block(tr_str(&lang, "分类占用", "Storage Breakdown"), None, pal, settings_group_card(pal, breakdown_rows)))
+            .child(settings_section_block(
+                tr_str(&lang, "配额与自动清理", "Limits & Retention"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_static_row(tr_str(&lang, "最大缓存上限", "Maximum cache size"), None, size_limit_pills, pal),
+                        settings_static_row(tr_str(&lang, "自动清理周期", "Auto-cleanup retention"), None, retention_pills, pal),
+                    ],
+                ),
+            ))
     }
 }

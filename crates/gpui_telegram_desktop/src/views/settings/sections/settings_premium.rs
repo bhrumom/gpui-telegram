@@ -1,11 +1,11 @@
-use gpui::*;
-use gpui::prelude::FluentBuilder;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::{tg_icon_rgba, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
+    settings_card_bg, settings_container, settings_group_card, settings_section_block,
 };
+use gpui::prelude::FluentBuilder;
+use gpui::*;
 
 #[derive(Debug, Clone)]
 pub struct PremiumTier {
@@ -70,12 +70,14 @@ impl Default for SettingsPremiumSections {
 
 impl Render for SettingsPremiumSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
-        let pal = self.palette.clone();
+        if !self.is_visible {
+            return div().into_any_element();
+        }
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let selected = self.selected_months;
         let is_active = self.is_premium_active;
-        let premium_accent = 0x9b51e0_u32;
 
         let perks = [
             (IconName::Paperclip, tr_str(&lang, "4 GB 超大文件上传", "4 GB Uploads"), tr_str(&lang, "单个文档与媒体体积上限提升至 4 GB", "Send documents and media up to 4 GB each")),
@@ -85,49 +87,169 @@ impl Render for SettingsPremiumSections {
             (IconName::FolderAll, tr_str(&lang, "高级对话分组管理", "Advanced Chat Management"), tr_str(&lang, "自定义默认分组与无限收藏夹标签", "Default folders and unlimited Saved Messages tags")),
         ];
 
-        settings_container(pal.clone())
-            .child(settings_section_header(
-                IconName::PremiumStar,
-                tr_str(&lang, "高级会员", "Premium"),
-                Some(if is_active { tr_str(&lang, "会员特权已生效", "Active Subscriber") } else { tr_str(&lang, "订阅解锁全部专属功能与更高配额", "Subscribe to unlock exclusive features") }),
-                pal.clone(),
-            ))
-            .child(div().flex().flex_row().gap(px(8.0)).children(self.tiers.iter().map(|tier| {
-                let months = tier.months;
-                let is_sel = months == selected;
-                let tier_title = if lang.starts_with("zh") {
-                    match tier.title {
-                        "Annual" => "年度方案",
-                        "Semi-Annual" => "半年方案",
-                        "Monthly" => "月度方案",
-                        _ => tier.title,
-                    }
+        let plan_cards = div().flex().flex_row().gap(px(10.0)).children(self.tiers.iter().map(|tier| {
+            let months = tier.months;
+            let is_sel = months == selected;
+            let tier_title = if lang.starts_with("zh") {
+                match tier.title {
+                    "Annual" => "年度方案",
+                    "Semi-Annual" => "半年方案",
+                    "Monthly" => "月度方案",
+                    _ => tier.title,
+                }
+            } else {
+                tier.title
+            };
+            div()
+                .flex_1()
+                .p(px(14.0))
+                .rounded(px(12.0))
+                .bg(if is_sel { ob.bg_control_hover() } else { settings_card_bg(pal) })
+                .border_1()
+                .border_color(if is_sel { ob.text_primary() } else { ob.frame_card_border() })
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.select_tier(months);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(pal.scaled_px(13.5)))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
+                                        .child(tier_title),
+                                )
+                                .when(tier.discount_pct > 0, |el| {
+                                    el.child(
+                                        div()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(6.0))
+                                            .bg(ob.bg_control())
+                                            .text_size(px(pal.scaled_px(11.0)))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(ob.success())
+                                            .child(format!("-{}%", tier.discount_pct)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(pal.scaled_px(13.0)))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_primary())
+                                .child(if lang.starts_with("zh") {
+                                    format!("${:.2}/月", tier.price_per_month)
+                                } else {
+                                    format!("${:.2}/mo", tier.price_per_month)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(pal.scaled_px(11.5)))
+                                .text_color(ob.text_muted())
+                                .child(if lang.starts_with("zh") {
+                                    format!("合计 ${:.2}", tier.total_price)
+                                } else {
+                                    format!("${:.2} total", tier.total_price)
+                                }),
+                        ),
+                )
+        }));
+
+        let perk_rows: Vec<AnyElement> = perks
+            .into_iter()
+            .map(|(icon, title, desc)| {
+                div()
+                    .w_full()
+                    .px(px(pal.scaled_px(16.0)))
+                    .py(px(pal.scaled_px(12.0)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(tg_icon_rgba(icon, pal.scaled_px(16.0), ob.text_muted()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(pal.scaled_px(13.5)))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(pal.scaled_px(12.0)))
+                                    .text_color(ob.text_muted())
+                                    .child(desc),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(&lang, "订阅方案", "Plans"),
+                Some(if is_active {
+                    tr_str(&lang, "会员特权已生效", "Active Subscriber")
                 } else {
-                    tier.title
-                };
-                div().flex_1().p(px(12.0)).rounded(px(10.0))
-                    .bg(rgb(if is_sel { pal.dialogs_hover_bg } else { pal.card_bg }))
-                    .border_1().border_color(rgb(if is_sel { premium_accent } else { pal.border_fg })).cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { this.select_tier(months); cx.notify(); }))
-                    .child(div().flex().flex_col().gap(px(4.0))
-                        .child(div().flex().flex_row().items_center().justify_between()
-                            .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(tier_title))
-                            .when(tier.discount_pct > 0, |el| el.child(div().px(px(5.0)).py(px(1.0)).rounded(px(4.0)).bg(rgb(pal.success)).text_xs().text_color(rgb(pal.active_button_fg)).child(format!("-{}%", tier.discount_pct)))))
-                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(premium_accent)).child(if lang.starts_with("zh") { format!("${:.2}/月", tier.price_per_month) } else { format!("${:.2}/mo", tier.price_per_month) }))
-                        .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(if lang.starts_with("zh") { format!("合计 ${:.2}", tier.total_price) } else { format!("${:.2} total", tier.total_price) })))
-            })))
-            .child(settings_subsection_title(tr_str(&lang, "专属特权", "Included Features"), pal.clone()))
-            .child(settings_card(pal.clone()).children(perks.into_iter().map(|(icon, title, desc)| {
-                div().flex().flex_row().items_center().gap(px(10.0)).px(px(10.0)).py(px(6.0))
-                    .child(tg_icon(icon, 16.0, premium_accent))
-                    .child(div().flex().flex_col().child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(rgb(pal.text_primary)).child(title)).child(div().text_xs().text_color(rgb(pal.text_secondary)).child(desc)))
-            })))
+                    tr_str(&lang, "订阅解锁全部专属功能与更高配额", "Subscribe to unlock exclusive features")
+                }),
+                pal,
+                plan_cards,
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "专属特权", "Included Features"),
+                None,
+                pal,
+                settings_group_card(pal, perk_rows),
+            ))
             .child(
-                div().w_full().py(px(10.0)).rounded(px(8.0)).bg(rgb(premium_accent)).flex().items_center().justify_center()
-                    .text_sm().font_weight(FontWeight::BOLD).text_color(rgb(pal.active_button_fg)).cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { this.subscribe(selected); cx.notify(); }))
+                div()
+                    .w_full()
+                    .py(px(11.0))
+                    .rounded(px(10.0))
+                    .bg(ob.surface_light())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(pal.scaled_px(13.5)))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(ob.text_on_light())
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.subscribe(selected);
+                            cx.notify();
+                        }),
+                    )
                     .child(if lang.starts_with("zh") {
-                        if is_active { format!("切换订阅周期 ({} 个月)", selected) } else { format!("立即开通会员 ({} 个月)", selected) }
+                        if is_active {
+                            format!("切换订阅周期 ({} 个月)", selected)
+                        } else {
+                            format!("立即开通会员 ({} 个月)", selected)
+                        }
                     } else if is_active {
                         format!("Switch Plan ({} mo)", selected)
                     } else {

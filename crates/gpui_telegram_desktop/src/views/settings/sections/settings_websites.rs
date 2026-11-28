@@ -5,7 +5,7 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_action_row, settings_card, settings_container, settings_empty_state,
-    settings_section_header,
+    settings_group_card, settings_section_block,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -151,40 +151,99 @@ impl Default for SettingsWebsitesSections {
 
 impl Render for SettingsWebsitesSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
+        if !self.is_visible {
+            return div().into_any_element();
+        }
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = &self.language_id;
 
+        let mut action_rows: Vec<AnyElement> = vec![settings_action_row(
+            IconName::Verified,
+            tr_str(lang, "添加 telegram.org 登录授权", "Authorize telegram.org Login"),
+            "+",
+            pal,
+            false,
+            |this| {
+                if this.websites.iter().any(|w| w.domain == "telegram.org") {
+                    this.authorize_domain("fragment.com");
+                } else {
+                    this.authorize_domain("telegram.org");
+                }
+            },
+            cx,
+        )];
+        if !self.websites.is_empty() {
+            action_rows.push(settings_action_row(
+                IconName::DeleteTrash,
+                tr_str(lang, "全部断开授权", "Disconnect All"),
+                "",
+                pal,
+                true,
+                |this| {
+                    this.disconnect_all();
+                },
+                cx,
+            ));
+        }
+
+        let sites_body: AnyElement = if self.websites.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::BotRobot,
+                    tr_str(lang, "暂无已登录网站", "No connected websites"),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = self
+                .websites
+                .clone()
+                .into_iter()
+                .map(|w| {
+                    let wid = w.id;
+                    settings_action_row(
+                        IconName::BotRobot,
+                        &format!("{} ({})", w.domain, w.browser),
+                        tr_str(lang, "断开", "Disconnect"),
+                        pal,
+                        true,
+                        move |this| {
+                            this.disconnect(wid);
+                        },
+                        cx,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
+        };
+
         settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::BotRobot, tr_str(lang, "已授权网站", "Connected Websites"), Some(tr_str(lang, "管理通过 Telegram 登录小组件授权的第三方网站", "Manage websites logged in via Telegram Login Widget")), pal))
-                .child(settings_action_row(IconName::Verified, tr_str(lang, "添加 telegram.org 登录授权", "Authorize telegram.org Login"), "+", pal, false, |this| {
-                    if this.websites.iter().any(|w| w.domain == "telegram.org") {
-                        this.authorize_domain("fragment.com");
-                    } else {
-                        this.authorize_domain("telegram.org");
-                    }
-                }, cx))
-                .when(!self.websites.is_empty(), |el| {
-                    el.child(settings_action_row(IconName::DeleteTrash, tr_str(lang, "全部断开授权", "Disconnect All"), "", pal, true, |this| {
-                        this.disconnect_all();
-                    }, cx))
-                })
-                .when_some(self.status_message.clone(), |el, msg| {
-                    el.child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.success)).child(msg))
-                })
-                .map(|el| {
-                    if self.websites.is_empty() {
-                        el.child(settings_empty_state(IconName::BotRobot, tr_str(lang, "暂无已登录网站", "No connected websites"), pal))
-                    } else {
-                        el.children(self.websites.clone().into_iter().map(|w| {
-                            let wid = w.id;
-                            settings_action_row(IconName::BotRobot, &format!("{} ({})", w.domain, w.browser), tr_str(lang, "断开", "Disconnect"), pal, true, move |this| {
-                                this.disconnect(wid);
-                            }, cx)
-                        }))
-                    }
-                }))
+            .child(settings_section_block(
+                tr_str(lang, "网站授权管理", "Authorization"),
+                Some(tr_str(
+                    lang,
+                    "管理通过 Telegram 登录小组件授权的第三方网站",
+                    "Manage websites logged in via Telegram Login Widget",
+                )),
+                pal,
+                settings_group_card(pal, action_rows),
+            ))
+            .when_some(self.status_message.clone(), |el, msg| {
+                el.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(px(pal.scaled_px(12.0)))
+                        .text_color(ob.success())
+                        .child(msg),
+                )
+            })
+            .child(settings_section_block(
+                tr_str(lang, "已登录网站", "Connected Sites"),
+                None,
+                pal,
+                sites_body,
+            ))
             .into_any_element()
     }
 }

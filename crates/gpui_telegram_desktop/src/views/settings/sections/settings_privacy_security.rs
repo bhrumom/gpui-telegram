@@ -7,8 +7,8 @@ use crate::theme::assets::{tg_icon, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::computer_workbench::render_ime_text_preview;
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_info_row,
-    settings_section_header, settings_subsection_title, settings_toggle_row,
+    settings_action_row, settings_card, settings_container, settings_group_card, settings_info_row,
+    settings_section_block, settings_subsection_title, settings_toggle_row,
 };
 use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::prelude::FluentBuilder;
@@ -1017,6 +1017,7 @@ impl Default for SettingsPrivacySecuritySections {
 impl Render for SettingsPrivacySecuritySections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let on_lbl = tr_str(&lang, "已开启", "On");
         let off_lbl = tr_str(&lang, "已关闭", "Off");
@@ -1030,227 +1031,257 @@ impl Render for SettingsPrivacySecuritySections {
         let two_factor_enabled = self.two_factor_enabled;
         let masked_pw: String = "•".repeat(self.two_factor_password_draft.chars().count());
 
-        let privacy_rows = [
+        let mut security_rows: Vec<AnyElement> = vec![
+            settings_action_row(
+                IconName::ComputerDesktop,
+                tr_str(&lang, "活跃设备与会话", "Active Sessions"),
+                &sessions_val,
+                pal,
+                false,
+                |this| {
+                    this.pending_nav_section = Some(SettingsSectionType::ActiveSessions);
+                },
+                cx,
+            ),
+            settings_action_row(
+                IconName::Lock,
+                tr_str(&lang, "应用锁", "Passcode Lock"),
+                passcode_val,
+                pal,
+                false,
+                |this| {
+                    this.pending_nav_section = Some(SettingsSectionType::LocalPasscode);
+                },
+                cx,
+            ),
+            settings_action_row(
+                IconName::Verified,
+                tr_str(&lang, "两步验证密码", "Two-Step Verification"),
+                twofa_val,
+                pal,
+                false,
+                |this| {
+                    this.two_factor_editing = !this.two_factor_editing;
+                    if this.two_factor_editing {
+                        this.recovery_key_editing = false;
+                    }
+                },
+                cx,
+            ),
+        ];
+
+        if is_2fa_editing {
+            security_rows.push(
+                div()
+                    .w_full()
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .bg(ob.bg_control())
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_canvas())
+                            .border_1()
+                            .border_color(ob.text_primary())
+                            .text_size(px(12.5))
+                            .text_color(if masked_pw.is_empty() {
+                                ob.text_muted()
+                            } else {
+                                ob.text_primary()
+                            })
+                            .child(if masked_pw.is_empty() {
+                                tr_str(&lang, "输入云端两步验证密码…", "Type cloud 2FA password...").to_string()
+                            } else {
+                                format!("{}|", masked_pw)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .when(two_factor_enabled, |row| {
+                                row.child(
+                                    div()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .rounded(px(7.0))
+                                        .bg(ob.danger())
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(0xFFFFFF))
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _e, _w, cx| {
+                                                this.pending_2fa_action = Some(None);
+                                                this.two_factor_editing = false;
+                                                this.two_factor_password_draft.zeroize();
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(&lang, "关闭两步验证", "Disable 2FA")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(7.0))
+                                    .bg(ob.surface_light())
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_on_light())
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _e, _w, cx| {
+                                            if !this.two_factor_password_draft.trim().is_empty() {
+                                                let pw = this.two_factor_password_draft.trim().to_string();
+                                                this.pending_2fa_action = Some(Some(pw));
+                                                this.two_factor_editing = false;
+                                                this.two_factor_password_draft.zeroize();
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(tr_str(&lang, "保存密码", "Save 2FA Password")),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        security_rows.push(settings_action_row(
+            IconName::Lock,
+            tr_str(&lang, "通行密钥 (Passkeys)", "Passkeys"),
+            "",
+            pal,
+            false,
+            |this| {
+                this.pending_nav_section = Some(SettingsSectionType::Passkeys);
+            },
+            cx,
+        ));
+        security_rows.push(settings_action_row(
+            IconName::Close,
+            tr_str(&lang, "已屏蔽用户", "Blocked Users"),
+            &blocked_val,
+            pal,
+            false,
+            |this| {
+                this.pending_nav_section = Some(SettingsSectionType::BlockedPeers);
+            },
+            cx,
+        ));
+        security_rows.push(settings_action_row(
+            IconName::ClockSending,
+            tr_str(&lang, "自动删除消息", "Auto-Delete Messages"),
+            global_ttl_val,
+            pal,
+            false,
+            |this| {
+                this.pending_nav_section = Some(SettingsSectionType::GlobalTtl);
+            },
+            cx,
+        ));
+        security_rows.push(settings_action_row(
+            IconName::CommunityGlobe,
+            tr_str(&lang, "已授权网站", "Connected Websites"),
+            "",
+            pal,
+            false,
+            |this| {
+                this.pending_nav_section = Some(SettingsSectionType::Websites);
+            },
+            cx,
+        ));
+
+        let privacy_rows: Vec<AnyElement> = [
             ("Phone Number", tr_str(&lang, "手机号码", "Phone Number"), self.phone_privacy.clone()),
             ("Last Seen & Online", tr_str(&lang, "最后上线状态", "Last Seen & Online"), self.last_seen_privacy.clone()),
             ("Profile Photos", tr_str(&lang, "个人头像", "Profile Photos"), self.photo_privacy.clone()),
             ("Calls", tr_str(&lang, "语音与视频通话", "Calls"), self.calls_privacy.clone()),
             ("Forwarded Messages", tr_str(&lang, "转发消息链接", "Forwarded Messages"), self.forwards_privacy.clone()),
             ("Groups & Channels", tr_str(&lang, "群组与频道邀请", "Groups & Channels"), self.groups_privacy.clone()),
-        ];
+        ]
+        .into_iter()
+        .map(|(cat_key, label, val)| {
+            let cat = cat_key.to_string();
+            let val_loc = Self::localize_privacy_value(&val, &lang).to_string();
+            settings_action_row(
+                IconName::Lock,
+                label,
+                &val_loc,
+                pal,
+                false,
+                move |this| {
+                    this.pending_edit_privacy_category = Some(cat.clone());
+                },
+                cx,
+            )
+        })
+        .collect();
 
         settings_container(pal)
-            .child(
-                settings_card(pal)
-                    .child(settings_section_header(
-                        IconName::Lock,
-                        tr_str(&lang, "隐私与安全", "Privacy and Security"),
-                        Some(tr_str(&lang, "管理登录设备、两步验证密码与隐私可见范围", "Manage active devices, 2FA, and privacy visibility")),
-                        pal,
-                    ))
-                    .child(settings_action_row(
-                        IconName::Close,
-                        tr_str(&lang, "已屏蔽用户", "Blocked Users"),
-                        &blocked_val,
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::BlockedPeers);
-                        },
-                        cx,
-                    ))
-                    .child(settings_action_row(
-                        IconName::ComputerDesktop,
-                        tr_str(&lang, "活跃设备与会话", "Active Sessions"),
-                        &sessions_val,
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::ActiveSessions);
-                        },
-                        cx,
-                    ))
-                    .child(settings_action_row(
-                        IconName::Lock,
-                        tr_str(&lang, "本地密码锁", "Local Passcode"),
-                        passcode_val,
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::LocalPasscode);
-                        },
-                        cx,
-                    ))
-                    .child(settings_action_row(
-                        IconName::Verified,
-                        tr_str(&lang, "两步验证密码", "Two-Step Verification"),
-                        twofa_val,
-                        pal,
-                        false,
-                        |this| {
-                            this.two_factor_editing = !this.two_factor_editing;
-                            if this.two_factor_editing {
-                                this.recovery_key_editing = false;
-                            }
-                        },
-                        cx,
-                    ))
-                    .when(is_2fa_editing, |el| {
-                        el.child(
-                            div()
-                                .w_full()
-                                .p(px(10.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(pal.input_bg))
-                                .border_1()
-                                .border_color(rgb(pal.accent))
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(pal.text_primary))
-                                        .child(if masked_pw.is_empty() {
-                                            tr_str(&lang, "直接输入云端两步验证密码…", "Type cloud 2FA password...").to_string()
-                                        } else {
-                                            format!("{}|", masked_pw)
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_end()
-                                        .gap(px(8.0))
-                                        .when(two_factor_enabled, |row| {
-                                            row.child(
-                                                div()
-                                                    .px(px(12.0))
-                                                    .py(px(5.0))
-                                                    .rounded(px(6.0))
-                                                    .bg(rgb(pal.danger))
-                                                    .text_size(px(12.0))
-                                                    .text_color(rgb(pal.active_button_fg))
-                                                    .cursor_pointer()
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _e, _w, cx| {
-                                                            this.pending_2fa_action = Some(None);
-                                                            this.two_factor_editing = false;
-                                                            this.two_factor_password_draft.zeroize();
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                    .child(tr_str(&lang, "关闭两步验证", "Disable 2FA")),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .px(px(12.0))
-                                                .py(px(5.0))
-                                                .rounded(px(6.0))
-                                                .bg(rgb(pal.accent))
-                                                .text_size(px(12.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(pal.active_button_fg))
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _e, _w, cx| {
-                                                        if !this.two_factor_password_draft.trim().is_empty() {
-                                                            let pw = this.two_factor_password_draft.trim().to_string();
-                                                            this.pending_2fa_action = Some(Some(pw));
-                                                            this.two_factor_editing = false;
-                                                            this.two_factor_password_draft.zeroize();
-                                                            cx.notify();
-                                                        }
-                                                    }),
-                                                )
-                                                .child(tr_str(&lang, "保存两步验证密码", "Save 2FA Password")),
-                                        ),
-                                ),
-                        )
-                    })
-                    .child(settings_action_row(
-                        IconName::ClockSending,
-                        tr_str(&lang, "全局自动删除消息", "Auto-Delete Messages"),
-                        global_ttl_val,
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::GlobalTtl);
-                        },
-                        cx,
-                    ))
-                    .child(settings_action_row(
-                        IconName::Lock,
-                        tr_str(&lang, "通行密钥 (Passkeys)", "Passkeys"),
-                        "›",
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::Passkeys);
-                        },
-                        cx,
-                    ))
-                    .child(settings_action_row(
-                        IconName::BotRobot,
-                        tr_str(&lang, "已授权网站", "Connected Websites"),
-                        "›",
-                        pal,
-                        false,
-                        |this| {
-                            this.pending_nav_section = Some(SettingsSectionType::Websites);
-                        },
-                        cx,
-                    )),
-            )
+            .child(settings_section_block(
+                tr_str(&lang, "账号安全", "Security"),
+                None,
+                pal,
+                settings_group_card(pal, security_rows),
+            ))
             .child(self.render_vault_custody_card(pal, &lang, cx))
-            .child(
-                settings_card(pal)
-                    .child(settings_subsection_title(tr_str(&lang, "隐私权限", "Privacy"), pal))
-                    .children(privacy_rows.into_iter().map(|(cat_key, label, val)| {
-                        let cat = cat_key.to_string();
-                        let val_loc = Self::localize_privacy_value(&val, &lang).to_string();
+            .child(settings_section_block(
+                tr_str(&lang, "隐私可见范围", "Privacy"),
+                None,
+                pal,
+                settings_group_card(pal, privacy_rows),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "账号与内容控制", "Account & Content"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
                         settings_action_row(
-                            IconName::Lock,
-                            label,
-                            &val_loc,
+                            IconName::ClockSending,
+                            tr_str(&lang, "账号自毁期限", "If Away For"),
+                            &ttl_desc,
                             pal,
                             false,
-                            move |this| {
-                                this.pending_edit_privacy_category = Some(cat.clone());
+                            |this| {
+                                let next = match this.ttl_months {
+                                    1 => 3,
+                                    3 => 6,
+                                    6 => 12,
+                                    12 => 18,
+                                    18 => 24,
+                                    _ => 1,
+                                };
+                                this.set_ttl_months(next);
+                                this.pending_save_settings = true;
                             },
                             cx,
-                        )
-                    })),
-            )
-            .child(
-                settings_card(pal)
-                    .child(settings_subsection_title(tr_str(&lang, "账号与内容控制", "Account & Content"), pal))
-                    .child(settings_action_row(
-                        IconName::ClockSending,
-                        tr_str(&lang, "账号自毁期限", "If Away For"),
-                        &ttl_desc,
-                        pal,
-                        false,
-                        |this| {
-                            let next = match this.ttl_months { 1 => 3, 3 => 6, 6 => 12, 12 => 18, 18 => 24, _ => 1 };
-                            this.set_ttl_months(next);
-                            this.pending_save_settings = true;
-                        },
-                        cx,
-                    ))
-                    .child(settings_toggle_row(
-                        IconName::Close,
-                        tr_str(&lang, "关闭敏感内容过滤", "Disable Filtering"),
-                        None,
-                        self.sensitive_content_enabled,
-                        pal,
-                        Self::toggle_sensitive_content,
-                        cx,
-                    )),
-            )
+                        ),
+                        settings_toggle_row(
+                            IconName::Close,
+                            tr_str(&lang, "关闭敏感内容过滤", "Disable Filtering"),
+                            None,
+                            self.sensitive_content_enabled,
+                            pal,
+                            Self::toggle_sensitive_content,
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
             .into_any_element()
     }
 }

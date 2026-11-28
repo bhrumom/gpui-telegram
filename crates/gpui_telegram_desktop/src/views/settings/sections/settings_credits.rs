@@ -1,11 +1,11 @@
-use gpui::*;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::{tg_icon_rgba, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_empty_state, settings_section_header,
-    settings_subsection_title,
+    settings_action_row_desc, settings_card, settings_container, settings_empty_state,
+    settings_group_card, settings_section_block, settings_static_row,
 };
+use gpui::*;
 
 pub const K_FIRST_PAGE_LIMIT: usize = 20;
 
@@ -101,54 +101,153 @@ impl Default for SettingsCreditsSections {
 
 impl Render for SettingsCreditsSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
-        let pal = self.palette.clone();
+        if !self.is_visible {
+            return div().into_any_element();
+        }
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let balance = self.balance_stars;
         let txs = self.transactions.clone();
 
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::WalletStars, tr_str(&lang, "星币", "Stars"), Some(tr_str(&lang, "数字商品支付、频道订阅与创作者激励", "Digital goods, channel subscriptions, and creator rewards")), pal.clone()))
-            .child(
-                settings_card(pal.clone()).child(
-                    div().flex().flex_row().items_center().justify_between()
-                        .child(div().flex().flex_col().gap(px(4.0))
-                            .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(tr_str(&lang, "可用余额", "Available Balance")))
-                            .child(div().flex().flex_row().items_center().gap(px(8.0))
-                                .child(tg_icon(IconName::PremiumStar, 22.0, pal.accent))
-                                .child(div().text_2xl().font_weight(FontWeight::BOLD).text_color(rgb(pal.text_primary)).child(format!("{} {}", balance, self.currency_code)))))
-                        .child(div().px(px(14.0)).py(px(8.0)).rounded(px(8.0)).bg(rgb(pal.accent)).text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.active_button_fg)).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.topup(500); cx.notify(); }))
-                            .child(format!("+ {}", tr_str(&lang, "购买星币", "Buy Stars")))),
-                ),
-            )
-            .child(
-                settings_card(pal.clone()).child(
-                    div().flex().flex_row().items_center().justify_between()
-                        .child(div().flex().flex_col()
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.text_primary)).child(tr_str(&lang, "创作者收益 (TON)", "Creator Rewards (TON)")))
-                            .child(div().text_xs().text_color(rgb(pal.text_secondary)).child(if lang.starts_with("zh") {
-                                format!("可提取 {:.2} TON", self.ton_balance)
-                            } else {
-                                format!("{:.2} TON available", self.ton_balance)
-                            })))
-                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(if self.can_withdraw() { pal.text_link } else { pal.text_secondary })).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { if this.can_withdraw() { this.pending_withdraw = true; cx.notify(); } }))
-                            .child(tr_str(&lang, "提现 ›", "Withdraw ›"))),
-                ),
-            )
-            .child(settings_subsection_title(tr_str(&lang, "交易记录", "Transaction History"), pal.clone()))
-            .child(if txs.is_empty() {
-                settings_empty_state(IconName::WalletStars, tr_str(&lang, "暂无星币交易记录", "No Stars transactions yet."), pal).into_any_element()
-            } else {
-                settings_card(pal.clone()).children(txs.into_iter().map(|tx| {
-                    let color = if tx.is_outgoing { pal.danger } else { pal.success };
+        let ton_desc = if lang.starts_with("zh") {
+            format!("可提取 {:.2} TON", self.ton_balance)
+        } else {
+            format!("{:.2} TON available", self.ton_balance)
+        };
+
+        let tx_body: AnyElement = if txs.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::WalletStars,
+                    tr_str(&lang, "暂无星币交易记录", "No Stars transactions yet."),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = txs
+                .into_iter()
+                .map(|tx| {
+                    let amount_fg = if tx.is_outgoing {
+                        ob.danger()
+                    } else {
+                        ob.success()
+                    };
                     let sign = if tx.amount > 0 { "+" } else { "" };
-                    div().flex().flex_row().items_center().justify_between().px(px(10.0)).py(px(6.0))
-                        .child(div().flex().flex_col().child(div().text_sm().text_color(rgb(pal.text_primary)).child(tx.title)).child(div().text_xs().text_color(rgb(pal.text_secondary)).child(tx.date)))
-                        .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(rgb(color)).child(format!("{}{} ★", sign, tx.amount)))
-                })).into_any_element()
-            })
+                    settings_static_row(
+                        &tx.title,
+                        Some(&tx.date),
+                        div()
+                            .text_size(px(pal.scaled_px(13.0)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(amount_fg)
+                            .child(format!("{}{} ★", sign, tx.amount)),
+                        pal,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
+        };
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(&lang, "余额", "Balance"),
+                Some(tr_str(
+                    &lang,
+                    "数字商品支付、频道订阅与创作者激励",
+                    "Digital goods, channel subscriptions, and creator rewards",
+                )),
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        div()
+                            .w_full()
+                            .px(px(pal.scaled_px(16.0)))
+                            .py(px(pal.scaled_px(14.0)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(pal.scaled_px(12.0)))
+                                            .text_color(ob.text_muted())
+                                            .child(tr_str(&lang, "可用余额", "Available Balance")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(tg_icon_rgba(
+                                                IconName::PremiumStar,
+                                                20.0,
+                                                ob.text_primary(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_size(px(pal.scaled_px(22.0)))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(ob.text_primary())
+                                                    .child(format!("{} {}", balance, self.currency_code)),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(14.0))
+                                    .py(px(8.0))
+                                    .rounded(px(8.0))
+                                    .bg(ob.surface_light())
+                                    .text_size(px(pal.scaled_px(12.5)))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(ob.text_on_light())
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.topup(500);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(format!("+ {}", tr_str(&lang, "购买星币", "Buy Stars"))),
+                            )
+                            .into_any_element(),
+                        settings_action_row_desc(
+                            Some(IconName::WalletStars),
+                            tr_str(&lang, "创作者收益 (TON)", "Creator Rewards (TON)"),
+                            Some(&ton_desc),
+                            if self.can_withdraw() {
+                                tr_str(&lang, "提现", "Withdraw")
+                            } else {
+                                tr_str(&lang, "未达门槛", "Unavailable")
+                            },
+                            pal,
+                            false,
+                            |this| {
+                                if this.can_withdraw() {
+                                    this.pending_withdraw = true;
+                                }
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "交易记录", "Transaction History"),
+                None,
+                pal,
+                tx_body,
+            ))
             .into_any_element()
     }
 }

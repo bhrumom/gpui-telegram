@@ -1,10 +1,11 @@
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use crate::i18n::tr_str;
-use crate::theme::assets::{tg_icon, IconName};
+use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_card, settings_container, settings_section_header, settings_subsection_title,
-    settings_toggle_row,
+    settings_action_row, settings_container, settings_group_card, settings_section_block,
+    settings_static_row, settings_toggle_row,
 };
 
 pub const K_MIC_TEST_UPDATE_INTERVAL_MS: u64 = 100;
@@ -140,46 +141,187 @@ impl Default for SettingsCallsSections {
 
 impl Render for SettingsCallsSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pal = self.palette.clone();
+        let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
+        let hover_ctrl = ob.bg_control_hover();
         let mic_pct = (self.mic_level * 120.0).clamp(0.0, 120.0);
-        settings_container(pal.clone())
-            .child(settings_section_header(IconName::PhoneCall, tr_str(&lang, "通话设置", "Call Settings"), Some(tr_str(&lang, "管理麦克风、扬声器、摄像头及点对点连接策略", "Audio input/output devices, camera, and peer-to-peer preference")), pal.clone()))
-            .child(settings_subsection_title(tr_str(&lang, "音频设备", "Audio Devices"), pal.clone()))
+        let input_display = if self.input_device.is_empty() {
+            tr_str(&lang, "系统默认", "System Default").to_string()
+        } else {
+            self.input_device.clone()
+        };
+        let output_display = if self.output_device.is_empty() {
+            tr_str(&lang, "系统默认", "System Default").to_string()
+        } else {
+            self.output_device.clone()
+        };
+        let camera_display = if self.camera_device.is_empty() {
+            tr_str(&lang, "系统默认", "System Default").to_string()
+        } else {
+            self.camera_device.clone()
+        };
+
+        let mic_test_controls = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
             .child(
-                settings_card(pal.clone())
-                    .child(div().flex().flex_row().justify_between().items_center().py(px(6.0)).cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.input_device = Self::cycle(&this.available_inputs, &this.input_device); this.pending_prefs_sync = true; cx.notify(); }))
-                        .child(div().flex().flex_row().items_center().gap(px(8.0)).child(tg_icon(IconName::Mic, 16.0, pal.icon_fg)).child(div().text_sm().text_color(rgb(pal.text_primary)).child(tr_str(&lang, "麦克风", "Microphone"))))
-                        .child(div().text_xs().text_color(rgb(pal.text_link)).child(self.input_device.clone())))
-                    .child(div().flex().flex_row().justify_between().items_center().py(px(6.0)).cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.output_device = Self::cycle(&this.available_outputs, &this.output_device); this.pending_prefs_sync = true; cx.notify(); }))
-                        .child(div().flex().flex_row().items_center().gap(px(8.0)).child(tg_icon(IconName::Speaker, 16.0, pal.icon_fg)).child(div().text_sm().text_color(rgb(pal.text_primary)).child(tr_str(&lang, "扬声器与耳机", self.lng_settings_call_section_output()))))
-                        .child(div().text_xs().text_color(rgb(pal.text_link)).child(self.output_device.clone())))
-                    .child(div().pt(px(4.0)).flex().flex_row().justify_between().items_center()
-                        .child(div().id("settings-calls-mic-test-btn").px(px(10.0)).py(px(5.0)).rounded(px(6.0)).bg(rgb(if self.mic_test_active { pal.danger } else { pal.accent })).text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(pal.active_button_fg)).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.toggle_mic_test(); cx.notify(); }))
-                            .child(if self.mic_test_active { tr_str(&lang, "停止麦克风测试", "Stop Mic Test") } else { tr_str(&lang, "测试麦克风", "Test Microphone") }))
-                        .child(div().w(px(120.0)).h(px(6.0)).rounded_full().bg(rgb(pal.input_bg)).child(div().w(px(mic_pct)).h_full().rounded_full().bg(rgb(pal.accent))))),
+                div()
+                    .w(px(120.0))
+                    .h(px(6.0))
+                    .rounded_full()
+                    .bg(ob.bg_control_active())
+                    .overflow_hidden()
+                    .child(div().w(px(mic_pct)).h_full().rounded_full().bg(ob.surface_light())),
             )
-            .child(settings_subsection_title(tr_str(&lang, "视频与端到端设置", "Video & Peer-to-Peer"), pal.clone()))
             .child(
-                settings_card(pal.clone())
-                    .child(div().flex().flex_row().justify_between().items_center().py(px(6.0)).cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.camera_device = Self::cycle(&this.available_cameras, &this.camera_device); this.pending_prefs_sync = true; cx.notify(); }))
-                        .child(div().flex().flex_row().items_center().gap(px(8.0)).child(tg_icon(IconName::VideoCall, 16.0, pal.icon_fg)).child(div().text_sm().text_color(rgb(pal.text_primary)).child(tr_str(&lang, "摄像头", "Camera"))))
-                        .child(div().text_xs().text_color(rgb(pal.text_link)).child(self.camera_device.clone())))
-                    .child(div().pt(px(4.0)).flex().flex_row().gap(px(6.0)).children(["Everybody", "Contacts", "Nobody"].into_iter().map(|mode| {
-                        let active = self.p2p_mode == mode;
-                        let mode_lbl = match mode {
-                            "Everybody" => tr_str(&lang, "所有人", "Everybody"),
-                            "Contacts" => tr_str(&lang, "联系人", "Contacts"),
-                            _ => tr_str(&lang, "没有人", "Nobody"),
-                        };
-                        div().flex_1().py(px(6.0)).rounded(px(6.0)).flex().items_center().justify_center().bg(rgb(if active { pal.accent } else { pal.input_bg })).text_xs().text_color(rgb(if active { pal.active_button_fg } else { pal.text_primary })).cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| { this.set_p2p_mode(mode); cx.notify(); })).child(format!("P2P: {}", mode_lbl))
-                    })))
-                    .child(settings_toggle_row(IconName::PhoneCall, tr_str(&lang, "允许在此设备接听通话", "Accept Calls on This Device"), None, self.accept_calls, pal, |this| { this.accept_calls = !this.accept_calls; this.pending_save_settings = true; }, cx)),
-            )
+                div()
+                    .id("settings-calls-mic-test-btn")
+                    .cursor_pointer()
+                    .h(px(28.0))
+                    .px(px(11.0))
+                    .rounded(px(7.0))
+                    .bg(if self.mic_test_active { ob.danger() } else { ob.bg_control() })
+                    .border_1()
+                    .border_color(if self.mic_test_active { ob.danger() } else { ob.border_strong_hairline() })
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if self.mic_test_active { rgb(0xFFFFFF) } else { ob.text_primary() })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.toggle_mic_test();
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.mic_test_active {
+                        tr_str(&lang, "停止测试", "Stop Test")
+                    } else {
+                        tr_str(&lang, "测试麦克风", "Test Mic")
+                    }),
+            );
+
+        let p2p_segmented = div()
+            .p(px(2.0))
+            .rounded(px(8.0))
+            .bg(ob.bg_control())
+            .border_1()
+            .border_color(ob.border_hairline())
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children(["Everybody", "Contacts", "Nobody"].into_iter().map(|mode| {
+                let active = self.p2p_mode == mode;
+                let mode_lbl = match mode {
+                    "Everybody" => tr_str(&lang, "所有人", "Everyone"),
+                    "Contacts" => tr_str(&lang, "联系人", "Contacts"),
+                    _ => tr_str(&lang, "禁用", "Nobody"),
+                };
+                div()
+                    .cursor_pointer()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .when(active, |el| el.bg(ob.surface_light()))
+                    .when(!active, |el| el.hover(move |s| s.bg(hover_ctrl)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                    .text_color(if active { ob.text_on_light() } else { ob.text_secondary() })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_p2p_mode(mode);
+                            cx.notify();
+                        }),
+                    )
+                    .child(mode_lbl)
+            }));
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(&lang, "音频设备", "Audio Devices"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row(
+                            IconName::Mic,
+                            tr_str(&lang, "麦克风", "Microphone"),
+                            &input_display,
+                            pal,
+                            false,
+                            |this| {
+                                this.input_device = Self::cycle(&this.available_inputs, &this.input_device);
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_action_row(
+                            IconName::Speaker,
+                            tr_str(&lang, "扬声器与耳机", self.lng_settings_call_section_output()),
+                            &output_display,
+                            pal,
+                            false,
+                            |this| {
+                                this.output_device = Self::cycle(&this.available_outputs, &this.output_device);
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_static_row(
+                            tr_str(&lang, "麦克风音量检测", "Microphone check"),
+                            Some(tr_str(&lang, "实时查看输入电平以确认收音正常。", "Monitor live input level to verify your microphone.")),
+                            mic_test_controls,
+                            pal,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "视频与通话连接", "Video & Calling"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row(
+                            IconName::VideoCall,
+                            tr_str(&lang, "摄像头", "Camera"),
+                            &camera_display,
+                            pal,
+                            false,
+                            |this| {
+                                this.camera_device = Self::cycle(&this.available_cameras, &this.camera_device);
+                                this.pending_prefs_sync = true;
+                            },
+                            cx,
+                        ),
+                        settings_static_row(
+                            tr_str(&lang, "点对点直连 (P2P)", "Peer-to-Peer"),
+                            Some(tr_str(&lang, "选择允许建立点对点低延迟语音连接的对象。", "Choose who can connect peer-to-peer for lower latency.")),
+                            p2p_segmented,
+                            pal,
+                        ),
+                        settings_toggle_row(
+                            IconName::PhoneCall,
+                            tr_str(&lang, "允许在此设备接听通话", "Accept calls on this device"),
+                            None,
+                            self.accept_calls,
+                            pal,
+                            |this| {
+                                this.accept_calls = !this.accept_calls;
+                                this.pending_save_settings = true;
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
     }
 }

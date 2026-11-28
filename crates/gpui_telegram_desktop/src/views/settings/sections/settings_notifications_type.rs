@@ -5,9 +5,8 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_action_row, settings_card, settings_container, settings_empty_state,
-    settings_section_header, settings_subsection_title, settings_toggle_row,
+    settings_group_card, settings_section_block, settings_toggle_row,
 };
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,32 +82,87 @@ impl Render for SettingsNotificationsTypeSections {
             &self.chat_type_name
         };
 
-        settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::Speaker, header_title, Some(tr_str(lang, "对话类型通知设置", "Chat type notifications")), pal))
-                .child(settings_toggle_row(IconName::Speaker, tr_str(lang, "弹出通知提醒", "Show Notifications"), None, self.alerts_enabled, pal, Self::toggle_alerts, cx))
-                .child(settings_toggle_row(IconName::FileDoc, tr_str(lang, "显示消息预览", "Message Preview"), None, self.message_preview, pal, Self::toggle_preview, cx))
-                .child(settings_toggle_row(IconName::Speaker, tr_str(lang, "播放提示音", "Play Sound"), None, self.sound_enabled, pal, Self::toggle_sound, cx)))
-            .child(settings_card(pal)
-                .child(settings_subsection_title(&format!("{} ({})", tr_str(lang, "例外列表", "Exceptions"), self.exceptions.len()), pal))
-                .map(|el| {
-                    if self.exceptions.is_empty() {
-                        el.child(settings_empty_state(IconName::Mute, tr_str(lang, "暂无例外对话", "No notification exceptions"), pal))
+        let exceptions_body: AnyElement = if self.exceptions.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::Mute,
+                    tr_str(lang, "暂无例外对话", "No notification exceptions"),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let lang_owned = lang.clone();
+            let rows: Vec<AnyElement> = self
+                .exceptions
+                .clone()
+                .into_iter()
+                .map(|ex| {
+                    let pid = ex.peer_id;
+                    let status = if ex.is_muted {
+                        tr_str(&lang_owned, "已静音", "Muted")
                     } else {
-                        let lang_owned = lang.clone();
-                        el.children(self.exceptions.clone().into_iter().map(move |ex| {
-                            let pid = ex.peer_id;
-                            let status = if ex.is_muted {
-                                tr_str(&lang_owned, "已静音", "Muted")
-                            } else {
-                                tr_str(&lang_owned, "自定义", "Custom")
-                            };
-                            settings_action_row(IconName::ContactsUsers, &ex.name, status, pal, false, move |this| {
-                                this.remove_exception(pid);
-                            }, cx)
-                        }))
-                    }
-                }))
+                        tr_str(&lang_owned, "自定义", "Custom")
+                    };
+                    settings_action_row(
+                        IconName::ContactsUsers,
+                        &ex.name,
+                        status,
+                        pal,
+                        false,
+                        move |this| {
+                            this.remove_exception(pid);
+                        },
+                        cx,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
+        };
+
+        settings_container(pal)
+            .child(settings_section_block(
+                header_title,
+                Some(tr_str(lang, "对话类型通知设置", "Chat type notifications")),
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_toggle_row(
+                            IconName::Speaker,
+                            tr_str(lang, "弹出通知提醒", "Show Notifications"),
+                            None,
+                            self.alerts_enabled,
+                            pal,
+                            Self::toggle_alerts,
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::FileDoc,
+                            tr_str(lang, "显示消息预览", "Message Preview"),
+                            None,
+                            self.message_preview,
+                            pal,
+                            Self::toggle_preview,
+                            cx,
+                        ),
+                        settings_toggle_row(
+                            IconName::Speaker,
+                            tr_str(lang, "播放提示音", "Play Sound"),
+                            None,
+                            self.sound_enabled,
+                            pal,
+                            Self::toggle_sound,
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                &format!("{} ({})", tr_str(lang, "例外列表", "Exceptions"), self.exceptions.len()),
+                None,
+                pal,
+                exceptions_body,
+            ))
             .into_any_element()
     }
 }

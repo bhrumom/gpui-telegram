@@ -115,37 +115,184 @@ pub fn compute_settings_page_layout(
     }
 }
 
+pub fn settings_card_bg(pal: TdesktopThemePalette) -> Rgba {
+    let ob = pal.openbot_palette();
+    rgb(if ob.scheme.is_dark() {
+        SETTINGS_CARD_BG_DARK
+    } else {
+        SETTINGS_CARD_BG_LIGHT
+    })
+}
+
 pub fn settings_container(pal: TdesktopThemePalette) -> Div {
     let ob = pal.openbot_palette();
     div()
         .w_full()
         .min_h_full()
         .px(px(0.0))
-        .py(px(pal.scaled_px(4.0)))
+        .py(px(pal.scaled_px(2.0)))
         .bg(ob.bg_canvas())
         .flex()
         .flex_col()
-        .gap(px(pal.scaled_px(16.0)))
+        .gap(px(pal.scaled_px(20.0)))
 }
 
-pub fn settings_card(pal: TdesktopThemePalette) -> Div {
+/// OpenBot `.settings-page-heading` (`24px` semibold title + concise muted description).
+pub fn settings_page_heading(
+    title: &str,
+    subtitle: Option<&str>,
+    pal: TdesktopThemePalette,
+) -> AnyElement {
     let ob = pal.openbot_palette();
-    let card_bg = rgb(if ob.scheme.is_dark() {
-        SETTINGS_CARD_BG_DARK
-    } else {
-        SETTINGS_CARD_BG_LIGHT
-    });
     div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(pal.scaled_px(4.0)))
+        .pb(px(pal.scaled_px(2.0)))
+        .child(
+            div()
+                .text_size(px(pal.scaled_px(24.0)))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ob.text_primary())
+                .child(title.to_string()),
+        )
+        .when_some(subtitle.filter(|s| !s.is_empty()), |el, sub| {
+            el.child(
+                div()
+                    .text_size(px(pal.scaled_px(13.0)))
+                    .text_color(ob.text_muted())
+                    .child(sub.to_string()),
+            )
+        })
+        .into_any_element()
+}
+
+/// OpenBot `<SettingsSection>`: section heading + optional muted caption cleanly OUTSIDE above a card.
+pub fn settings_section_block(
+    title: &str,
+    description: Option<&str>,
+    pal: TdesktopThemePalette,
+    body: impl IntoElement,
+) -> AnyElement {
+    let ob = pal.openbot_palette();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(pal.scaled_px(8.0)))
+        .child(
+            div()
+                .px(px(2.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(pal.scaled_px(13.5)))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ob.text_primary())
+                        .child(title.to_string()),
+                )
+                .when_some(description.filter(|s| !s.is_empty()), |el, desc| {
+                    el.child(
+                        div()
+                            .text_size(px(pal.scaled_px(12.0)))
+                            .text_color(ob.text_muted())
+                            .child(desc.to_string()),
+                    )
+                }),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+/// OpenBot `<ItemGroup class="settings-modal-card">`: 12px rounded card with 1px inset hairline dividers between rows.
+pub fn settings_group_card(pal: TdesktopThemePalette, rows: Vec<AnyElement>) -> AnyElement {
+    let ob = pal.openbot_palette();
+    let card_bg = settings_card_bg(pal);
+    let divider_color = ob.border_hairline();
+    let mut card = div()
         .w_full()
         .rounded(px(pal.scaled_px(SETTINGS_CARD_RADIUS_PX)))
         .bg(card_bg)
         .border_1()
         .border_color(ob.frame_card_border())
+        .overflow_hidden()
+        .flex()
+        .flex_col();
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        if idx > 0 {
+            card = card.child(
+                div()
+                    .w_full()
+                    .px(px(pal.scaled_px(16.0)))
+                    .child(div().w_full().h(px(1.0)).bg(divider_color)),
+            );
+        }
+        card = card.child(row);
+    }
+    card.into_any_element()
+}
+
+/// OpenBot `<Item class="settings-modal-row">`: title + optional description on left, custom control on right.
+pub fn settings_static_row(
+    title: &str,
+    subtitle: Option<&str>,
+    trailing: impl IntoElement,
+    pal: TdesktopThemePalette,
+) -> AnyElement {
+    let ob = pal.openbot_palette();
+    div()
+        .w_full()
+        .min_h(px(pal.scaled_px(56.0)))
         .px(px(pal.scaled_px(16.0)))
-        .py(px(pal.scaled_px(10.0)))
+        .py(px(pal.scaled_px(12.0)))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(pal.scaled_px(16.0)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(pal.scaled_px(13.5)))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ob.text_primary())
+                        .child(title.to_string()),
+                )
+                .when_some(subtitle.filter(|s| !s.is_empty()), |el, sub| {
+                    el.child(
+                        div()
+                            .text_size(px(pal.scaled_px(12.0)))
+                            .text_color(ob.text_muted())
+                            .child(sub.to_string()),
+                    )
+                }),
+        )
+        .child(div().flex_shrink_0().flex().items_center().child(trailing))
+        .into_any_element()
+}
+
+pub fn settings_card(pal: TdesktopThemePalette) -> Div {
+    let ob = pal.openbot_palette();
+    div()
+        .w_full()
+        .rounded(px(pal.scaled_px(SETTINGS_CARD_RADIUS_PX)))
+        .bg(settings_card_bg(pal))
+        .border_1()
+        .border_color(ob.frame_card_border())
+        .px(px(pal.scaled_px(16.0)))
+        .py(px(pal.scaled_px(12.0)))
         .flex()
         .flex_col()
-        .gap(px(pal.scaled_px(6.0)))
+        .gap(px(pal.scaled_px(8.0)))
 }
 
 pub fn settings_section_header(
@@ -158,21 +305,9 @@ pub fn settings_section_header(
     div()
         .flex()
         .items_center()
-        .gap(px(pal.scaled_px(12.0)))
-        .pb(px(pal.scaled_px(4.0)))
-        .child(
-            div()
-                .w(px(pal.scaled_px(34.0)))
-                .h(px(pal.scaled_px(34.0)))
-                .rounded_full()
-                .bg(ob.bg_control_active())
-                .border_1()
-                .border_color(ob.border_hairline())
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(tg_icon_rgba(icon, pal.scaled_px(17.0), ob.text_primary())),
-        )
+        .gap(px(pal.scaled_px(10.0)))
+        .pb(px(pal.scaled_px(2.0)))
+        .child(tg_icon_rgba(icon, pal.scaled_px(17.0), ob.text_muted()))
         .child(
             div()
                 .flex()
@@ -180,12 +315,12 @@ pub fn settings_section_header(
                 .gap(px(2.0))
                 .child(
                     div()
-                        .text_size(px(pal.scaled_px(16.0)))
+                        .text_size(px(pal.scaled_px(15.0)))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(ob.text_primary())
                         .child(title.to_string()),
                 )
-                .when_some(subtitle, |el, sub| {
+                .when_some(subtitle.filter(|s| !s.is_empty()), |el, sub| {
                     el.child(
                         div()
                             .text_size(px(pal.scaled_px(12.0)))
@@ -202,9 +337,10 @@ pub fn settings_subsection_title(title: &str, pal: TdesktopThemePalette) -> AnyE
     div()
         .pt(px(2.0))
         .pb(px(2.0))
-        .text_size(px(pal.scaled_px(12.0)))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(ob.text_muted())
+        .px(px(2.0))
+        .text_size(px(pal.scaled_px(13.0)))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(ob.text_primary())
         .child(title.to_string())
         .into_any_element()
 }
@@ -223,15 +359,14 @@ pub fn settings_toggle_row<V: 'static>(
     div()
         .cursor_pointer()
         .w_full()
-        .min_h(px(pal.scaled_px(SETTINGS_ROW_MIN_HEIGHT_PX)))
-        .px(px(pal.scaled_px(10.0)))
-        .py(px(pal.scaled_px(8.0)))
-        .rounded(px(pal.scaled_px(8.0)))
+        .min_h(px(pal.scaled_px(56.0)))
+        .px(px(pal.scaled_px(16.0)))
+        .py(px(pal.scaled_px(11.0)))
         .hover(move |s| s.bg(hover_bg))
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(pal.scaled_px(12.0)))
+        .gap(px(pal.scaled_px(14.0)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _e, _w, cx| {
@@ -241,12 +376,16 @@ pub fn settings_toggle_row<V: 'static>(
         )
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
                 .items_center()
                 .gap(px(pal.scaled_px(10.0)))
-                .child(tg_icon_rgba(icon, pal.scaled_px(16.0), ob.text_muted()))
+                .child(tg_icon_rgba(icon, pal.scaled_px(15.0), ob.text_muted()))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
@@ -257,7 +396,7 @@ pub fn settings_toggle_row<V: 'static>(
                                 .text_color(ob.text_primary())
                                 .child(title.to_string()),
                         )
-                        .when_some(subtitle, |el, sub| {
+                        .when_some(subtitle.filter(|s| !s.is_empty()), |el, sub| {
                             el.child(
                                 div()
                                     .text_size(px(pal.scaled_px(12.0)))
@@ -310,9 +449,10 @@ pub fn settings_toggle_row<V: 'static>(
         .into_any_element()
 }
 
-pub fn settings_action_row<V: 'static>(
-    icon: IconName,
+pub fn settings_action_row_desc<V: 'static>(
+    icon: Option<IconName>,
     title: &str,
+    subtitle: Option<&str>,
     value_text: &str,
     pal: TdesktopThemePalette,
     danger: bool,
@@ -328,17 +468,20 @@ pub fn settings_action_row<V: 'static>(
     } else {
         ob.hover()
     };
+    let clean_val = value_text.trim();
+    let show_val = !clean_val.is_empty() && clean_val != "›" && clean_val != ">";
+
     div()
         .cursor_pointer()
         .w_full()
-        .min_h(px(pal.scaled_px(SETTINGS_ROW_MIN_HEIGHT_PX)))
-        .px(px(pal.scaled_px(10.0)))
-        .py(px(pal.scaled_px(8.0)))
-        .rounded(px(pal.scaled_px(8.0)))
+        .min_h(px(pal.scaled_px(56.0)))
+        .px(px(pal.scaled_px(16.0)))
+        .py(px(pal.scaled_px(11.0)))
         .hover(move |s| s.bg(hover_bg))
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(pal.scaled_px(12.0)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _e, _w, cx| {
@@ -348,29 +491,52 @@ pub fn settings_action_row<V: 'static>(
         )
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
                 .items_center()
                 .gap(px(pal.scaled_px(10.0)))
-                .child(tg_icon_rgba(icon, pal.scaled_px(16.0), icon_fg))
+                .when_some(icon, |el, ic| {
+                    el.child(tg_icon_rgba(ic, pal.scaled_px(15.0), icon_fg))
+                })
                 .child(
                     div()
-                        .text_size(px(pal.scaled_px(13.5)))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(fg)
-                        .child(title.to_string()),
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(pal.scaled_px(13.5)))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child(title.to_string()),
+                        )
+                        .when_some(subtitle.filter(|s| !s.is_empty()), |el, sub| {
+                            el.child(
+                                div()
+                                    .text_size(px(pal.scaled_px(12.0)))
+                                    .text_color(ob.text_muted())
+                                    .child(sub.to_string()),
+                            )
+                        }),
                 ),
         )
         .child(
             div()
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap(px(pal.scaled_px(6.0)))
-                .child(
-                    div()
-                        .text_size(px(pal.scaled_px(12.5)))
-                        .text_color(val_fg)
-                        .child(value_text.to_string()),
-                )
+                .when(show_val, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(pal.scaled_px(12.5)))
+                            .text_color(val_fg)
+                            .child(clean_val.to_string()),
+                    )
+                })
                 .child(tg_icon_rgba(
                     IconName::ChevronRight,
                     pal.scaled_px(13.0),
@@ -380,30 +546,40 @@ pub fn settings_action_row<V: 'static>(
         .into_any_element()
 }
 
+pub fn settings_action_row<V: 'static>(
+    icon: IconName,
+    title: &str,
+    value_text: &str,
+    pal: TdesktopThemePalette,
+    danger: bool,
+    on_tap: impl Fn(&mut V) + 'static,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    settings_action_row_desc(Some(icon), title, None, value_text, pal, danger, on_tap, cx)
+}
+
 pub fn settings_info_row(label: &str, value: &str, pal: TdesktopThemePalette) -> AnyElement {
     let ob = pal.openbot_palette();
     div()
         .w_full()
-        .px(px(pal.scaled_px(12.0)))
-        .py(px(pal.scaled_px(9.0)))
-        .rounded(px(pal.scaled_px(8.0)))
-        .bg(ob.bg_surface_raised())
-        .border_1()
-        .border_color(ob.border_hairline())
+        .min_h(px(pal.scaled_px(50.0)))
+        .px(px(pal.scaled_px(16.0)))
+        .py(px(pal.scaled_px(11.0)))
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(pal.scaled_px(12.0)))
         .child(
             div()
-                .text_size(px(pal.scaled_px(12.5)))
-                .text_color(ob.text_muted())
+                .text_size(px(pal.scaled_px(13.5)))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ob.text_primary())
                 .child(label.to_string()),
         )
         .child(
             div()
                 .text_size(px(pal.scaled_px(12.5)))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(ob.text_primary())
+                .text_color(ob.text_muted())
                 .child(value.to_string()),
         )
         .into_any_element()
@@ -417,7 +593,7 @@ pub fn settings_empty_state(icon: IconName, text: &str, pal: TdesktopThemePalett
         .flex_col()
         .items_center()
         .gap(px(pal.scaled_px(8.0)))
-        .child(tg_icon_rgba(icon, pal.scaled_px(26.0), ob.text_dim()))
+        .child(tg_icon_rgba(icon, pal.scaled_px(24.0), ob.text_dim()))
         .child(
             div()
                 .text_size(px(pal.scaled_px(12.5)))

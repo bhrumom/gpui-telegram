@@ -4,7 +4,7 @@ use crate::i18n::tr_str;
 use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container, settings_section_header,
+    settings_action_row, settings_container, settings_group_card, settings_section_block,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -130,41 +130,108 @@ impl Default for SettingsGlobalTtlSections {
 impl Render for SettingsGlobalTtlSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = &self.language_id;
         let opts = [TTL_OFF, TTL_ONE_DAY, TTL_ONE_WEEK, TTL_ONE_MONTH];
 
-        settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::ClockSending, tr_str(lang, "全局自动删除消息", "Auto-Delete Messages"), Some(tr_str(lang, "新发起的所有对话将自动套用此自动删除期限", "Automatically delete messages in all new chats")), pal))
-                .children(opts.into_iter().map(|ttl| {
-                    let mark = if self.current_ttl == ttl { "✓" } else { "" };
-                    let label = Self::format_ttl_localized(ttl, lang);
-                    settings_action_row(IconName::ClockSending, label, mark, pal, false, move |this| {
-                        this.set_ttl(ttl);
-                    }, cx)
-                }))
-                .child(settings_action_row(
-                    IconName::Forward,
-                    tr_str(lang, "应用到现有私聊对话", "Apply to Existing Private Chats"),
-                    Self::format_ttl_localized(self.current_ttl, lang),
+        let timer_rows: Vec<AnyElement> = opts
+            .into_iter()
+            .map(|ttl| {
+                let mark = if self.current_ttl == ttl { "✓" } else { "" };
+                let label = Self::format_ttl_localized(ttl, lang);
+                settings_action_row(
+                    IconName::ClockSending,
+                    label,
+                    mark,
                     pal,
                     false,
-                    Self::apply_to_existing,
+                    move |this| {
+                        this.set_ttl(ttl);
+                    },
                     cx,
+                )
+            })
+            .collect();
+
+        settings_container(pal)
+            .child(settings_section_block(
+                tr_str(lang, "自动删除计时器", "Auto-Delete Timer"),
+                Some(tr_str(
+                    lang,
+                    "新发起的所有对话将自动套用此自动删除期限",
+                    "Automatically delete messages in all new chats",
+                )),
+                pal,
+                settings_group_card(pal, timer_rows),
+            ))
+            .when(self.is_confirming, |el| {
+                let pending = self.pending_ttl.unwrap_or(TTL_ONE_DAY);
+                let confirm_title = if lang.starts_with("zh") {
+                    format!(
+                        "确认开启 {} 自动删除？",
+                        Self::format_ttl_localized(pending, lang)
+                    )
+                } else {
+                    format!(
+                        "Enable {} auto-delete?",
+                        Self::format_ttl_localized(pending, lang)
+                    )
+                };
+                el.child(settings_section_block(
+                    tr_str(lang, "确认更改", "Confirm"),
+                    None,
+                    pal,
+                    settings_group_card(
+                        pal,
+                        vec![
+                            settings_action_row(
+                                IconName::SelectCheck,
+                                &confirm_title,
+                                tr_str(lang, "确认", "Confirm"),
+                                pal,
+                                false,
+                                Self::confirm_pending,
+                                cx,
+                            ),
+                            settings_action_row(
+                                IconName::Close,
+                                tr_str(lang, "取消", "Cancel"),
+                                "",
+                                pal,
+                                true,
+                                Self::cancel_confirm,
+                                cx,
+                            ),
+                        ],
+                    ),
                 ))
-                .when(self.is_confirming, |el| {
-                    let pending = self.pending_ttl.unwrap_or(TTL_ONE_DAY);
-                    let confirm_title = if lang.starts_with("zh") {
-                        format!("确认开启 {} 自动删除？", Self::format_ttl_localized(pending, lang))
-                    } else {
-                        format!("Enable {} auto-delete?", Self::format_ttl_localized(pending, lang))
-                    };
-                    el.child(settings_action_row(IconName::SelectCheck, &confirm_title, tr_str(lang, "确认", "Confirm"), pal, false, Self::confirm_pending, cx))
-                        .child(settings_action_row(IconName::Close, tr_str(lang, "取消", "Cancel"), "", pal, true, Self::cancel_confirm, cx))
-                })
-                .when_some(self.status_message.clone(), |el, msg| {
-                    el.child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.success)).child(msg))
-                }))
+            })
+            .child(settings_section_block(
+                tr_str(lang, "应用范围", "Apply"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![settings_action_row(
+                        IconName::Forward,
+                        tr_str(lang, "应用到现有私聊对话", "Apply to Existing Private Chats"),
+                        Self::format_ttl_localized(self.current_ttl, lang),
+                        pal,
+                        false,
+                        Self::apply_to_existing,
+                        cx,
+                    )],
+                ),
+            ))
+            .when_some(self.status_message.clone(), |el, msg| {
+                el.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(px(pal.scaled_px(12.0)))
+                        .text_color(ob.success())
+                        .child(msg),
+                )
+            })
             .into_any_element()
     }
 }

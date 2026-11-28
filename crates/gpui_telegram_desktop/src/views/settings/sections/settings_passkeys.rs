@@ -5,7 +5,7 @@ use crate::theme::assets::IconName;
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
     settings_action_row, settings_card, settings_container, settings_empty_state,
-    settings_section_header, settings_subsection_title,
+    settings_group_card, settings_section_block,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -141,41 +141,91 @@ impl Default for SettingsPasskeysSections {
 
 impl Render for SettingsPasskeysSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
+        if !self.is_visible {
+            return div().into_any_element();
+        }
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = &self.language_id;
 
+        let keys_body: AnyElement = if self.passkeys.is_empty() {
+            settings_card(pal)
+                .child(settings_empty_state(
+                    IconName::Lock,
+                    tr_str(lang, "暂无通行密钥", "No passkeys registered"),
+                    pal,
+                ))
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = self
+                .passkeys
+                .clone()
+                .into_iter()
+                .map(|pk| {
+                    let id = pk.id;
+                    settings_action_row(
+                        IconName::Verified,
+                        &pk.name,
+                        tr_str(lang, "删除", "Remove"),
+                        pal,
+                        true,
+                        move |this| {
+                            this.delete_passkey(id);
+                        },
+                        cx,
+                    )
+                })
+                .collect();
+            settings_group_card(pal, rows)
+        };
+
         settings_container(pal)
-            .child(settings_card(pal)
-                .child(settings_section_header(IconName::Lock, tr_str(lang, "通行密钥 (Passkeys)", "Passkeys"), Some(tr_str(lang, "使用系统生物识别或硬件安全密钥无密码登录", "Sign in securely without passwords using biometrics or security keys")), pal))
-                .child(settings_action_row(IconName::Lock, tr_str(lang, "注册新通行密钥", "Add Passkey"), "+", pal, false, |this| {
-                    this.is_registering = true;
-                    let idx = this.next_id;
-                    let label = if this.language_id.starts_with("zh") {
-                        format!("本机通行密钥 #{}", idx)
-                    } else {
-                        format!("Desktop Passkey #{}", idx)
-                    };
-                    this.add_passkey(&label, None);
-                    this.is_registering = false;
-                }, cx))
-                .when_some(self.status_message.clone(), |el, msg| {
-                    el.child(div().text_size(px(pal.scaled_px(12.0))).text_color(rgb(pal.success)).child(msg))
-                }))
-            .child(settings_card(pal)
-                .child(settings_subsection_title(tr_str(lang, "已绑定密钥", "Registered Passkeys"), pal))
-                .map(|el| {
-                    if self.passkeys.is_empty() {
-                        el.child(settings_empty_state(IconName::Lock, tr_str(lang, "暂无通行密钥", "No passkeys registered"), pal))
-                    } else {
-                        el.children(self.passkeys.clone().into_iter().map(|pk| {
-                            let id = pk.id;
-                            settings_action_row(IconName::Verified, &pk.name, tr_str(lang, "删除", "Remove"), pal, true, move |this| {
-                                this.delete_passkey(id);
-                            }, cx)
-                        }))
-                    }
-                }))
+            .child(settings_section_block(
+                tr_str(lang, "添加密钥", "Add Passkey"),
+                Some(tr_str(
+                    lang,
+                    "使用系统生物识别或硬件安全密钥无密码登录",
+                    "Sign in securely without passwords using biometrics or security keys",
+                )),
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![settings_action_row(
+                        IconName::Lock,
+                        tr_str(lang, "注册新通行密钥", "Add Passkey"),
+                        "+",
+                        pal,
+                        false,
+                        |this| {
+                            this.is_registering = true;
+                            let idx = this.next_id;
+                            let label = if this.language_id.starts_with("zh") {
+                                format!("本机通行密钥 #{}", idx)
+                            } else {
+                                format!("Desktop Passkey #{}", idx)
+                            };
+                            this.add_passkey(&label, None);
+                            this.is_registering = false;
+                        },
+                        cx,
+                    )],
+                ),
+            ))
+            .when_some(self.status_message.clone(), |el, msg| {
+                el.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(px(pal.scaled_px(12.0)))
+                        .text_color(ob.success())
+                        .child(msg),
+                )
+            })
+            .child(settings_section_block(
+                tr_str(lang, "已绑定密钥", "Registered Passkeys"),
+                None,
+                pal,
+                keys_body,
+            ))
             .into_any_element()
     }
 }

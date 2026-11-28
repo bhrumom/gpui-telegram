@@ -1,12 +1,13 @@
 //! Upstream Source: Telegram/SourceFiles/settings/sections/settings_information.cpp
 
 use crate::i18n::tr_str;
-use crate::theme::assets::IconName;
+use crate::theme::assets::{tg_icon_rgba, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::settings::settings_theme_ui::{
-    settings_action_row, settings_card, settings_container,
-    settings_section_header, settings_subsection_title,
+    settings_action_row, settings_action_row_desc, settings_card, settings_container,
+    settings_group_card, settings_section_block,
 };
+use crate::views::settings::settings_type::SettingsSectionType;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
@@ -47,6 +48,8 @@ pub struct SettingsInformationSections {
     pub active_field: ProfileEditField,
     pub pending_save_profile: bool,
     pub pending_logout: bool,
+    pub pending_nav_section: Option<SettingsSectionType>,
+    pub pending_copy_text: Option<String>,
     pub status_message: Option<String>,
     pub is_visible: bool,
     pub palette: TdesktopThemePalette,
@@ -71,6 +74,8 @@ impl SettingsInformationSections {
             active_field: ProfileEditField::None,
             pending_save_profile: false,
             pending_logout: false,
+            pending_nav_section: None,
+            pending_copy_text: None,
             status_message: None,
             is_visible: true,
             palette: TdesktopThemePalette::build(TdesktopThemeMode::Night, 0x5288C1, 14, 12),
@@ -251,12 +256,40 @@ impl Default for SettingsInformationSections {
 
 impl Render for SettingsInformationSections {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.is_visible { return div().into_any_element(); }
+        if !self.is_visible {
+            return div().into_any_element();
+        }
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
         let active_field = self.active_field;
         let bio_count = self.bio.chars().count();
         let bio_limit = self.bio_limit();
+        let hover_ctrl = ob.bg_control_hover();
+
+        let full_name = format!("{} {}", self.first_name.trim(), self.last_name.trim())
+            .trim()
+            .to_string();
+        let display_name = if full_name.is_empty() {
+            if !self.username.is_empty() {
+                format!("@{}", self.username)
+            } else {
+                tr_str(&lang, "我的账号", "My Account").to_string()
+            }
+        } else {
+            full_name
+        };
+        let avatar_initial: String = display_name
+            .chars()
+            .find(|c| !c.is_whitespace() && *c != '@')
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "U".to_string());
+        let handle_meta = match (!self.username.is_empty(), !self.phone.is_empty()) {
+            (true, true) => format!("@{} · {}", self.username, self.phone),
+            (true, false) => format!("@{}", self.username),
+            (false, true) => self.phone.clone(),
+            (false, false) => tr_str(&lang, "未设置用户名或手机号", "No username or phone set").to_string(),
+        };
 
         let render_edit_box = |field: ProfileEditField,
                                label: &str,
@@ -266,34 +299,50 @@ impl Render for SettingsInformationSections {
          -> AnyElement {
             let is_focused = active_field == field;
             let shown = if value.is_empty() {
-                if is_focused { "|".to_string() } else { placeholder.to_string() }
+                if is_focused {
+                    "|".to_string()
+                } else {
+                    placeholder.to_string()
+                }
             } else if is_focused {
                 format!("{}|", value)
             } else {
                 value.to_string()
             };
             div()
-                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
+                .gap(px(5.0))
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(px(12.0))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(if is_focused { pal.accent } else { pal.text_secondary }))
+                        .text_color(if is_focused {
+                            ob.text_primary()
+                        } else {
+                            ob.text_muted()
+                        })
                         .child(label.to_string()),
                 )
                 .child(
                     div()
                         .w_full()
-                        .px(px(11.0))
+                        .min_h(px(36.0))
+                        .px(px(12.0))
                         .py(px(8.0))
                         .rounded(px(8.0))
-                        .bg(rgb(pal.input_bg))
+                        .bg(ob.bg_control())
                         .border_1()
-                        .border_color(rgb(if is_focused { pal.accent } else { pal.border_fg }))
+                        .border_color(if is_focused {
+                            ob.text_primary()
+                        } else {
+                            ob.border_hairline()
+                        })
                         .cursor_text()
+                        .flex()
+                        .items_center()
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _e, _w, cx| {
@@ -304,11 +353,11 @@ impl Render for SettingsInformationSections {
                         .child(
                             div()
                                 .text_size(px(13.0))
-                                .text_color(rgb(if value.is_empty() && !is_focused {
-                                    pal.text_secondary
+                                .text_color(if value.is_empty() && !is_focused {
+                                    ob.text_muted()
                                 } else {
-                                    pal.text_primary
-                                }))
+                                    ob.text_primary()
+                                })
                                 .child(shown),
                         ),
                 )
@@ -331,7 +380,7 @@ impl Render for SettingsInformationSections {
         );
         let user_el = render_edit_box(
             ProfileEditField::Username,
-            tr_str(&lang, "用户名 (@username)", "Username (@handle)"),
+            tr_str(&lang, "用户名", "Username"),
             &self.username.clone(),
             tr_str(&lang, "输入用户名", "Enter username"),
             cx,
@@ -352,84 +401,272 @@ impl Render for SettingsInformationSections {
             cx,
         );
 
-        settings_container(pal)
-            .child(
-                settings_card(pal)
-                    .child(settings_section_header(
-                        IconName::ContactsUsers,
-                        tr_str(&lang, "编辑个人资料", "Edit Profile"),
-                        Some(tr_str(&lang, "点击任意栏位直接修改并实时同步到服务器", "Click any field to edit and save to server")),
-                        pal,
-                    ))
-                    .child(first_el)
-                    .child(last_el)
-                    .child(user_el)
-                    .child(phone_el)
-                    .child(bio_el)
-                    .when_some(self.status_message.clone(), |el, msg| {
-                        el.child(div().text_size(px(12.0)).text_color(rgb(pal.success)).child(msg))
-                    })
-                    .child(
-                        div()
-                            .pt(px(4.0))
-                            .flex()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .id("settings-info-save-btn")
-                                    .px(px(16.0))
-                                    .py(px(7.0))
-                                    .rounded(px(8.0))
-                                    .bg(rgb(pal.accent))
-                                    .text_size(px(12.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(pal.active_button_fg))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _e, _w, cx| {
-                                            this.pending_save_profile = true;
-                                            this.save_pending = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(&lang, "保存修改", "Save Profile")),
-                            ),
-                    ),
-            )
-            .when(!self.accounts.is_empty(), |el| {
-                el.child(
-                    settings_card(pal)
-                        .child(settings_subsection_title(tr_str(&lang, "已登录账号", "Accounts"), pal))
-                        .children(self.accounts.clone().into_iter().map(|acc| {
-                            let id = acc.account_id;
-                            settings_action_row(
-                                IconName::ContactsUsers,
-                                &acc.name,
-                                if acc.is_active { tr_str(&lang, "当前在线", "Active") } else { &acc.phone },
-                                pal,
-                                false,
-                                move |this| {
-                                    this.switch_account(id);
-                                },
-                                cx,
-                            )
-                        })),
+        let username_for_copy = self.username.clone();
+        let has_username = !username_for_copy.is_empty();
+
+        let hero_card = settings_card(pal).child(
+            div()
+                .w_full()
+                .py(px(4.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(14.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(14.0))
+                        .child(
+                            div()
+                                .w(px(46.0))
+                                .h(px(46.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(ob.bg_control_active())
+                                .border_1()
+                                .border_color(ob.border_strong_hairline())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
+                                .child(avatar_initial),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(16.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(ob.text_primary())
+                                        .truncate()
+                                        .child(display_name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(ob.text_muted())
+                                        .truncate()
+                                        .child(handle_meta),
+                                ),
+                        ),
                 )
+                .when(has_username, |el| {
+                    el.child(
+                        div()
+                            .id("settings-profile-copy-handle")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(11.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_control())
+                            .border_1()
+                            .border_color(ob.border_strong_hairline())
+                            .hover(move |s| s.bg(hover_ctrl))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    let handle = format!("@{}", username_for_copy);
+                                    this.pending_copy_text = Some(handle.clone());
+                                    this.status_message = Some(if this.language_id.starts_with("zh") {
+                                        format!("已复制 {handle}")
+                                    } else {
+                                        format!("Copied {handle}")
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tg_icon_rgba(IconName::Copy, 12.5, ob.text_muted()))
+                            .child(tr_str(&lang, "复制用户名", "Copy handle")),
+                    )
+                }),
+        );
+
+        let form_card = settings_card(pal)
+            .gap(px(12.0))
+            .py(px(16.0))
+            .child(div().w_full().flex().gap(px(12.0)).child(first_el).child(last_el))
+            .child(div().w_full().flex().gap(px(12.0)).child(user_el).child(phone_el))
+            .child(bio_el)
+            .when_some(self.status_message.clone(), |el, msg| {
+                el.child(div().text_size(px(12.0)).text_color(ob.success()).child(msg))
             })
             .child(
-                settings_card(pal).child(settings_action_row(
-                    IconName::Close,
-                    tr_str(&lang, "退出当前账号", "Log Out"),
-                    "",
+                div()
+                    .pt(px(4.0))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .id("settings-info-save-btn")
+                            .px(px(16.0))
+                            .py(px(7.0))
+                            .rounded(px(8.0))
+                            .bg(ob.surface_light())
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ob.text_on_light())
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, _w, cx| {
+                                    this.pending_save_profile = true;
+                                    this.save_pending = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(&lang, "保存修改", "Save changes")),
+                    ),
+            );
+
+        let account_rows: Vec<AnyElement> = self
+            .accounts
+            .clone()
+            .into_iter()
+            .map(|acc| {
+                let id = acc.account_id;
+                let badge = if acc.is_active {
+                    tr_str(&lang, "当前在线", "Active").to_string()
+                } else {
+                    acc.phone
+                };
+                settings_action_row(
+                    IconName::ContactsUsers,
+                    &acc.name,
+                    &badge,
                     pal,
-                    true,
-                    |this| {
-                        this.pending_logout = true;
+                    false,
+                    move |this| {
+                        this.switch_account(id);
                     },
                     cx,
+                )
+            })
+            .collect();
+
+        let premium_status = if self.is_premium {
+            tr_str(&lang, "已开通", "Active")
+        } else {
+            tr_str(&lang, "查看方案", "Plans")
+        };
+
+        settings_container(pal)
+            .child(hero_card)
+            .child(settings_section_block(
+                tr_str(&lang, "基本信息", "Profile Details"),
+                Some(tr_str(
+                    &lang,
+                    "点击任意栏位即可编辑，保存后实时同步到账号。",
+                    "Click any field to edit and sync to your account.",
                 )),
-            )
+                pal,
+                form_card,
+            ))
+            .when(!account_rows.is_empty(), |el| {
+                el.child(settings_section_block(
+                    tr_str(&lang, "已登录账号", "Accounts"),
+                    None,
+                    pal,
+                    settings_group_card(pal, account_rows),
+                ))
+            })
+            .child(settings_section_block(
+                tr_str(&lang, "会员与扩展", "Membership & Extras"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![
+                        settings_action_row_desc(
+                            Some(IconName::PremiumStar),
+                            tr_str(&lang, "高级会员", "Premium"),
+                            Some(tr_str(
+                                &lang,
+                                "更大文件上传、加速下载与专属特权。",
+                                "Higher upload limits, faster downloads, and exclusive perks.",
+                            )),
+                            premium_status,
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_nav_section = Some(SettingsSectionType::Premium);
+                            },
+                            cx,
+                        ),
+                        settings_action_row_desc(
+                            Some(IconName::WalletStars),
+                            tr_str(&lang, "星币钱包", "Stars"),
+                            Some(tr_str(
+                                &lang,
+                                "查看可用余额、创作者收益与交易记录。",
+                                "Balance, creator rewards, and transaction history.",
+                            )),
+                            "",
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_nav_section = Some(SettingsSectionType::Credits);
+                            },
+                            cx,
+                        ),
+                        settings_action_row_desc(
+                            Some(IconName::ChannelMegaphone),
+                            tr_str(&lang, "商业功能", "Business"),
+                            Some(tr_str(
+                                &lang,
+                                "营业时间、快捷回复、欢迎语与自动离开回复。",
+                                "Opening hours, quick replies, greetings, and away messages.",
+                            )),
+                            "",
+                            pal,
+                            false,
+                            |this| {
+                                this.pending_nav_section = Some(SettingsSectionType::Business);
+                            },
+                            cx,
+                        ),
+                    ],
+                ),
+            ))
+            .child(settings_section_block(
+                tr_str(&lang, "登录状态", "Session"),
+                None,
+                pal,
+                settings_group_card(
+                    pal,
+                    vec![settings_action_row_desc(
+                        Some(IconName::Close),
+                        tr_str(&lang, "退出当前账号", "Log Out"),
+                        Some(tr_str(
+                            &lang,
+                            "退出登录并清除本机当前会话凭证。",
+                            "Sign out and clear local session credentials on this device.",
+                        )),
+                        "",
+                        pal,
+                        true,
+                        |this| {
+                            this.pending_logout = true;
+                        },
+                        cx,
+                    )],
+                ),
+            ))
             .into_any_element()
     }
 }
