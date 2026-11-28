@@ -65,6 +65,10 @@ pub enum TopBarUiAction {
     ToggleSidePanel,
     NewThread,
     SelectThread(Option<String>),
+    DeleteThread(String),
+    CloseOtherThreads(String),
+    CloseThreadsToRight(String),
+    ToggleThreadTabMenu(Option<String>),
     ToggleModelPicker,
     SelectModel {
         model_id: Option<String>,
@@ -533,6 +537,7 @@ pub fn render_stage_top_bar_with_group<V: 'static>(
             bot_activity_state,
             active_thread_id: None,
             thread_tabs: &[],
+            thread_tab_menu_id: None,
             active_model_label: "",
             active_thinking_effort: "",
             model_picker_open: false,
@@ -1658,6 +1663,7 @@ pub struct OpenBotHeaderProps<'a> {
     pub bot_activity_state: &'a str,
     pub active_thread_id: Option<&'a str>,
     pub thread_tabs: &'a [(String, String)],
+    pub thread_tab_menu_id: Option<&'a str>,
     pub active_model_label: &'a str,
     pub active_thinking_effort: &'a str,
     pub model_picker_open: bool,
@@ -2105,16 +2111,43 @@ pub fn render_openbot_conversation_header<V: 'static>(
         .child(title_tab);
 
     if layout.new_thread_btn_visible {
-        for (tid, tlabel) in props.thread_tabs.iter().take(4) {
+        let total_tabs = props.thread_tabs.len();
+        for (tab_idx, (tid, tlabel)) in props.thread_tabs.iter().enumerate() {
             let is_sel = props.active_thread_id == Some(tid.as_str());
-            let tid_owned = tid.clone();
+            let is_menu_open = props.thread_tab_menu_id == Some(tid.as_str());
+            let has_others = total_tabs > 1;
+            let has_right = tab_idx + 1 < total_tabs;
+            let tid_sel = tid.clone();
+            let tid_mid = tid.clone();
+            let tid_rclick = tid.clone();
+            let tid_close = tid.clone();
+            let tid_menu_close = tid.clone();
+            let tid_menu_others = tid.clone();
+            let tid_menu_right = tid.clone();
+            let tid_menu_del = tid.clone();
             let a_sel = on_action.clone();
+            let a_mid = on_action.clone();
+            let a_rclick = on_action.clone();
+            let a_close = on_action.clone();
+            let a_m_close = on_action.clone();
+            let a_m_others = on_action.clone();
+            let a_m_right = on_action.clone();
+            let a_m_del = on_action.clone();
             let tab_hover = ob.hover();
+            let close_hover = ob.bg_control_hover();
+            let surface_bg = ob.bg_surface();
+            let border_strong = ob.border_strong_hairline();
+            let danger_col = ob.danger();
+            let menu_hover = ob.bg_control_hover();
+            let text_pri = ob.text_primary();
+            let text_mut = ob.text_muted();
             let tab_el = div()
                 .id(SharedString::from(format!("hdr-thread-tab-{}", tid)))
+                .relative()
                 .h(px(if is_sel && layout.tab_shape_visible { 32.0 } else { 28.0 }))
-                .max_w(px(140.0))
-                .px(px(9.0))
+                .max_w(px(164.0))
+                .pl(px(9.0))
+                .pr(px(5.0))
                 .when(!is_sel || !layout.tab_shape_visible, |el| {
                     el.mb(px(4.0)).rounded(px(6.0)).hover(move |s| s.bg(tab_hover))
                 })
@@ -2130,11 +2163,31 @@ pub fn render_openbot_conversation_header<V: 'static>(
                 .cursor_pointer()
                 .flex()
                 .items_center()
+                .gap(px(4.0))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        a_sel(this, TopBarUiAction::SelectThread(Some(tid_owned.clone())), cx);
+                        a_sel(this, TopBarUiAction::SelectThread(Some(tid_sel.clone())), cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        a_mid(this, TopBarUiAction::DeleteThread(tid_mid.clone()), cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let next = if is_menu_open {
+                            None
+                        } else {
+                            Some(tid_rclick.clone())
+                        };
+                        a_rclick(this, TopBarUiAction::ToggleThreadTabMenu(next), cx);
                     }),
                 )
                 .child(
@@ -2145,9 +2198,159 @@ pub fn render_openbot_conversation_header<V: 'static>(
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .text_size(px(12.5))
-                        .text_color(if is_sel { ob.text_primary() } else { ob.text_muted() })
+                        .text_color(if is_sel { text_pri } else { text_mut })
                         .child(tlabel.clone()),
-                );
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("hdr-thread-tab-close-{}", tid)))
+                        .flex_shrink_0()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(move |s| s.bg(close_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                a_close(this, TopBarUiAction::DeleteThread(tid_close.clone()), cx);
+                            }),
+                        )
+                        .child(openbot_stage_icon(
+                            OpenBotStageIcon::Close,
+                            11.0,
+                            if is_sel { text_pri } else { text_mut },
+                        )),
+                )
+                .when(is_menu_open, |el| {
+                    el.child(
+                        deferred(
+                            div()
+                                .id(SharedString::from(format!("hdr-thread-tab-menu-{}", tid)))
+                                .absolute()
+                                .top(px(34.0))
+                                .left(px(0.0))
+                                .w(px(172.0))
+                                .p(px(4.0))
+                                .rounded(px(10.0))
+                                .bg(surface_bg)
+                                .border_1()
+                                .border_color(border_strong)
+                                .shadow(palette.popover_shadows())
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("hdr-thread-menu-close-{}", tid)))
+                                        .cursor_pointer()
+                                        .px(px(8.0))
+                                        .py(px(6.0))
+                                        .rounded(px(6.0))
+                                        .hover(move |s| s.bg(menu_hover))
+                                        .text_size(px(12.5))
+                                        .text_color(text_pri)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                a_m_close(
+                                                    this,
+                                                    TopBarUiAction::DeleteThread(tid_menu_close.clone()),
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(tr_str(lang_id, "关闭标签页", "Close tab")),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("hdr-thread-menu-others-{}", tid)))
+                                        .when(has_others, |r| {
+                                            r.cursor_pointer()
+                                                .hover(move |s| s.bg(menu_hover))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        a_m_others(
+                                                            this,
+                                                            TopBarUiAction::CloseOtherThreads(
+                                                                tid_menu_others.clone(),
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    }),
+                                                )
+                                        })
+                                        .px(px(8.0))
+                                        .py(px(6.0))
+                                        .rounded(px(6.0))
+                                        .text_size(px(12.5))
+                                        .text_color(if has_others { text_pri } else { text_mut })
+                                        .child(tr_str(lang_id, "关闭其他标签页", "Close other tabs")),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("hdr-thread-menu-right-{}", tid)))
+                                        .when(has_right, |r| {
+                                            r.cursor_pointer()
+                                                .hover(move |s| s.bg(menu_hover))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        a_m_right(
+                                                            this,
+                                                            TopBarUiAction::CloseThreadsToRight(
+                                                                tid_menu_right.clone(),
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    }),
+                                                )
+                                        })
+                                        .px(px(8.0))
+                                        .py(px(6.0))
+                                        .rounded(px(6.0))
+                                        .text_size(px(12.5))
+                                        .text_color(if has_right { text_pri } else { text_mut })
+                                        .child(tr_str(lang_id, "关闭右侧标签页", "Close tabs to the right")),
+                                )
+                                .child(div().h(px(1.0)).mx(px(4.0)).my(px(2.0)).bg(border_strong))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("hdr-thread-menu-delete-{}", tid)))
+                                        .cursor_pointer()
+                                        .px(px(8.0))
+                                        .py(px(6.0))
+                                        .rounded(px(6.0))
+                                        .hover(move |s| s.bg(menu_hover))
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(danger_col)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                a_m_del(
+                                                    this,
+                                                    TopBarUiAction::DeleteThread(tid_menu_del.clone()),
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(tr_str(lang_id, "删除对话", "Delete conversation")),
+                                ),
+                        )
+                        .with_priority(60),
+                    )
+                });
             heading_group = heading_group.child(tab_el);
         }
         let a_new_thread = on_action.clone();

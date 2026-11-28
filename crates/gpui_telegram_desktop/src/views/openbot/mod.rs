@@ -31,6 +31,7 @@ pub mod sidebar;
 pub mod steps_and_trace;
 pub mod ui_probe;
 pub mod workflow_canvas;
+pub mod workflow_interactive;
 pub mod workspace_shell;
 
 pub use agent_studio::{AgentSettingsState, FirstAgentSetupState, GlobalSearchState};
@@ -69,6 +70,10 @@ pub use ui_probe::{
     ALL_UI_PROBE_SCENARIOS, LiveFusionSnapshot, UiProbeError, evaluate_ui_probe,
 };
 pub use workflow_canvas::WorkflowCanvasState;
+pub use workflow_interactive::{
+    OPENBOT_WORKFLOW_TEMPLATES, WorkflowUiAction, build_openbot_template_graph,
+    hydrate_workflows_from_runtime,
+};
 pub use workspace_shell::{
     ActiveOpenBotTarget, DualSurfaceFusionSnapshot, LEGACY_GROK_AVATAR_SHAPES,
     OpenBotShellSummarySnapshot, OpenBotWorkspaceEvent, OpenBotWorkspaceShell,

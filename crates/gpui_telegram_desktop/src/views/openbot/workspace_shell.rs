@@ -78,7 +78,15 @@ use super::steps_and_trace::{
     AgentStepsState, SubagentDockState, TraceWaterfallState, render_agent_steps,
     render_subagent_dock, render_trace_waterfall_dialog,
 };
-use super::workflow_canvas::{WorkflowCanvasState, render_workflow_canvas};
+use super::workflow_canvas::{
+    WorkflowCanvasState, WorkflowInkTool, WorkflowSubToolPanel, WorkflowTextInputTarget,
+    render_workflow_canvas,
+};
+use super::workflow_interactive::{
+    WorkflowUiAction, apply_workflow_ui_action, handle_canvas_pointer_down,
+    handle_canvas_pointer_move, handle_canvas_pointer_up, handle_canvas_scroll_wheel,
+    handle_node_pointer_down, hydrate_workflows_from_runtime, render_workflow_canvas_interactive,
+};
 
 /// Exact canonical Telegram `Cmd+1..9` navigation destination labels preserved across dual-surface fusion.
 pub const TELEGRAM_CMD_1_TO_9_DESTINATIONS: [&str; 9] = [
@@ -331,6 +339,7 @@ pub struct OpenBotWorkspaceShell {
     /// When `true`, `AppShell` already provides the outer `52px` `PageRail` and workspace card frame,
     /// so `render_workspace_root()` suppresses its internal `page_rail` and `server_rail`.
     pub embedded_in_app_shell: bool,
+    workflow_runtime: Option<Arc<openbot_runtime::OpenBotHostRuntime>>,
     pending_page_select: Arc<Mutex<Option<OpenBotPage>>>,
 }
 
@@ -412,7 +421,112 @@ impl OpenBotWorkspaceShell {
             beam_wave: None,
             data_dir: None,
             embedded_in_app_shell: false,
+            workflow_runtime: None,
             pending_page_select: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Attaches a shared live `OpenBotHostRuntime` so the Workflows Studio shares the same
+    /// SQLite `openbot.db` connection as `AppShell` native bot fusion.
+    pub fn set_workflow_runtime(&mut self, runtime: Arc<openbot_runtime::OpenBotHostRuntime>) {
+        self.workflow_runtime = Some(runtime);
+    }
+
+    /// Lazily opens (or returns the cached) `OpenBotHostRuntime` backed by `<data_dir>/openbot.db`.
+    pub fn ensure_workflow_runtime(&mut self) -> Option<Arc<openbot_runtime::OpenBotHostRuntime>> {
+        if let Some(ref rt) = self.workflow_runtime {
+            return Some(Arc::clone(rt));
+        }
+        let dir = self.data_dir.as_deref()?;
+        match openbot_runtime::OpenBotHostRuntime::open(dir) {
+            Ok(rt) => {
+                self.workflow_runtime = Some(Arc::clone(&rt));
+                Some(rt)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Merges live host bots / OpenBot agents into the Workflows Studio Agent-node picker.
+    pub fn sync_workflow_agents(&mut self, agents: Vec<(String, String)>) {
+        let mut merged: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, name) in agents {
+            let trimmed_id = id.trim().to_string();
+            if trimmed_id.is_empty() || !seen.insert(trimmed_id.clone()) {
+                continue;
+            }
+            let display = if name.trim().is_empty() {
+                trimmed_id.clone()
+            } else {
+                name.trim().to_string()
+            };
+            merged.push((trimmed_id, display));
+        }
+        for a in &self.agents {
+            if !a.id.is_empty() && seen.insert(a.id.clone()) {
+                merged.push((a.id.clone(), a.name.clone()));
+            }
+        }
+        if let Some(rt) = self.workflow_runtime.as_ref() {
+            for a in rt.agents().list_agents() {
+                if !a.id.is_empty() && seen.insert(a.id.clone()) {
+                    merged.push((a.id, a.name));
+                }
+            }
+        }
+        self.workflow_canvas.available_agents = merged;
+    }
+
+    /// Hydrates `workflow_canvas` directly from live SQLite `openbot.db` + folders JSON.
+    /// Shows OpenBot's `WorkflowsEmpty` screen when 0 workflows exist instead of static sample data.
+    pub fn hydrate_workflows_live(&mut self) {
+        let prev_id = self.workflow_canvas.workflow_id.clone();
+        let was_hydrated = self.workflow_canvas.hydrated_from_store;
+        if let (Some(rt), Some(dir)) = (self.ensure_workflow_runtime(), self.data_dir.clone()) {
+            hydrate_workflows_from_runtime(&mut self.workflow_canvas, &rt, &dir);
+            if self.workflow_canvas.has_active_workflow
+                && !self.workflow_canvas.graph.nodes.is_empty()
+                && (!was_hydrated || self.workflow_canvas.workflow_id != prev_id)
+            {
+                self.workflow_canvas.fit_to_view(960.0, 560.0);
+            }
+        } else if !self.workflow_canvas.hydrated_from_store {
+            self.workflow_canvas = WorkflowCanvasState::empty_workspace();
+        }
+    }
+
+    /// Navigates to `OpenBotPage::Workflows` and ensures live SQLite workflows are hydrated.
+    pub fn open_workflows_page(&mut self) {
+        self.select_page(OpenBotPage::Workflows);
+        self.hydrate_workflows_live();
+    }
+
+    /// Executes an interactive Workflows Studio action against state + live SQLite persistence.
+    pub fn dispatch_workflow_action(&mut self, action: WorkflowUiAction) {
+        let rt = self.ensure_workflow_runtime();
+        let dir = self.data_dir.clone();
+        let lang = self.lang_id.clone();
+        apply_workflow_ui_action(
+            &mut self.workflow_canvas,
+            action,
+            rt.as_deref(),
+            dir.as_deref(),
+            &lang,
+        );
+    }
+
+    /// Clears whichever inline text field is currently focused inside the Workflows Studio.
+    pub fn clear_workflow_active_input(&mut self) {
+        match self.workflow_canvas.active_text_input {
+            WorkflowTextInputTarget::None => {}
+            WorkflowTextInputTarget::SearchNodes => {
+                self.workflow_canvas.search_query.clear();
+            }
+            _ => {
+                self.workflow_canvas.input_buffer.clear();
+                self.workflow_canvas.import_error = None;
+            }
         }
     }
 
@@ -614,6 +728,15 @@ impl OpenBotWorkspaceShell {
             .collect()
     }
 
+    /// Returns the currently focused inline text buffer inside the Workflows Studio (for IME/copy).
+    pub fn workflow_active_input_text(&self) -> &str {
+        match self.workflow_canvas.active_text_input {
+            WorkflowTextInputTarget::None => "",
+            WorkflowTextInputTarget::SearchNodes => &self.workflow_canvas.search_query,
+            _ => &self.workflow_canvas.input_buffer,
+        }
+    }
+
     /// Routes committed text / IME input into whichever OpenBot text surface currently holds focus.
     pub fn handle_text_input(&mut self, text: &str) {
         if text.is_empty() {
@@ -636,6 +759,63 @@ impl OpenBotWorkspaceShell {
             let mut next = self.conversation.search.query.clone();
             next.push_str(text);
             self.conversation.run_search(&next);
+            return;
+        }
+        if self.active_page == OpenBotPage::Workflows {
+            if self.workflow_canvas.has_active_text_input() {
+                if self.workflow_canvas.active_text_input == WorkflowTextInputTarget::SearchNodes {
+                    self.workflow_canvas.search_query.push_str(text);
+                } else {
+                    self.workflow_canvas.input_buffer.push_str(text);
+                    self.workflow_canvas.import_error = None;
+                }
+                return;
+            }
+            if self.workflow_canvas.has_active_workflow
+                && !self.workflow_canvas.import_dialog_open
+                && text.chars().count() == 1
+            {
+                match text {
+                    "v" | "V" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::SetTool(
+                            WorkflowInkTool::Select,
+                        ));
+                    }
+                    "h" | "H" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::SetTool(
+                            WorkflowInkTool::Pan,
+                        ));
+                    }
+                    "p" | "P" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::ToggleSubToolPanel(
+                            WorkflowSubToolPanel::Draw,
+                        ));
+                    }
+                    "n" | "N" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::ToggleSubToolPanel(
+                            WorkflowSubToolPanel::Note,
+                        ));
+                    }
+                    "r" | "R" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::ToggleSubToolPanel(
+                            WorkflowSubToolPanel::Shape,
+                        ));
+                    }
+                    "T" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::TidyLayout);
+                    }
+                    "!" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::FitToView);
+                    }
+                    "+" | "=" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::ZoomIn);
+                    }
+                    "-" => {
+                        self.dispatch_workflow_action(WorkflowUiAction::ZoomOut);
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
         if self.active_page == OpenBotPage::Agents
@@ -679,6 +859,21 @@ impl OpenBotWorkspaceShell {
             self.conversation.run_search(&next);
             return;
         }
+        if self.active_page == OpenBotPage::Workflows {
+            if self.workflow_canvas.has_active_text_input() {
+                if self.workflow_canvas.active_text_input == WorkflowTextInputTarget::SearchNodes {
+                    self.workflow_canvas.search_query.pop();
+                } else {
+                    self.workflow_canvas.input_buffer.pop();
+                    self.workflow_canvas.import_error = None;
+                }
+            } else if self.workflow_canvas.has_active_workflow
+                && !self.workflow_canvas.selected_node_ids.is_empty()
+            {
+                self.dispatch_workflow_action(WorkflowUiAction::DeleteSelected);
+            }
+            return;
+        }
         if self.active_page == OpenBotPage::Agents
             && self.agents.is_empty()
             && self.active_target == ActiveOpenBotTarget::None
@@ -692,7 +887,18 @@ impl OpenBotWorkspaceShell {
         self.sync_composer_picker_from_text();
     }
 
-    /// Handles Enter / Cmd+Enter across search, dialogs, and the main/channel composer.
+    /// Handles forward Delete key (e.g. removing selected workflow nodes on the canvas).
+    pub fn handle_delete(&mut self) {
+        if self.active_page == OpenBotPage::Workflows
+            && !self.workflow_canvas.has_active_text_input()
+            && self.workflow_canvas.has_active_workflow
+            && !self.workflow_canvas.selected_node_ids.is_empty()
+        {
+            self.dispatch_workflow_action(WorkflowUiAction::DeleteSelected);
+        }
+    }
+
+    /// Handles Enter / Cmd+Enter across search, dialogs, Workflows Studio, and the main/channel composer.
     pub fn handle_enter(&mut self, cmd_or_ctrl: bool) {
         if self.global_search.open {
             self.global_search.flush_debounce();
@@ -701,6 +907,24 @@ impl OpenBotWorkspaceShell {
         }
         if self.conversation.search.open {
             self.conversation.next_search_match();
+            return;
+        }
+        if self.active_page == OpenBotPage::Workflows {
+            if cmd_or_ctrl {
+                if self.workflow_canvas.has_active_workflow {
+                    self.dispatch_workflow_action(WorkflowUiAction::RunWorkflow {
+                        from_node_id: None,
+                    });
+                }
+                return;
+            }
+            if self.workflow_canvas.has_active_text_input() {
+                if self.workflow_canvas.active_text_input == WorkflowTextInputTarget::ImportJson {
+                    self.workflow_canvas.input_buffer.push('\n');
+                } else {
+                    self.dispatch_workflow_action(WorkflowUiAction::CommitTextInput);
+                }
+            }
             return;
         }
         if self.composer.active_trigger.is_some() {
@@ -757,6 +981,27 @@ impl OpenBotWorkspaceShell {
             self.show_server_settings = false;
         } else if self.show_trace_dialog {
             self.show_trace_dialog = false;
+        } else if self.active_page == OpenBotPage::Workflows {
+            if self.workflow_canvas.has_active_text_input() {
+                self.dispatch_workflow_action(WorkflowUiAction::CancelTextInput);
+            } else if self.workflow_canvas.import_dialog_open {
+                self.dispatch_workflow_action(WorkflowUiAction::CloseImportDialog);
+            } else if self.workflow_canvas.search_open {
+                self.dispatch_workflow_action(WorkflowUiAction::ToggleSearch);
+            } else if self.workflow_canvas.connecting_from.is_some() {
+                self.dispatch_workflow_action(WorkflowUiAction::CancelConnect);
+            } else if self.workflow_canvas.switcher_open
+                || self.workflow_canvas.add_menu_open
+                || self.workflow_canvas.runs_menu_open
+                || self.workflow_canvas.zoom_menu_open
+                || self.workflow_canvas.sub_tool_panel != WorkflowSubToolPanel::None
+            {
+                self.workflow_canvas.close_transient_menus();
+            } else if self.workflow_canvas.preview_version_id.is_some() {
+                self.dispatch_workflow_action(WorkflowUiAction::CloseVersionPreview);
+            } else if !self.workflow_canvas.selected_node_ids.is_empty() {
+                self.dispatch_workflow_action(WorkflowUiAction::ClearSelection);
+            }
         } else if self.composer.active_trigger.is_some() {
             self.composer.close_picker();
         } else if self.conversation.search.open {
@@ -781,6 +1026,32 @@ impl OpenBotWorkspaceShell {
         } else {
             chord.ctrl && !chord.meta
         };
+        if self.active_page == OpenBotPage::Workflows && primary_mod && !chord.alt {
+            if chord.code.eq_ignore_ascii_case("KeyZ") {
+                if chord.shift {
+                    self.dispatch_workflow_action(WorkflowUiAction::Redo);
+                } else {
+                    self.dispatch_workflow_action(WorkflowUiAction::Undo);
+                }
+                return true;
+            }
+            if !chord.shift && chord.code.eq_ignore_ascii_case("KeyY") {
+                self.dispatch_workflow_action(WorkflowUiAction::Redo);
+                return true;
+            }
+            if !chord.shift && chord.code.eq_ignore_ascii_case("KeyF") {
+                self.dispatch_workflow_action(WorkflowUiAction::ToggleSearch);
+                return true;
+            }
+            if !chord.shift && chord.code.eq_ignore_ascii_case("Equal") {
+                self.dispatch_workflow_action(WorkflowUiAction::ZoomIn);
+                return true;
+            }
+            if !chord.shift && chord.code.eq_ignore_ascii_case("Minus") {
+                self.dispatch_workflow_action(WorkflowUiAction::ZoomOut);
+                return true;
+            }
+        }
         if primary_mod && !chord.alt && !chord.shift && chord.code.eq_ignore_ascii_case("Comma") {
             self.select_page(OpenBotPage::Settings);
             return true;
@@ -1254,6 +1525,53 @@ impl OpenBotWorkspaceShell {
         cx.notify();
     }
 
+    fn apply_workflow_ui_action_cx(&mut self, action: WorkflowUiAction, cx: &mut Context<Self>) {
+        self.dispatch_workflow_action(action);
+        cx.notify();
+    }
+
+    fn workflow_canvas_pointer_down(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        handle_canvas_pointer_down(&mut self.workflow_canvas, x, y);
+        cx.notify();
+    }
+
+    fn workflow_node_pointer_down(
+        &mut self,
+        node_id: String,
+        additive: bool,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        handle_node_pointer_down(&mut self.workflow_canvas, &node_id, additive, x, y);
+        cx.notify();
+    }
+
+    fn workflow_canvas_pointer_move(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if handle_canvas_pointer_move(&mut self.workflow_canvas, x, y) {
+            cx.notify();
+        }
+    }
+
+    fn workflow_canvas_pointer_up(&mut self, cx: &mut Context<Self>) {
+        let rt = self.ensure_workflow_runtime();
+        let lang = self.lang_id.clone();
+        if handle_canvas_pointer_up(&mut self.workflow_canvas, rt.as_deref(), &lang) {
+            cx.notify();
+        }
+    }
+
+    fn workflow_canvas_scroll_wheel(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        is_zoom_gesture: bool,
+        cx: &mut Context<Self>,
+    ) {
+        handle_canvas_scroll_wheel(&mut self.workflow_canvas, dx, dy, is_zoom_gesture);
+        cx.notify();
+    }
+
     fn render_main_surface(&self, cx: Option<&mut Context<Self>>) -> Div {
         match self.active_page {
             OpenBotPage::Agents => match &self.active_target {
@@ -1276,7 +1594,27 @@ impl OpenBotWorkspaceShell {
                 }
             },
             OpenBotPage::Workflows => {
-                render_workflow_canvas(&self.workflow_canvas, &self.palette, self.now_sec)
+                if let Some(cx) = cx {
+                    render_workflow_canvas_interactive(
+                        &self.workflow_canvas,
+                        &self.palette,
+                        &self.lang_id,
+                        self.now_sec,
+                        cx,
+                        |this, act, cx| this.apply_workflow_ui_action_cx(act, cx),
+                        |this, x, y, cx| this.workflow_canvas_pointer_down(x, y, cx),
+                        |this, node_id, additive, x, y, cx| {
+                            this.workflow_node_pointer_down(node_id, additive, x, y, cx);
+                        },
+                        |this, x, y, cx| this.workflow_canvas_pointer_move(x, y, cx),
+                        |this, cx| this.workflow_canvas_pointer_up(cx),
+                        |this, dx, dy, is_zoom, cx| {
+                            this.workflow_canvas_scroll_wheel(dx, dy, is_zoom, cx);
+                        },
+                    )
+                } else {
+                    render_workflow_canvas(&self.workflow_canvas, &self.palette, self.now_sec)
+                }
             }
             OpenBotPage::Tasks => {
                 render_tasks_panel(&self.tasks_panel, &self.palette, self.now_sec)

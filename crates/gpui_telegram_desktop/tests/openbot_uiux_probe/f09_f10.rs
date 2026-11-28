@@ -56,7 +56,7 @@ pub fn default_header_props<'a>(tabs: &'a [(String, String)]) -> OpenBotHeaderPr
         chat_id: Some(1001), title: "OpenBot Assistant", subtitle: "Ready", initials: "OB",
         avatar_url: None, active_fabushi_bot: None, is_bot_chat: true, is_group_chat: false,
         group_member_tiles: None, group_member_briefs: &[], bot_activity_state: "idle",
-        active_thread_id: None, thread_tabs: tabs, active_model_label: "Claude 4.5",
+        active_thread_id: None, thread_tabs: tabs, thread_tab_menu_id: None, active_model_label: "Claude 4.5",
         active_thinking_effort: "High", model_picker_open: false, pinned_count: 2,
         pinned_popover_open: true, search_open: false, more_menu_open: false,
         side_panel_open: false, right_panel_slot_open: false, external_hosted: true,

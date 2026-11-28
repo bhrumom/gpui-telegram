@@ -28,6 +28,10 @@ fn map_shell_key_to_openbot_code(key_lower: &str) -> Option<&'static str> {
         "]" => Some("BracketRight"),
         "n" => Some("KeyN"),
         "t" => Some("KeyT"),
+        "z" => Some("KeyZ"),
+        "y" => Some("KeyY"),
+        "=" | "+" => Some("Equal"),
+        "-" => Some("Minus"),
         _ => None,
     }
 }

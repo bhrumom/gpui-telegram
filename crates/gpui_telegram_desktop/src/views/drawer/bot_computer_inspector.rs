@@ -5945,14 +5945,12 @@ pub fn render_openbot_bot_subpage(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         this.pending_openbot_action = Some(
-                                            OpenBotInspectorAction::OpenSidePanelPane(
-                                                SidePanelPaneKind::Threads,
-                                            ),
+                                            OpenBotInspectorAction::OpenWorkflowsPage,
                                         );
                                         cx.notify();
                                     }),
                                 )
-                                .child(tr_str(lang, "在话题中打开", "Open in Threads")),
+                                .child(tr_str(lang, "打开工作流画布", "Open Workflows")),
                         ),
                 )
                 .into_any_element()

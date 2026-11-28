@@ -140,6 +140,7 @@ define_icons! {
         SparkleAlgo => "community_algo_spark.svg",
         CommunityAward => "community_award.svg",
         CommunityThread => "community_thread.svg",
+        WorkflowWaypoints => "workflow_waypoints.svg",
     }
 }
 

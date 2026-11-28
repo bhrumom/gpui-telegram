@@ -1555,17 +1555,22 @@ impl AppShell {
                     .collect();
                 (sc.balance_stars as i64, sc.ton_balance, ledger)
             });
+        let shared_runtime = self.ensure_native_openbot_runtime();
         let created = cx.new(|_| {
             let mut ws = OpenBotWorkspaceShell::with_data_dir(&data_dir);
             ws.set_embedded_in_app_shell(true);
             ws.sync_color_scheme(scheme);
             ws.sync_locale(&lang);
             ws.set_window_width(width_px);
+            if let Some(rt) = shared_runtime {
+                ws.set_workflow_runtime(rt);
+            }
             if data_dir.join("openbot.db").is_file() {
                 if let Ok(bridge) = OpenBotRuntimeBridge::open(&data_dir) {
                     let _ = bridge.hydrate_workspace_shell(&mut ws);
                 }
             }
+            ws.hydrate_workflows_live();
             if let Some((stars, ton, ledger)) = cached_wallet {
                 ws.sync_wallet_credits(stars, ton, 0, ledger);
             }
@@ -4000,6 +4005,7 @@ impl Render for AppShell {
                                                         st.pending_model_badge.clone(),
                                                         st.reduced_motion,
                                                         st.window_glass,
+                                                        st.thread_tab_menu_id.clone(),
                                                     ),
                                                 )
                                             };
@@ -4019,6 +4025,7 @@ impl Render for AppShell {
                                                 bot_activity_state: &st_snap.10,
                                                 active_thread_id: st_snap.11.as_deref(),
                                                 thread_tabs: &st_snap.12,
+                                                thread_tab_menu_id: st_extra.6.as_deref(),
                                                 active_model_label: &st_snap.13,
                                                 active_thinking_effort: &st_snap.14,
                                                 model_picker_open: st_snap.15,
@@ -4899,6 +4906,17 @@ impl AppShell {
                                 rcx.notify();
                             }
                         });
+                        if *hovered
+                            && sec == crate::views::apple_sidebar::AppleSidebarSection::Workflows
+                        {
+                            let ws = this.ensure_openbot_workspace(cx);
+                            ws.update(cx, |w, _| {
+                                w.shell.page_rail.hover_workflows();
+                                if !w.workflow_canvas.hydrated_from_store {
+                                    w.hydrate_workflows_live();
+                                }
+                            });
+                        }
                         cx.notify();
                     }))
                     .on_mouse_down(

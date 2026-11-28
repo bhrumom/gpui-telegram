@@ -429,6 +429,7 @@ impl ChannelBrowserAccess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenBotInspectorAction {
     OpenSidePanelPane(crate::views::openbot::side_panel::SidePanelPaneKind),
+    OpenWorkflowsPage,
     OpenPublishedCreation {
         creation_id: String,
         kind_code: &'static str,

@@ -596,16 +596,19 @@ impl OpenBotRuntimeBridge {
             }
         }
 
-        if let Ok(workflows) = self.runtime.workflows().list_workflows() {
-            if let Some(first) = workflows.first() {
-                if let Ok(Some(detail)) = self.runtime.workflows().get_workflow(&first.id) {
-                    shell.workflow_canvas.workflow_id = detail.summary.id;
-                    shell.workflow_canvas.title = detail.summary.title;
-                    shell.workflow_canvas.revision = detail.revision;
-                    shell.workflow_canvas.graph = detail.graph;
-                }
-            }
-        }
+        shell.set_workflow_runtime(std::sync::Arc::clone(&self.runtime));
+        shell.sync_workflow_agents(
+            shell
+                .agents
+                .iter()
+                .map(|a| (a.id.clone(), a.name.clone()))
+                .collect(),
+        );
+        super::workflow_interactive::hydrate_workflows_from_runtime(
+            &mut shell.workflow_canvas,
+            &self.runtime,
+            &self.data_dir,
+        );
 
         let mut calendar_items: Vec<RoutineCalendarItem> = Vec::new();
         for agent in &raw_agents {

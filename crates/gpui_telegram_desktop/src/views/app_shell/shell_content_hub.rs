@@ -557,6 +557,7 @@ impl AppShell {
         }
         match section {
             AppleSidebarSection::Chats => {
+                let leaving_openbot = self.active_panel == ActiveWorkspacePanel::OpenBot;
                 self.leave_workspace_modal_panel_for_hub(cx);
                 self.dismiss_transient_popovers_for_hub(cx);
                 self.active_panel = ActiveWorkspacePanel::Chats;
@@ -579,6 +580,9 @@ impl AppShell {
                     && !self.is_compose_or_creation_modal_active(cx)
                 {
                     self.exit_compose_or_modal_isolation(true, cx);
+                }
+                if leaving_openbot {
+                    self.refresh_active_bot_fusion_snapshot(cx);
                 }
                 cx.notify();
             }
@@ -620,9 +624,19 @@ impl AppShell {
                 };
                 self.leave_workspace_modal_panel_for_hub(cx);
                 self.dismiss_transient_popovers_for_hub(cx);
+                let live_agents = self.collect_workflow_agent_options(cx);
+                let shared_rt = self.ensure_native_openbot_runtime();
                 let ws = self.open_openbot_workspace(cx);
                 ws.update(cx, |w, wcx| {
-                    w.select_page(page);
+                    if let Some(rt) = shared_rt {
+                        w.set_workflow_runtime(rt);
+                    }
+                    if section == AppleSidebarSection::Workflows {
+                        w.sync_workflow_agents(live_agents);
+                        w.open_workflows_page();
+                    } else {
+                        w.select_page(page);
+                    }
                     wcx.notify();
                 });
                 if section == AppleSidebarSection::Usage && !ws.read(cx).usage_credits.is_loading {
@@ -996,7 +1010,54 @@ impl AppShell {
                 };
                 self.handle_main_menu_command(cmd, cx);
             }
+            AppleSidebarEvent::PreloadWorkflows => {
+                let live_agents = self.collect_workflow_agent_options(cx);
+                let shared_rt = self.ensure_native_openbot_runtime();
+                let ws = self.ensure_openbot_workspace(cx);
+                ws.update(cx, |w, _| {
+                    w.shell.page_rail.hover_workflows();
+                    if let Some(rt) = shared_rt {
+                        w.set_workflow_runtime(rt);
+                    }
+                    w.sync_workflow_agents(live_agents);
+                    if !w.workflow_canvas.hydrated_from_store {
+                        w.hydrate_workflows_live();
+                    }
+                });
+            }
         }
+    }
+
+    /// Collects live OpenBot agents and active Fabushi bots for Workflows Studio Agent-node selection.
+    pub(crate) fn collect_workflow_agent_options(&mut self, cx: &gpui::App) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(fab) = self
+            .stage
+            .read(cx)
+            .active_fabushi_bot
+            .as_ref()
+            .or_else(|| self.inspector.read(cx).active_fabushi_bot.as_ref())
+        {
+            if let Some(openbot_id) = self.bot_fusion.agent_map.get(fab.agent_id.trim()) {
+                if seen.insert(openbot_id.clone()) {
+                    let name = if fab.display_name.trim().is_empty() {
+                        fab.agent_id.clone()
+                    } else {
+                        fab.display_name.clone()
+                    };
+                    out.push((openbot_id.clone(), name));
+                }
+            }
+        }
+        if let Some(rt) = self.ensure_native_openbot_runtime() {
+            for agent in rt.agents().list_agents() {
+                if !agent.id.is_empty() && seen.insert(agent.id.clone()) {
+                    out.push((agent.id, agent.name));
+                }
+            }
+        }
+        out
     }
 
     /// Handles events emitted by `ContentHubWorkspace`.

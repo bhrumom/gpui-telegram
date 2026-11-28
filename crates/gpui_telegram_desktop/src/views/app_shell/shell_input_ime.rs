@@ -761,6 +761,8 @@ impl AppShell {
                             w.channel_editor.name.clone()
                         } else if w.conversation.search.open {
                             w.conversation.search.query.clone()
+                        } else if w.active_page == crate::views::openbot::OpenBotPage::Workflows {
+                            w.workflow_active_input_text().to_string()
                         } else if w.active_page == crate::views::openbot::OpenBotPage::Agents
                             && w.agents.is_empty()
                             && w.active_target == crate::views::openbot::ActiveOpenBotTarget::None
@@ -915,6 +917,8 @@ impl AppShell {
                             w.channel_editor.set_name(String::new());
                         } else if w.conversation.search.open {
                             w.conversation.run_search("");
+                        } else if w.active_page == crate::views::openbot::OpenBotPage::Workflows {
+                            w.clear_workflow_active_input();
                         } else if w.active_page == crate::views::openbot::OpenBotPage::Agents
                             && w.agents.is_empty()
                             && w.active_target == crate::views::openbot::ActiveOpenBotTarget::None
@@ -2642,6 +2646,13 @@ impl AppShell {
                         "backspace" => {
                             ws.update(cx, |w, wcx| {
                                 w.handle_backspace();
+                                wcx.notify();
+                            });
+                            true
+                        }
+                        "delete" => {
+                            ws.update(cx, |w, wcx| {
+                                w.handle_delete();
                                 wcx.notify();
                             });
                             true

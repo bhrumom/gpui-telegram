@@ -448,6 +448,10 @@ pub enum StageAction {
     OpenContactProfile,
     ToggleSidePanel,
     NewThread,
+    DeleteThread {
+        thread_id: String,
+        label: String,
+    },
     SelectModel {
         model_id: Option<String>,
         thinking_level: Option<String>,
@@ -702,6 +706,8 @@ pub struct ConversationStage {
     pub model_picker: crate::components::openbot_model_picker::OpenBotModelPickerState,
     pub active_thread_id: Option<String>,
     pub thread_tabs: Vec<(String, String)>,
+    pub thread_tab_seq: u64,
+    pub thread_tab_menu_id: Option<String>,
     pub active_model_label: String,
     pub active_thinking_effort: String,
     pub available_models: Vec<String>,
@@ -863,6 +869,8 @@ impl ConversationStage {
             model_picker: crate::components::openbot_model_picker::OpenBotModelPickerState::default(),
             active_thread_id: None,
             thread_tabs: Vec::new(),
+            thread_tab_seq: 0,
+            thread_tab_menu_id: None,
             active_model_label: String::new(),
             active_thinking_effort: String::new(),
             available_models: Vec::new(),
@@ -912,12 +920,81 @@ impl ConversationStage {
         }
     }
 
+    /// Returns the next monotonic display index (`1, 2, 3, ...`) for a new conversation tab,
+    /// avoiding duplicate IDs or labels after earlier tabs are deleted.
+    pub fn next_thread_tab_number(&self) -> usize {
+        let max_existing = self
+            .thread_tabs
+            .iter()
+            .filter_map(|(tid, _)| tid.strip_prefix("thread-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        (self.thread_tab_seq.max(max_existing) + 1) as usize
+    }
+
     /// Appends a new thread tab to the conversation header and focuses it (`UI-F09-04`).
     pub fn append_and_focus_thread_tab(&mut self, title: impl Into<String>) -> String {
-        let tid = format!("thread-{}", self.thread_tabs.len() + 1);
+        let next_num = self.next_thread_tab_number();
+        self.thread_tab_seq = next_num as u64;
+        let tid = format!("thread-{next_num}");
         self.thread_tabs.push((tid.clone(), title.into()));
         self.active_thread_id = Some(tid.clone());
+        self.thread_tab_menu_id = None;
         tid
+    }
+
+    /// Deletes a side-thread / new-conversation tab by `thread_id` and smoothly shifts focus
+    /// to an adjacent tab or back to the main conversation (`active_thread_id = None`).
+    pub fn remove_thread_tab(&mut self, thread_id: &str) -> Option<(String, String)> {
+        let pos = self
+            .thread_tabs
+            .iter()
+            .position(|(tid, _)| tid == thread_id)?;
+        let removed = self.thread_tabs.remove(pos);
+        if self.thread_tab_menu_id.as_deref() == Some(thread_id) {
+            self.thread_tab_menu_id = None;
+        }
+        if self.active_thread_id.as_deref() == Some(thread_id) {
+            self.active_thread_id = if self.thread_tabs.is_empty() {
+                None
+            } else if pos > 0 {
+                self.thread_tabs.get(pos - 1).map(|(tid, _)| tid.clone())
+            } else {
+                self.thread_tabs.first().map(|(tid, _)| tid.clone())
+            };
+        }
+        Some(removed)
+    }
+
+    /// Deletes all side-thread tabs other than `keep_thread_id` (matching OpenBot `Close others`).
+    pub fn remove_other_thread_tabs(&mut self, keep_thread_id: &str) -> usize {
+        let before = self.thread_tabs.len();
+        self.thread_tabs.retain(|(tid, _)| tid == keep_thread_id);
+        let removed = before.saturating_sub(self.thread_tabs.len());
+        self.thread_tab_menu_id = None;
+        if let Some(ref cur) = self.active_thread_id {
+            if !self.thread_tabs.iter().any(|(tid, _)| tid == cur) {
+                self.active_thread_id = self.thread_tabs.first().map(|(tid, _)| tid.clone());
+            }
+        }
+        removed
+    }
+
+    /// Deletes all side-thread tabs positioned to the right of `thread_id`.
+    pub fn remove_thread_tabs_to_right(&mut self, thread_id: &str) -> usize {
+        let Some(pos) = self.thread_tabs.iter().position(|(tid, _)| tid == thread_id) else {
+            return 0;
+        };
+        let keep_len = pos + 1;
+        let removed = self.thread_tabs.len().saturating_sub(keep_len);
+        self.thread_tabs.truncate(keep_len);
+        self.thread_tab_menu_id = None;
+        if let Some(ref cur) = self.active_thread_id {
+            if !self.thread_tabs.iter().any(|(tid, _)| tid == cur) {
+                self.active_thread_id = Some(thread_id.to_string());
+            }
+        }
+        removed
     }
 
     pub fn take_stage_action(&mut self) -> Option<StageAction> {
@@ -1351,6 +1428,8 @@ impl ConversationStage {
         self.clear_model_picker_state();
         self.active_thread_id = None;
         self.thread_tabs.clear();
+        self.thread_tab_seq = 0;
+        self.thread_tab_menu_id = None;
         self.scroll_rail_hovered = false;
         self.scroll_rail_hovered_turn_idx = None;
         self.chat_custom_colors.clear();
@@ -1536,6 +1615,8 @@ impl ConversationStage {
             self.permission_dock.sync_requests(Vec::new());
             self.active_thread_id = None;
             self.thread_tabs.clear();
+            self.thread_tab_seq = 0;
+            self.thread_tab_menu_id = None;
             self.expanded_error_msg_ids.clear();
             self.expanded_steps_msg_ids.clear();
             self.expanded_long_msg_ids.clear();
@@ -2178,6 +2259,7 @@ impl Render for ConversationStage {
                     bot_activity_state: &self.bot_activity_state,
                     active_thread_id: self.active_thread_id.as_deref(),
                     thread_tabs: &self.thread_tabs,
+                    thread_tab_menu_id: self.thread_tab_menu_id.as_deref(),
                     active_model_label: &self.active_model_label,
                     active_thinking_effort: &self.active_thinking_effort,
                     model_picker_open: self.model_picker_open,

@@ -30,7 +30,7 @@ fn pal(palette: &OpenBotPalette, token: &str, fallback: u32) -> Rgba {
 pub const fn page_rail_icon(page: OpenBotPage) -> IconName {
     match page {
         OpenBotPage::Agents => IconName::BotRobot,
-        OpenBotPage::Workflows => IconName::TerminalMcp,
+        OpenBotPage::Workflows => IconName::WorkflowWaypoints,
         OpenBotPage::Tasks => IconName::SelectCheck,
         OpenBotPage::Schedule => IconName::ClockSending,
         OpenBotPage::Usage => IconName::Poll,

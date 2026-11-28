@@ -178,6 +178,93 @@ pub struct WorkflowHudRun {
     pub steps: Vec<WorkflowHudStep>,
 }
 
+/// User-created workflow organization folder persisted in `<data_dir>/workflow-folders.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowFolderItem {
+    pub id: String,
+    pub name: String,
+}
+
+/// Summary of a past workflow execution loaded from SQLite `WorkflowRunStore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPastRunSummary {
+    pub run_id: String,
+    pub number: u64,
+    pub status: WorkflowRunStatus,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub steps: Vec<WorkflowHudStep>,
+}
+
+/// Active inline text input target inside the interactive Workflows studio.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkflowTextInputTarget {
+    #[default]
+    None,
+    RenameWorkflow,
+    NewFolder,
+    RenameFolder {
+        folder_id: String,
+    },
+    SearchNodes,
+    EditNodeField {
+        node_id: String,
+        field_key: String,
+    },
+    ImportJson,
+}
+
+/// Active floating sub-toolbar above the bottom tool dock (`wfn-hud-sub`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowSubToolPanel {
+    #[default]
+    None,
+    Draw,
+    Note,
+    Shape,
+}
+
+/// Pending edge-wiring origin when connecting a node's output port to a target input port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPortConnectStart {
+    pub from_node_id: String,
+    pub port_type: WorkflowPortType,
+    pub branch: Option<WorkflowBranch>,
+}
+
+/// Snapshot kept briefly after deleting a workflow so `WorkflowDeleteUndoToast` can restore it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedWorkflowUndo {
+    pub title: String,
+    pub graph: WorkflowGraph,
+    pub paused: bool,
+    pub folder_id: Option<String>,
+}
+
+/// Pointer drag mode tracked during active mouse drag on the workflow canvas.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowPointerDrag {
+    PanCanvas {
+        last_x: f32,
+        last_y: f32,
+    },
+    MoveNode {
+        node_id: String,
+        last_x: f32,
+        last_y: f32,
+        moved: bool,
+    },
+    DrawStroke {
+        stroke_id: String,
+    },
+}
+
 /// Complete interactive pan/zoom workflow DAG state controller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,6 +291,77 @@ pub struct WorkflowCanvasState {
     pub active_tool: WorkflowInkTool,
     pub tidy_applied: bool,
     pub reduced_motion: bool,
+    // --- OpenBot 1:1 Interactive Workflows Studio State ---
+    #[serde(default)]
+    pub has_active_workflow: bool,
+    #[serde(default)]
+    pub hydrated_from_store: bool,
+    #[serde(default)]
+    pub library: Vec<openbot_contracts::workflows::WorkflowSummary>,
+    #[serde(default)]
+    pub open_tab_ids: Vec<String>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub folders: Vec<WorkflowFolderItem>,
+    #[serde(default)]
+    pub folder_placement: BTreeMap<String, String>,
+    #[serde(default)]
+    pub past_runs: Vec<WorkflowPastRunSummary>,
+    #[serde(default)]
+    pub viewing_run_number: Option<u64>,
+    #[serde(default)]
+    pub preview_version_id: Option<String>,
+    #[serde(default)]
+    pub preview_graph: Option<WorkflowGraph>,
+    #[serde(default)]
+    pub switcher_open: bool,
+    #[serde(default)]
+    pub switcher_expanded_folder: Option<String>,
+    #[serde(default)]
+    pub switcher_move_open: bool,
+    #[serde(default)]
+    pub switcher_versions_open: bool,
+    #[serde(default)]
+    pub runs_menu_open: bool,
+    #[serde(default)]
+    pub add_menu_open: bool,
+    #[serde(default)]
+    pub search_open: bool,
+    #[serde(default)]
+    pub search_query: String,
+    #[serde(default)]
+    pub sub_tool_panel: WorkflowSubToolPanel,
+    #[serde(default)]
+    pub ink_color_hex: String,
+    #[serde(default)]
+    pub note_tone_hex: String,
+    #[serde(default)]
+    pub shape_kind: String,
+    #[serde(default)]
+    pub shape_fill_hex: String,
+    #[serde(default)]
+    pub active_text_input: WorkflowTextInputTarget,
+    #[serde(default)]
+    pub input_buffer: String,
+    #[serde(default)]
+    pub connecting_from: Option<WorkflowPortConnectStart>,
+    #[serde(default)]
+    pub dismissed_starter_for: Option<String>,
+    #[serde(default)]
+    pub deleted_undo: Option<DeletedWorkflowUndo>,
+    #[serde(default)]
+    pub status_toast: Option<String>,
+    #[serde(default)]
+    pub import_dialog_open: bool,
+    #[serde(default)]
+    pub import_error: Option<String>,
+    #[serde(default)]
+    pub available_agents: Vec<(String, String)>,
+    #[serde(default)]
+    pub pending_approval: Option<(String, String)>,
+    #[serde(skip)]
+    pub pointer_drag: Option<WorkflowPointerDrag>,
 }
 
 impl Default for WorkflowCanvasState {
@@ -243,7 +401,80 @@ impl WorkflowCanvasState {
             active_tool: WorkflowInkTool::Select,
             tidy_applied: false,
             reduced_motion: false,
+            has_active_workflow: true,
+            hydrated_from_store: false,
+            library: Vec::new(),
+            open_tab_ids: Vec::new(),
+            paused: false,
+            folders: Vec::new(),
+            folder_placement: BTreeMap::new(),
+            past_runs: Vec::new(),
+            viewing_run_number: None,
+            preview_version_id: None,
+            preview_graph: None,
+            switcher_open: false,
+            switcher_expanded_folder: None,
+            switcher_move_open: false,
+            switcher_versions_open: false,
+            runs_menu_open: false,
+            add_menu_open: false,
+            search_open: false,
+            search_query: String::new(),
+            sub_tool_panel: WorkflowSubToolPanel::None,
+            ink_color_hex: "#42a0ff".to_string(),
+            note_tone_hex: "#e5a50a".to_string(),
+            shape_kind: "rect".to_string(),
+            shape_fill_hex: "#8688ff".to_string(),
+            active_text_input: WorkflowTextInputTarget::None,
+            input_buffer: String::new(),
+            connecting_from: None,
+            dismissed_starter_for: None,
+            deleted_undo: None,
+            status_toast: None,
+            import_dialog_open: false,
+            import_error: None,
+            available_agents: Vec::new(),
+            pending_approval: None,
+            pointer_drag: None,
         }
+    }
+
+    /// Creates an empty zero-workflow studio state matching OpenBot's `WorkflowsEmpty` screen.
+    pub fn empty_workspace() -> Self {
+        let mut s = Self::new("");
+        s.workflow_id.clear();
+        s.has_active_workflow = false;
+        s.versions.clear();
+        s
+    }
+
+    /// Returns `true` when any workflow inline text input (rename, folder, search, node edit, import) holds focus.
+    pub fn has_active_text_input(&self) -> bool {
+        !matches!(self.active_text_input, WorkflowTextInputTarget::None)
+    }
+
+    /// Closes all floating popovers (switcher, add menu, zoom menu, runs menu, sub-toolbars).
+    pub fn close_transient_menus(&mut self) {
+        self.switcher_open = false;
+        self.switcher_move_open = false;
+        self.switcher_versions_open = false;
+        self.runs_menu_open = false;
+        self.add_menu_open = false;
+        self.zoom_menu_open = false;
+    }
+
+    /// Returns the graph currently visible on canvas (historical version preview or live graph).
+    pub fn display_graph(&self) -> &WorkflowGraph {
+        self.preview_graph.as_ref().unwrap_or(&self.graph)
+    }
+
+    /// Returns `true` when the active workflow has 0 nodes and the OpenBot `WorkflowStart` template picker should display.
+    pub fn showing_start_templates(&self) -> bool {
+        self.has_active_workflow
+            && self.preview_version_id.is_none()
+            && self.graph.nodes.is_empty()
+            && self.graph.strokes.is_empty()
+            && self.dismissed_starter_for.as_deref() != Some(self.workflow_id.as_str())
     }
 
     /// Creates a representative 5-node workflow graph with trigger, agent, condition, approval, and output.
@@ -815,7 +1046,7 @@ pub fn parse_workflow_graph_json(graph_json: &serde_json::Value) -> Result<Workf
     serde_json::from_value(normalized).map_err(|e| format!("invalid workflow graph JSON: {e}"))
 }
 
-fn node_dimensions(node: &WorkflowNode) -> (f32, f32) {
+pub(crate) fn node_dimensions(node: &WorkflowNode) -> (f32, f32) {
     let default_h = match node.kind {
         WorkflowNodeKind::Note | WorkflowNodeKind::Text => 96.0,
         WorkflowNodeKind::Shape => 112.0,
@@ -835,11 +1066,11 @@ fn node_dimensions(node: &WorkflowNode) -> (f32, f32) {
     (w, h)
 }
 
-fn pal_rgba(palette: &OpenBotPalette, key: &str, fallback_hex: u32) -> Rgba {
+pub(crate) fn pal_rgba(palette: &OpenBotPalette, key: &str, fallback_hex: u32) -> Rgba {
     palette.rgba(key).unwrap_or_else(|| rgb(fallback_hex))
 }
 
-fn parse_hex_rgb(hex: &str, fallback: u32) -> Rgba {
+pub(crate) fn parse_hex_rgb(hex: &str, fallback: u32) -> Rgba {
     let trimmed = hex.trim().trim_start_matches('#');
     if trimmed.len() == 6 {
         if let Ok(val) = u32::from_str_radix(trimmed, 16) {
@@ -849,7 +1080,7 @@ fn parse_hex_rgb(hex: &str, fallback: u32) -> Rgba {
     rgb(fallback)
 }
 
-fn port_color(port: WorkflowPortType, palette: &OpenBotPalette) -> Rgba {
+pub(crate) fn port_color(port: WorkflowPortType, palette: &OpenBotPalette) -> Rgba {
     match port {
         WorkflowPortType::Text => pal_rgba(palette, "--openbot-accent", 0x007cf7),
         WorkflowPortType::Image => rgb(0xb474f4),
@@ -857,7 +1088,7 @@ fn port_color(port: WorkflowPortType, palette: &OpenBotPalette) -> Rgba {
     }
 }
 
-fn node_kind_label(kind: WorkflowNodeKind) -> &'static str {
+pub(crate) fn node_kind_label(kind: WorkflowNodeKind) -> &'static str {
     match kind {
         WorkflowNodeKind::Trigger => "Trigger",
         WorkflowNodeKind::Prompt => "Prompt",
@@ -874,7 +1105,7 @@ fn node_kind_label(kind: WorkflowNodeKind) -> &'static str {
     }
 }
 
-fn node_kind_accent(kind: WorkflowNodeKind, palette: &OpenBotPalette) -> Rgba {
+pub(crate) fn node_kind_accent(kind: WorkflowNodeKind, palette: &OpenBotPalette) -> Rgba {
     match kind {
         WorkflowNodeKind::Trigger => pal_rgba(palette, "--openbot-success", 0x31cf76),
         WorkflowNodeKind::Prompt => rgb(0x74b9ff),
@@ -891,7 +1122,7 @@ fn node_kind_accent(kind: WorkflowNodeKind, palette: &OpenBotPalette) -> Rgba {
     }
 }
 
-fn node_kind_icon(kind: WorkflowNodeKind) -> IconName {
+pub(crate) fn node_kind_icon(kind: WorkflowNodeKind) -> IconName {
     match kind {
         WorkflowNodeKind::Trigger => IconName::Play,
         WorkflowNodeKind::Prompt => IconName::ComposePen,
@@ -908,7 +1139,7 @@ fn node_kind_icon(kind: WorkflowNodeKind) -> IconName {
     }
 }
 
-fn step_status_color(status: WorkflowStepStatus, palette: &OpenBotPalette) -> Rgba {
+pub(crate) fn step_status_color(status: WorkflowStepStatus, palette: &OpenBotPalette) -> Rgba {
     match status {
         WorkflowStepStatus::Running => pal_rgba(palette, "--openbot-accent", 0x007cf7),
         WorkflowStepStatus::Approval => pal_rgba(palette, "--openbot-warning", 0xff9412),
@@ -919,7 +1150,7 @@ fn step_status_color(status: WorkflowStepStatus, palette: &OpenBotPalette) -> Rg
     }
 }
 
-fn paint_workflow_edges_and_strokes(
+pub(crate) fn paint_workflow_edges_and_strokes(
     bounds: Bounds<Pixels>,
     state: &WorkflowCanvasState,
     loop_set: &BTreeSet<String>,
@@ -934,9 +1165,14 @@ fn paint_workflow_edges_and_strokes(
         return;
     }
 
-    // 1. Pan/zoom dot-grid background
-    let step = (28.0 * state.zoom).clamp(12.0, 64.0);
-    let dot_color: Hsla = pal_rgba(palette, "--openbot-border-strong", 0x333335).into();
+    // 1. Pan/zoom dot-grid background (matching OpenBot 20px subtle radial dot grid)
+    let step = (20.0 * state.zoom).clamp(10.0, 56.0);
+    let dot_color: Hsla = pal_rgba(palette, "--openbot-text-primary", 0xffffff).into();
+    let dot_alpha = if palette.scheme == OpenBotColorScheme::Light {
+        0.13
+    } else {
+        0.14
+    };
     let start_x = ((state.pan_x % step) + step) % step;
     let start_y = ((state.pan_y % step) + step) % step;
     let mut grid_builder = PathBuilder::fill();
@@ -956,7 +1192,7 @@ fn paint_workflow_edges_and_strokes(
         gx += step;
     }
     if let Ok(path) = grid_builder.build() {
-        window.paint_path(path, dot_color.opacity(0.65));
+        window.paint_path(path, dot_color.opacity(dot_alpha));
     }
 
     // 2. Group frames
@@ -978,13 +1214,14 @@ fn paint_workflow_edges_and_strokes(
     }
 
     // 3. Cubic Bezier typed-port edges (loop edges highlighted in warning/danger)
+    let graph = state.display_graph();
     let node_map: HashMap<&str, &WorkflowNode> =
-        state.graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let warn_color: Hsla = pal_rgba(palette, "--openbot-warning", 0xff9412).into();
     let danger_color: Hsla = pal_rgba(palette, "--openbot-danger", 0xfd2f3b).into();
     let success_color: Hsla = pal_rgba(palette, "--openbot-success", 0x31cf76).into();
 
-    for edge in &state.graph.edges {
+    for edge in &graph.edges {
         let (Some(src), Some(dst)) = (
             node_map.get(edge.from.as_str()),
             node_map.get(edge.to.as_str()),
@@ -1033,7 +1270,7 @@ fn paint_workflow_edges_and_strokes(
     }
 
     // 4. Freehand ink strokes
-    for stroke in &state.graph.strokes {
+    for stroke in &graph.strokes {
         if stroke.points.len() < 2 {
             continue;
         }
@@ -1062,13 +1299,14 @@ fn paint_workflow_edges_and_strokes(
     }
 }
 
-fn paint_workflow_minimap(
+pub(crate) fn paint_workflow_minimap(
     bounds: Bounds<Pixels>,
     state: &WorkflowCanvasState,
     loop_set: &BTreeSet<String>,
     palette: &OpenBotPalette,
     window: &mut Window,
 ) {
+    let graph = state.display_graph();
     let ox = f32::from(bounds.origin.x);
     let oy = f32::from(bounds.origin.y);
     let bw = f32::from(bounds.size.width).max(1.0);
@@ -1090,11 +1328,11 @@ fn paint_workflow_minimap(
     };
 
     let node_map: HashMap<&str, &WorkflowNode> =
-        state.graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let warn_c: Hsla = pal_rgba(palette, "--openbot-warning", 0xff9412).into();
     let muted_c: Hsla = pal_rgba(palette, "--openbot-text-muted", 0x979797).into();
 
-    for edge in &state.graph.edges {
+    for edge in &graph.edges {
         let (Some(src), Some(dst)) = (
             node_map.get(edge.from.as_str()),
             node_map.get(edge.to.as_str()),
@@ -1120,7 +1358,7 @@ fn paint_workflow_minimap(
         }
     }
 
-    for node in &state.graph.nodes {
+    for node in &graph.nodes {
         let (nw, nh) = node_dimensions(node);
         let (x0, y0) = map_pt(node.at.x as f32, node.at.y as f32);
         let rw = (nw * scale).max(6.0);
@@ -1157,7 +1395,7 @@ fn paint_workflow_minimap(
     }
 }
 
-fn node_summary_text(node: &WorkflowNode) -> String {
+pub(crate) fn node_summary_text(node: &WorkflowNode) -> String {
     let field_str = |key: &str| -> Option<&str> {
         match node.fields.get(key) {
             Some(WorkflowFieldValue::Text(s)) if !s.trim().is_empty() => Some(s.as_str()),

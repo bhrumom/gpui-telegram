@@ -127,6 +127,8 @@ impl ConversationStage {
                 self.reaction_picker_msg_id = None;
                 self.hover_grace = None;
                 self.hover_grace_generation = self.hover_grace_generation.wrapping_add(1);
+            } else if self.thread_tab_menu_id.is_some() {
+                self.thread_tab_menu_id = None;
             } else if self.pinned_popover_open {
                 self.pinned_popover_open = false;
             } else if self.model_picker_open {
@@ -390,6 +392,7 @@ impl ConversationStage {
                 self.more_menu_open = false;
                 self.pinned_popover_open = false;
                 self.model_picker_open = false;
+                self.thread_tab_menu_id = None;
                 self.pending_stage_action =
                     Some(crate::views::conversation_stage::StageAction::NewThread);
             }
@@ -397,6 +400,62 @@ impl ConversationStage {
                 self.active_thread_id = thread_id;
                 self.pinned_popover_open = false;
                 self.model_picker_open = false;
+                self.thread_tab_menu_id = None;
+            }
+            TopBarUiAction::DeleteThread(thread_id) => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.thread_tab_menu_id = None;
+                if let Some((removed_id, label)) = self.remove_thread_tab(&thread_id) {
+                    self.pending_stage_action =
+                        Some(crate::views::conversation_stage::StageAction::DeleteThread {
+                            thread_id: removed_id,
+                            label,
+                        });
+                }
+            }
+            TopBarUiAction::CloseOtherThreads(keep_id) => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                let removed_count = self.remove_other_thread_tabs(&keep_id);
+                if removed_count > 0 {
+                    let summary = if self.lang_id.starts_with("zh") {
+                        format!("{removed_count} 个标签页")
+                    } else {
+                        format!("{removed_count} tab(s)")
+                    };
+                    self.pending_stage_action =
+                        Some(crate::views::conversation_stage::StageAction::DeleteThread {
+                            thread_id: keep_id,
+                            label: summary,
+                        });
+                }
+            }
+            TopBarUiAction::CloseThreadsToRight(anchor_id) => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                let removed_count = self.remove_thread_tabs_to_right(&anchor_id);
+                if removed_count > 0 {
+                    let summary = if self.lang_id.starts_with("zh") {
+                        format!("{removed_count} 个标签页")
+                    } else {
+                        format!("{removed_count} tab(s)")
+                    };
+                    self.pending_stage_action =
+                        Some(crate::views::conversation_stage::StageAction::DeleteThread {
+                            thread_id: anchor_id,
+                            label: summary,
+                        });
+                }
+            }
+            TopBarUiAction::ToggleThreadTabMenu(target_id) => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.thread_tab_menu_id = target_id;
             }
             TopBarUiAction::ToggleModelPicker => {
                 self.more_menu_open = false;

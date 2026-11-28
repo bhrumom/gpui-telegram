@@ -1877,7 +1877,10 @@ impl AppShell {
             return true;
         }
         if lower == "workflow" {
-            self.toggle_bot_companion_panel(Some(BotCompanionTab::Workflow), cx);
+            self.select_apple_sidebar_section(
+                crate::views::apple_sidebar::AppleSidebarSection::Workflows,
+                cx,
+            );
             return true;
         }
         if let Some(wf_slug) = lower.strip_prefix("workflow:") {
@@ -3781,6 +3784,12 @@ impl AppShell {
             OpenBotInspectorAction::OpenSidePanelPane(pane) => {
                 self.open_unified_side_panel_pane(pane, cx);
             }
+            OpenBotInspectorAction::OpenWorkflowsPage => {
+                self.select_apple_sidebar_section(
+                    crate::views::apple_sidebar::AppleSidebarSection::Workflows,
+                    cx,
+                );
+            }
             OpenBotInspectorAction::OpenPublishedCreation {
                 creation_id,
                 kind_code,
@@ -3947,22 +3956,20 @@ impl AppShell {
                 cx.notify();
             }
             OpenBotInspectorAction::StartNewChannelConversation => {
-                let next_idx = self.stage.read(cx).thread_tabs.len() + 1;
-                let tid = format!("thread-{next_idx}");
+                let next_idx = self.stage.read(cx).next_thread_tab_number();
                 let label = if lang.starts_with("zh") {
                     format!("新对话 #{next_idx}")
                 } else {
                     format!("Thread #{next_idx}")
                 };
                 self.stage.update(cx, |st, scx| {
-                    st.thread_tabs.push((tid.clone(), label));
-                    st.active_thread_id = Some(tid);
+                    st.append_and_focus_thread_tab(label);
                     scx.notify();
                 });
                 if let Some(cid) = active_chat {
                     self.show_chat_toast(
                         cid,
-                        tr_str(&lang, "已开启新对话线程", "Started new conversation").to_string(),
+                        tr_str(&lang, "已开启新对话", "Started new conversation").to_string(),
                         1800,
                         cx,
                     );
@@ -5996,10 +6003,22 @@ impl AppShell {
                 col.into_any_element()
             }
             SidePanelPaneKind::Threads => {
-                let (threads, active_tid) = {
+                let (threads, active_tid, chat_title) = {
                     let st = self.stage.read(cx);
-                    (st.thread_tabs.clone(), st.active_thread_id.clone())
+                    (
+                        st.thread_tabs.clone(),
+                        st.active_thread_id.clone(),
+                        st.chat_title.clone(),
+                    )
                 };
+                let is_zh = lang.starts_with("zh");
+                let main_selected = active_tid.is_none();
+                let main_label = if chat_title.trim().is_empty() {
+                    tr_str(lang, "主对话", "Main conversation").to_string()
+                } else {
+                    format!("{} ({})", chat_title, tr_str(lang, "主对话", "Main"))
+                };
+                let thread_row_hover = ob.bg_control_hover();
                 let mut col = div()
                     .id("openbot-sp-pane-threads")
                     .flex_1()
@@ -6008,7 +6027,7 @@ impl AppShell {
                     .p(px(14.0))
                     .flex()
                     .flex_col()
-                    .gap(px(12.0))
+                    .gap(px(10.0))
                     .child(
                         div()
                             .flex()
@@ -6021,7 +6040,7 @@ impl AppShell {
                                     .text_color(ob.text_muted())
                                     .child(format!(
                                         "{} ({})",
-                                        tr_str(lang, "对话分支话题", "Threads"),
+                                        tr_str(lang, "对话话题", "Threads"),
                                         threads.len()
                                     )),
                             )
@@ -6039,13 +6058,16 @@ impl AppShell {
                                     .text_color(ob.text_primary())
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            let next_idx = this.stage.read(cx).thread_tabs.len() + 1;
-                                            let tid = format!("thread-{next_idx}");
-                                            let lbl = format!("分支 #{next_idx}");
+                                        cx.listener(move |this, _, _, cx| {
+                                            let next_idx =
+                                                this.stage.read(cx).next_thread_tab_number();
+                                            let lbl = if is_zh {
+                                                format!("新对话 #{next_idx}")
+                                            } else {
+                                                format!("Thread #{next_idx}")
+                                            };
                                             this.stage.update(cx, |st, scx| {
-                                                st.thread_tabs.push((tid.clone(), lbl.clone()));
-                                                st.active_thread_id = Some(tid);
+                                                st.append_and_focus_thread_tab(lbl.clone());
                                                 scx.notify();
                                             });
                                             this.bot_fusion_branch_from_active_message(
@@ -6055,7 +6077,53 @@ impl AppShell {
                                             );
                                         }),
                                     )
-                                    .child(tr_str(lang, "+ 新建分支", "+ New Branch")),
+                                    .child(tr_str(lang, "+ 新建对话", "+ New Thread")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("openbot-sp-thread-main")
+                            .cursor_pointer()
+                            .w_full()
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(if main_selected {
+                                ob.bg_control_active()
+                            } else {
+                                ob.bg_surface()
+                            })
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .hover(move |s| s.bg(thread_row_hover))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.stage.update(cx, |st, scx| {
+                                        st.active_thread_id = None;
+                                        st.thread_tab_menu_id = None;
+                                        scx.notify();
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(12.5))
+                                    .font_weight(if main_selected {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(ob.text_primary())
+                                    .child(main_label),
                             ),
                     );
 
@@ -6069,123 +6137,113 @@ impl AppShell {
                             .border_color(ob.border_hairline())
                             .text_size(px(12.0))
                             .text_color(ob.text_muted())
-                            .child(tr_str(lang, "暂无分支话题，点击「+ 新建分支」从当前上下文开启并行讨论。", "Click '+ New Branch' to fork a side thread.")),
+                            .child(tr_str(
+                                lang,
+                                "暂无其他话题，点击「+ 新建对话」或顶部「+」开启并行讨论。",
+                                "No side threads yet. Click '+ New Thread' or '+' in the header to start one.",
+                            )),
                     );
                 } else {
                     for (idx, (tid, lbl)) in threads.into_iter().enumerate() {
                         let is_sel = active_tid.as_deref() == Some(tid.as_str());
                         let tid_click = tid.clone();
+                        let tid_del = tid.clone();
+                        let lbl_del = lbl.clone();
+                        let del_hover = ob.bg_control_hover();
+                        let del_color = ob.danger();
+                        let muted_col = ob.text_muted();
                         col = col.child(
                             div()
                                 .id(("openbot-sp-thread-row", idx))
                                 .cursor_pointer()
                                 .w_full()
                                 .px(px(10.0))
-                                .py(px(8.0))
+                                .py(px(7.0))
                                 .rounded(px(8.0))
-                                .bg(if is_sel { ob.bg_control_active() } else { ob.bg_surface() })
+                                .bg(if is_sel {
+                                    ob.bg_control_active()
+                                } else {
+                                    ob.bg_surface()
+                                })
                                 .border_1()
                                 .border_color(ob.border_hairline())
-                                .text_size(px(12.5))
-                                .text_color(ob.text_primary())
+                                .hover(move |s| s.bg(thread_row_hover))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
                                         this.stage.update(cx, |st, scx| {
                                             st.active_thread_id = Some(tid_click.clone());
+                                            st.thread_tab_menu_id = None;
                                             scx.notify();
                                         });
                                         cx.notify();
                                     }),
                                 )
-                                .child(lbl),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .font_weight(if is_sel {
+                                            FontWeight::MEDIUM
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .text_color(ob.text_primary())
+                                        .child(lbl),
+                                )
+                                .child(
+                                    div()
+                                        .id(("openbot-sp-thread-delete", idx))
+                                        .flex_shrink_0()
+                                        .w(px(22.0))
+                                        .h(px(22.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(move |s| s.bg(del_hover))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                let removed = this.stage.update(cx, |st, scx| {
+                                                    let res = st.remove_thread_tab(&tid_del);
+                                                    scx.notify();
+                                                    res
+                                                });
+                                                if removed.is_some() {
+                                                    let msg = if is_zh {
+                                                        format!("已删除对话：{lbl_del}")
+                                                    } else {
+                                                        format!("Deleted conversation: {lbl_del}")
+                                                    };
+                                                    if let Some(cid) = this
+                                                        .stage
+                                                        .read(cx)
+                                                        .active_chat_id
+                                                        .or_else(|| this.sidebar.read(cx).active_chat_id)
+                                                    {
+                                                        this.show_chat_toast(cid, msg, 1800, cx);
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tg_icon_rgba(
+                                            IconName::DeleteTrash,
+                                            13.0,
+                                            if is_sel { del_color } else { muted_col },
+                                        )),
+                                ),
                         );
                     }
-                }
-
-                // Workflows section
-                col = col.child(
-                    div()
-                        .mt(px(4.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(ob.text_muted())
-                                .child(format!(
-                                    "{} ({})",
-                                    tr_str(lang, "工作流", "Workflows"),
-                                    snap.workflows.len()
-                                )),
-                        )
-                        .child(
-                            div()
-                                .id("openbot-sp-wf-create")
-                                .cursor_pointer()
-                                .px(px(9.0))
-                                .py(px(4.0))
-                                .rounded(px(6.0))
-                                .bg(ob.bg_surface())
-                                .border_1()
-                                .border_color(ob.border_hairline())
-                                .hover(|s| s.bg(ob.bg_control_hover()))
-                                .text_size(px(11.5))
-                                .text_color(ob.text_primary())
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.bot_fusion_create_starter_workflow(cx);
-                                    }),
-                                )
-                                .child(tr_str(lang, "+ 新建审批流", "+ New Flow")),
-                        ),
-                );
-                for (idx, wf) in snap.workflows.iter().enumerate() {
-                    let wid = wf.id.clone();
-                    col = col.child(
-                        div()
-                            .id(("openbot-sp-wf-card", idx))
-                            .w_full()
-                            .p(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(ob.bg_surface())
-                            .border_1()
-                            .border_color(ob.border_hairline())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(12.5))
-                                    .text_color(ob.text_primary())
-                                    .child(wf.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id(("openbot-sp-wf-run", idx))
-                                    .cursor_pointer()
-                                    .px(px(8.0))
-                                    .py(px(3.0))
-                                    .rounded(px(6.0))
-                                    .bg(ob.bg_control_hover())
-                                    .text_size(px(11.5))
-                                    .text_color(ob.text_primary())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.bot_fusion_run_workflow(wid.clone(), cx);
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "▶ 运行", "▶ Run")),
-                            ),
-                    );
                 }
 
                 // Queue controls

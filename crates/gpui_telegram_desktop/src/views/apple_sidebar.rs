@@ -66,8 +66,19 @@ pub const RAIL_TOOLTIP_RADIUS_PX: f32 = 8.0;
 /// Atomic JSON filename storing user-pinned `PageRail` sections inside `preferences_dir`.
 pub const PAGE_RAIL_PINS_FILE: &str = "openbot-page-rail-pins-v1.json";
 
-/// Default pinned sections mounted directly under fixed `Chats` in the `52px` `PageRail`.
-pub const DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 5] = [
+/// Legacy v1 default pinned sections before Workflows was promoted into the default left rail.
+const LEGACY_V1_DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 5] = [
+    AppleSidebarSection::Community,
+    AppleSidebarSection::Books,
+    AppleSidebarSection::Music,
+    AppleSidebarSection::Games,
+    AppleSidebarSection::AppStore,
+];
+
+/// Default pinned sections mounted directly under fixed `Chats` in the `52px` `PageRail`,
+/// placing `Workflows` first directly beneath `Chats` to match OpenBot's `PageRail` layout.
+pub const DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 6] = [
+    AppleSidebarSection::Workflows,
     AppleSidebarSection::Community,
     AppleSidebarSection::Books,
     AppleSidebarSection::Music,
@@ -77,6 +88,7 @@ pub const DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 5] = [
 
 /// Complete ordered catalog of all 16 pinnable `RailMoreMenu` destinations (excludes fixed `Chats`).
 pub const PINNABLE_SECTIONS: [AppleSidebarSection; 16] = [
+    AppleSidebarSection::Workflows,
     AppleSidebarSection::Community,
     AppleSidebarSection::Books,
     AppleSidebarSection::Music,
@@ -85,7 +97,6 @@ pub const PINNABLE_SECTIONS: [AppleSidebarSection; 16] = [
     AppleSidebarSection::MyCreations,
     AppleSidebarSection::Contacts,
     AppleSidebarSection::Calls,
-    AppleSidebarSection::Workflows,
     AppleSidebarSection::Tasks,
     AppleSidebarSection::Schedule,
     AppleSidebarSection::Library,
@@ -159,7 +170,7 @@ impl AppleSidebarSection {
             Self::MyCreations => IconName::HubCreations,
             Self::Contacts => IconName::ContactsUsers,
             Self::Calls => IconName::PhoneCall,
-            Self::Workflows => IconName::HubSparkles,
+            Self::Workflows => IconName::WorkflowWaypoints,
             Self::Tasks => IconName::SelectCheck,
             Self::Schedule => IconName::ClockSending,
             Self::Library => IconName::FileDoc,
@@ -272,11 +283,16 @@ pub fn load_page_rail_pins(preferences_dir: &Path) -> Vec<AppleSidebarSection> {
     let Some(arr) = val.get("pinned_sections").and_then(|v| v.as_array()) else {
         return DEFAULT_PINNED_SECTIONS.to_vec();
     };
+    let version = val.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     let parsed: Vec<AppleSidebarSection> = arr
         .iter()
         .filter_map(|elem| serde_json::from_value::<AppleSidebarSection>(elem.clone()).ok())
         .collect();
-    sanitize_pinned_sections(parsed)
+    let mut pins = sanitize_pinned_sections(parsed);
+    if version < 2 && pins.as_slice() == LEGACY_V1_DEFAULT_PINNED_SECTIONS.as_slice() {
+        pins.insert(0, AppleSidebarSection::Workflows);
+    }
+    pins
 }
 
 /// Loads persisted hidden optional bottom rail items from `<preferences_dir>/openbot-page-rail-pins-v1.json`.
@@ -310,7 +326,7 @@ pub fn save_page_rail_prefs(
 ) -> std::io::Result<()> {
     let path = preferences_dir.join(PAGE_RAIL_PINS_FILE);
     let payload = PageRailPinsPersisted {
-        version: 1,
+        version: 2,
         pinned_sections: sanitize_pinned_sections(pins.to_vec()),
         hidden_bottom_items: sanitize_hidden_bottom_items(hidden.to_vec()),
     };
@@ -393,6 +409,7 @@ pub enum AppleSidebarEvent {
     TogglePin(AppleSidebarSection),
     OpenHelp,
     OpenHelpAction(RailHelpAction),
+    PreloadWorkflows,
 }
 
 pub(crate) fn default_usage_ring_metric() -> UsageRingMetric {
@@ -862,6 +879,9 @@ impl AppleAppSidebar {
             .when(!is_active, |el| el.hover(move |s| s.bg(hover_bg)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 if *hovered {
+                    if section == AppleSidebarSection::Workflows {
+                        cx.emit(AppleSidebarEvent::PreloadWorkflows);
+                    }
                     if this.hovered_tooltip.as_ref() != Some(&hover_label) {
                         this.hovered_tooltip = Some(hover_label.clone());
                         cx.notify();
@@ -1392,10 +1412,11 @@ mod tests {
 
     #[std::prelude::v1::test]
     fn page_rail_default_and_pinnable_sections_and_sanitize() {
-        assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 5);
+        assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 6);
         assert_eq!(
             DEFAULT_PINNED_SECTIONS,
             [
+                AppleSidebarSection::Workflows,
                 AppleSidebarSection::Community,
                 AppleSidebarSection::Books,
                 AppleSidebarSection::Music,
@@ -1403,7 +1424,12 @@ mod tests {
                 AppleSidebarSection::AppStore,
             ]
         );
+        assert_eq!(
+            AppleSidebarSection::Workflows.icon_name(),
+            IconName::WorkflowWaypoints
+        );
         assert_eq!(PINNABLE_SECTIONS.len(), 16);
+        assert_eq!(PINNABLE_SECTIONS[0], AppleSidebarSection::Workflows);
         assert!(!AppleSidebarSection::Chats.is_pinnable());
         assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::Chats));
 
@@ -1424,10 +1450,33 @@ mod tests {
     fn page_rail_pins_atomic_persistence_round_trip_empty_and_corrupt_fallback() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        // Absent file falls back to DEFAULT_PINNED_SECTIONS
+        // Absent file falls back to DEFAULT_PINNED_SECTIONS (with Workflows first)
         assert_eq!(
             load_page_rail_pins(dir.path()),
             DEFAULT_PINNED_SECTIONS.to_vec()
+        );
+
+        // Legacy v1 file with untouched v1 defaults transparently promotes Workflows to index 0
+        let legacy_v1 = serde_json::json!({
+            "version": 1,
+            "pinned_sections": ["community", "books", "music", "games", "app_store"],
+            "hidden_bottom_items": []
+        });
+        fs::write(
+            dir.path().join(PAGE_RAIL_PINS_FILE),
+            serde_json::to_vec(&legacy_v1).unwrap(),
+        )
+        .expect("write legacy v1");
+        assert_eq!(
+            load_page_rail_pins(dir.path()),
+            DEFAULT_PINNED_SECTIONS.to_vec()
+        );
+
+        // Explicitly unpinning Workflows (saved at version 2) is preserved across reloads
+        save_page_rail_pins(dir.path(), &LEGACY_V1_DEFAULT_PINNED_SECTIONS).expect("save v2");
+        assert_eq!(
+            load_page_rail_pins(dir.path()),
+            LEGACY_V1_DEFAULT_PINNED_SECTIONS.to_vec()
         );
 
         // Save custom subset (with duplicate and non-pinnable Chats) -> round-trips cleanly with zero .tmp files
@@ -1466,10 +1515,13 @@ mod tests {
         let mut rail = AppleAppSidebar::new(TdesktopThemePalette::default(), "en");
         assert!(!rail.current_in_more_menu());
 
+        rail.set_highlighted_destination(Some(AppleSidebarSection::Workflows));
+        assert!(!rail.current_in_more_menu());
+
         rail.set_highlighted_destination(Some(AppleSidebarSection::Books));
         assert!(!rail.current_in_more_menu());
 
-        rail.set_highlighted_destination(Some(AppleSidebarSection::Workflows));
+        rail.set_highlighted_destination(Some(AppleSidebarSection::Schedule));
         assert!(rail.current_in_more_menu());
 
         rail.set_highlighted_destination(Some(AppleSidebarSection::Browser));

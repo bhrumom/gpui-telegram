@@ -931,6 +931,7 @@ pub fn evaluate_headless_shell_layout_suite() -> HeadlessShellLayoutAudit {
                 bot_activity_state: "",
                 active_thread_id: None,
                 thread_tabs: &[],
+                thread_tab_menu_id: None,
                 active_model_label: "",
                 active_thinking_effort: "",
                 model_picker_open: false,

@@ -2487,7 +2487,7 @@ impl AppShell {
                     }
                 }
                 StageAction::NewThread => {
-                    let next_idx = self.stage.read(cx).thread_tabs.len() + 1;
+                    let next_idx = self.stage.read(cx).next_thread_tab_number();
                     let label = if lang.starts_with("zh") {
                         format!("新对话 #{next_idx}")
                     } else {
@@ -2505,7 +2505,20 @@ impl AppShell {
                     if let Some(cid) = active_chat {
                         self.show_chat_toast(
                             cid,
-                            tr_str(lang, "已创建新对话分支", "Created new thread").to_string(),
+                            tr_str(lang, "已创建新对话", "Created new conversation").to_string(),
+                            1800,
+                            cx,
+                        );
+                    }
+                }
+                StageAction::DeleteThread { label, .. } => {
+                    if let Some(cid) = active_chat {
+                        self.show_chat_toast(
+                            cid,
+                            format!(
+                                "{}: {label}",
+                                tr_str(lang, "已删除对话", "Deleted conversation")
+                            ),
                             1800,
                             cx,
                         );

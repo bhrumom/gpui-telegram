@@ -1106,7 +1106,8 @@ fn m1_ui_f04_page_rail_width_pins_persistence_and_more_menu_highlight() {
     assert!((OPENBOT_PAGE_RAIL_WIDTH - 52.0).abs() < f32::EPSILON);
     assert!((EXPANDED_WIDTH - 52.0).abs() < f32::EPSILON);
     assert!((COLLAPSED_WIDTH - 52.0).abs() < f32::EPSILON);
-    assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 5);
+    assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 6);
+    assert_eq!(DEFAULT_PINNED_SECTIONS[0], AppleSidebarSection::Workflows);
     assert_eq!(PINNABLE_SECTIONS.len(), 16);
     assert!(!AppleSidebarSection::Chats.is_pinnable());
 
