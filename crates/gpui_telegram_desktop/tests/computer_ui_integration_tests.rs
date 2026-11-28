@@ -530,3 +530,235 @@ fn bot_profile_model_syncs_with_settings_and_never_injects_fake_gpt54() {
     assert!(!insp.ai_models.synced);
     assert!(insp.ai_models.active_model.is_empty());
 }
+
+#[test]
+fn test_stage_header_model_picker_and_bot_creator_never_use_fake_models() {
+    use gpui_telegram_client::net::hermes_client::{
+        MagpieProviderDto, MagpieRoutingGroupDto, MagpieStateDto, MagpieSubscriptionDto,
+    };
+    use gpui_telegram_desktop::views::boxes::peers::create_managed_bot_box::CreateManagedBotBoxPeers;
+    use gpui_telegram_desktop::views::conversation_stage::{ConversationStage, StageAction};
+    use gpui_telegram_desktop::views::drawer::InspectorAiModelCatalog;
+    use gpui_telegram_desktop::views::settings::sections::settings_ai_providers::SubscriptionAccountDto;
+    use gpui_telegram_desktop::views::stage::stage_bars::{
+        build_openbot_model_picker_rows, format_thinking_effort_pill,
+        OpenBotModelPickerPopoverProps, TopBarUiAction,
+    };
+
+    // 1. Unsynced / empty catalog must NEVER synthesize fake claude-sonnet-4-5 / gpt-5 / gemini-2.5-pro rows.
+    let empty_props = OpenBotModelPickerPopoverProps {
+        active_model: "",
+        active_effort: "",
+        models: &[],
+        active_provider_name: "",
+        settings_default_model: "",
+        bot_override_model: None,
+        catalog_synced: false,
+        needs_provider_selection: false,
+        can_override_bot_model: false,
+        show_thinking_effort: false,
+    };
+    assert!(
+        build_openbot_model_picker_rows(&empty_props, "zh-CN").is_empty(),
+        "empty model list must never fabricate fake fallback models"
+    );
+
+    // 2. Sync real Settings state (Google Vertex AI with gemini-3.8-flash + live models + routing group).
+    let magpie_state = MagpieStateDto {
+        active_provider: "google_vertex:bhrum21@gmail.com".to_string(),
+        active_model: "gemini-3.8-flash".to_string(),
+        needs_provider_selection: false,
+        has_active_subscription: true,
+        has_configured_provider: true,
+        subscriptions: vec![MagpieSubscriptionDto {
+            id: "google_vertex:bhrum21@gmail.com".to_string(),
+            kind: "google_vertex".to_string(),
+            label: "Magpie Google Vertex AI (Magpie)".to_string(),
+            active: true,
+            default_model: Some("gemini-3.8-flash".to_string()),
+            ..Default::default()
+        }],
+        providers: vec![MagpieProviderDto {
+            provider_id: "google_vertex:bhrum21@gmail.com".to_string(),
+            name: "Google Vertex AI".to_string(),
+            default_model: "gemini-3.8-flash".to_string(),
+            models: vec![
+                "gemini-3.8-flash".to_string(),
+                "gemini-3.7-flash".to_string(),
+            ],
+            enabled: true,
+            is_active: true,
+            ..Default::default()
+        }],
+        routing_groups: vec![MagpieRoutingGroupDto {
+            id: "fast-pool".to_string(),
+            name: "Fast Pool".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let local_subs = vec![SubscriptionAccountDto {
+        id: "google_vertex:bhrum21@gmail.com".to_string(),
+        kind: "google_vertex".to_string(),
+        label: "Google Vertex AI".to_string(),
+        models: vec![
+            "gemini-3.8-flash".to_string(),
+            "gemini-3.7-flash".to_string(),
+            "gemini-2.5-flash".to_string(),
+        ],
+        active: true,
+        ..Default::default()
+    }];
+    let catalog = InspectorAiModelCatalog::from_magpie_state(&magpie_state, &[], &local_subs);
+
+    // Official/non-owned bot (e.g. 全球法布施): shows real Settings active model directly, never "默认模型" or fake list.
+    let mut stage = ConversationStage::new();
+    stage.set_chat(101, "全球法布施", "bot", "法", 0xE040FB);
+    stage.sync_model_picker_context(&catalog, None, "medium".to_string(), false, true);
+    assert_eq!(stage.active_model_label, "gemini-3.8-flash");
+    assert_eq!(stage.settings_default_model, "gemini-3.8-flash");
+    assert_eq!(stage.active_provider_name, "Google Vertex AI");
+    assert!(stage.provider_connected);
+    assert!(stage.model_catalog_synced);
+    assert!(!stage.available_models.iter().any(|m| m == "claude-sonnet-4-5" || m == "gpt-5"));
+    assert!(stage.available_models.contains(&"gemini-3.8-flash".to_string()));
+    assert!(stage.available_models.contains(&"gemini-3.7-flash".to_string()));
+    assert!(stage.available_models.contains(&"group/fast-pool".to_string()));
+
+    let official_rows = build_openbot_model_picker_rows(
+        &OpenBotModelPickerPopoverProps {
+            active_model: &stage.active_model_label,
+            active_effort: &stage.active_thinking_effort,
+            models: &stage.available_models,
+            active_provider_name: &stage.active_provider_name,
+            settings_default_model: &stage.settings_default_model,
+            bot_override_model: stage.bot_override_model.as_deref(),
+            catalog_synced: stage.model_catalog_synced,
+            needs_provider_selection: stage.model_needs_provider_selection,
+            can_override_bot_model: stage.can_override_bot_model,
+            show_thinking_effort: true,
+        },
+        "zh-CN",
+    );
+    assert!(!official_rows.is_empty());
+    assert!(official_rows
+        .iter()
+        .all(|r| r.model_id != "claude-sonnet-4-5" && r.model_id != "gpt-5"));
+    assert!(official_rows
+        .iter()
+        .any(|r| r.model_id == "gemini-3.8-flash" && r.is_selected));
+
+    // Effort-only selection updates active_thinking_effort without clobbering active_model_label.
+    stage.apply_topbar_action(TopBarUiAction::SelectModel {
+        model_id: None,
+        thinking_level: Some("high".to_string()),
+    });
+    assert_eq!(stage.active_model_label, "gemini-3.8-flash");
+    assert_eq!(stage.active_thinking_effort, "high");
+    assert_eq!(
+        stage.pending_stage_action,
+        Some(StageAction::SelectModel {
+            model_id: None,
+            thinking_level: Some("high".to_string()),
+        })
+    );
+    assert_eq!(format_thinking_effort_pill("high", "zh-CN").as_deref(), Some("深度"));
+    assert_eq!(format_thinking_effort_pill("off", "zh-CN"), None);
+
+    // 3. Owned bot with Follow Settings row, stale mismatch detection, and reset-to-default action.
+    stage.sync_model_picker_context(
+        &catalog,
+        Some("gpt-5".to_string()),
+        "low".to_string(),
+        true,
+        true,
+    );
+    assert_eq!(stage.active_model_label, "gpt-5");
+    let owned_rows = build_openbot_model_picker_rows(
+        &OpenBotModelPickerPopoverProps {
+            active_model: &stage.active_model_label,
+            active_effort: &stage.active_thinking_effort,
+            models: &stage.available_models,
+            active_provider_name: &stage.active_provider_name,
+            settings_default_model: &stage.settings_default_model,
+            bot_override_model: stage.bot_override_model.as_deref(),
+            catalog_synced: stage.model_catalog_synced,
+            needs_provider_selection: stage.model_needs_provider_selection,
+            can_override_bot_model: stage.can_override_bot_model,
+            show_thinking_effort: true,
+        },
+        "zh-CN",
+    );
+    assert!(owned_rows[0].is_follow_settings);
+    assert_eq!(owned_rows[0].badge.as_deref(), Some("gemini-3.8-flash"));
+    assert!(owned_rows.iter().any(|r| r.model_id == "gpt-5" && r.is_mismatch));
+
+    // Selecting Follow Settings ("") restores active_model_label to settings_default_model.
+    stage.apply_topbar_action(TopBarUiAction::SelectModel {
+        model_id: Some(String::new()),
+        thinking_level: None,
+    });
+    assert_eq!(stage.bot_override_model, None);
+    assert_eq!(stage.active_model_label, "gemini-3.8-flash");
+
+    // 4. OpenAiProvidersSettings action closes popover and queues navigation.
+    stage.model_picker_open = true;
+    stage.apply_topbar_action(TopBarUiAction::OpenAiProvidersSettings);
+    assert!(!stage.model_picker_open);
+    assert_eq!(stage.pending_stage_action, Some(StageAction::OpenAiProvidersSettings));
+
+    // 5. Disconnected / unconfigured Settings state sets provider_connected=false and emits zero rows.
+    let unconfigured = InspectorAiModelCatalog::from_magpie_state(
+        &MagpieStateDto {
+            needs_provider_selection: true,
+            ..Default::default()
+        },
+        &[],
+        &[],
+    );
+    stage.sync_model_picker_context(&unconfigured, None, String::new(), false, false);
+    assert!(!stage.provider_connected);
+    assert!(stage.active_model_label.is_empty());
+    assert!(stage.available_models.is_empty());
+
+    // 6. Chat switch preserves user Settings catalog while clearing per-bot override; reset() clears all.
+    stage.sync_model_picker_context(
+        &catalog,
+        Some("gemini-2.5-flash".to_string()),
+        "high".to_string(),
+        true,
+        true,
+    );
+    stage.set_chat(202, "Other Bot", "bot", "OB", 0x2AABEE);
+    assert_eq!(stage.bot_override_model, None);
+    assert!(stage.active_thinking_effort.is_empty());
+    assert_eq!(stage.active_model_label, "gemini-3.8-flash");
+    stage.reset();
+    assert!(!stage.model_catalog_synced);
+    assert!(stage.available_models.is_empty());
+    assert!(stage.active_model_label.is_empty());
+
+    // 7. CreateManagedBotBoxPeers never shows fake "GPT-6-Luna" / "claude-sonnet-4-6" and syncs live Settings models.
+    let mut creator = CreateManagedBotBoxPeers::new();
+    assert_ne!(creator.studio_model_display_label("zh-CN"), "GPT-6-Luna");
+    assert_eq!(creator.studio_model_display_label("zh-CN"), "跟随设置默认");
+    assert!(creator
+        .studio_model_options("zh-CN")
+        .iter()
+        .all(|(id, lbl)| id != "gpt-6-luna"
+            && id != "claude-sonnet-4-6"
+            && !lbl.contains("GPT-6-Luna")));
+
+    creator.sync_ai_models(catalog);
+    assert_eq!(creator.studio_model_display_label("zh-CN"), "gemini-3.8-flash");
+    let opts = creator.studio_model_options("zh-CN");
+    assert_eq!(opts[0].0, "");
+    assert_eq!(opts[0].1, "跟随设置默认 (gemini-3.8-flash)");
+    assert!(opts.iter().any(|(id, _)| id == "gemini-3.8-flash"));
+    assert!(opts.iter().any(|(id, _)| id == "gemini-3.7-flash"));
+    assert!(opts.iter().any(|(id, _)| id == "group/fast-pool"));
+    assert!(opts
+        .iter()
+        .all(|(id, _)| id != "gpt-6-luna" && id != "claude-sonnet-4-6" && id != "deepseek-reasoner"));
+}
+

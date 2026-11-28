@@ -478,6 +478,7 @@ impl AppShell {
             insp.set_active_fabushi_bot(active_fab);
             insp_cx.notify();
         });
+        self.sync_model_picker_to_stage(cx);
         self.refresh_active_bot_fusion_snapshot(cx);
     }
 
@@ -922,6 +923,7 @@ impl AppShell {
             st.set_bot_prestart_state(desc_card, show_start_bar, is_viewer_owner_fabushi);
             st_cx.notify();
         });
+        self.sync_model_picker_to_stage(cx);
     }
 
     /// Selects an existing dialog or inserts a provisional row before loading the stage.

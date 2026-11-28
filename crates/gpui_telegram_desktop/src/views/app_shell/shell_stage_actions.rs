@@ -2515,18 +2515,120 @@ impl AppShell {
                     model_id,
                     thinking_level,
                 } => {
-                    let summary = match thinking_level.as_deref() {
-                        Some(eff) if !eff.is_empty() => format!("{model_id} · {eff}"),
-                        _ => model_id,
-                    };
-                    if let Some(cid) = active_chat {
-                        self.show_chat_toast(
-                            cid,
-                            format!("{}: {summary}", tr_str(lang, "已切换模型", "Model")),
-                            1800,
-                            cx,
-                        );
+                    let viewer_uid = self.session_sync.user_id;
+                    let active_fab = self
+                        .stage
+                        .read(cx)
+                        .active_fabushi_bot
+                        .clone()
+                        .or_else(|| self.inspector.read(cx).active_fabushi_bot.clone());
+                    let bot_id = active_fab
+                        .as_ref()
+                        .map(|b| b.bot_user_id.max(0) as u64)
+                        .filter(|&id| id > 0)
+                        .or_else(|| self.active_chat_bot_id(cx));
+                    let is_strict_fabushi_owner = active_fab.as_ref().is_some_and(|fab| {
+                        fab.owner_user_id > 0
+                            && viewer_uid.is_some_and(|u| fab.owner_user_id as u64 == u)
+                    });
+                    let is_non_fabushi_owner = active_fab.is_none()
+                        && bot_id.is_some()
+                        && self.inspector.read(cx).profile.is_viewer_owner;
+                    let has_existing_bot_override = active_fab.as_ref().is_some_and(|fab| {
+                        !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(
+                            &fab.preferred_model,
+                        )
+                    }) || bot_id.is_some_and(|bid| {
+                        self.computers.bot_profiles.get(&bid).is_some_and(|p| {
+                            !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(
+                                &p.preferred_model,
+                            )
+                        })
+                    });
+
+                    if let Some(ref eff) = thinking_level {
+                        if let Some(bid) = bot_id.filter(|_| active_fab.is_some()) {
+                            let patch_model = if is_strict_fabushi_owner || has_existing_bot_override
+                            {
+                                model_id.clone()
+                            } else {
+                                None
+                            };
+                            self.patch_fabushi_bot_from_ui(
+                                bid,
+                                gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                                    preferred_model: patch_model,
+                                    thinking_level: Some(eff.clone()),
+                                    ..Default::default()
+                                },
+                                active_chat,
+                                cx,
+                            );
+                            if !is_strict_fabushi_owner && !has_existing_bot_override {
+                                if let Some(m) =
+                                    model_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                                {
+                                    self.switch_active_settings_model(
+                                        m.to_string(),
+                                        active_chat,
+                                        cx,
+                                    );
+                                }
+                            }
+                        } else {
+                            self.sync_model_picker_to_stage(cx);
+                        }
+                    } else if let Some(raw_model) = model_id {
+                        let trimmed = raw_model.trim().to_string();
+                        if is_strict_fabushi_owner {
+                            if let Some(bid) = bot_id {
+                                self.patch_fabushi_bot_from_ui(
+                                    bid,
+                                    gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                                        preferred_model: Some(trimmed),
+                                        ..Default::default()
+                                    },
+                                    active_chat,
+                                    cx,
+                                );
+                            }
+                        } else if is_non_fabushi_owner {
+                            if let Some(bid) = bot_id {
+                                self.persist_bot_computer_profile(
+                                    bid,
+                                    gpui_telegram_proto::UpdateBotComputerRequest {
+                                        preferred_model: Some(trimmed),
+                                        ..Default::default()
+                                    },
+                                    false,
+                                    cx,
+                                );
+                            }
+                        } else if has_existing_bot_override && active_fab.is_some() && trimmed.is_empty()
+                        {
+                            if let Some(bid) = bot_id {
+                                self.patch_fabushi_bot_from_ui(
+                                    bid,
+                                    gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest {
+                                        preferred_model: Some(String::new()),
+                                        ..Default::default()
+                                    },
+                                    active_chat,
+                                    cx,
+                                );
+                            }
+                        } else if !trimmed.is_empty() {
+                            self.switch_active_settings_model(trimmed, active_chat, cx);
+                        } else {
+                            self.sync_model_picker_to_stage(cx);
+                        }
                     }
+                }
+                StageAction::OpenAiProvidersSettings => {
+                    self.open_ai_providers_settings(cx);
+                }
+                StageAction::RefreshModelCatalog => {
+                    self.refresh_magpie_state(cx);
                 }
                 StageAction::DecideToolApproval {
                     approval_id,

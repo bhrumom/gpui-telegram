@@ -56,7 +56,7 @@ use crate::views::stage::stage_bars::{
     render_openbot_model_picker_popover, render_openbot_pinned_messages_popover,
     render_pinned_banner_46px, render_scroll_to_bottom_fab, render_stage_more_menu_overlay,
     render_stage_search_bar, render_stage_top_bar_with_group, ChatSearchBarLayout,
-    OpenBotHeaderProps, TopBarUiAction,
+    OpenBotHeaderProps, OpenBotModelPickerPopoverProps, TopBarUiAction,
 };
 use crate::views::stage::wallpaper::{
     render_empty_history_placeholder, render_empty_no_chat_pill, render_loading_history_skeleton,
@@ -449,9 +449,11 @@ pub enum StageAction {
     ToggleSidePanel,
     NewThread,
     SelectModel {
-        model_id: String,
+        model_id: Option<String>,
         thinking_level: Option<String>,
     },
+    OpenAiProvidersSettings,
+    RefreshModelCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,6 +704,13 @@ pub struct ConversationStage {
     pub active_model_label: String,
     pub active_thinking_effort: String,
     pub available_models: Vec<String>,
+    pub active_provider_name: String,
+    pub settings_default_model: String,
+    pub bot_override_model: Option<String>,
+    pub model_catalog_synced: bool,
+    pub model_needs_provider_selection: bool,
+    pub can_override_bot_model: bool,
+    pub can_edit_thinking_effort: bool,
     pub bot_activity_started_at_ms: Option<u64>,
     pub bot_activity_steps_expanded: bool,
     pub live_agent_steps: Vec<AgentStepEntry>,
@@ -855,6 +864,13 @@ impl ConversationStage {
             active_model_label: String::new(),
             active_thinking_effort: String::new(),
             available_models: Vec::new(),
+            active_provider_name: String::new(),
+            settings_default_model: String::new(),
+            bot_override_model: None,
+            model_catalog_synced: false,
+            model_needs_provider_selection: false,
+            can_override_bot_model: false,
+            can_edit_thinking_effort: false,
             bot_activity_started_at_ms: None,
             bot_activity_steps_expanded: false,
             live_agent_steps: Vec::new(),
@@ -1120,6 +1136,68 @@ impl ConversationStage {
         self.active_model_label = active_model;
         self.active_thinking_effort = effort;
         self.available_models = models;
+        if !self.available_models.is_empty() || !self.active_model_label.trim().is_empty() {
+            self.model_catalog_synced = true;
+            self.model_needs_provider_selection = false;
+            self.provider_connected = true;
+        }
+    }
+
+    /// Synchronizes the header model picker with live Settings AI provider catalog and active bot settings.
+    pub fn sync_model_picker_context(
+        &mut self,
+        catalog: &crate::views::drawer::InspectorAiModelCatalog,
+        bot_override_model: Option<String>,
+        thinking_effort: String,
+        can_override_bot_model: bool,
+        can_edit_thinking_effort: bool,
+    ) {
+        let cleaned_override = bot_override_model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !crate::views::drawer::InspectorAiModelCatalog::is_placeholder_model(m));
+        self.active_provider_name = catalog.active_provider_name.clone();
+        self.settings_default_model = catalog.active_model.clone();
+        self.available_models = catalog.selectable_models();
+        self.model_catalog_synced = catalog.synced;
+        self.model_needs_provider_selection = catalog.needs_provider_selection;
+        self.bot_override_model = cleaned_override.clone();
+        self.can_override_bot_model = can_override_bot_model;
+        self.can_edit_thinking_effort = can_edit_thinking_effort;
+        self.active_thinking_effort = thinking_effort;
+
+        self.provider_connected = if !catalog.synced {
+            true
+        } else {
+            !catalog.needs_provider_selection
+                && (!catalog.active_model.is_empty() || !self.available_models.is_empty())
+        };
+
+        self.active_model_label = if let Some(ov) = cleaned_override {
+            ov
+        } else if !catalog.needs_provider_selection && !catalog.active_model.is_empty() {
+            catalog.active_model.clone()
+        } else if !catalog.needs_provider_selection {
+            self.available_models.first().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
+    }
+
+    /// Clears all Settings/bot model picker state on logout or account switch.
+    pub fn clear_model_picker_state(&mut self) {
+        self.model_picker_open = false;
+        self.active_model_label.clear();
+        self.active_thinking_effort.clear();
+        self.available_models.clear();
+        self.active_provider_name.clear();
+        self.settings_default_model.clear();
+        self.bot_override_model = None;
+        self.model_catalog_synced = false;
+        self.model_needs_provider_selection = false;
+        self.can_override_bot_model = false;
+        self.can_edit_thinking_effort = false;
+        self.provider_connected = true;
+        self.pending_model_badge = None;
     }
 
     pub fn set_live_agent_steps(&mut self, steps: Vec<AgentStepEntry>) {
@@ -1240,7 +1318,7 @@ impl ConversationStage {
         self.is_loading_workspace = false;
         self.loaded_history_chats.clear();
         self.pinned_popover_open = false;
-        self.model_picker_open = false;
+        self.clear_model_picker_state();
         self.active_thread_id = None;
         self.thread_tabs.clear();
         self.scroll_rail_hovered = false;
@@ -1423,6 +1501,15 @@ impl ConversationStage {
             let saved_color = self.chat_custom_colors.get(&chat_id).cloned();
             self.chat_bg_tint_hex = saved_color.clone();
             self.explicit_bubble_accent_hex = saved_color;
+            self.bot_override_model = None;
+            self.active_thinking_effort.clear();
+            self.can_override_bot_model = false;
+            self.can_edit_thinking_effort = false;
+            self.active_model_label = if self.model_needs_provider_selection {
+                String::new()
+            } else {
+                self.settings_default_model.clone()
+            };
             self.channel_activity =
                 crate::components::bloub_avatar::ChannelActivityIndicatorState::default();
         }
@@ -2857,10 +2944,20 @@ impl Render for ConversationStage {
         }
 
         if is_apple && self.model_picker_open && has_active_chat {
+            let picker_props = OpenBotModelPickerPopoverProps {
+                active_model: &self.active_model_label,
+                active_effort: &self.active_thinking_effort,
+                models: &self.available_models,
+                active_provider_name: &self.active_provider_name,
+                settings_default_model: &self.settings_default_model,
+                bot_override_model: self.bot_override_model.as_deref(),
+                catalog_synced: self.model_catalog_synced,
+                needs_provider_selection: self.model_needs_provider_selection,
+                can_override_bot_model: self.can_override_bot_model,
+                show_thinking_effort: self.can_edit_thinking_effort || self.active_fabushi_bot.is_some(),
+            };
             root = root.child(render_openbot_model_picker_popover(
-                &self.active_model_label,
-                &self.active_thinking_effort,
-                &self.available_models,
+                &picker_props,
                 &self.palette,
                 &self.lang_id,
                 cx,

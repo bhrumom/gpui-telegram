@@ -402,13 +402,26 @@ impl ConversationStage {
                 self.more_menu_open = false;
                 self.pinned_popover_open = false;
                 self.model_picker_open = !self.model_picker_open;
+                if self.model_picker_open && !self.model_catalog_synced {
+                    self.pending_stage_action =
+                        Some(crate::views::conversation_stage::StageAction::RefreshModelCatalog);
+                }
             }
             TopBarUiAction::SelectModel {
                 model_id,
                 thinking_level,
             } => {
-                if !model_id.trim().is_empty() {
-                    self.active_model_label = model_id.clone();
+                if let Some(ref mid) = model_id {
+                    let trimmed = mid.trim();
+                    if trimmed.is_empty() {
+                        self.bot_override_model = None;
+                        self.active_model_label = self.settings_default_model.clone();
+                    } else {
+                        if self.can_override_bot_model {
+                            self.bot_override_model = Some(trimmed.to_string());
+                        }
+                        self.active_model_label = trimmed.to_string();
+                    }
                 }
                 if let Some(ref effort) = thinking_level {
                     self.active_thinking_effort = effort.clone();
@@ -419,6 +432,13 @@ impl ConversationStage {
                         model_id,
                         thinking_level,
                     });
+            }
+            TopBarUiAction::OpenAiProvidersSettings => {
+                self.more_menu_open = false;
+                self.pinned_popover_open = false;
+                self.model_picker_open = false;
+                self.pending_stage_action =
+                    Some(crate::views::conversation_stage::StageAction::OpenAiProvidersSettings);
             }
             TopBarUiAction::TogglePinnedMessagesPopover => {
                 self.more_menu_open = false;

@@ -1293,6 +1293,9 @@ fn dispatch_headless_hermes_bugfix_target(target: &str) -> ! {
         "user_switch_clears_bot_browser_and_magpie" => {
             HeadlessRunner::Sync(body_user_switch_clears_bot_browser_and_magpie)
         }
+        "stage_model_picker_live_sync_and_persistence" => HeadlessRunner::Async(Box::new(|app| {
+            Box::pin(body_stage_model_picker_live_sync_and_persistence(app))
+        })),
         other => {
             eprintln!("unknown headless hermes bugfix target: {other}");
             std::process::exit(101);
@@ -2932,3 +2935,430 @@ fn test_webmcp_reused_overlay_switch_and_reload_isolation() {
         "webmcp_reused_overlay_switch_and_reload_isolation",
     );
 }
+
+async fn body_stage_model_picker_live_sync_and_persistence(mut cx: gpui::AsyncApp) {
+    use gpui::{AppContext, Entity};
+    use gpui_telegram_client::net::hermes_client::{
+        MagpieProviderDto, MagpieStateDto, MagpieSubscriptionDto,
+    };
+    use gpui_telegram_client::{AuthResponse, ClientConfig, TelegramClient};
+    use gpui_telegram_desktop::views::stage::stage_bars::TopBarUiAction;
+    use gpui_telegram_desktop::views::AppShell;
+    use gpui_telegram_proto::miniapp_contracts::FabushiBotSummaryDto;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Default)]
+    struct MockModelServerState {
+        active_model: String,
+        activated_models: Vec<String>,
+        patched_bots: Vec<(i64, Option<String>, Option<String>)>,
+        owned_bot_model: String,
+        owned_bot_thinking: String,
+    }
+
+    let server_state = Arc::new(Mutex::new(MockModelServerState {
+        active_model: "gemini-3.8-flash".to_string(),
+        activated_models: Vec::new(),
+        patched_bots: Vec::new(),
+        owned_bot_model: String::new(),
+        owned_bot_thinking: "medium".to_string(),
+    }));
+    let server_state_bg = Arc::clone(&server_state);
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _rt = rt.enter();
+    let base_url = rt.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let make_magpie_state = |active_model: &str| MagpieStateDto {
+                active_provider: "google_vertex:bhrum21@gmail.com".to_string(),
+                active_model: active_model.to_string(),
+                allow_local_fallback: false,
+                has_active_subscription: true,
+                has_configured_provider: true,
+                needs_provider_selection: false,
+                subscriptions: vec![MagpieSubscriptionDto {
+                    id: "google_vertex:bhrum21@gmail.com".to_string(),
+                    kind: "google_vertex".to_string(),
+                    label: "Google Vertex AI".to_string(),
+                    active: true,
+                    default_model: Some(active_model.to_string()),
+                    ..Default::default()
+                }],
+                providers: vec![MagpieProviderDto {
+                    provider_id: "google_vertex:bhrum21@gmail.com".to_string(),
+                    name: "Google Vertex AI".to_string(),
+                    default_model: active_model.to_string(),
+                    models: vec![
+                        "gemini-3.8-flash".to_string(),
+                        "gemini-3.7-flash".to_string(),
+                        "gemini-2.5-pro".to_string(),
+                    ],
+                    enabled: true,
+                    is_active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let st_arc = Arc::clone(&server_state_bg);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let mut total = 0usize;
+                    let header_end;
+                    loop {
+                        let Ok(n) = sock.read(&mut buf[total..]).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        total += n;
+                        if let Some(pos) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = pos + 4;
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while total < header_end + content_len {
+                        let Ok(n) = sock.read(&mut buf[total..]).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    let body_str = String::from_utf8_lossy(
+                        &buf[header_end..(header_end + content_len).min(total)],
+                    )
+                    .to_string();
+                    let first_line = head.lines().next().unwrap_or("");
+                    let mut parts = first_line.split_whitespace();
+                    let method = parts.next().unwrap_or("GET").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+
+                    let resp_body = if method == "GET"
+                        && path.starts_with("/api/v1/hermes/magpie/models/catalog")
+                    {
+                        r#"{"fetched_at_ms":1700000000000,"source":"mock","providers":{}}"#
+                            .to_string()
+                    } else if method == "GET" && path == "/api/v1/hermes/magpie/state" {
+                        let cur = st_arc.lock().unwrap().active_model.clone();
+                        serde_json::to_string(&make_magpie_state(&cur)).unwrap()
+                    } else if method == "GET" && path == "/api/v1/hermes/magpie/subscriptions" {
+                        let cur = st_arc.lock().unwrap().active_model.clone();
+                        json!([{
+                            "id": "google_vertex:bhrum21@gmail.com",
+                            "kind": "google_vertex",
+                            "label": "Google Vertex AI",
+                            "models": ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-pro"],
+                            "active": true,
+                            "active_model": cur,
+                        }])
+                        .to_string()
+                    } else if method == "POST"
+                        && path.starts_with("/api/v1/hermes/magpie/subscriptions/")
+                        && path.ends_with("/activate")
+                    {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body_str).unwrap_or_default();
+                        let next_model = parsed
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("gemini-3.8-flash")
+                            .to_string();
+                        {
+                            let mut g = st_arc.lock().unwrap();
+                            g.active_model = next_model.clone();
+                            g.activated_models.push(next_model.clone());
+                        }
+                        json!({
+                            "ok": true,
+                            "active_provider_id": "google_vertex:bhrum21@gmail.com",
+                            "active_model": next_model,
+                            "state": make_magpie_state(&next_model),
+                        })
+                        .to_string()
+                    } else if method == "PATCH" && path == "/api/v1/fabushi-bots/777001" {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body_str).unwrap_or_default();
+                        let pm = parsed
+                            .get("preferred_model")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        let tl = parsed
+                            .get("thinking_level")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        let (cur_pm, cur_tl) = {
+                            let mut g = st_arc.lock().unwrap();
+                            if let Some(ref m) = pm {
+                                g.owned_bot_model = m.clone();
+                            }
+                            if let Some(ref t) = tl {
+                                g.owned_bot_thinking = t.clone();
+                            }
+                            g.patched_bots.push((777_001, pm.clone(), tl.clone()));
+                            (g.owned_bot_model.clone(), g.owned_bot_thinking.clone())
+                        };
+                        serde_json::to_string(&FabushiBotSummaryDto {
+                            bot_user_id: 777_001,
+                            owner_user_id: 500_001,
+                            agent_id: "owned_bot".to_string(),
+                            username: "owned_bot".to_string(),
+                            display_name: "My Owned Bot".to_string(),
+                            preferred_model: cur_pm,
+                            thinking_level: cur_tl,
+                            companion_chat_id: Some(888_002),
+                            ..Default::default()
+                        })
+                        .unwrap()
+                    } else if path == "/api/v1/chats" || path.contains("/messages") {
+                        "[]".to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    });
+
+    let mut cfg = ClientConfig::default();
+    cfg.server_url = base_url;
+    let client = Arc::new(TelegramClient::new(cfg));
+    let viewer_uid = 500_001u64;
+    let auth = AuthResponse {
+        token: "tok_model_picker_e2e".to_string(),
+        session_id: "sess_model_picker_e2e".to_string(),
+        user_id: viewer_uid,
+        username: "picker_tester".to_string(),
+        first_name: None,
+        created_at: None,
+        expires_at: None,
+    };
+    client.set_auth_session(auth.clone());
+
+    let official_fab = FabushiBotSummaryDto {
+        bot_user_id: 666_001,
+        owner_user_id: 0,
+        agent_id: "fabushi_bot".to_string(),
+        username: "fabushi_bot".to_string(),
+        display_name: "全球法布施".to_string(),
+        preferred_model: String::new(),
+        thinking_level: "medium".to_string(),
+        companion_chat_id: Some(888_001),
+        ..Default::default()
+    };
+    let owned_fab = FabushiBotSummaryDto {
+        bot_user_id: 777_001,
+        owner_user_id: viewer_uid as i64,
+        agent_id: "owned_bot".to_string(),
+        username: "owned_bot".to_string(),
+        display_name: "My Owned Bot".to_string(),
+        preferred_model: String::new(),
+        thinking_level: "medium".to_string(),
+        companion_chat_id: Some(888_002),
+        ..Default::default()
+    };
+
+    let shell: Entity<AppShell> = cx
+        .update(|app| {
+            app.new(|cx| {
+                let mut s = AppShell::new_with_client(client.clone(), cx);
+                s.session_sync.begin_session(
+                    auth.token.clone(),
+                    auth.session_id.clone(),
+                    auth.user_id,
+                    auth.username.clone(),
+                );
+                s.is_authenticated = true;
+                s.miniapps.fabushi_bots = vec![official_fab.clone(), owned_fab.clone()];
+                s.stage.update(cx, |st, _| {
+                    st.set_chat(888_001, "全球法布施", "bot", "法", 0xE040FB);
+                    st.is_bot_chat = true;
+                    st.set_active_fabushi_bot(Some(official_fab.clone()));
+                });
+                s.refresh_magpie_state(cx);
+                s
+            })
+        })
+        .expect("create AppShell");
+
+    // 1. Wait for refresh_magpie_state to hydrate ConversationStage, Inspector, and CreateManagedBotBoxPeers.
+    for _ in 0..80 {
+        cx.background_executor().timer(Duration::from_millis(20)).await;
+        let synced = shell
+            .read_with(&cx, |s, cx| s.stage.read(cx).model_catalog_synced)
+            .unwrap();
+        if synced {
+            break;
+        }
+    }
+    shell
+        .update(&mut cx, |s, cx| {
+            let st = s.stage.read(cx);
+            assert!(st.model_catalog_synced, "stage must receive live Magpie catalog");
+            assert_eq!(st.active_model_label, "gemini-3.8-flash");
+            assert!(st.available_models.contains(&"gemini-3.8-flash".to_string()));
+            assert!(st.available_models.contains(&"gemini-2.5-pro".to_string()));
+            assert!(!st.available_models.iter().any(|m| m == "claude-sonnet-4-5" || m == "gpt-5"));
+
+            let box_ent = s.ensure_create_bot_box(cx);
+            assert_eq!(
+                box_ent.read(cx).studio_model_display_label("zh-CN"),
+                "gemini-3.8-flash"
+            );
+        })
+        .unwrap();
+
+    // 2. Switching model on official bot (全球法布施) activates the real Settings model on backend.
+    shell
+        .update(&mut cx, |s, cx| {
+            s.stage.update(cx, |st, st_cx| {
+                st.handle_topbar_action(
+                    TopBarUiAction::SelectModel {
+                        model_id: Some("gemini-2.5-pro".to_string()),
+                        thinking_level: None,
+                    },
+                    st_cx,
+                );
+            });
+        })
+        .unwrap();
+
+    for _ in 0..80 {
+        cx.background_executor().timer(Duration::from_millis(20)).await;
+        if !server_state.lock().unwrap().activated_models.is_empty()
+            && shell
+                .read_with(&cx, |s, cx| s.inspector.read(cx).ai_models.active_model == "gemini-2.5-pro")
+                .unwrap()
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        server_state.lock().unwrap().activated_models,
+        vec!["gemini-2.5-pro".to_string()]
+    );
+    shell
+        .read_with(&cx, |s, cx| {
+            assert_eq!(s.stage.read(cx).active_model_label, "gemini-2.5-pro");
+            assert_eq!(s.inspector.read(cx).ai_models.active_model, "gemini-2.5-pro");
+        })
+        .unwrap();
+
+    // 3. Switching model + thinking effort on viewer-owned Fabushi bot sends real PATCH /api/v1/fabushi-bots/777001.
+    shell
+        .update(&mut cx, |s, cx| {
+            s.stage.update(cx, |st, _| {
+                st.set_chat(888_002, "My Owned Bot", "bot", "MB", 0x2AABEE);
+                st.is_bot_chat = true;
+                st.set_active_fabushi_bot(Some(owned_fab.clone()));
+            });
+            s.inspector.update(cx, |insp, _| {
+                insp.set_active_fabushi_bot(Some(owned_fab.clone()));
+            });
+            s.sync_fabushi_bots_to_views(cx);
+            s.stage.update(cx, |st, st_cx| {
+                st.handle_topbar_action(
+                    TopBarUiAction::SelectModel {
+                        model_id: Some("gemini-3.7-flash".to_string()),
+                        thinking_level: None,
+                    },
+                    st_cx,
+                );
+            });
+        })
+        .unwrap();
+
+    for _ in 0..80 {
+        cx.background_executor().timer(Duration::from_millis(20)).await;
+        if !server_state.lock().unwrap().patched_bots.is_empty() {
+            break;
+        }
+    }
+    shell
+        .update(&mut cx, |s, cx| {
+            s.stage.update(cx, |st, st_cx| {
+                st.handle_topbar_action(
+                    TopBarUiAction::SelectModel {
+                        model_id: None,
+                        thinking_level: Some("high".to_string()),
+                    },
+                    st_cx,
+                );
+            });
+        })
+        .unwrap();
+
+    for _ in 0..80 {
+        cx.background_executor().timer(Duration::from_millis(20)).await;
+        if server_state.lock().unwrap().patched_bots.len() >= 2
+            && shell
+                .read_with(&cx, |s, cx| s.stage.read(cx).active_thinking_effort == "high")
+                .unwrap()
+        {
+            break;
+        }
+    }
+    {
+        let g = server_state.lock().unwrap();
+        assert_eq!(g.owned_bot_model, "gemini-3.7-flash");
+        assert_eq!(g.owned_bot_thinking, "high");
+        assert_eq!(g.patched_bots[0], (777_001, Some("gemini-3.7-flash".to_string()), None));
+        assert_eq!(g.patched_bots[1], (777_001, None, Some("high".to_string())));
+    }
+    shell
+        .read_with(&cx, |s, cx| {
+            let st = s.stage.read(cx);
+            assert_eq!(st.active_model_label, "gemini-3.7-flash");
+            assert_eq!(st.active_thinking_effort, "high");
+        })
+        .unwrap();
+
+    // 4. Logout clears stage model picker state so zero stale models leak across accounts.
+    shell
+        .update(&mut cx, |s, cx| {
+            s.logout(cx);
+            let st = s.stage.read(cx);
+            assert!(!st.model_catalog_synced);
+            assert!(st.available_models.is_empty());
+            assert!(st.active_model_label.is_empty());
+        })
+        .unwrap();
+}
+
+#[test]
+fn test_stage_model_picker_live_sync_and_persistence() {
+    spawn_headless_hermes_bugfix_test(
+        "test_stage_model_picker_live_sync_and_persistence",
+        "stage_model_picker_live_sync_and_persistence",
+    );
+}
+

@@ -933,6 +933,7 @@ impl AppShell {
                             icx.notify();
                         });
                     }
+                    shell.sync_model_picker_to_stage(cx);
                     cx.notify();
                 }
             });
@@ -1742,7 +1743,7 @@ impl AppShell {
         }
     }
 
-    fn persist_bot_computer_profile(
+    pub(crate) fn persist_bot_computer_profile(
         &mut self,
         bot_id: u64,
         req: UpdateBotComputerRequest,
@@ -1833,6 +1834,7 @@ impl AppShell {
                                 }
                             });
                         }
+                        shell.sync_model_picker_to_stage(cx);
                         let msg = tr_str(
                             shell.active_lang_id(),
                             "Bot 电脑与运行配置已保存",
@@ -1848,6 +1850,7 @@ impl AppShell {
                         shell.refresh_computers(cx);
                     }
                     Err(e) => {
+                        shell.sync_model_picker_to_stage(cx);
                         let pfx = tr_str(
                             shell.active_lang_id(),
                             "保存 Bot 配置失败",

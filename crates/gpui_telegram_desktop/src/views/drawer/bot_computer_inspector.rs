@@ -5247,7 +5247,11 @@ pub fn render_openbot_bot_subpage(
                     tr_str(lang, "添加备用模型（最多 8 个）", "Add backup model (max 8)"),
                     &inspector.bot_backup_model_draft,
                     preedit.as_deref(),
-                    "gpt-5-mini / claude-sonnet-4",
+                    if !inspector.ai_models.active_model.trim().is_empty() {
+                        inspector.ai_models.active_model.as_str()
+                    } else {
+                        tr_str(lang, "输入设置中的模型 ID", "Enter model ID from Settings")
+                    },
                     inspector.openbot_text_focus
                         == Some(OpenBotInspectorTextField::BotBackupModelDraft),
                     38.0,

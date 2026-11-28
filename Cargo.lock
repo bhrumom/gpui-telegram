@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "bot-browser"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "aes",
  "argon2",
@@ -2119,7 +2119,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_magpie_gateway"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "e2e_suite"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_daemon"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "fabushi_remote_engine"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_agent"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_cli"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -3418,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_client"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "aes",
  "argon2",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_coding"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3483,7 +3483,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_community"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "chrono",
  "gpui_telegram_core",
@@ -3503,7 +3503,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_core"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "aes",
  "cbc",
@@ -3525,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_desktop"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "bot-browser",
@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_media"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "chrono",
  "fabushi-messaging-core",
@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_proto"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_server"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_test_harness"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -3687,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_telegram_webrtc"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4759,7 +4759,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "magpie_gateway"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5766,7 +5766,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_contracts"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5787,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_runtime"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5832,7 +5832,7 @@ dependencies = [
 
 [[package]]
 name = "openbot_storage"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5861,7 +5861,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orca_bots"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5889,7 +5889,7 @@ dependencies = [
 
 [[package]]
 name = "orca_core"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -5911,7 +5911,7 @@ dependencies = [
 
 [[package]]
 name = "orca_ide"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",

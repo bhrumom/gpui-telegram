@@ -771,101 +771,111 @@ impl AppShell {
                 let _ = self.handle_bot_fusion_inspector_action(act, cx);
             }
             InspectorAction::PatchFabushiBot { bot_id, req } => {
-                let Some(fence) = self.capture_client_fence() else {
-                    return;
-                };
-                let lang_owned = lang.to_string();
-                let target_cid = active_chat;
-                let captured_panel = self.active_panel;
-                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
-                    if !fence.preflight_ui(&weak, app).await {
-                        return;
-                    }
-                    let res = fence
-                        .client
-                        .patch_fabushi_bot_with_token(&fence.token, fence.client_epoch, bot_id, &req)
-                        .await;
-                    let _ = weak.update(app, |shell, cx| {
-                        if !fence.is_valid(shell) {
-                            return;
-                        }
-                        let show_patch_toast =
-                            |shell: &mut Self, msg: String, duration_ms: u64, cx: &mut Context<Self>| {
-                                if let Some(cid) = target_cid {
-                                    if shell.stage.read(cx).active_chat_id == Some(cid) {
-                                        shell.show_chat_toast(cid, msg, duration_ms, cx);
-                                    }
-                                } else {
-                                    let cur_active = resolve_active_target_chat_id(
-                                        shell.stage.read(cx).active_chat_id,
-                                        shell.sidebar.read(cx).active_chat_id,
-                                    );
-                                    if shell.active_panel == captured_panel
-                                        && cur_active.is_none()
-                                    {
-                                        shell.show_non_chat_toast(msg, duration_ms, cx);
-                                    }
-                                }
-                            };
-                        match res {
-                            Ok(updated) => {
-                                if let Some(slot) = shell
-                                    .miniapps
-                                    .fabushi_bots
-                                    .iter_mut()
-                                    .find(|b| b.bot_user_id == updated.bot_user_id)
-                                {
-                                    *slot = updated.clone();
-                                } else {
-                                    shell.miniapps.fabushi_bots.push(updated.clone());
-                                }
-                                for prof in shell.miniapps.bot_profiles_cache.values_mut() {
-                                    if prof.bot.bot_user_id == updated.bot_user_id {
-                                        prof.bot.coding_agent = updated.coding_agent.clone();
-                                        prof.bot.preferred_model = updated.preferred_model.clone();
-                                    }
-                                }
-                                if let Some(comp_prof) = shell
-                                    .computers
-                                    .bot_profiles
-                                    .get_mut(&(updated.bot_user_id.max(0) as u64))
-                                {
-                                    comp_prof.preferred_model = updated.preferred_model.clone();
-                                    let synced_prof = comp_prof.clone();
-                                    if shell.inspector.read(cx).profile.bot_id
-                                        == updated.bot_user_id.max(0) as u64
-                                    {
-                                        shell.inspector.update(cx, |insp, icx| {
-                                            insp.sync_bot_computer_profile(Some(synced_prof));
-                                            icx.notify();
-                                        });
-                                    }
-                                }
-                                shell.sync_fabushi_bots_to_views(cx);
-                                shell.refresh_miniapps_catalog(None, cx);
-                                let msg = tr_str(
-                                    &lang_owned,
-                                    "已更新 Fabushi 智能体配置",
-                                    "Updated Fabushi bot settings",
-                                );
-                                show_patch_toast(shell, msg.to_string(), 1800, cx);
-                            }
-                            Err(e) => {
-                                let msg = format!(
-                                    "{}: {}",
-                                    tr_str(&lang_owned, "更新失败", "Update failed"),
-                                    e
-                                );
-                                show_patch_toast(shell, msg, 2600, cx);
-                            }
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
+                self.patch_fabushi_bot_from_ui(bot_id, req, active_chat, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Patches a Fabushi Bot's live backend configuration (model, thinking effort, persona, etc.)
+    /// with session fencing and full state synchronization across Inspector, Stage, and bot caches.
+    pub(crate) fn patch_fabushi_bot_from_ui(
+        &mut self,
+        bot_id: u64,
+        req: gpui_telegram_proto::miniapp_contracts::PatchFabushiBotRequest,
+        target_cid: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(fence) = self.capture_client_fence() else {
+            return;
+        };
+        let lang_owned = self.active_lang_id().to_string();
+        let captured_panel = self.active_panel;
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            if !fence.preflight_ui(&weak, app).await {
+                return;
+            }
+            let res = fence
+                .client
+                .patch_fabushi_bot_with_token(&fence.token, fence.client_epoch, bot_id, &req)
+                .await;
+            let _ = weak.update(app, |shell, cx| {
+                if !fence.is_valid(shell) {
+                    return;
+                }
+                let show_patch_toast =
+                    |shell: &mut Self, msg: String, duration_ms: u64, cx: &mut Context<Self>| {
+                        if let Some(cid) = target_cid {
+                            if shell.stage.read(cx).active_chat_id == Some(cid) {
+                                shell.show_chat_toast(cid, msg, duration_ms, cx);
+                            }
+                        } else {
+                            let cur_active = resolve_active_target_chat_id(
+                                shell.stage.read(cx).active_chat_id,
+                                shell.sidebar.read(cx).active_chat_id,
+                            );
+                            if shell.active_panel == captured_panel && cur_active.is_none() {
+                                shell.show_non_chat_toast(msg, duration_ms, cx);
+                            }
+                        }
+                    };
+                match res {
+                    Ok(updated) => {
+                        if let Some(slot) = shell
+                            .miniapps
+                            .fabushi_bots
+                            .iter_mut()
+                            .find(|b| b.bot_user_id == updated.bot_user_id)
+                        {
+                            *slot = updated.clone();
+                        } else {
+                            shell.miniapps.fabushi_bots.push(updated.clone());
+                        }
+                        for prof in shell.miniapps.bot_profiles_cache.values_mut() {
+                            if prof.bot.bot_user_id == updated.bot_user_id {
+                                prof.bot.coding_agent = updated.coding_agent.clone();
+                                prof.bot.preferred_model = updated.preferred_model.clone();
+                            }
+                        }
+                        if let Some(comp_prof) = shell
+                            .computers
+                            .bot_profiles
+                            .get_mut(&(updated.bot_user_id.max(0) as u64))
+                        {
+                            comp_prof.preferred_model = updated.preferred_model.clone();
+                            let synced_prof = comp_prof.clone();
+                            if shell.inspector.read(cx).profile.bot_id
+                                == updated.bot_user_id.max(0) as u64
+                            {
+                                shell.inspector.update(cx, |insp, icx| {
+                                    insp.sync_bot_computer_profile(Some(synced_prof));
+                                    icx.notify();
+                                });
+                            }
+                        }
+                        shell.sync_fabushi_bots_to_views(cx);
+                        shell.refresh_miniapps_catalog(None, cx);
+                        let msg = tr_str(
+                            &lang_owned,
+                            "已更新 Fabushi 智能体配置",
+                            "Updated Fabushi bot settings",
+                        );
+                        show_patch_toast(shell, msg.to_string(), 1800, cx);
+                    }
+                    Err(e) => {
+                        shell.sync_model_picker_to_stage(cx);
+                        let msg = format!(
+                            "{}: {}",
+                            tr_str(&lang_owned, "更新失败", "Update failed"),
+                            e
+                        );
+                        show_patch_toast(shell, msg, 2600, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Shared cleanup for leaving or deleting a chat across both modal confirmation and sidebar

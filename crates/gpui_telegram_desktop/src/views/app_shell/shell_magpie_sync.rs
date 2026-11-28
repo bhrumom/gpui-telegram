@@ -81,6 +81,208 @@ impl AppShell {
         self.refresh_magpie_state(cx);
     }
 
+    /// Returns the live `InspectorAiModelCatalog` from cached Magpie state (or `ContextInspector` fallback).
+    pub(crate) fn current_ai_model_catalog(&self, cx: &gpui::App) -> InspectorAiModelCatalog {
+        if let Some(ref state) = self.magpie_local.latest_state {
+            let local_dtos = self
+                .magpie_local
+                .cached_dtos(Some(state.active_provider.as_str()));
+            InspectorAiModelCatalog::from_magpie_state(
+                state,
+                &self.magpie_local.server_subscriptions,
+                &local_dtos,
+            )
+        } else {
+            self.inspector.read(cx).ai_models.clone()
+        }
+    }
+
+    /// Synchronizes the conversation header model picker with live Settings AI models and the active bot's
+    /// real `preferred_model` / `thinking_level` (never falling back to hardcoded fake models).
+    pub(crate) fn sync_model_picker_to_stage(&mut self, cx: &mut Context<Self>) {
+        let catalog = self.current_ai_model_catalog(cx);
+        let viewer_uid = self.session_sync.user_id;
+        let active_fab = self
+            .stage
+            .read(cx)
+            .active_fabushi_bot
+            .clone()
+            .or_else(|| self.inspector.read(cx).active_fabushi_bot.clone());
+        let bot_id = active_fab
+            .as_ref()
+            .map(|b| b.bot_user_id.max(0) as u64)
+            .filter(|&id| id > 0)
+            .or_else(|| self.active_chat_bot_id(cx));
+        let comp_override = bot_id
+            .and_then(|bid| self.computers.bot_profiles.get(&bid))
+            .map(|p| p.preferred_model.trim().to_string())
+            .filter(|m| !InspectorAiModelCatalog::is_placeholder_model(m))
+            .or_else(|| {
+                let insp = self.inspector.read(cx);
+                let matches_active = bot_id.is_none()
+                    || insp.profile.bot_id == 0
+                    || Some(insp.profile.bot_id) == bot_id;
+                matches_active
+                    .then(|| insp.effective_bot_preferred_model())
+                    .flatten()
+            });
+        let fab_override = active_fab
+            .as_ref()
+            .map(|f| f.preferred_model.trim().to_string())
+            .filter(|m| !InspectorAiModelCatalog::is_placeholder_model(m));
+        let bot_override_model = comp_override.or(fab_override);
+
+        let is_strict_fabushi_owner = active_fab.as_ref().is_some_and(|fab| {
+            fab.owner_user_id > 0 && viewer_uid.is_some_and(|u| fab.owner_user_id as u64 == u)
+        });
+        let is_non_fabushi_owner = active_fab.is_none()
+            && bot_id.is_some()
+            && self.inspector.read(cx).profile.is_viewer_owner;
+        let can_override_bot_model = is_strict_fabushi_owner || is_non_fabushi_owner;
+        let can_edit_thinking_effort = active_fab.is_some();
+
+        let thinking_effort = active_fab
+            .as_ref()
+            .map(|f| f.thinking_level.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+
+        self.stage.update(cx, |st, st_cx| {
+            st.sync_model_picker_context(
+                &catalog,
+                bot_override_model,
+                thinking_effort,
+                can_override_bot_model,
+                can_edit_thinking_effort,
+            );
+            st_cx.notify();
+        });
+    }
+
+    /// Switches the viewer's active Settings/Magpie model on the currently active provider or subscription.
+    pub(crate) fn switch_active_settings_model(
+        &mut self,
+        model: String,
+        chat_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = model.trim().to_string();
+        if trimmed.is_empty() {
+            self.sync_model_picker_to_stage(cx);
+            return;
+        }
+        let lang = self.active_lang_id().to_string();
+        let Some(state) = self.magpie_local.latest_state.clone() else {
+            self.refresh_magpie_state(cx);
+            if let Some(cid) = chat_id {
+                self.show_chat_toast(
+                    cid,
+                    tr_str(
+                        &lang,
+                        "正在同步模型设置，请稍后再试",
+                        "Syncing model settings, please retry shortly",
+                    )
+                    .to_string(),
+                    2000,
+                    cx,
+                );
+            }
+            return;
+        };
+
+        let active_pid = state.active_provider.trim().to_string();
+        let matching_sub_id: Option<String> = if active_pid.is_empty() || trimmed.starts_with("group/") {
+            None
+        } else {
+            self.magpie_local
+                .discovered_items
+                .iter()
+                .find(|i| {
+                    i.account.id == active_pid
+                        || (i.account.kind == magpie_gateway::SubscriptionKind::GoogleVertex
+                            && active_pid == "magpie_provider:google-vertex")
+                })
+                .map(|i| i.account.id.clone())
+                .or_else(|| {
+                    self.magpie_local
+                        .server_subscriptions
+                        .iter()
+                        .find(|s| {
+                            s.id == active_pid
+                                || (s.kind == "google_vertex"
+                                    && active_pid == "magpie_provider:google-vertex")
+                        })
+                        .map(|s| s.id.clone())
+                })
+                .or_else(|| {
+                    state
+                        .subscriptions
+                        .iter()
+                        .find(|s| {
+                            s.id == active_pid
+                                || (s.kind == "google_vertex"
+                                    && active_pid == "magpie_provider:google-vertex")
+                        })
+                        .map(|s| s.id.clone())
+                })
+        };
+
+        if let Some(sub_id) = matching_sub_id {
+            self.activate_subscription(sub_id, Some(trimmed.clone()), cx);
+            if let Some(cid) = chat_id {
+                self.show_chat_toast(
+                    cid,
+                    format!("{}: {trimmed}", tr_str(&lang, "正在切换模型", "Switching model")),
+                    1800,
+                    cx,
+                );
+            }
+            return;
+        }
+
+        let target_provider_id = if !active_pid.is_empty() {
+            Some(active_pid)
+        } else {
+            state
+                .providers
+                .iter()
+                .find(|p| p.is_active)
+                .map(|p| p.provider_id.clone())
+        };
+
+        if let Some(pid) = target_provider_id {
+            let req = MagpieSaveProviderRequest {
+                provider_id: Some(pid),
+                default_model: Some(trimmed.clone()),
+                activate: true,
+                ..Default::default()
+            };
+            self.spawn_magpie_state_mutation(
+                "已切换默认模型",
+                "Active model updated",
+                false,
+                move |c, tok, epoch| async move {
+                    c.hermes_magpie_save_provider_with_token(&tok, epoch, &req)
+                        .await
+                        .map(|r| r.state)
+                        .map_err(|e| e.to_string())
+                },
+                cx,
+            );
+            if let Some(cid) = chat_id {
+                self.show_chat_toast(
+                    cid,
+                    format!("{}: {trimmed}", tr_str(&lang, "已切换模型", "Model")),
+                    1800,
+                    cx,
+                );
+            }
+        } else {
+            self.sync_model_picker_to_stage(cx);
+            self.open_ai_providers_settings(cx);
+        }
+    }
+
     /// Applies fetched `MagpieStateDto` and optional explicit `SubscriptionAccountDto` records to desktop views.
     pub(crate) fn apply_magpie_state_and_subscriptions_to_views(
         &mut self,
@@ -102,6 +304,7 @@ impl AppShell {
             &self.magpie_local.server_subscriptions,
             &local_dtos,
         );
+        let catalog_for_creator = inspector_catalog.clone();
         let state_for_ws = state.clone();
         self.settings_router.update(cx, |sr, scx| {
             if let Some(ref ap) = sr.settings_ai_providers {
@@ -129,10 +332,18 @@ impl AppShell {
             insp.sync_ai_models(inspector_catalog);
             icx.notify();
         });
+        if let Some(ref creator) = self.miniapps.create_bot_box {
+            creator.update(cx, |b, bcx| {
+                b.sync_ai_models(catalog_for_creator);
+                bcx.notify();
+            });
+        }
+        self.sync_model_picker_to_stage(cx);
         cx.notify();
     }
 
-    /// Pushes cached Settings/Magpie AI model catalog into `ContextInspector`, or fetches it if absent.
+    /// Pushes cached Settings/Magpie AI model catalog into `ContextInspector`, `ConversationStage`,
+    /// and `CreateManagedBotBoxPeers`, or fetches it if absent.
     pub fn sync_cached_ai_models_to_inspector(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.magpie_local.latest_state.clone() {
             let local_dtos = self
@@ -143,12 +354,23 @@ impl AppShell {
                 &self.magpie_local.server_subscriptions,
                 &local_dtos,
             );
+            let catalog_for_creator = catalog.clone();
             self.inspector.update(cx, |insp, icx| {
                 insp.sync_ai_models(catalog);
                 icx.notify();
             });
+            if let Some(ref creator) = self.miniapps.create_bot_box {
+                creator.update(cx, |b, bcx| {
+                    b.sync_ai_models(catalog_for_creator);
+                    bcx.notify();
+                });
+            }
+            self.sync_model_picker_to_stage(cx);
         } else if self.is_authenticated {
+            self.sync_model_picker_to_stage(cx);
             self.refresh_magpie_state(cx);
+        } else {
+            self.sync_model_picker_to_stage(cx);
         }
     }
 
@@ -478,6 +700,7 @@ impl AppShell {
                                 });
                             }
                         });
+                        shell.sync_model_picker_to_stage(cx);
                         shell.show_non_chat_toast(msg, 2800, cx);
                         cx.notify();
                     }
@@ -766,6 +989,7 @@ impl AppShell {
                                 });
                             }
                         });
+                        shell.sync_model_picker_to_stage(cx);
                         shell.show_non_chat_toast(msg, 3000, cx);
                     }
                 }

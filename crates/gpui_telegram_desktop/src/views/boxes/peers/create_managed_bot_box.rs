@@ -129,14 +129,6 @@ const STUDIO_STARTER_SUGGESTIONS: [StudioStarterSuggestion; 6] = [
     },
 ];
 
-const STUDIO_MODEL_CHOICES: [(&str, &str); 5] = [
-    ("", "GPT-6-Luna (默认)"),
-    ("gpt-6-luna", "GPT-6-Luna"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-    ("deepseek-reasoner", "DeepSeek Reasoner"),
-];
-
 fn template_category_label_zh(cat: BotTemplateCategory) -> &'static str {
     match cat {
         BotTemplateCategory::Coding => "编程",
@@ -360,6 +352,7 @@ pub struct CreateManagedBotBoxPeers {
     pub model_picker_open: bool,
     pub advanced_open: bool,
     pub hero_wink_toggle: bool,
+    pub ai_models: crate::views::drawer::InspectorAiModelCatalog,
 }
 
 impl Default for CreateManagedBotBoxPeers {
@@ -416,7 +409,55 @@ impl CreateManagedBotBoxPeers {
             model_picker_open: false,
             advanced_open: false,
             hero_wink_toggle: false,
+            ai_models: crate::views::drawer::InspectorAiModelCatalog::default(),
         }
+    }
+
+    pub fn sync_ai_models(&mut self, catalog: crate::views::drawer::InspectorAiModelCatalog) {
+        self.ai_models = catalog;
+    }
+
+    /// Returns the real model label shown on the Bot Studio model button (never hardcoded fake models).
+    pub fn studio_model_display_label(&self, lang: &str) -> String {
+        let trimmed = self.preferred_model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        if !self.ai_models.needs_provider_selection && !self.ai_models.active_model.trim().is_empty()
+        {
+            self.ai_models.active_model.trim().to_string()
+        } else if self.ai_models.synced && self.ai_models.needs_provider_selection {
+            tr_str(lang, "未配置模型", "No model").to_string()
+        } else {
+            tr_str(lang, "跟随设置默认", "Follow Settings").to_string()
+        }
+    }
+
+    /// Returns real selectable `(model_id, display_label)` choices sourced exclusively from Settings.
+    pub fn studio_model_options(&self, lang: &str) -> Vec<(String, String)> {
+        let follow_lbl = if !self.ai_models.needs_provider_selection
+            && !self.ai_models.active_model.trim().is_empty()
+        {
+            if lang.starts_with("zh") {
+                format!("跟随设置默认 ({})", self.ai_models.active_model.trim())
+            } else {
+                format!("Follow Settings ({})", self.ai_models.active_model.trim())
+            }
+        } else {
+            tr_str(lang, "跟随设置默认", "Follow Settings").to_string()
+        };
+        let mut opts = vec![(String::new(), follow_lbl)];
+        for model in self.ai_models.selectable_models() {
+            let trimmed = model.trim();
+            if !trimmed.is_empty()
+                && !opts
+                    .iter()
+                    .any(|(id, _)| !id.is_empty() && id.eq_ignore_ascii_case(trimmed))
+            {
+                opts.push((trimmed.to_string(), trimmed.to_string()));
+            }
+        }
+        opts
     }
 
     /// Pre-fills the unified Fabushi Bot form from one of the 24 built-in templates.
@@ -1880,12 +1921,11 @@ impl Render for CreateManagedBotBoxPeers {
                     ),
             );
 
-        let model_display = if self.preferred_model.trim().is_empty() {
-            "GPT-6-Luna".to_string()
-        } else {
-            self.preferred_model.trim().to_string()
-        };
+        let model_display = self.studio_model_display_label(lang);
         let think_display = thinking_level_label(&self.thinking_level, lang);
+        let studio_model_opts = self.studio_model_options(lang);
+        let has_live_studio_models = studio_model_opts.len() > 1;
+        let studio_models_synced = self.ai_models.synced;
 
         let fabushi_body = is_fabushi.then(|| {
             let avatar_picker = self.render_studio_avatar_picker(pal, cx);
@@ -1896,6 +1936,62 @@ impl Render for CreateManagedBotBoxPeers {
             let model_field_active = self.active_field == 4;
 
             let model_dropdown = self.model_picker_open.then(|| {
+                let mut opts_col = div()
+                    .id("studio-model-picker-scroll")
+                    .max_h(px(200.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(studio_model_opts.into_iter().enumerate().map(|(idx, (id_val, lbl))| {
+                        let selected = self.preferred_model.trim().eq_ignore_ascii_case(&id_val);
+                        let owned = id_val.clone();
+                        div()
+                            .id(SharedString::from(format!("studio-model-opt-{idx}")))
+                            .cursor_pointer()
+                            .min_h(px(30.0))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .when(selected, |el| el.bg(bg_active))
+                            .hover(move |s| if selected { s } else { s.bg(hover_bg) })
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(13.0))
+                            .text_color(if selected { text_pri } else { text_sec })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.preferred_model = owned.clone();
+                                    this.model_picker_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(lbl)
+                    }));
+                if !has_live_studio_models {
+                    opts_col = opts_col.child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .text_size(px(11.5))
+                            .text_color(text_muted)
+                            .child(if studio_models_synced {
+                                tr_str(
+                                    lang,
+                                    "设置中尚未配置可用模型，请先在「设置 → AI 模型供应商」中配置",
+                                    "No models configured yet — configure a provider in Settings → AI Providers",
+                                )
+                            } else {
+                                tr_str(
+                                    lang,
+                                    "正在同步设置中的模型列表…",
+                                    "Syncing available models from Settings…",
+                                )
+                            }),
+                    );
+                }
                 div()
                     .id("studio-model-picker-dropdown")
                     .w_full()
@@ -1907,38 +2003,7 @@ impl Render for CreateManagedBotBoxPeers {
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .children(STUDIO_MODEL_CHOICES.into_iter().enumerate().map(|(idx, (id_val, lbl))| {
-                                let selected = self.preferred_model.trim() == id_val;
-                                let owned = id_val.to_string();
-                                div()
-                                    .id(SharedString::from(format!("studio-model-opt-{idx}")))
-                                    .cursor_pointer()
-                                    .h(px(30.0))
-                                    .px(px(8.0))
-                                    .rounded(px(6.0))
-                                    .when(selected, |el| el.bg(bg_active))
-                                    .hover(move |s| if selected { s } else { s.bg(hover_bg) })
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_size(px(13.0))
-                                    .text_color(if selected { text_pri } else { text_sec })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.preferred_model = owned.clone();
-                                            this.model_picker_open = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(lbl)
-                            })),
-                    )
+                    .child(opts_col)
                     .child(div().h(px(1.0)).w_full().bg(border_subtle))
                     .child(
                         div()

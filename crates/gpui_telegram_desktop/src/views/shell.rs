@@ -1107,6 +1107,7 @@ impl AppShell {
                 });
             }
             self.inspector.update(cx, |insp, _| insp.clear_ai_models());
+            self.stage.update(cx, |st, _| st.clear_model_picker_state());
             self.tasks_workspace.update(cx, |w, wcx| {
                 w.reset_on_logout();
                 wcx.notify();
@@ -1188,6 +1189,7 @@ impl AppShell {
         }
         self.magpie_local.reset_on_logout();
         self.inspector.update(cx, |insp, _| insp.clear_ai_models());
+        self.stage.update(cx, |st, _| st.clear_model_picker_state());
         self.tasks_workspace.update(cx, |w, wcx| {
             w.reset_on_logout();
             wcx.notify();

@@ -245,11 +245,16 @@ impl AppShell {
         let lang = self.active_lang_id().to_string();
         let detected = self.coding_host.detected_providers.clone();
         let device_id = self.client.device_id();
+        let ai_catalog = self.current_ai_model_catalog(cx);
+        if !ai_catalog.synced && self.is_authenticated {
+            self.refresh_magpie_state(cx);
+        }
         if let Some(ref existing) = self.miniapps.create_bot_box {
             existing.update(cx, |b, _| {
                 b.set_palette(pal);
                 b.set_language(lang);
                 b.set_detected_coding_providers(detected, Some(device_id));
+                b.sync_ai_models(ai_catalog);
             });
             return existing.clone();
         }
@@ -258,6 +263,7 @@ impl AppShell {
             b.set_palette(pal);
             b.set_language(lang);
             b.set_detected_coding_providers(detected, Some(device_id));
+            b.sync_ai_models(ai_catalog);
             b
         });
         let mut prev_state = (false, false, false, false, 0u8);
