@@ -10,11 +10,13 @@ pub mod books_view;
 pub mod creations_view;
 pub mod game_runtime_sheet;
 pub mod games_view;
+pub mod marketplace_state;
+pub mod marketplace_view;
 pub mod music_player_bar;
 pub mod music_view;
 pub mod publish_review_modal;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -27,6 +29,7 @@ use gpui_telegram_proto::creations::{
     SubmitReviewRequest, UpdateCreationRequest, UpsertCreationStateRequest, UserCreationDto,
     UserCreationStateDto,
 };
+use openbot_storage::{McpKeyValue, McpTransport};
 
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
@@ -42,6 +45,11 @@ pub use creations_view::{
     render_my_creations_view, render_quick_creations_drawer, QUICK_DRAWER_WIDTH,
 };
 pub use game_runtime_sheet::{extract_game_payload, ActiveGameSession};
+pub use marketplace_state::{
+    ConnectorSetupDraft, CustomServerFormDraft, MarketplaceAppEntry, MarketplaceBotSummary,
+    MarketplaceHubState, MarketplaceNavTab, MarketplaceRoute, MarketplaceSkillSortMode,
+    MarketplaceSourceChoice,
+};
 pub use music_player_bar::{build_music_track_entries_from_creation, synthesize_entry_from_track};
 pub use publish_review_modal::{
     render_publish_review_modal_body, PublishModalField, PublishReviewModalState,
@@ -55,6 +63,7 @@ use apple_primitives::{
 /// Top-level creative vertical or personal cloud studio section mounted inside `ContentHubWorkspace`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContentHubSection {
+    Marketplace,
     Books,
     Music,
     Games,
@@ -84,6 +93,7 @@ impl ContentHubSection {
 
     pub fn creation_kind(self) -> Option<CreationKind> {
         match self {
+            Self::Marketplace => None,
             Self::Books => Some(CreationKind::Book),
             Self::Music => Some(CreationKind::Music),
             Self::Games => Some(CreationKind::Game),
@@ -94,6 +104,7 @@ impl ContentHubSection {
 
     pub fn default_sub_tab(self) -> &'static str {
         match self {
+            Self::Marketplace => "apps",
             Self::Books => "reading_now",
             Self::Music => "home",
             Self::Games => "discover",
@@ -113,6 +124,16 @@ pub enum ContentHubInputTarget {
     QuickDrawerSearch,
     ReviewTitle,
     ReviewBody,
+    MarketplaceSearch,
+    MarketplaceSetupPrimary,
+    MarketplaceSetupSecondary,
+    MarketplaceCustomName,
+    MarketplaceCustomCommand,
+    MarketplaceCustomArgs,
+    MarketplaceCustomEnv,
+    MarketplaceCustomWorkDir,
+    MarketplaceCustomUrl,
+    MarketplaceCustomHeaders,
 }
 
 /// Typed events emitted by `ContentHubWorkspace` to `AppShell` (`shell_content_hub.rs`).
@@ -120,6 +141,7 @@ pub enum ContentHubInputTarget {
 pub enum ContentHubEvent {
     RefreshMyCreations,
     RefreshCatalog(ContentHubSection),
+    RefreshMarketplaceState,
     RefreshReviewQueue,
     OpenCreatorBot(Option<CreationKind>),
     OpenCreatorBotWithCommand(String),
@@ -190,6 +212,70 @@ pub enum ContentHubEvent {
         short_name: String,
         web_url: Option<String>,
     },
+    MarketplaceConnectPlugin {
+        slug: String,
+        auth_values: BTreeMap<String, String>,
+        override_url: Option<String>,
+    },
+    MarketplaceConnectNative {
+        connector_id: String,
+        account_label: Option<String>,
+        credential: Option<String>,
+        metadata: BTreeMap<String, String>,
+    },
+    MarketplaceDisconnectApp {
+        app_id: String,
+    },
+    MarketplaceSaveCustomMcp {
+        edit_server_id: Option<String>,
+        name: String,
+        transport: McpTransport,
+        command: String,
+        args: Vec<String>,
+        env: Vec<McpKeyValue>,
+        working_dir: String,
+        url: String,
+        headers: Vec<McpKeyValue>,
+    },
+    MarketplaceTestCustomMcp {
+        name: String,
+        transport: McpTransport,
+        command: String,
+        args: Vec<String>,
+        env: Vec<McpKeyValue>,
+        working_dir: String,
+        url: String,
+        headers: Vec<McpKeyValue>,
+    },
+    MarketplaceRemoveCustomMcp {
+        server_id: String,
+    },
+    MarketplaceToggleServerAgentAccess {
+        server_id: String,
+        agent_id: String,
+        allowed: bool,
+    },
+    MarketplaceAddAgent {
+        slug: String,
+    },
+    MarketplaceOpenAgentChat {
+        slug: String,
+    },
+    MarketplaceToggleSkillForAgent {
+        slug: String,
+        agent_id: String,
+        install: bool,
+    },
+    MarketplaceRunPrompt {
+        app_name: String,
+        prompt: String,
+    },
+    MarketplaceOpenExternalUrl {
+        url: String,
+    },
+    MarketplaceCopyLink {
+        url: String,
+    },
     CloseQuickDrawer,
     ClosePublishReviewModal,
     NavigateSection(ContentHubSection),
@@ -197,13 +283,15 @@ pub enum ContentHubEvent {
 }
 
 /// Primary Apple Content Hub workspace entity holding synced cloud creations, vertical catalogs,
-/// embedded Apple Books reader, headless-safe `MusicTransportEngine`, interactive `ActiveGameSession`,
-/// Quick Creations Drawer state, and `PublishReviewModalState`.
+/// unified OpenBot Marketplace state, embedded Apple Books reader, headless-safe
+/// `MusicTransportEngine`, interactive `ActiveGameSession`, Quick Creations Drawer state,
+/// and `PublishReviewModalState`.
 pub struct ContentHubWorkspace {
     pub active_section: ContentHubSection,
     pub active_sub_tab: String,
     pub active_action_hint: Option<String>,
     pub quick_drawer_open: bool,
+    pub marketplace: MarketplaceHubState,
     pub music_engine: MusicTransportEngine,
     pub music_lyrics_open: bool,
     pub music_queue_open: bool,
@@ -255,10 +343,11 @@ impl ContentHubWorkspace {
         let mut publish_modal = PublishReviewModalState::default();
         publish_modal.language_id = language_id.clone();
         Self {
-            active_section: ContentHubSection::Books,
-            active_sub_tab: ContentHubSection::Books.default_sub_tab().to_string(),
+            active_section: ContentHubSection::Marketplace,
+            active_sub_tab: ContentHubSection::Marketplace.default_sub_tab().to_string(),
             active_action_hint: None,
             quick_drawer_open: false,
+            marketplace: MarketplaceHubState::new(),
             music_engine: MusicTransportEngine::new(),
             music_lyrics_open: false,
             music_queue_open: false,
@@ -335,6 +424,50 @@ impl ContentHubWorkspace {
                 self.active_input = ContentHubInputTarget::None;
             }
         }
+        match section {
+            ContentHubSection::Books => self.marketplace.select_tab(MarketplaceNavTab::Books),
+            ContentHubSection::Games => self.marketplace.select_tab(MarketplaceNavTab::Games),
+            ContentHubSection::AppStore => self.marketplace.select_tab(MarketplaceNavTab::MiniApps),
+            _ => {}
+        }
+    }
+
+    pub fn select_marketplace_tab_with_refresh(
+        &mut self,
+        tab: MarketplaceNavTab,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_input_ime_preedit(None);
+        self.active_section = ContentHubSection::Marketplace;
+        self.marketplace.select_tab(tab);
+        self.selected_creation_id = None;
+        self.selected_catalog_item = None;
+        self.selected_detail_creation = None;
+        self.selected_genre_filter = None;
+        self.active_reviews.clear();
+        self.active_leaderboard.clear();
+        self.review_status_notice = None;
+        if self.active_input != ContentHubInputTarget::QuickDrawerSearch {
+            self.active_input = ContentHubInputTarget::None;
+        }
+        match tab {
+            MarketplaceNavTab::MiniApps => {
+                self.active_sub_tab = ContentHubSection::AppStore.default_sub_tab().to_string();
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::AppStore));
+            }
+            MarketplaceNavTab::Books => {
+                self.active_sub_tab = ContentHubSection::Books.default_sub_tab().to_string();
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Books));
+            }
+            MarketplaceNavTab::Games => {
+                self.active_sub_tab = ContentHubSection::Games.default_sub_tab().to_string();
+                cx.emit(ContentHubEvent::RefreshCatalog(ContentHubSection::Games));
+            }
+            MarketplaceNavTab::Apps | MarketplaceNavTab::Agents | MarketplaceNavTab::Skills => {
+                cx.emit(ContentHubEvent::RefreshMarketplaceState);
+            }
+        }
+        cx.notify();
     }
 
     pub fn is_publish_review_modal_open(&self) -> bool {
@@ -348,7 +481,17 @@ impl ContentHubWorkspace {
             ContentHubInputTarget::CatalogSearch
             | ContentHubInputTarget::CreationsSearch
             | ContentHubInputTarget::ReviewTitle
-            | ContentHubInputTarget::ReviewBody => in_content_hub,
+            | ContentHubInputTarget::ReviewBody
+            | ContentHubInputTarget::MarketplaceSearch
+            | ContentHubInputTarget::MarketplaceSetupPrimary
+            | ContentHubInputTarget::MarketplaceSetupSecondary
+            | ContentHubInputTarget::MarketplaceCustomName
+            | ContentHubInputTarget::MarketplaceCustomCommand
+            | ContentHubInputTarget::MarketplaceCustomArgs
+            | ContentHubInputTarget::MarketplaceCustomEnv
+            | ContentHubInputTarget::MarketplaceCustomWorkDir
+            | ContentHubInputTarget::MarketplaceCustomUrl
+            | ContentHubInputTarget::MarketplaceCustomHeaders => in_content_hub,
         }
     }
 
@@ -366,6 +509,7 @@ impl ContentHubWorkspace {
         self.quick_drawer_search.set_ime_preedit(None);
         self.review_draft_title.set_ime_preedit(None);
         self.review_draft_body.set_ime_preedit(None);
+        self.marketplace.clear_all_preedits();
     }
 
     fn active_field(&self) -> Option<&EditableFieldState> {
@@ -376,6 +520,28 @@ impl ContentHubWorkspace {
             ContentHubInputTarget::QuickDrawerSearch => Some(&self.quick_drawer_search),
             ContentHubInputTarget::ReviewTitle => Some(&self.review_draft_title),
             ContentHubInputTarget::ReviewBody => Some(&self.review_draft_body),
+            ContentHubInputTarget::MarketplaceSearch => Some(&self.marketplace.search),
+            ContentHubInputTarget::MarketplaceSetupPrimary => {
+                self.marketplace.setup_draft.as_ref().map(|d| &d.primary)
+            }
+            ContentHubInputTarget::MarketplaceSetupSecondary => {
+                self.marketplace.setup_draft.as_ref().map(|d| &d.secondary)
+            }
+            ContentHubInputTarget::MarketplaceCustomName => Some(&self.marketplace.custom_form.name),
+            ContentHubInputTarget::MarketplaceCustomCommand => {
+                Some(&self.marketplace.custom_form.command)
+            }
+            ContentHubInputTarget::MarketplaceCustomArgs => Some(&self.marketplace.custom_form.args),
+            ContentHubInputTarget::MarketplaceCustomEnv => {
+                Some(&self.marketplace.custom_form.env_lines)
+            }
+            ContentHubInputTarget::MarketplaceCustomWorkDir => {
+                Some(&self.marketplace.custom_form.working_dir)
+            }
+            ContentHubInputTarget::MarketplaceCustomUrl => Some(&self.marketplace.custom_form.url),
+            ContentHubInputTarget::MarketplaceCustomHeaders => {
+                Some(&self.marketplace.custom_form.header_lines)
+            }
         }
     }
 
@@ -387,6 +553,34 @@ impl ContentHubWorkspace {
             ContentHubInputTarget::QuickDrawerSearch => Some(&mut self.quick_drawer_search),
             ContentHubInputTarget::ReviewTitle => Some(&mut self.review_draft_title),
             ContentHubInputTarget::ReviewBody => Some(&mut self.review_draft_body),
+            ContentHubInputTarget::MarketplaceSearch => Some(&mut self.marketplace.search),
+            ContentHubInputTarget::MarketplaceSetupPrimary => {
+                self.marketplace.setup_draft.as_mut().map(|d| &mut d.primary)
+            }
+            ContentHubInputTarget::MarketplaceSetupSecondary => {
+                self.marketplace.setup_draft.as_mut().map(|d| &mut d.secondary)
+            }
+            ContentHubInputTarget::MarketplaceCustomName => {
+                Some(&mut self.marketplace.custom_form.name)
+            }
+            ContentHubInputTarget::MarketplaceCustomCommand => {
+                Some(&mut self.marketplace.custom_form.command)
+            }
+            ContentHubInputTarget::MarketplaceCustomArgs => {
+                Some(&mut self.marketplace.custom_form.args)
+            }
+            ContentHubInputTarget::MarketplaceCustomEnv => {
+                Some(&mut self.marketplace.custom_form.env_lines)
+            }
+            ContentHubInputTarget::MarketplaceCustomWorkDir => {
+                Some(&mut self.marketplace.custom_form.working_dir)
+            }
+            ContentHubInputTarget::MarketplaceCustomUrl => {
+                Some(&mut self.marketplace.custom_form.url)
+            }
+            ContentHubInputTarget::MarketplaceCustomHeaders => {
+                Some(&mut self.marketplace.custom_form.header_lines)
+            }
         }
     }
 
@@ -433,6 +627,7 @@ impl ContentHubWorkspace {
             self.quick_drawer_search.set_ime_preedit(None);
             self.review_draft_title.set_ime_preedit(None);
             self.review_draft_body.set_ime_preedit(None);
+            self.marketplace.clear_all_preedits();
         } else if let Some(field) = self.active_field_mut() {
             field.set_ime_preedit(preedit);
         }
@@ -444,6 +639,7 @@ impl ContentHubWorkspace {
             || self.quick_drawer_search.ime_preedit.is_some()
             || self.review_draft_title.ime_preedit.is_some()
             || self.review_draft_body.ime_preedit.is_some()
+            || self.marketplace.has_any_preedit()
             || self.publish_modal.has_any_preedit();
         if had {
             self.set_active_input_ime_preedit(None);
@@ -997,10 +1193,11 @@ impl ContentHubWorkspace {
         self.music_now_playing_creation_id = None;
         self.book_reader = None;
         self.active_game = None;
-        self.active_section = ContentHubSection::Books;
-        self.active_sub_tab = ContentHubSection::Books.default_sub_tab().to_string();
+        self.active_section = ContentHubSection::Marketplace;
+        self.active_sub_tab = ContentHubSection::Marketplace.default_sub_tab().to_string();
         self.active_action_hint = None;
         self.quick_drawer_open = false;
+        self.marketplace = MarketplaceHubState::new();
         self.my_creations.clear();
         self.my_creations_revision = 0;
         self.deleted_creation_revisions.clear();
@@ -1040,6 +1237,7 @@ impl ContentHubWorkspace {
 impl ContentHubWorkspace {
     pub(crate) fn active_catalog_items(&self, section: ContentHubSection) -> Vec<PublicCatalogItemDto> {
         let base: Vec<PublicCatalogItemDto> = match section {
+            ContentHubSection::Marketplace => Vec::new(),
             ContentHubSection::Books => self.books_catalog.clone(),
             ContentHubSection::Music => self.music_catalog.clone(),
             ContentHubSection::Games => self.games_catalog.clone(),
@@ -1409,6 +1607,7 @@ impl Render for ContentHubWorkspace {
         let pal = self.palette;
         let vp_w = f32::from(window.viewport_size().width);
         let active_page = match self.active_section {
+            ContentHubSection::Marketplace => "marketplace",
             ContentHubSection::Books => "books",
             ContentHubSection::Music => "music",
             ContentHubSection::Games => "games",
@@ -1432,10 +1631,28 @@ impl Render for ContentHubWorkspace {
             book_reader::render_book_reader(self, cx)
         } else {
             match self.active_section {
-                ContentHubSection::Books => books_view::render_books_hub_view(self, cx),
+                ContentHubSection::Marketplace => {
+                    marketplace_view::render_marketplace_hub_view(self, cx)
+                }
+                ContentHubSection::Books => {
+                    if self.marketplace.active_tab != MarketplaceNavTab::Books {
+                        self.marketplace.select_tab(MarketplaceNavTab::Books);
+                    }
+                    marketplace_view::render_marketplace_hub_view(self, cx)
+                }
+                ContentHubSection::Games => {
+                    if self.marketplace.active_tab != MarketplaceNavTab::Games {
+                        self.marketplace.select_tab(MarketplaceNavTab::Games);
+                    }
+                    marketplace_view::render_marketplace_hub_view(self, cx)
+                }
+                ContentHubSection::AppStore => {
+                    if self.marketplace.active_tab != MarketplaceNavTab::MiniApps {
+                        self.marketplace.select_tab(MarketplaceNavTab::MiniApps);
+                    }
+                    marketplace_view::render_marketplace_hub_view(self, cx)
+                }
                 ContentHubSection::Music => music_view::render_music_hub_view(self, cx),
-                ContentHubSection::Games => games_view::render_games_hub_view(self, cx),
-                ContentHubSection::AppStore => app_store_view::render_app_store_hub_view(self, cx),
                 ContentHubSection::MyCreations => render_my_creations_view(self, cx),
             }
         };

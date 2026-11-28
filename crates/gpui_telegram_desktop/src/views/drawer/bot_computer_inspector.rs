@@ -5652,22 +5652,80 @@ pub fn render_openbot_bot_subpage(
                         )
                         .child(quick_row),
                 )
-                .child(
-                    div()
+                .child({
+                    let hover_bg = ob.bg_control_hover();
+                    let mut mcp_card = div()
                         .px(px(12.0))
                         .py(px(10.0))
-                        .rounded(px(8.0))
+                        .rounded(px(10.0))
                         .bg(ob.bg_surface())
                         .border_1()
                         .border_color(ob.border_hairline())
-                        .text_size(px(12.5))
-                        .text_color(ob.text_muted())
-                        .child(format!(
-                            "{}: {}",
-                            tr_str(lang, "已连接 MCP 服务", "Connected MCP Servers"),
-                            snap.mcp_servers.len()
-                        )),
-                )
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_primary())
+                                        .child(format!(
+                                            "{}: {}",
+                                            tr_str(lang, "已连接连接器 / MCP 服务", "Connected Apps & MCP"),
+                                            snap.mcp_servers.len()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("bot-inspector-open-marketplace-apps")
+                                        .cursor_pointer()
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(6.0))
+                                        .bg(ob.bg_control())
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ob.text_primary())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.pending_action =
+                                                    Some(InspectorAction::OpenMarketplaceApps);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(tr_str(lang, "去市场添加 →", "Marketplace →")),
+                                ),
+                        );
+                    if !snap.mcp_servers.is_empty() {
+                        mcp_card = mcp_card.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(6.0))
+                                .children(snap.mcp_servers.iter().map(|srv| {
+                                    div()
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(999.0))
+                                        .bg(ob.bg_canvas())
+                                        .border_1()
+                                        .border_color(ob.border_hairline())
+                                        .text_size(px(11.0))
+                                        .text_color(ob.text_secondary())
+                                        .child(srv.name.clone())
+                                })),
+                        );
+                    }
+                    mcp_card
+                })
                 .into_any_element()
         }
         OpenBotSettingsSubpage::DataTables => {

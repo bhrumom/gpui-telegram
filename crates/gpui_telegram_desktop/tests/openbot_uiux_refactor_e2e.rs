@@ -466,9 +466,9 @@ fn ui_f04_defect_c7_corrupt_page_rail_pins_must_preserve_valid_entries() {
     let d1 = tempfile::tempdir().unwrap();
     std::fs::write(
         d1.path().join("openbot-page-rail-pins-v1.json"),
-        r#"{"version":1,"pinned_sections":["books","nonexistent_tab","","chats","books"]}"#,
+        r#"{"version":1,"pinned_sections":["music","books","mcp_tools","schedule","nonexistent_tab","","chats","music"]}"#,
     ).unwrap();
-    assert_eq!(load_page_rail_pins(d1.path()), vec![AppleSidebarSection::Books]);
+    assert_eq!(load_page_rail_pins(d1.path()), vec![AppleSidebarSection::Music]);
 
     let d2 = tempfile::tempdir().unwrap();
     std::fs::write(d2.path().join("openbot-page-rail-pins-v1.json"), r#"{"version":1,"pinned_sections":[]}"#).unwrap();

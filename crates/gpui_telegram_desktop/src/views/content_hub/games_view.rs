@@ -537,6 +537,22 @@ pub fn render_games_hub_view(
     ws: &mut ContentHubWorkspace,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
+    render_games_inner(ws, false, cx)
+}
+
+/// Renders the Games / Arcade body embedded inside the unified OpenBot Marketplace.
+pub fn render_games_embedded_body(
+    ws: &mut ContentHubWorkspace,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> AnyElement {
+    render_games_inner(ws, true, cx)
+}
+
+fn render_games_inner(
+    ws: &mut ContentHubWorkspace,
+    embedded: bool,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> AnyElement {
     let pal = ws.palette;
     let lang = ws.language_id.clone();
     let active_tab = normalize_games_sub_tab(&ws.active_sub_tab);
@@ -585,6 +601,407 @@ pub fn render_games_hub_view(
 
     let ob = pal.openbot_palette();
     let root_label = tr_str(&lang, "游戏", "Games");
+
+    let content_col = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(20.0))
+        .when(embedded && selected_detail.is_none(), |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(16.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(28.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(ob.text_primary())
+                                            .child(root_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .text_color(ob.text_muted())
+                                            .child(tr_str(
+                                                &lang,
+                                                "即点即玩的原生街机、益智与排行榜挑战游戏",
+                                                "Play instant native arcade, puzzle, and leaderboard games.",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                openbot_secondary_btn(
+                                    "games-refresh-btn",
+                                    tr_str(&lang, "刷新", "Refresh"),
+                                    pal,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_this, _, _, cx| {
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::Games,
+                                        ));
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div().w(px(280.0)).max_w_full().child(
+                                    render_editable_field_box(
+                                        "content-hub-catalog-search-input",
+                                        &search_field,
+                                        tr_str(&lang, "搜索游戏与街机…", "Search Games…"),
+                                        search_focused,
+                                        false,
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.focus_input(
+                                                ContentHubInputTarget::CatalogSearch,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .children(sort_options.iter().map(|&(mode, id, zh, en)| {
+                                        filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.sort_mode = mode;
+                                                    cx.emit(ContentHubEvent::RefreshCatalog(
+                                                        ContentHubSection::Games,
+                                                    ));
+                                                    cx.notify();
+                                                }),
+                                            )
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.0))
+                            .children(GAMES_SUB_TABS.iter().map(|&(slug, zh, en)| {
+                                let count = match slug {
+                                    "library" => library_games.len(),
+                                    "discover" | "arcade" => filtered_games.len(),
+                                    _ => 0,
+                                };
+                                let label = if count > 0 {
+                                    format!("{} ({count})", tr_str(&lang, zh, en))
+                                } else {
+                                    tr_str(&lang, zh, en).to_string()
+                                };
+                                filter_pill(
+                                    SharedString::from(format!("games-tab-{slug}")),
+                                    label,
+                                    active_tab == slug,
+                                    pal,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.active_sub_tab = slug.to_string();
+                                        this.selected_creation_id = None;
+                                        this.selected_catalog_item = None;
+                                        this.selected_detail_creation = None;
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                    )
+                    .when(!genres.is_empty(), |inner| {
+                        inner.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    filter_pill(
+                                        "games-genre-all",
+                                        tr_str(&lang, "全部类型", "All Categories"),
+                                        selected_genre.is_none(),
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.selected_genre_filter = None;
+                                            cx.notify();
+                                        }),
+                                    ),
+                                )
+                                .children(genres.iter().take(8).map(|g| {
+                                    let g_val = g.clone();
+                                    let active = selected_genre
+                                        .as_deref()
+                                        .is_some_and(|s| s.eq_ignore_ascii_case(&g_val));
+                                    filter_pill(
+                                        SharedString::from(format!("games-genre-{g_val}")),
+                                        g_val.clone(),
+                                        active,
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.selected_genre_filter = Some(g_val.clone());
+                                            cx.notify();
+                                        }),
+                                    )
+                                })),
+                        )
+                    }),
+            )
+        })
+        .when_some(selected_detail.clone(), |el, detail| {
+            el.child(render_game_detail_card(ws, detail, cx))
+        })
+        .when(selected_detail.is_none(), |el| {
+            let list = if active_tab == "library" {
+                library_games.clone()
+            } else {
+                filtered_games.clone()
+            };
+            let featured_hero = list.first().cloned();
+
+            el.child(hero_banner(
+                "apple-games-hero-banner",
+                tr_str(&lang, "游戏 · 精选推荐", "GAMES · FEATURED"),
+                featured_hero
+                    .as_ref()
+                    .map(|g| g.title.as_str())
+                    .unwrap_or_else(|| {
+                        tr_str(
+                            &lang,
+                            "即点即玩的原生街机与益智游戏",
+                            "Play Native Arcade & Puzzle Games",
+                        )
+                    }),
+                featured_hero
+                    .as_ref()
+                    .map(|g| g.summary.as_str())
+                    .unwrap_or_else(|| {
+                        tr_str(
+                            &lang,
+                            "GPUI 原生画布渲染、成就徽章与云端高分榜。",
+                            "Native GPUI canvas arcade engine, achievements & cloud high-score leaderboards.",
+                        )
+                    }),
+                "#212121",
+                "#1A1A1A",
+                IconName::HubGames,
+                pal,
+            ))
+            .when(active_tab == "charts" && !list.is_empty(), |inner| {
+                inner.child(
+                    apple_grouped_card(pal)
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(apple_shelf_header(
+                            tr_str(&lang, "游戏总榜 · Top Charts", "Top Games Charts"),
+                            Some(format!("Top {}", list.len().min(15))),
+                            pal,
+                        ))
+                        .children(list.iter().take(15).enumerate().map(|(rank, item)| {
+                            let cid = item.creation_id.clone();
+                            let item_c = item.clone();
+                            let hover_bg = ob.bg_control_hover();
+                            div()
+                                .id(SharedString::from(format!("games-chart-row-{rank}")))
+                                .cursor_pointer()
+                                .px(px(10.0))
+                                .py(px(8.0))
+                                .rounded(px(10.0))
+                                .hover(move |s| s.bg(hover_bg))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.selected_creation_id = Some(cid.clone());
+                                        this.selected_catalog_item = Some(item_c.clone());
+                                        cx.emit(ContentHubEvent::OpenCreationDetail {
+                                            section: ContentHubSection::Games,
+                                            creation_id: cid.clone(),
+                                            action: Some("open".to_string()),
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .w(px(24.0))
+                                                .flex_shrink_0()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(if rank < 3 {
+                                                    ob.text_primary()
+                                                } else {
+                                                    ob.text_muted()
+                                                })
+                                                .child(format!("{}", rank + 1)),
+                                        )
+                                        .child(cover_artwork_box(
+                                            &item.cover,
+                                            42.0,
+                                            42.0,
+                                            10.0,
+                                            0x3D3B52,
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(ob.text_primary())
+                                                        .child(item.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(11.0))
+                                                        .text_color(ob.text_muted())
+                                                        .child(format!(
+                                                            "{} · {} {}",
+                                                            item.author_display_name,
+                                                            item.engagement_count,
+                                                            tr_str(&lang, "次游玩", "plays")
+                                                        )),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div().flex_shrink_0().child(rating_pill(
+                                        item.rating_avg,
+                                        item.rating_count,
+                                        pal,
+                                    )),
+                                )
+                        })),
+                )
+            })
+            .when(active_tab != "charts", |inner| {
+                inner
+                    .child(apple_shelf_header(
+                        match active_tab {
+                            "arcade" => tr_str(&lang, "原生街机与小游戏", "Playable Arcade"),
+                            "library" => tr_str(&lang, "我的游戏库", "My Game Library"),
+                            _ => tr_str(&lang, "精选公开游戏", "Featured Published Games"),
+                        },
+                        Some(format!("{} {}", list.len(), tr_str(&lang, "款", "games"))),
+                        pal,
+                    ))
+                    .when(list.is_empty(), |empty_el| {
+                        let cta = openbot_secondary_btn(
+                            "games-empty-refresh-btn",
+                            tr_str(&lang, "刷新游戏", "Refresh Games"),
+                            pal,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _, _, cx| {
+                                cx.emit(ContentHubEvent::RefreshCatalog(
+                                    ContentHubSection::Games,
+                                ));
+                            }),
+                        );
+                        empty_el.child(empty_state_card_shell(
+                            IconName::HubGames,
+                            tr_str(&lang, "暂无公开上架游戏", "No Published Games Yet"),
+                            tr_str(
+                                &lang,
+                                "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布游戏，审核上架后会显示在这里。",
+                                "Chat with @CreatorStudioBot directly in Messages to build and publish games. Published games appear here.",
+                            ),
+                            cta,
+                            pal,
+                        ))
+                    })
+                    .when(!list.is_empty(), |grid_el| {
+                        grid_el.child(div().flex().flex_wrap().gap(px(14.0)).children(
+                            list.iter().map(|item| {
+                                let best = ws
+                                    .my_creation_states
+                                    .get(&item.creation_id)
+                                    .and_then(|s| {
+                                        serde_json::from_value::<GameUserState>(
+                                            s.state_json.clone(),
+                                        )
+                                        .ok()
+                                    })
+                                    .map(|gs| gs.high_score);
+                                let is_sel = selected_id.as_deref()
+                                    == Some(item.creation_id.as_str());
+                                render_game_card(item, best, is_sel, pal, &lang, cx)
+                            }),
+                        ))
+                    })
+            })
+        });
+
+    if embedded {
+        return div()
+            .id("apple-games-embedded-root")
+            .w_full()
+            .child(content_col)
+            .into_any_element();
+    }
+
     let hover_crumb = ob.bg_control();
     let text_pri = ob.text_primary();
     let header = if let Some(ref detail) = selected_detail {
@@ -778,211 +1195,7 @@ pub fn render_games_hub_view(
             .mx_auto()
             .px(px(24.0))
             .py(px(20.0))
-            .flex()
-            .flex_col()
-            .gap(px(20.0))
-            .when_some(selected_detail.clone(), |el, detail| {
-                el.child(render_game_detail_card(ws, detail, cx))
-            })
-            .when(selected_detail.is_none(), |el| {
-                let list = if active_tab == "library" {
-                    library_games.clone()
-                } else {
-                    filtered_games.clone()
-                };
-                let featured_hero = list.first().cloned();
-
-                el.child(hero_banner(
-                    "apple-games-hero-banner",
-                    tr_str(&lang, "游戏 · 精选推荐", "GAMES · FEATURED"),
-                    featured_hero
-                        .as_ref()
-                        .map(|g| g.title.as_str())
-                        .unwrap_or_else(|| {
-                            tr_str(
-                                &lang,
-                                "即点即玩的原生街机与益智游戏",
-                                "Play Native Arcade & Puzzle Games",
-                            )
-                        }),
-                    featured_hero
-                        .as_ref()
-                        .map(|g| g.summary.as_str())
-                        .unwrap_or_else(|| {
-                            tr_str(
-                                &lang,
-                                "GPUI 原生画布渲染、成就徽章与云端高分榜。",
-                                "Native GPUI canvas arcade engine, achievements & cloud high-score leaderboards.",
-                            )
-                        }),
-                    "#212121",
-                    "#1A1A1A",
-                    IconName::HubGames,
-                    pal,
-                ))
-                .when(active_tab == "charts" && !list.is_empty(), |inner| {
-                    inner.child(
-                        apple_grouped_card(pal)
-                            .p(px(16.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(apple_shelf_header(
-                                tr_str(&lang, "游戏总榜 · Top Charts", "Top Games Charts"),
-                                Some(format!("Top {}", list.len().min(15))),
-                                pal,
-                            ))
-                            .children(list.iter().take(15).enumerate().map(|(rank, item)| {
-                                let cid = item.creation_id.clone();
-                                let item_c = item.clone();
-                                let hover_bg = ob.bg_control_hover();
-                                div()
-                                    .id(SharedString::from(format!("games-chart-row-{rank}")))
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(8.0))
-                                    .rounded(px(10.0))
-                                    .hover(move |s| s.bg(hover_bg))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(12.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.selected_creation_id = Some(cid.clone());
-                                            this.selected_catalog_item = Some(item_c.clone());
-                                            cx.emit(ContentHubEvent::OpenCreationDetail {
-                                                section: ContentHubSection::Games,
-                                                creation_id: cid.clone(),
-                                                action: Some("open".to_string()),
-                                            });
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(10.0))
-                                            .child(
-                                                div()
-                                                    .w(px(24.0))
-                                                    .flex_shrink_0()
-                                                    .text_size(px(14.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(if rank < 3 {
-                                                        ob.text_primary()
-                                                    } else {
-                                                        ob.text_muted()
-                                                    })
-                                                    .child(format!("{}", rank + 1)),
-                                            )
-                                            .child(cover_artwork_box(
-                                                &item.cover,
-                                                42.0,
-                                                42.0,
-                                                10.0,
-                                                0x3D3B52,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_size(px(13.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(ob.text_primary())
-                                                            .child(item.title.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_size(px(11.0))
-                                                            .text_color(ob.text_muted())
-                                                            .child(format!(
-                                                                "{} · {} {}",
-                                                                item.author_display_name,
-                                                                item.engagement_count,
-                                                                tr_str(&lang, "次游玩", "plays")
-                                                            )),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div().flex_shrink_0().child(rating_pill(
-                                            item.rating_avg,
-                                            item.rating_count,
-                                            pal,
-                                        )),
-                                    )
-                            })),
-                    )
-                })
-                .when(active_tab != "charts", |inner| {
-                    inner
-                        .child(apple_shelf_header(
-                            match active_tab {
-                                "arcade" => tr_str(&lang, "原生街机与小游戏", "Playable Arcade"),
-                                "library" => tr_str(&lang, "我的游戏库", "My Game Library"),
-                                _ => tr_str(&lang, "精选公开游戏", "Featured Published Games"),
-                            },
-                            Some(format!("{} {}", list.len(), tr_str(&lang, "款", "games"))),
-                            pal,
-                        ))
-                        .when(list.is_empty(), |empty_el| {
-                            let cta = openbot_secondary_btn(
-                                "games-empty-refresh-btn",
-                                tr_str(&lang, "刷新游戏", "Refresh Games"),
-                                pal,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|_this, _, _, cx| {
-                                    cx.emit(ContentHubEvent::RefreshCatalog(
-                                        ContentHubSection::Games,
-                                    ));
-                                }),
-                            );
-                            empty_el.child(empty_state_card_shell(
-                                IconName::HubGames,
-                                tr_str(&lang, "暂无公开上架游戏", "No Published Games Yet"),
-                                tr_str(
-                                    &lang,
-                                    "在「消息」中直接与 @CreatorStudioBot 对话即可创作并发布游戏，审核上架后会显示在这里。",
-                                    "Chat with @CreatorStudioBot directly in Messages to build and publish games. Published games appear here.",
-                                ),
-                                cta,
-                                pal,
-                            ))
-                        })
-                        .when(!list.is_empty(), |grid_el| {
-                            grid_el.child(div().flex().flex_wrap().gap(px(14.0)).children(
-                                list.iter().map(|item| {
-                                    let best = ws
-                                        .my_creation_states
-                                        .get(&item.creation_id)
-                                        .and_then(|s| {
-                                            serde_json::from_value::<GameUserState>(
-                                                s.state_json.clone(),
-                                            )
-                                            .ok()
-                                        })
-                                        .map(|gs| gs.high_score);
-                                    let is_sel = selected_id.as_deref()
-                                        == Some(item.creation_id.as_str());
-                                    render_game_card(item, best, is_sel, pal, &lang, cx)
-                                }),
-                            ))
-                        })
-                })
-            }),
+            .child(content_col),
     );
 
     div()

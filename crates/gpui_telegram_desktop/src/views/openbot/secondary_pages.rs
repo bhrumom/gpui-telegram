@@ -1232,6 +1232,80 @@ impl Default for MarketplacePageState {
 
 impl MarketplacePageState {
     pub fn new(reduced_motion: bool) -> Self {
+        let catalog = openbot_runtime::platform::marketplace::openbot_marketplace_catalog();
+        let mut items = Vec::with_capacity(
+            catalog.connectors.len()
+                + catalog.plugins.len()
+                + catalog.agents.len()
+                + catalog.skills.len(),
+        );
+        let parse_hex = |raw: &str, fallback: u32| -> u32 {
+            u32::from_str_radix(raw.trim().trim_start_matches('#'), 16).unwrap_or(fallback)
+        };
+        for conn in &catalog.connectors {
+            items.push(MarketplaceCatalogItem {
+                id: format!("connector:{}", conn.connector_id),
+                tab: MarketplaceTab::Apps,
+                name: conn.name.clone(),
+                author: "OpenBot".into(),
+                summary: conn.tagline.clone(),
+                category: conn.category.clone(),
+                verified: true,
+                installs: 25_000,
+                gradient_hex: parse_hex(&conn.brand_hex, 0x007cf7),
+            });
+        }
+        for plug in &catalog.plugins {
+            items.push(MarketplaceCatalogItem {
+                id: format!("plugin:{}", plug.slug),
+                tab: MarketplaceTab::Apps,
+                name: plug.name.clone(),
+                author: if plug.creator_name.is_empty() {
+                    "OpenBot".into()
+                } else {
+                    plug.creator_name.clone()
+                },
+                summary: plug.tagline.clone(),
+                category: plug.category.clone(),
+                verified: true,
+                installs: plug.installs,
+                gradient_hex: parse_hex(&plug.brand_hex, 0x007cf7),
+            });
+        }
+        for agent in &catalog.agents {
+            items.push(MarketplaceCatalogItem {
+                id: format!("agent:{}", agent.slug),
+                tab: MarketplaceTab::Agents,
+                name: agent.name.clone(),
+                author: if agent.creator_name.is_empty() {
+                    "OpenBot".into()
+                } else {
+                    agent.creator_name.clone()
+                },
+                summary: agent.title.clone(),
+                category: agent.category.clone(),
+                verified: agent.verified,
+                installs: agent.installs,
+                gradient_hex: 0xd6adf2,
+            });
+        }
+        for skill in &catalog.skills {
+            items.push(MarketplaceCatalogItem {
+                id: format!("skill:{}", skill.slug),
+                tab: MarketplaceTab::Skills,
+                name: skill.name.clone(),
+                author: if skill.creator_name.is_empty() {
+                    "OpenBot".into()
+                } else {
+                    skill.creator_name.clone()
+                },
+                summary: skill.description.clone(),
+                category: skill.category.clone(),
+                verified: skill.verified,
+                installs: skill.installs,
+                gradient_hex: 0x31cf76,
+            });
+        }
         Self {
             active_tab: MarketplaceTab::Apps,
             breadcrumbs: vec![MarketplaceBreadcrumb {
@@ -1242,41 +1316,7 @@ impl MarketplacePageState {
             }],
             search_query: String::new(),
             source_filter: MarketplaceSourceFilter::All,
-            items: vec![
-                MarketplaceCatalogItem {
-                    id: "app-github".into(),
-                    tab: MarketplaceTab::Apps,
-                    name: "GitHub MCP".into(),
-                    author: "OpenBot".into(),
-                    summary: "PR reviews, issues, and workflow triggers".into(),
-                    category: "Developer".into(),
-                    verified: true,
-                    installs: 14_820,
-                    gradient_hex: 0x007cf7,
-                },
-                MarketplaceCatalogItem {
-                    id: "agent-triage".into(),
-                    tab: MarketplaceTab::Agents,
-                    name: "Release Triage Bot".into(),
-                    author: "OpenBot".into(),
-                    summary: "Automated changelog & regression auditor".into(),
-                    category: "Engineering".into(),
-                    verified: true,
-                    installs: 8_410,
-                    gradient_hex: 0xd6adf2,
-                },
-                MarketplaceCatalogItem {
-                    id: "skill-git".into(),
-                    tab: MarketplaceTab::Skills,
-                    name: "Git Hygiene".into(),
-                    author: "Community".into(),
-                    summary: "Safe rebase, bisect, and diff verification".into(),
-                    category: "Git".into(),
-                    verified: true,
-                    installs: 21_300,
-                    gradient_hex: 0x31cf76,
-                },
-            ],
+            items,
             no_match_plush: MarketplaceNoMatchPlushState::new(reduced_motion),
         }
     }

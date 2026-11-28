@@ -1547,6 +1547,10 @@ impl McpGateway {
         }
     }
 
+    pub fn list_server_access(&self) -> BTreeMap<String, Option<Vec<String>>> {
+        self.access_lock.lock().servers.clone()
+    }
+
     pub fn generate_pkce_s256(&self) -> RuntimeResult<PkceS256Challenge> {
         generate_pkce_s256()
     }

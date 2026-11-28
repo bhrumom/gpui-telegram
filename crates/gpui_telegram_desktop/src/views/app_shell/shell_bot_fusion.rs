@@ -1255,6 +1255,10 @@ impl AppShell {
                 self.toggle_bot_companion_panel(Some(tab), cx);
                 true
             }
+            InspectorAction::OpenMarketplaceApps => {
+                self.open_marketplace_tab(crate::views::content_hub::MarketplaceNavTab::Apps, cx);
+                true
+            }
             _ => false,
         }
     }

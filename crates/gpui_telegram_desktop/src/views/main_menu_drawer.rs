@@ -339,12 +339,6 @@ impl Render for MainMenuDrawer {
                 cmd: MainMenuCommand::TaskCenter,
             },
             MenuRowEntry::Action {
-                icon: IconName::TerminalMcp,
-                zh: "MCP 工具",
-                en: "MCP Tools",
-                cmd: MainMenuCommand::McpTools,
-            },
-            MenuRowEntry::Action {
                 icon: IconName::ComputerDesktop,
                 zh: "远程电脑",
                 en: "Remote Computer",

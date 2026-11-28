@@ -283,6 +283,7 @@ pub enum InspectorAction {
         approve: bool,
     },
     OpenBotCompanion(BotCompanionTab),
+    OpenMarketplaceApps,
 }
 
 /// Summary of a published/user Book, Music, or Game creation produced by the active Bot.

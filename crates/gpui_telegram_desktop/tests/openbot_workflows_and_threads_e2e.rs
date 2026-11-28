@@ -114,7 +114,8 @@ fn test_left_sidebar_workflows_entry_matches_openbot_and_migrates_v1_pins() {
     .expect("write legacy v1 pins");
     let upgraded = load_page_rail_pins(tmp.path());
     assert_eq!(upgraded[0], AppleSidebarSection::Workflows);
-    assert_eq!(upgraded.len(), 6);
+    assert_eq!(upgraded.len(), 3);
+    assert_eq!(upgraded, DEFAULT_PINNED_SECTIONS.to_vec());
 
     // 3. Explicit v2 unpin of Workflows persists across restart
     let unpinned: Vec<AppleSidebarSection> = upgraded

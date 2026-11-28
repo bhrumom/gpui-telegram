@@ -34,6 +34,10 @@ impl EditableFieldState {
         }
     }
 
+    pub fn with_text(initial: impl Into<String>) -> Self {
+        Self::new(initial)
+    }
+
     pub fn set_text(&mut self, value: impl Into<String>) {
         self.text = value.into();
         self.cursor_char = self.text.chars().count();

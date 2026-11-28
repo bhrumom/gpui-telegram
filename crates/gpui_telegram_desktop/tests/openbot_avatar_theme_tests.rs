@@ -1106,10 +1106,16 @@ fn m1_ui_f04_page_rail_width_pins_persistence_and_more_menu_highlight() {
     assert!((OPENBOT_PAGE_RAIL_WIDTH - 52.0).abs() < f32::EPSILON);
     assert!((EXPANDED_WIDTH - 52.0).abs() < f32::EPSILON);
     assert!((COLLAPSED_WIDTH - 52.0).abs() < f32::EPSILON);
-    assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 6);
+    assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 3);
     assert_eq!(DEFAULT_PINNED_SECTIONS[0], AppleSidebarSection::Workflows);
-    assert_eq!(PINNABLE_SECTIONS.len(), 16);
+    assert_eq!(PINNABLE_SECTIONS.len(), 11);
     assert!(!AppleSidebarSection::Chats.is_pinnable());
+    assert!(!AppleSidebarSection::Marketplace.is_pinnable());
+    assert!(!AppleSidebarSection::McpTools.is_pinnable());
+    assert!(!AppleSidebarSection::Schedule.is_pinnable());
+    assert!(!AppleSidebarSection::Books.is_pinnable());
+    assert!(!AppleSidebarSection::Games.is_pinnable());
+    assert!(!AppleSidebarSection::AppStore.is_pinnable());
 
     for sec in PINNABLE_SECTIONS {
         assert!(sec.is_pinnable());
@@ -1126,6 +1132,8 @@ fn m1_ui_f04_page_rail_width_pins_persistence_and_more_menu_highlight() {
 
     let sanitized = sanitize_pinned_sections(vec![
         AppleSidebarSection::Chats,
+        AppleSidebarSection::McpTools,
+        AppleSidebarSection::Schedule,
         AppleSidebarSection::Workflows,
         AppleSidebarSection::Usage,
         AppleSidebarSection::Workflows,
@@ -1157,8 +1165,14 @@ fn m1_ui_f04_page_rail_width_pins_persistence_and_more_menu_highlight() {
     assert!((rail.effective_width() - 52.0).abs() < f32::EPSILON);
     assert!(!rail.current_in_more_menu());
 
-    rail.set_highlighted_destination(Some(AppleSidebarSection::McpTools));
+    rail.set_highlighted_destination(Some(AppleSidebarSection::Workflows));
+    assert!(!rail.current_in_more_menu());
+
+    rail.set_highlighted_destination(Some(AppleSidebarSection::Library));
     assert!(rail.current_in_more_menu());
+
+    rail.set_highlighted_destination(Some(AppleSidebarSection::Marketplace));
+    assert!(!rail.current_in_more_menu());
 
     rail.set_narrow_hidden(true);
     assert!((rail.effective_width() - 0.0).abs() < f32::EPSILON);

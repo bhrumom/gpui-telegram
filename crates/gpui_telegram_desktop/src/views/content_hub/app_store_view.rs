@@ -732,6 +732,23 @@ pub fn render_app_store_hub_view(
     ws: &mut ContentHubWorkspace,
     cx: &mut Context<ContentHubWorkspace>,
 ) -> AnyElement {
+    render_app_store_inner(ws, false, cx)
+}
+
+/// Renders the Mini-Apps & Storefront body embedded inside the unified OpenBot Marketplace
+/// (under the dedicated `小程序应用` entry below `技能`, kept strictly separate from Connectors).
+pub fn render_app_store_embedded_body(
+    ws: &mut ContentHubWorkspace,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> AnyElement {
+    render_app_store_inner(ws, true, cx)
+}
+
+fn render_app_store_inner(
+    ws: &mut ContentHubWorkspace,
+    embedded: bool,
+    cx: &mut Context<ContentHubWorkspace>,
+) -> AnyElement {
     let pal = ws.palette;
     let lang = ws.language_id.clone();
     let active_tab = normalize_appstore_sub_tab(&ws.active_sub_tab);
@@ -809,6 +826,396 @@ pub fn render_app_store_hub_view(
     ];
 
     let ob = pal.openbot_palette();
+    let content_col = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(20.0))
+        .when(embedded && selected_detail.is_none(), |el| {
+            el.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(16.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(28.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(ob.text_primary())
+                                            .child(tr_str(&lang, "小程序应用", "Mini Apps")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .text_color(ob.text_muted())
+                                            .child(tr_str(
+                                                &lang,
+                                                "探索社区与机器人发布的独立小程序与互动应用（与连接器应用分开管理）",
+                                                "Explore published bot Mini Apps and community storefront apps (separate from Connector Apps).",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                openbot_secondary_btn(
+                                    "appstore-refresh-btn",
+                                    tr_str(&lang, "刷新", "Refresh"),
+                                    pal,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_this, _, _, cx| {
+                                        cx.emit(ContentHubEvent::RefreshCatalog(
+                                            ContentHubSection::AppStore,
+                                        ));
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div().w(px(280.0)).max_w_full().child(
+                                    render_editable_field_box(
+                                        "content-hub-catalog-search-input",
+                                        &search_field,
+                                        tr_str(&lang, "搜索小程序与创意应用…", "Search Mini Apps…"),
+                                        search_focused,
+                                        false,
+                                        pal,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.focus_input(
+                                                ContentHubInputTarget::CatalogSearch,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .children(sort_options.iter().map(|&(mode, id, zh, en)| {
+                                        filter_pill(id, tr_str(&lang, zh, en), sort_mode == mode, pal)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.sort_mode = mode;
+                                                    cx.emit(ContentHubEvent::RefreshCatalog(
+                                                        ContentHubSection::AppStore,
+                                                    ));
+                                                    cx.notify();
+                                                }),
+                                            )
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.0))
+                            .children(APPSTORE_SUB_TABS.iter().map(|&(slug, zh, en)| {
+                                let label = match slug {
+                                    "installed" if !installed_items.is_empty() => {
+                                        format!("{} ({})", tr_str(&lang, zh, en), installed_items.len())
+                                    }
+                                    _ => tr_str(&lang, zh, en).to_string(),
+                                };
+                                filter_pill(
+                                    SharedString::from(format!("appstore-tab-{slug}")),
+                                    label,
+                                    active_tab == slug,
+                                    pal,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.active_sub_tab = slug.to_string();
+                                        this.selected_creation_id = None;
+                                        this.selected_catalog_item = None;
+                                        this.selected_detail_creation = None;
+                                        cx.notify();
+                                    }),
+                                )
+                            })),
+                    ),
+            )
+        })
+        .when_some(selected_detail.clone(), |el, detail| {
+            el.child(render_app_detail_card(ws, detail, cx))
+        })
+        .when(selected_detail.is_none(), |el| {
+            let tile_hover = ob.bg_control_hover();
+            el
+                // Today Editorial Hero Cards (OpenBot monochrome editorial cards)
+                .when(active_tab == "today" && !today_heroes.is_empty(), |inner| {
+                    inner
+                        .child(apple_shelf_header(
+                            tr_str(&lang, "今日精选 · Today", "Today"),
+                            Some(
+                                tr_str(&lang, "编辑精选与热门上架", "Editor's Picks")
+                                    .to_string(),
+                            ),
+                            pal,
+                        ))
+                        .child(div().flex().flex_wrap().gap(px(14.0)).children(
+                            today_heroes.iter().enumerate().map(|(idx, item)| {
+                                let kicker = if idx == 0 {
+                                    tr_str(&lang, "今日推荐 · TODAY'S PICK", "TODAY'S PICK")
+                                } else {
+                                    tr_str(&lang, "精品聚焦 · FEATURED", "FEATURED STORY")
+                                };
+                                let installed = ws
+                                    .my_creation_states
+                                    .get(&item.creation_id)
+                                    .is_some_and(|s| s.in_library);
+                                render_today_editorial_card(
+                                    item, kicker, installed, pal, &lang, cx,
+                                )
+                            }),
+                        ))
+                })
+                // Monochrome Category quick-jump tiles on Categories tab
+                .when(active_tab == "categories", |inner| {
+                    let cats: &[(&str, &str, ContentHubSection)] = &[
+                        ("图书 · Books", "Books", ContentHubSection::Books),
+                        ("音乐 · Music", "Music", ContentHubSection::Music),
+                        ("游戏 · Games", "Games", ContentHubSection::Games),
+                    ];
+                    inner.child(div().flex().flex_wrap().gap(px(12.0)).children(
+                        cats.iter().map(|&(zh, en, sec)| {
+                            div()
+                                .id(SharedString::from(format!("appstore-cat-{sec:?}")))
+                                .cursor_pointer()
+                                .w(px(210.0))
+                                .max_w_full()
+                                .p(px(16.0))
+                                .rounded(px(14.0))
+                                .bg(ob.bg_surface())
+                                .hover(move |s| s.bg(tile_hover))
+                                .border_1()
+                                .border_color(ob.frame_card_border())
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(ob.text_primary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |_this, _, _, cx| {
+                                        cx.emit(ContentHubEvent::NavigateSection(sec));
+                                    }),
+                                )
+                                .child(tr_str(&lang, zh, en))
+                        }),
+                    ))
+                })
+                // Published Mini Apps shelf
+                .when(
+                    !filtered_miniapps.is_empty() && active_tab != "installed",
+                    |inner| {
+                        inner
+                            .child(apple_shelf_header(
+                                tr_str(
+                                    &lang,
+                                    "精选 Mini Apps 与机器人应用",
+                                    "Featured Mini Apps",
+                                ),
+                                Some(format!(
+                                    "{} {}",
+                                    filtered_miniapps.len(),
+                                    tr_str(&lang, "个小程序", "mini apps")
+                                )),
+                                pal,
+                            ))
+                            .child(div().flex().flex_wrap().gap(px(12.0)).children(
+                                filtered_miniapps.iter().map(|app| {
+                                    let bot_un = app.bot_username.clone();
+                                    let short = app.short_name.clone();
+                                    let web_url = (!app.web_url.trim().is_empty())
+                                        .then(|| app.web_url.clone());
+                                    apple_grouped_card(pal)
+                                        .w(px(292.0))
+                                        .max_w_full()
+                                        .p(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(ob.text_primary())
+                                                        .truncate()
+                                                        .child(app.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(ob.text_muted())
+                                                        .truncate()
+                                                        .child(format!(
+                                                            "@{} · {}",
+                                                            app.bot_username, app.description
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            openbot_primary_cta_btn(
+                                                SharedString::from(format!(
+                                                    "appstore-launch-miniapp-{}-{}",
+                                                    app.bot_username, app.short_name
+                                                )),
+                                                tr_str(&lang, "打开", "Open"),
+                                                pal,
+                                            )
+                                            .flex_shrink_0()
+                                            .px(px(11.0))
+                                            .py(px(5.0))
+                                            .text_size(px(11.5))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |_this, _, _, cx| {
+                                                    cx.emit(ContentHubEvent::LaunchMiniApp {
+                                                        bot_username: bot_un.clone(),
+                                                        short_name: short.clone(),
+                                                        web_url: web_url.clone(),
+                                                    });
+                                                }),
+                                            ),
+                                        )
+                                }),
+                            ))
+                    },
+                )
+                // Unified Apps & Verticals Shelf
+                .when(!tab_items.is_empty(), |inner| {
+                    inner
+                        .child(apple_shelf_header(
+                            if active_tab == "installed" {
+                                tr_str(&lang, "已获取 / 已安装", "Installed & Saved")
+                            } else {
+                                tr_str(&lang, "小程序与精选公开作品", "Mini Apps & Featured Creations")
+                            },
+                            Some(format!(
+                                "{} {}",
+                                tab_items.len(),
+                                tr_str(&lang, "项", "items")
+                            )),
+                            pal,
+                        ))
+                        .child(div().flex().flex_wrap().gap(px(12.0)).children(
+                            tab_items.iter().map(|item| {
+                                let installed = ws
+                                    .my_creation_states
+                                    .get(&item.creation_id)
+                                    .is_some_and(|s| s.in_library);
+                                render_app_store_row_card(item, installed, pal, &lang, cx)
+                            }),
+                        ))
+                })
+                // Cross-Vertical Spotlight (Books + Music + Games)
+                .when(
+                    active_tab == "today" && !cross_vertical.is_empty(),
+                    |inner| {
+                        inner
+                            .child(apple_shelf_header(
+                                tr_str(
+                                    &lang,
+                                    "跨板块精品推荐（图书 · 音乐 · 游戏）",
+                                    "Featured Across Books, Music & Games",
+                                ),
+                                Some(format!(
+                                    "{} {}",
+                                    cross_vertical.len(),
+                                    tr_str(&lang, "款精选", "picks")
+                                )),
+                                pal,
+                            ))
+                            .child(div().flex().flex_wrap().gap(px(12.0)).children(
+                                cross_vertical.iter().map(|item| {
+                                    let installed = ws
+                                        .my_creation_states
+                                        .get(&item.creation_id)
+                                        .is_some_and(|s| s.in_library);
+                                    render_app_store_row_card(item, installed, pal, &lang, cx)
+                                }),
+                            ))
+                    },
+                )
+                // Empty state when truly empty
+                .when(tab_items.is_empty() && filtered_miniapps.is_empty(), |inner| {
+                    let cta = openbot_secondary_btn(
+                        "appstore-empty-refresh-btn",
+                        tr_str(&lang, "刷新小程序商店", "Refresh Mini Apps"),
+                        pal,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _, _, cx| {
+                            cx.emit(ContentHubEvent::RefreshCatalog(
+                                ContentHubSection::AppStore,
+                            ));
+                        }),
+                    );
+                    inner.child(empty_state_card_shell(
+                        IconName::HubAppStore,
+                        if active_tab == "installed" {
+                            tr_str(&lang, "暂未获取任何小程序或作品", "No Installed Items Yet")
+                        } else {
+                            tr_str(&lang, "暂无上架小程序应用", "No Mini App Listings Yet")
+                        },
+                        tr_str(
+                            &lang,
+                            "在「消息」中直接与 @CreatorStudioBot 或 @BotFather 对话即可创作并上架小程序与应用。",
+                            "Chat with @CreatorStudioBot or @BotFather directly in Messages to create and publish Mini Apps.",
+                        ),
+                        cta,
+                        pal,
+                    ))
+                })
+        });
+
+    if embedded {
+        return div()
+            .id("apple-appstore-embedded-root")
+            .w_full()
+            .child(content_col)
+            .into_any_element();
+    }
+
     let hover_crumb = ob.bg_control();
     let text_pri = ob.text_primary();
     let header = if let Some(ref detail) = selected_detail {
@@ -951,249 +1358,7 @@ pub fn render_app_store_hub_view(
             .mx_auto()
             .px(px(24.0))
             .py(px(20.0))
-            .flex()
-            .flex_col()
-            .gap(px(20.0))
-            .when_some(selected_detail.clone(), |el, detail| {
-                el.child(render_app_detail_card(ws, detail, cx))
-            })
-            .when(selected_detail.is_none(), |el| {
-                let tile_hover = ob.bg_control_hover();
-                el
-                    // Today Editorial Hero Cards (OpenBot monochrome editorial cards)
-                    .when(active_tab == "today" && !today_heroes.is_empty(), |inner| {
-                        inner
-                            .child(apple_shelf_header(
-                                tr_str(&lang, "今日精选 · Today", "Today"),
-                                Some(
-                                    tr_str(&lang, "编辑精选与热门上架", "Editor's Picks")
-                                        .to_string(),
-                                ),
-                                pal,
-                            ))
-                            .child(div().flex().flex_wrap().gap(px(14.0)).children(
-                                today_heroes.iter().enumerate().map(|(idx, item)| {
-                                    let kicker = if idx == 0 {
-                                        tr_str(&lang, "今日推荐 · TODAY'S PICK", "TODAY'S PICK")
-                                    } else {
-                                        tr_str(&lang, "精品聚焦 · FEATURED", "FEATURED STORY")
-                                    };
-                                    let installed = ws
-                                        .my_creation_states
-                                        .get(&item.creation_id)
-                                        .is_some_and(|s| s.in_library);
-                                    render_today_editorial_card(
-                                        item, kicker, installed, pal, &lang, cx,
-                                    )
-                                }),
-                            ))
-                    })
-                    // Monochrome Category quick-jump tiles on Categories tab
-                    .when(active_tab == "categories", |inner| {
-                        let cats: &[(&str, &str, ContentHubSection)] = &[
-                            ("图书 · Books", "Books", ContentHubSection::Books),
-                            ("音乐 · Music", "Music", ContentHubSection::Music),
-                            ("游戏 · Games", "Games", ContentHubSection::Games),
-                        ];
-                        inner.child(div().flex().flex_wrap().gap(px(12.0)).children(
-                            cats.iter().map(|&(zh, en, sec)| {
-                                div()
-                                    .id(SharedString::from(format!("appstore-cat-{sec:?}")))
-                                    .cursor_pointer()
-                                    .w(px(210.0))
-                                    .max_w_full()
-                                    .p(px(16.0))
-                                    .rounded(px(14.0))
-                                    .bg(ob.bg_surface())
-                                    .hover(move |s| s.bg(tile_hover))
-                                    .border_1()
-                                    .border_color(ob.frame_card_border())
-                                    .text_size(px(14.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(ob.text_primary())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |_this, _, _, cx| {
-                                            cx.emit(ContentHubEvent::NavigateSection(sec));
-                                        }),
-                                    )
-                                    .child(tr_str(&lang, zh, en))
-                            }),
-                        ))
-                    })
-                    // Published Mini Apps shelf
-                    .when(
-                        !filtered_miniapps.is_empty() && active_tab != "installed",
-                        |inner| {
-                            inner
-                                .child(apple_shelf_header(
-                                    tr_str(
-                                        &lang,
-                                        "精选 Mini Apps 与机器人应用",
-                                        "Featured Mini Apps",
-                                    ),
-                                    Some(format!(
-                                        "{} {}",
-                                        filtered_miniapps.len(),
-                                        tr_str(&lang, "个小程序", "mini apps")
-                                    )),
-                                    pal,
-                                ))
-                                .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                    filtered_miniapps.iter().map(|app| {
-                                        let bot_un = app.bot_username.clone();
-                                        let short = app.short_name.clone();
-                                        let web_url = (!app.web_url.trim().is_empty())
-                                            .then(|| app.web_url.clone());
-                                        apple_grouped_card(pal)
-                                            .w(px(292.0))
-                                            .max_w_full()
-                                            .p(px(12.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(10.0))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(2.0))
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.5))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(ob.text_primary())
-                                                            .truncate()
-                                                            .child(app.title.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.0))
-                                                            .text_color(ob.text_muted())
-                                                            .truncate()
-                                                            .child(format!(
-                                                                "@{} · {}",
-                                                                app.bot_username, app.description
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                openbot_primary_cta_btn(
-                                                    SharedString::from(format!(
-                                                        "appstore-launch-miniapp-{}-{}",
-                                                        app.bot_username, app.short_name
-                                                    )),
-                                                    tr_str(&lang, "打开", "Open"),
-                                                    pal,
-                                                )
-                                                .flex_shrink_0()
-                                                .px(px(11.0))
-                                                .py(px(5.0))
-                                                .text_size(px(11.5))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |_this, _, _, cx| {
-                                                        cx.emit(ContentHubEvent::LaunchMiniApp {
-                                                            bot_username: bot_un.clone(),
-                                                            short_name: short.clone(),
-                                                            web_url: web_url.clone(),
-                                                        });
-                                                    }),
-                                                ),
-                                            )
-                                    }),
-                                ))
-                        },
-                    )
-                    // Unified Apps & Verticals Shelf
-                    .when(!tab_items.is_empty(), |inner| {
-                        inner
-                            .child(apple_shelf_header(
-                                if active_tab == "installed" {
-                                    tr_str(&lang, "已获取 / 已安装", "Installed & Saved")
-                                } else {
-                                    tr_str(&lang, "应用与精选公开作品", "Apps & Featured Creations")
-                                },
-                                Some(format!(
-                                    "{} {}",
-                                    tab_items.len(),
-                                    tr_str(&lang, "项", "items")
-                                )),
-                                pal,
-                            ))
-                            .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                tab_items.iter().map(|item| {
-                                    let installed = ws
-                                        .my_creation_states
-                                        .get(&item.creation_id)
-                                        .is_some_and(|s| s.in_library);
-                                    render_app_store_row_card(item, installed, pal, &lang, cx)
-                                }),
-                            ))
-                    })
-                    // Cross-Vertical Spotlight (Books + Music + Games)
-                    .when(
-                        active_tab == "today" && !cross_vertical.is_empty(),
-                        |inner| {
-                            inner
-                                .child(apple_shelf_header(
-                                    tr_str(
-                                        &lang,
-                                        "跨板块精品推荐（图书 · 音乐 · 游戏）",
-                                        "Featured Across Books, Music & Games",
-                                    ),
-                                    Some(format!(
-                                        "{} {}",
-                                        cross_vertical.len(),
-                                        tr_str(&lang, "款精选", "picks")
-                                    )),
-                                    pal,
-                                ))
-                                .child(div().flex().flex_wrap().gap(px(12.0)).children(
-                                    cross_vertical.iter().map(|item| {
-                                        let installed = ws
-                                            .my_creation_states
-                                            .get(&item.creation_id)
-                                            .is_some_and(|s| s.in_library);
-                                        render_app_store_row_card(item, installed, pal, &lang, cx)
-                                    }),
-                                ))
-                        },
-                    )
-                    // Empty state when truly empty
-                    .when(tab_items.is_empty() && filtered_miniapps.is_empty(), |inner| {
-                        let cta = openbot_secondary_btn(
-                            "appstore-empty-refresh-btn",
-                            tr_str(&lang, "刷新 App Store", "Refresh App Store"),
-                            pal,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_this, _, _, cx| {
-                                cx.emit(ContentHubEvent::RefreshCatalog(
-                                    ContentHubSection::AppStore,
-                                ));
-                            }),
-                        );
-                        inner.child(empty_state_card_shell(
-                            IconName::HubAppStore,
-                            if active_tab == "installed" {
-                                tr_str(&lang, "暂未获取任何应用或作品", "No Installed Items Yet")
-                            } else {
-                                tr_str(&lang, "App Store 暂无上架条目", "No Store Listings Yet")
-                            },
-                            tr_str(
-                                &lang,
-                                "在「消息」中直接与 @CreatorStudioBot 或 @BotFather 对话即可创作并上架应用、Mini Apps 与作品。",
-                                "Chat with @CreatorStudioBot or @BotFather directly in Messages to create and publish apps and Mini Apps.",
-                            ),
-                            cta,
-                            pal,
-                        ))
-                    })
-            }),
+            .child(content_col),
     );
 
     div()

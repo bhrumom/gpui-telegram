@@ -1852,7 +1852,7 @@ impl AppShell {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(menu_row("account-popover-profile", IconName::ContactsUsers, tr_str(lang, "个人资料", "Profile"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::MyProfile, cx)))
                     .child(menu_row("account-popover-saved", IconName::SavedMessages, tr_str(lang, "收藏夹", "Saved"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::SavedMessages, cx)))
-                    .child(menu_row("account-popover-connectors", IconName::TerminalMcp, tr_str(lang, "连接器", "Connectors"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::McpTools, cx)))
+                    .child(menu_row("account-popover-connectors", IconName::MarketplacePlug, tr_str(lang, "连接器", "Connectors"), pal.text_primary, false, |this, cx| this.open_marketplace_tab(crate::views::content_hub::MarketplaceNavTab::Apps, cx)))
                     .child(menu_row("account-popover-browser", IconName::ScreenShare, tr_str(lang, "内置浏览器 · 自动化应用", "Built-in Browser & Apps"), pal.accent, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Browser, cx)))
                     .child(menu_row("account-popover-settings", IconName::SettingsGear, tr_str(lang, "设置", "Settings"), pal.text_primary, false, |this, cx| this.handle_main_menu_command(MainMenuCommand::Settings, cx)))
                     .when(has_passcode, |col| {

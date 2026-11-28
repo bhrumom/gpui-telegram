@@ -214,6 +214,18 @@ impl AppShell {
                         .ime_preedit
                         .as_deref()
                         .is_some_and(|p| !p.is_empty()),
+                    ContentHubInputTarget::MarketplaceSearch
+                    | ContentHubInputTarget::MarketplaceSetupPrimary
+                    | ContentHubInputTarget::MarketplaceSetupSecondary
+                    | ContentHubInputTarget::MarketplaceCustomName
+                    | ContentHubInputTarget::MarketplaceCustomCommand
+                    | ContentHubInputTarget::MarketplaceCustomArgs
+                    | ContentHubInputTarget::MarketplaceCustomEnv
+                    | ContentHubInputTarget::MarketplaceCustomWorkDir
+                    | ContentHubInputTarget::MarketplaceCustomUrl
+                    | ContentHubInputTarget::MarketplaceCustomHeaders => {
+                        h.marketplace.has_any_preedit()
+                    }
                     ContentHubInputTarget::None => false,
                 };
                 (

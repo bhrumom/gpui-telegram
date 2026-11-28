@@ -66,7 +66,8 @@ pub const RAIL_TOOLTIP_RADIUS_PX: f32 = 8.0;
 /// Atomic JSON filename storing user-pinned `PageRail` sections inside `preferences_dir`.
 pub const PAGE_RAIL_PINS_FILE: &str = "openbot-page-rail-pins-v1.json";
 
-/// Legacy v1 default pinned sections before Workflows was promoted into the default left rail.
+/// Legacy v1 default pinned sections before Workflows was promoted into the default left rail
+/// and before Books/Games/AppStore moved into the Marketplace.
 const LEGACY_V1_DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 5] = [
     AppleSidebarSection::Community,
     AppleSidebarSection::Books,
@@ -77,31 +78,26 @@ const LEGACY_V1_DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 5] = [
 
 /// Default pinned sections mounted directly under fixed `Chats` in the `52px` `PageRail`,
 /// placing `Workflows` first directly beneath `Chats` to match OpenBot's `PageRail` layout.
-pub const DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 6] = [
+/// Books, Games, and Mini-Apps (`应用商店`) now live inside the unified OpenBot Marketplace (`市场`).
+pub const DEFAULT_PINNED_SECTIONS: [AppleSidebarSection; 3] = [
     AppleSidebarSection::Workflows,
     AppleSidebarSection::Community,
-    AppleSidebarSection::Books,
     AppleSidebarSection::Music,
-    AppleSidebarSection::Games,
-    AppleSidebarSection::AppStore,
 ];
 
-/// Complete ordered catalog of all 16 pinnable `RailMoreMenu` destinations (excludes fixed `Chats`).
-pub const PINNABLE_SECTIONS: [AppleSidebarSection; 16] = [
+/// Complete ordered catalog of all 11 pinnable `RailMoreMenu` destinations
+/// (excludes fixed `Chats`, bottom-rail `Marketplace`, removed `Schedule`/`McpTools`,
+/// and Marketplace-hosted `Books`/`Games`/`AppStore`).
+pub const PINNABLE_SECTIONS: [AppleSidebarSection; 11] = [
     AppleSidebarSection::Workflows,
     AppleSidebarSection::Community,
-    AppleSidebarSection::Books,
     AppleSidebarSection::Music,
-    AppleSidebarSection::Games,
-    AppleSidebarSection::AppStore,
     AppleSidebarSection::MyCreations,
     AppleSidebarSection::Contacts,
     AppleSidebarSection::Calls,
     AppleSidebarSection::Tasks,
-    AppleSidebarSection::Schedule,
     AppleSidebarSection::Library,
     AppleSidebarSection::Usage,
-    AppleSidebarSection::McpTools,
     AppleSidebarSection::RemoteComputer,
     AppleSidebarSection::Browser,
 ];
@@ -111,6 +107,7 @@ pub const PINNABLE_SECTIONS: [AppleSidebarSection; 16] = [
 #[serde(rename_all = "snake_case")]
 pub enum AppleSidebarSection {
     Chats,
+    Marketplace,
     Community,
     Books,
     Music,
@@ -133,6 +130,7 @@ impl AppleSidebarSection {
     /// Converts this sidebar destination into a [`ContentHubSection`] (`None` for non-ContentHub entries).
     pub fn to_content_hub_section(self) -> Option<ContentHubSection> {
         match self {
+            Self::Marketplace => Some(ContentHubSection::Marketplace),
             Self::Books => Some(ContentHubSection::Books),
             Self::Music => Some(ContentHubSection::Music),
             Self::Games => Some(ContentHubSection::Games),
@@ -145,6 +143,7 @@ impl AppleSidebarSection {
     /// Maps a [`ContentHubSection`] back to its corresponding [`AppleSidebarSection`].
     pub fn from_content_hub_section(section: ContentHubSection) -> Self {
         match section {
+            ContentHubSection::Marketplace => Self::Marketplace,
             ContentHubSection::Books => Self::Books,
             ContentHubSection::Music => Self::Music,
             ContentHubSection::Games => Self::Games,
@@ -153,15 +152,27 @@ impl AppleSidebarSection {
         }
     }
 
-    /// Returns `true` when this destination may be pinned/unpinned in `RailMoreMenu` (`Chats` is fixed).
+    /// Returns `true` when this destination may be pinned/unpinned in `RailMoreMenu`.
+    /// Fixed `Chats`, bottom-rail `Marketplace`, Marketplace-hosted verticals (`Books`/`Games`/`AppStore`),
+    /// and retired `Schedule`/`McpTools` are never pinnable on the top rail.
     pub const fn is_pinnable(self) -> bool {
-        !matches!(self, Self::Chats)
+        !matches!(
+            self,
+            Self::Chats
+                | Self::Marketplace
+                | Self::Books
+                | Self::Games
+                | Self::AppStore
+                | Self::Schedule
+                | Self::McpTools
+        )
     }
 
     /// Returns the existing embedded [`IconName`] for this `PageRail` destination.
     pub const fn icon_name(self) -> IconName {
         match self {
             Self::Chats => IconName::BotRobot,
+            Self::Marketplace => IconName::MarketplaceStore,
             Self::Community => IconName::CommunityGlobe,
             Self::Books => IconName::HubBooks,
             Self::Music => IconName::HubMusic,
@@ -185,11 +196,12 @@ impl AppleSidebarSection {
     pub fn localized_label(self, lang: &str) -> &'static str {
         match self {
             Self::Chats => tr_str(lang, "消息", "Chats"),
+            Self::Marketplace => tr_str(lang, "市场", "Marketplace"),
             Self::Community => tr_str(lang, "社区", "Community"),
             Self::Books => tr_str(lang, "图书", "Books"),
             Self::Music => tr_str(lang, "音乐", "Music"),
             Self::Games => tr_str(lang, "游戏", "Games"),
-            Self::AppStore => tr_str(lang, "应用商店", "App Store"),
+            Self::AppStore => tr_str(lang, "小程序应用", "Mini Apps"),
             Self::MyCreations => tr_str(lang, "云端创作", "My Creations"),
             Self::Contacts => tr_str(lang, "联系人", "Contacts"),
             Self::Calls => tr_str(lang, "通话", "Calls"),
@@ -208,6 +220,7 @@ impl AppleSidebarSection {
     pub const fn element_id(self) -> &'static str {
         match self {
             Self::Chats => "apple-sidebar-nav-chats",
+            Self::Marketplace => "apple-sidebar-nav-marketplace",
             Self::Community => "apple-sidebar-nav-community",
             Self::Books => "apple-sidebar-nav-books",
             Self::Music => "apple-sidebar-nav-music",
@@ -288,8 +301,10 @@ pub fn load_page_rail_pins(preferences_dir: &Path) -> Vec<AppleSidebarSection> {
         .iter()
         .filter_map(|elem| serde_json::from_value::<AppleSidebarSection>(elem.clone()).ok())
         .collect();
+    let is_legacy_v1_defaults =
+        version < 2 && parsed.as_slice() == LEGACY_V1_DEFAULT_PINNED_SECTIONS.as_slice();
     let mut pins = sanitize_pinned_sections(parsed);
-    if version < 2 && pins.as_slice() == LEGACY_V1_DEFAULT_PINNED_SECTIONS.as_slice() {
+    if is_legacy_v1_defaults && !pins.contains(&AppleSidebarSection::Workflows) {
         pins.insert(0, AppleSidebarSection::Workflows);
     }
     pins
@@ -367,6 +382,7 @@ pub struct PageRailBottomLayout {
     pub usage_ring_slots: usize,
     pub collapsed_more_rings_count: usize,
     pub min_free_px: f32,
+    pub marketplace_visible: bool,
     pub help_visible: bool,
     pub settings_visible: bool,
     pub update_dot_px: f32,
@@ -628,6 +644,7 @@ impl AppleAppSidebar {
     pub fn compute_layout(&self, viewport_h: f32) -> PageRailLayoutSnapshot {
         let visible = !self.narrow_hidden;
         let width_px = self.effective_width();
+        let marketplace_visible = !self.is_bottom_item_hidden(PageRailHideableItem::Marketplace);
         let help_visible = !self.is_bottom_item_hidden(PageRailHideableItem::Help);
         let settings_visible = true;
         let total_rings = self.usage_ring_metrics.len().max(1);
@@ -635,7 +652,10 @@ impl AppleAppSidebar {
         let top_h = TOP_CLEARANCE_HEIGHT
             + (top_btn_count as f32) * RAIL_BUTTON_SIZE_PX
             + (top_btn_count.saturating_sub(1) as f32) * RAIL_GROUP_GAP_PX;
-        let fixed_bottom_btns = usize::from(help_visible) + usize::from(settings_visible) + 1;
+        let fixed_bottom_btns = usize::from(marketplace_visible)
+            + usize::from(help_visible)
+            + usize::from(settings_visible)
+            + 1;
         let divider_total_h = RAIL_DIVIDER_HEIGHT_PX + 4.0 + RAIL_GROUP_GAP_PX;
         let fixed_bottom_h = RAIL_BOTTOM_PADDING_PX
             + (fixed_bottom_btns as f32) * RAIL_BUTTON_SIZE_PX
@@ -686,6 +706,7 @@ impl AppleAppSidebar {
                 usage_ring_slots,
                 collapsed_more_rings_count,
                 min_free_px: free_px,
+                marketplace_visible,
                 help_visible,
                 settings_visible,
                 update_dot_px: RAIL_UPDATE_DOT_SIZE_PX,
@@ -947,6 +968,15 @@ impl Render for AppleAppSidebar {
         let divider_col = ob.border_hairline();
         let badge_new_col = ob.badge_new();
         let active_dest = self.active_rail_destination();
+        let marketplace_active = matches!(
+            active_dest,
+            Some(
+                AppleSidebarSection::Marketplace
+                    | AppleSidebarSection::Books
+                    | AppleSidebarSection::Games
+                    | AppleSidebarSection::AppStore
+            )
+        );
         let more_active = self.more_menu_open || self.current_in_more_menu();
         let help_active = self.help_menu_open;
         let settings_active = self.settings_active;
@@ -956,6 +986,12 @@ impl Render for AppleAppSidebar {
         let show_more_tip = !self.more_menu_open
             && !self.help_menu_open
             && self.hovered_tooltip.as_ref() == Some(&more_label);
+
+        let marketplace_label = SharedString::from(tr_str(&lang, "市场", "Marketplace"));
+        let marketplace_hover = marketplace_label.clone();
+        let show_marketplace_tip = !self.more_menu_open
+            && !self.help_menu_open
+            && self.hovered_tooltip.as_ref() == Some(&marketplace_label);
 
         let help_label = SharedString::from(tr_str(&lang, "帮助", "Help"));
         let help_hover = help_label.clone();
@@ -1145,6 +1181,60 @@ impl Render for AppleAppSidebar {
                         )
                     }),
             )
+            .when(layout.bottom_items.marketplace_visible, |col| {
+                col.child(
+                    div()
+                        .id(AppleSidebarSection::Marketplace.element_id())
+                        .relative()
+                        .cursor_pointer()
+                        .w(px(layout.button_size_px))
+                        .h(px(layout.button_size_px))
+                        .rounded(px(layout.button_radius_px))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(marketplace_active, |el| el.bg(active_bg))
+                        .when(!marketplace_active, |el| el.hover(move |s| s.bg(hover_bg)))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                if this.hovered_tooltip.as_ref() != Some(&marketplace_hover) {
+                                    this.hovered_tooltip = Some(marketplace_hover.clone());
+                                    cx.notify();
+                                }
+                            } else if this.hovered_tooltip.as_ref() == Some(&marketplace_hover) {
+                                this.hovered_tooltip = None;
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.select_section(AppleSidebarSection::Marketplace, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.hide_bottom_item_by_id("marketplace") {
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(tg_icon_rgba(
+                            IconName::MarketplaceStore,
+                            layout.icon_size_px,
+                            if marketplace_active {
+                                icon_primary
+                            } else {
+                                icon_muted
+                            },
+                        ))
+                        .when(show_marketplace_tip, |el| {
+                            el.child(self.render_tooltip_pill(marketplace_label))
+                        }),
+                )
+            })
             .when(layout.bottom_items.help_visible, |col| {
                 col.child(
                     div()
@@ -1412,37 +1502,49 @@ mod tests {
 
     #[std::prelude::v1::test]
     fn page_rail_default_and_pinnable_sections_and_sanitize() {
-        assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 6);
+        assert_eq!(DEFAULT_PINNED_SECTIONS.len(), 3);
         assert_eq!(
             DEFAULT_PINNED_SECTIONS,
             [
                 AppleSidebarSection::Workflows,
                 AppleSidebarSection::Community,
-                AppleSidebarSection::Books,
                 AppleSidebarSection::Music,
-                AppleSidebarSection::Games,
-                AppleSidebarSection::AppStore,
             ]
         );
         assert_eq!(
             AppleSidebarSection::Workflows.icon_name(),
             IconName::WorkflowWaypoints
         );
-        assert_eq!(PINNABLE_SECTIONS.len(), 16);
+        assert_eq!(PINNABLE_SECTIONS.len(), 11);
         assert_eq!(PINNABLE_SECTIONS[0], AppleSidebarSection::Workflows);
         assert!(!AppleSidebarSection::Chats.is_pinnable());
+        assert!(!AppleSidebarSection::Marketplace.is_pinnable());
+        assert!(!AppleSidebarSection::McpTools.is_pinnable());
+        assert!(!AppleSidebarSection::Schedule.is_pinnable());
+        assert!(!AppleSidebarSection::Books.is_pinnable());
+        assert!(!AppleSidebarSection::Games.is_pinnable());
+        assert!(!AppleSidebarSection::AppStore.is_pinnable());
         assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::Chats));
+        assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::McpTools));
+        assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::Schedule));
+        assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::Books));
+        assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::Games));
+        assert!(!PINNABLE_SECTIONS.contains(&AppleSidebarSection::AppStore));
 
+        // Legacy saved pins containing Books/McpTools/Schedule/Chats are automatically cleaned.
         let sanitized = sanitize_pinned_sections(vec![
             AppleSidebarSection::Chats,
             AppleSidebarSection::Books,
+            AppleSidebarSection::McpTools,
+            AppleSidebarSection::Schedule,
+            AppleSidebarSection::Music,
             AppleSidebarSection::Browser,
-            AppleSidebarSection::Books,
+            AppleSidebarSection::Music,
             AppleSidebarSection::Chats,
         ]);
         assert_eq!(
             sanitized,
-            vec![AppleSidebarSection::Books, AppleSidebarSection::Browser]
+            vec![AppleSidebarSection::Music, AppleSidebarSection::Browser]
         );
     }
 
@@ -1457,6 +1559,7 @@ mod tests {
         );
 
         // Legacy v1 file with untouched v1 defaults transparently promotes Workflows to index 0
+        // while stripping Marketplace-hosted Books/Games/AppStore.
         let legacy_v1 = serde_json::json!({
             "version": 1,
             "pinned_sections": ["community", "books", "music", "games", "app_store"],
@@ -1473,15 +1576,15 @@ mod tests {
         );
 
         // Explicitly unpinning Workflows (saved at version 2) is preserved across reloads
-        save_page_rail_pins(dir.path(), &LEGACY_V1_DEFAULT_PINNED_SECTIONS).expect("save v2");
-        assert_eq!(
-            load_page_rail_pins(dir.path()),
-            LEGACY_V1_DEFAULT_PINNED_SECTIONS.to_vec()
-        );
+        let without_workflows = vec![AppleSidebarSection::Community, AppleSidebarSection::Music];
+        save_page_rail_pins(dir.path(), &without_workflows).expect("save v2");
+        assert_eq!(load_page_rail_pins(dir.path()), without_workflows);
 
-        // Save custom subset (with duplicate and non-pinnable Chats) -> round-trips cleanly with zero .tmp files
+        // Save custom subset (with duplicate and non-pinnable Chats/McpTools/Schedule) -> round-trips cleanly with zero .tmp files
         let custom = vec![
             AppleSidebarSection::Chats,
+            AppleSidebarSection::McpTools,
+            AppleSidebarSection::Schedule,
             AppleSidebarSection::Browser,
             AppleSidebarSection::Workflows,
             AppleSidebarSection::Browser,
@@ -1518,10 +1621,19 @@ mod tests {
         rail.set_highlighted_destination(Some(AppleSidebarSection::Workflows));
         assert!(!rail.current_in_more_menu());
 
+        rail.set_highlighted_destination(Some(AppleSidebarSection::Music));
+        assert!(!rail.current_in_more_menu());
+
+        rail.set_highlighted_destination(Some(AppleSidebarSection::Marketplace));
+        assert!(!rail.current_in_more_menu());
+
         rail.set_highlighted_destination(Some(AppleSidebarSection::Books));
         assert!(!rail.current_in_more_menu());
 
         rail.set_highlighted_destination(Some(AppleSidebarSection::Schedule));
+        assert!(!rail.current_in_more_menu());
+
+        rail.set_highlighted_destination(Some(AppleSidebarSection::Library));
         assert!(rail.current_in_more_menu());
 
         rail.set_highlighted_destination(Some(AppleSidebarSection::Browser));
@@ -1529,5 +1641,8 @@ mod tests {
 
         rail.set_highlighted_destination(Some(AppleSidebarSection::Chats));
         assert!(!rail.current_in_more_menu());
+
+        let layout = rail.compute_layout(900.0);
+        assert!(layout.bottom_items.marketplace_visible);
     }
 }

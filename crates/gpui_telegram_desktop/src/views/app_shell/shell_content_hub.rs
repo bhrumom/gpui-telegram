@@ -28,7 +28,7 @@ use crate::views::apple_sidebar::{
 use crate::views::content_hub::{
     build_music_track_entries_from_creation, render_publish_review_modal_body,
     render_quick_creations_drawer, ContentHubEvent, ContentHubInputTarget, ContentHubSection,
-    GameStatus, PublishModalField, ReviewerAccessState,
+    GameStatus, MarketplaceNavTab, PublishModalField, ReviewerAccessState,
 };
 use crate::views::main_menu_drawer::MainMenuCommand;
 use crate::views::nav_rail::NavDestination;
@@ -66,6 +66,7 @@ impl ShellContentHubState {
 
     pub fn bump_catalog_gen_for(&mut self, section: ContentHubSection) -> u64 {
         let slot = match section {
+            ContentHubSection::Marketplace => &mut self.appstore_catalog_gen,
             ContentHubSection::Books => &mut self.books_catalog_gen,
             ContentHubSection::Music => &mut self.music_catalog_gen,
             ContentHubSection::Games => &mut self.games_catalog_gen,
@@ -78,6 +79,7 @@ impl ShellContentHubState {
 
     pub fn catalog_gen_for(&self, section: ContentHubSection) -> u64 {
         match section {
+            ContentHubSection::Marketplace => self.appstore_catalog_gen,
             ContentHubSection::Books => self.books_catalog_gen,
             ContentHubSection::Music => self.music_catalog_gen,
             ContentHubSection::Games => self.games_catalog_gen,
@@ -458,7 +460,7 @@ impl AppShell {
                 ActiveWorkspacePanel::Community => Some(AppleSidebarSection::Community),
                 ActiveWorkspacePanel::Calls => Some(AppleSidebarSection::Calls),
                 ActiveWorkspacePanel::TaskCenter => Some(AppleSidebarSection::Tasks),
-                ActiveWorkspacePanel::McpTools => Some(AppleSidebarSection::McpTools),
+                ActiveWorkspacePanel::McpTools => None,
                 ActiveWorkspacePanel::Browser => Some(AppleSidebarSection::Browser),
                 ActiveWorkspacePanel::Settings => {
                     is_standalone_computers.then_some(AppleSidebarSection::RemoteComputer)
@@ -466,9 +468,10 @@ impl AppShell {
                 ActiveWorkspacePanel::OpenBot => match openbot_page {
                     Some(OpenBotPage::Workflows) => Some(AppleSidebarSection::Workflows),
                     Some(OpenBotPage::Tasks) => Some(AppleSidebarSection::Tasks),
-                    Some(OpenBotPage::Schedule) => Some(AppleSidebarSection::Schedule),
+                    Some(OpenBotPage::Schedule) => None,
                     Some(OpenBotPage::Library) => Some(AppleSidebarSection::Library),
                     Some(OpenBotPage::Usage) => Some(AppleSidebarSection::Usage),
+                    Some(OpenBotPage::Marketplace) => Some(AppleSidebarSection::Marketplace),
                     Some(OpenBotPage::Settings) => None,
                     _ => Some(AppleSidebarSection::Chats),
                 },
@@ -537,6 +540,10 @@ impl AppShell {
         if !self.is_authenticated || self.overlays.is_passcode_locked {
             return;
         }
+        if section == AppleSidebarSection::Marketplace {
+            self.open_marketplace_tab(MarketplaceNavTab::Apps, cx);
+            return;
+        }
         if section == AppleSidebarSection::Community {
             self.leave_workspace_modal_panel_for_hub(cx);
             self.dismiss_transient_popovers_for_hub(cx);
@@ -599,9 +606,9 @@ impl AppShell {
                 self.dismiss_transient_popovers_for_hub(cx);
                 self.handle_main_menu_command(MainMenuCommand::TaskCenter, cx);
             }
-            AppleSidebarSection::McpTools => {
+            // MCP Tools and Schedule entries have been removed; connectors live in Marketplace -> Apps.
+            AppleSidebarSection::McpTools | AppleSidebarSection::Schedule => {
                 self.dismiss_transient_popovers_for_hub(cx);
-                self.handle_main_menu_command(MainMenuCommand::McpTools, cx);
             }
             AppleSidebarSection::RemoteComputer => {
                 self.dismiss_transient_popovers_for_hub(cx);
@@ -612,12 +619,10 @@ impl AppShell {
                 self.open_browser_workspace(cx);
             }
             AppleSidebarSection::Workflows
-            | AppleSidebarSection::Schedule
             | AppleSidebarSection::Library
             | AppleSidebarSection::Usage => {
                 let page = match section {
                     AppleSidebarSection::Workflows => OpenBotPage::Workflows,
-                    AppleSidebarSection::Schedule => OpenBotPage::Schedule,
                     AppleSidebarSection::Library => OpenBotPage::Library,
                     AppleSidebarSection::Usage => OpenBotPage::Usage,
                     _ => OpenBotPage::Agents,
@@ -645,7 +650,8 @@ impl AppShell {
                 self.sync_apple_sidebar_to_active_panel(cx);
                 cx.notify();
             }
-            AppleSidebarSection::Community
+            AppleSidebarSection::Marketplace
+            | AppleSidebarSection::Community
             | AppleSidebarSection::Books
             | AppleSidebarSection::Music
             | AppleSidebarSection::Games
@@ -661,6 +667,10 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         if !self.is_authenticated || self.overlays.is_passcode_locked {
+            return;
+        }
+        if section == ContentHubSection::Marketplace {
+            self.open_marketplace_tab(MarketplaceNavTab::Apps, cx);
             return;
         }
         self.leave_workspace_modal_panel_for_hub(cx);
@@ -680,6 +690,12 @@ impl AppShell {
             hcx.notify();
         });
         self.sync_local_miniapps_to_content_hub(cx);
+        if matches!(
+            section,
+            ContentHubSection::Books | ContentHubSection::Games | ContentHubSection::AppStore
+        ) {
+            self.sync_marketplace_runtime_state(cx);
+        }
         if section == ContentHubSection::MyCreations {
             self.refresh_my_creations(cx);
             if self.content_hub.read(cx).publish_modal.reviewer_access
@@ -717,7 +733,7 @@ impl AppShell {
         }
     }
 
-    fn dismiss_transient_popovers_for_hub(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss_transient_popovers_for_hub(&mut self, cx: &mut Context<Self>) {
         self.occlude_browser_for_overlay(cx);
         self.blur_community_if_focused(cx);
         self.clear_all_ime_preedits(cx);
@@ -1068,6 +1084,7 @@ impl AppShell {
         match ev {
             ContentHubEvent::RefreshMyCreations => self.refresh_my_creations(cx),
             ContentHubEvent::RefreshCatalog(sec) => self.refresh_content_hub_catalog(*sec, cx),
+            ContentHubEvent::RefreshMarketplaceState => self.sync_marketplace_runtime_state(cx),
             ContentHubEvent::RefreshReviewQueue => self.probe_reviewer_queue(cx, true),
             ContentHubEvent::OpenCreatorBot(kind_opt) => {
                 let cmd = kind_opt.map(|k| match k {
@@ -1225,6 +1242,123 @@ impl AppShell {
                     );
                 }
             }
+            ContentHubEvent::MarketplaceConnectPlugin {
+                slug,
+                auth_values,
+                override_url,
+            } => {
+                self.handle_marketplace_connect_plugin(
+                    slug.clone(),
+                    auth_values.clone(),
+                    override_url.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceConnectNative {
+                connector_id,
+                account_label,
+                credential,
+                metadata,
+            } => {
+                self.handle_marketplace_connect_native(
+                    connector_id.clone(),
+                    account_label.clone(),
+                    credential.clone(),
+                    metadata.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceDisconnectApp { app_id } => {
+                self.handle_marketplace_disconnect_app(app_id.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceSaveCustomMcp {
+                edit_server_id,
+                name,
+                transport,
+                command,
+                args,
+                env,
+                working_dir,
+                url,
+                headers,
+            } => {
+                self.handle_marketplace_save_custom_mcp(
+                    edit_server_id.clone(),
+                    name.clone(),
+                    *transport,
+                    command.clone(),
+                    args.clone(),
+                    env.clone(),
+                    working_dir.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceTestCustomMcp {
+                name,
+                transport,
+                command,
+                args,
+                env,
+                working_dir,
+                url,
+                headers,
+            } => {
+                self.handle_marketplace_test_custom_mcp(
+                    name.clone(),
+                    *transport,
+                    command.clone(),
+                    args.clone(),
+                    env.clone(),
+                    working_dir.clone(),
+                    url.clone(),
+                    headers.clone(),
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceRemoveCustomMcp { server_id } => {
+                self.handle_marketplace_remove_custom_mcp(server_id.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceToggleServerAgentAccess {
+                server_id,
+                agent_id,
+                allowed,
+            } => {
+                self.handle_marketplace_toggle_server_agent_access(
+                    server_id.clone(),
+                    agent_id.clone(),
+                    *allowed,
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceAddAgent { slug } => {
+                self.handle_marketplace_add_agent(slug.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceOpenAgentChat { slug } => {
+                self.handle_marketplace_open_agent_chat(slug.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceToggleSkillForAgent {
+                slug,
+                agent_id,
+                install,
+            } => {
+                self.handle_marketplace_toggle_skill_for_agent(
+                    slug.clone(),
+                    agent_id.clone(),
+                    *install,
+                    cx,
+                );
+            }
+            ContentHubEvent::MarketplaceRunPrompt { app_name, prompt } => {
+                self.handle_marketplace_run_prompt(app_name.clone(), prompt.clone(), cx);
+            }
+            ContentHubEvent::MarketplaceOpenExternalUrl { url } => {
+                self.open_external_url_with_toast(url, cx);
+            }
+            ContentHubEvent::MarketplaceCopyLink { url } => {
+                self.handle_marketplace_copy_link(url.clone(), cx);
+            }
             ContentHubEvent::CloseQuickDrawer => {
                 self.toggle_quick_creations_drawer(false, cx);
             }
@@ -1332,7 +1466,7 @@ impl AppShell {
 }
 
 impl AppShell {
-    fn sync_local_miniapps_to_content_hub(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_local_miniapps_to_content_hub(&mut self, cx: &mut Context<Self>) {
         let fallback: Vec<AppStoreMiniAppEntry> = self
             .miniapps
             .catalog_miniapps
@@ -1465,6 +1599,10 @@ impl AppShell {
         if !self.is_authenticated {
             return;
         }
+        if section == ContentHubSection::Marketplace {
+            self.sync_marketplace_runtime_state(cx);
+            return;
+        }
         if section == ContentHubSection::MyCreations {
             self.refresh_my_creations(cx);
             return;
@@ -1473,7 +1611,17 @@ impl AppShell {
         let Some(fence) = build_hub_fence(self, req_gen) else {
             return;
         };
-        let is_active_section = self.active_panel == ActiveWorkspacePanel::ContentHub(section);
+        let is_section_visible_in_hub = |shell: &AppShell, cx: &gpui::App| {
+            shell.active_panel == ActiveWorkspacePanel::ContentHub(section)
+                || (shell.active_panel == ActiveWorkspacePanel::ContentHub(ContentHubSection::Marketplace)
+                    && matches!(
+                        (shell.content_hub.read(cx).marketplace.active_tab, section),
+                        (MarketplaceNavTab::MiniApps, ContentHubSection::AppStore)
+                            | (MarketplaceNavTab::Books, ContentHubSection::Books)
+                            | (MarketplaceNavTab::Games, ContentHubSection::Games)
+                    ))
+        };
+        let is_active_section = is_section_visible_in_hub(self, cx);
         let (query_opt, sort_mode) = if is_active_section {
             let h = self.content_hub.read(cx);
             let q = h.catalog_search.text.trim().to_string();
@@ -1504,8 +1652,11 @@ impl AppShell {
                     ) {
                         return;
                     }
-                    let still_active =
-                        shell.active_panel == ActiveWorkspacePanel::ContentHub(section);
+                    let still_active = shell.active_panel == ActiveWorkspacePanel::ContentHub(section)
+                        || (shell.active_panel
+                            == ActiveWorkspacePanel::ContentHub(ContentHubSection::Marketplace)
+                            && shell.content_hub.read(cx).marketplace.active_tab
+                                == MarketplaceNavTab::MiniApps);
                     shell.content_hub.update(cx, |h, hcx| {
                         if still_active {
                             h.is_loading_catalog = false;
@@ -1545,8 +1696,14 @@ impl AppShell {
                     ) {
                         return;
                     }
-                    let still_active =
-                        shell.active_panel == ActiveWorkspacePanel::ContentHub(section);
+                    let still_active = shell.active_panel == ActiveWorkspacePanel::ContentHub(section)
+                        || (shell.active_panel
+                            == ActiveWorkspacePanel::ContentHub(ContentHubSection::Marketplace)
+                            && matches!(
+                                (shell.content_hub.read(cx).marketplace.active_tab, section),
+                                (MarketplaceNavTab::Books, ContentHubSection::Books)
+                                    | (MarketplaceNavTab::Games, ContentHubSection::Games)
+                            ));
                     shell.content_hub.update(cx, |h, hcx| {
                         if still_active {
                             h.is_loading_catalog = false;

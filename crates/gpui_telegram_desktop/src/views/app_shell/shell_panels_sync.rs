@@ -767,7 +767,8 @@ impl AppShell {
             | InspectorAction::CreateStarterWorkflow
             | InspectorAction::RunBotWorkflow { .. }
             | InspectorAction::DecideBotWorkflowApproval { .. }
-            | InspectorAction::OpenBotCompanion(_)) => {
+            | InspectorAction::OpenBotCompanion(_)
+            | InspectorAction::OpenMarketplaceApps) => {
                 let _ = self.handle_bot_fusion_inspector_action(act, cx);
             }
             InspectorAction::PatchFabushiBot { bot_id, req } => {

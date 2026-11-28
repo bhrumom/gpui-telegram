@@ -542,7 +542,7 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
     let on_plus = on_action.clone();
     let on_more = on_action.clone();
 
-    let primary_items: [(&'static str, NavDestination, IconName, &'static str, &'static str, u32); 3] = [
+    let primary_items: [(&'static str, NavDestination, IconName, &'static str, &'static str, u32); 2] = [
         (
             "sidebar-nav-chats",
             NavDestination::Chats,
@@ -558,14 +558,6 @@ pub fn render_expanded_gemini_nav_section<V: 'static>(
             "任务中心",
             "Task Center",
             nav.tasks_unread,
-        ),
-        (
-            "sidebar-nav-mcp",
-            NavDestination::McpTools,
-            IconName::TerminalMcp,
-            "MCP 工具",
-            "MCP Tools",
-            nav.mcp_unread,
         ),
     ];
 

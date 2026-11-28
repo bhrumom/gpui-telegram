@@ -141,6 +141,19 @@ define_icons! {
         CommunityAward => "community_award.svg",
         CommunityThread => "community_thread.svg",
         WorkflowWaypoints => "workflow_waypoints.svg",
+        MarketplaceStore => "marketplace_store.svg",
+        MarketplaceBlocks => "marketplace_blocks.svg",
+        MarketplacePlug => "marketplace_plug.svg",
+        BrandSlack => "brand_slack.svg",
+        BrandDiscord => "brand_discord.svg",
+        BrandTelegram => "brand_telegram.svg",
+        BrandWhatsApp => "brand_whatsapp.svg",
+        BrandGitHub => "brand_github.svg",
+        BrandOnePassword => "brand_onepassword.svg",
+        BrandBitwarden => "brand_bitwarden.svg",
+        BrandProtonPass => "brand_protonpass.svg",
+        BrandX => "brand_x.svg",
+        BrandStripe => "brand_stripe.svg",
     }
 }
 
