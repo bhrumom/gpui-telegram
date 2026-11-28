@@ -5134,6 +5134,234 @@ impl AppShell {
         }
     }
 
+    /// Resolves the active chat/bot identity for `BrowserDock` and tab owner avatars.
+    pub fn active_browser_dock_owner(&self, cx: &App) -> crate::views::browser::BrowserTabOwner {
+        let st = self.stage.read(cx);
+        if let Some(ref fab) = st.active_fabushi_bot {
+            let (shape, hue, color_hex) = crate::views::stage::openbot_stage_chrome::normalize_fabushi_plush_spec(
+                &fab.avatar_shape,
+                &fab.avatar_color,
+            );
+            let avatar_seed = shape
+                .map(|s| format!("plush:{}", s.as_str()))
+                .unwrap_or_else(|| {
+                    if fab.avatar_shape.trim().is_empty() {
+                        "plush:galet".to_string()
+                    } else {
+                        fab.avatar_shape.clone()
+                    }
+                });
+            let name = if fab.display_name.trim().is_empty() {
+                if fab.agent_id.trim().is_empty() {
+                    "New agent".to_string()
+                } else {
+                    fab.agent_id.clone()
+                }
+            } else {
+                fab.display_name.trim().to_string()
+            };
+            return crate::views::browser::BrowserTabOwner {
+                agent_id: fab.agent_id.clone(),
+                name,
+                avatar_seed,
+                avatar_hue: hue.or(Some(openbot_contracts::avatar::AvatarHue::Violet)),
+                avatar_color: color_hex,
+                avatar_shape: shape.or(Some(openbot_contracts::avatar::BloubShape::Galet)),
+                avatar_url: st.chat_avatar_url.clone(),
+            };
+        }
+        let mut owner = crate::views::browser::BrowserTabOwner::default();
+        if !st.chat_title.trim().is_empty() {
+            owner.name = st.chat_title.trim().to_string();
+        }
+        if let Some(cid) = st.active_chat_id {
+            owner.agent_id = format!("chat-{cid}");
+        }
+        owner
+    }
+
+    /// Synchronizes active chat/bot state into `BrowserWorkspace`'s floating `BrowserDock`.
+    pub fn sync_browser_dock_context(&mut self, cx: &mut Context<Self>) {
+        let Some(bw) = self.browser_workspace.clone() else {
+            return;
+        };
+        let is_zh = self.active_lang_id().starts_with("zh");
+        let owner = self.active_browser_dock_owner(cx);
+        let (working, activity_label, latest_reply) = {
+            let st = self.stage.read(cx);
+            let busy = !st.bot_activity_state.is_empty()
+                && !st.bot_activity_state.eq_ignore_ascii_case("idle");
+            let label = if busy {
+                Some(
+                    crate::views::browser::browser_action_label(&st.bot_activity_state, is_zh)
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let reply = st.messages.iter().rev().find_map(|m| {
+                if m.direction == MessageDirection::Incoming {
+                    if let MessageContent::Text { ref text, .. } = m.content {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let is_q = trimmed.ends_with('?') || trimmed.ends_with('？');
+                            return Some((format!("msg-{}", m.id), trimmed.to_string(), is_q));
+                        }
+                    }
+                }
+                None
+            });
+            (busy, label, reply)
+        };
+        let queued: Vec<(String, String)> = self
+            .bot_fusion
+            .snapshot
+            .queue_items
+            .iter()
+            .map(|q| (q.delivery_id.clone(), q.text.clone()))
+            .collect();
+        bw.update(cx, |w, wcx| {
+            w.sync_dock_agent_context(owner, working, activity_label, latest_reply, queued, wcx);
+        });
+    }
+
+    /// Mirrors live `BrowserWorkspace::session` tabs into `bot_fusion.side_panel.state.browser`
+    /// so legacy callers and `openbot_ui_fusion_tests` stay synchronized with the single source of truth.
+    pub fn sync_side_browser_pane_from_workspace(&mut self, cx: &App) {
+        let Some(ref bw) = self.browser_workspace else {
+            return;
+        };
+        let is_zh = self.active_lang_id().starts_with("zh");
+        let (tabs, active_id, url_input) = {
+            let r = bw.read(cx);
+            let tabs: Vec<crate::views::openbot::side_panel::SideBrowserTab> = r
+                .session
+                .tabs
+                .iter()
+                .map(|t| crate::views::openbot::side_panel::SideBrowserTab {
+                    id: t.id.clone(),
+                    title: t.preview_title(is_zh),
+                    url: t.url.clone(),
+                    group_label: (t.profile_id != "default").then(|| t.profile_id.clone()),
+                    loading: t.loading,
+                })
+                .collect();
+            (tabs, r.session.active_tab_id.clone(), r.url_input.clone())
+        };
+        self.bot_fusion.side_panel.state.browser.tabs = tabs;
+        self.bot_fusion.side_panel.state.browser.active_tab_id = active_id;
+        self.bot_fusion.side_panel.state.browser.address_input = url_input;
+    }
+
+    /// Ensures `self.browser_workspace` exists in the background (hidden & occluded) so the Chat
+    /// Right `SidePanel` (`BrowserPreviewSidebar`) shares the exact same `OpenBotBrowserSession`.
+    pub fn ensure_browser_workspace_background(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<BrowserWorkspace> {
+        if let Some(existing) = self.browser_workspace.clone() {
+            return existing;
+        }
+        let data_dir = match self.session_sync.user_id {
+            Some(uid) => user_bot_browser_dir(&self.preferences_dir, uid),
+            None => self.preferences_dir.join("bot_browser"),
+        };
+        let pal = self.theme_state.palette;
+        let lang = self.active_lang_id().to_string();
+        let shared_fabushi = Arc::clone(&self.bot_browser.shared_local_fabushi);
+        let cfg = BrowserWorkspaceConfig {
+            data_dir,
+            client: Some(Arc::clone(&self.client)),
+            session_registry: Arc::clone(&self.bot_browser.browser_registry),
+            orchestrator: self.bot_browser.orchestrator.clone(),
+            local_fabushi: self.bot_browser.local_fabushi.clone(),
+            unlocked_vault_key: self.bot_browser.unlocked_vault_key.clone(),
+            tokio_handle: Some(self.client.runtime().handle().clone()),
+            palette: pal,
+            language_id: lang,
+        };
+        let created = cx.new(|wcx| {
+            let mut w = BrowserWorkspace::new(cfg, wcx);
+            w.set_shared_local_fabushi(shared_fabushi);
+            w.set_workspace_visible(false, wcx);
+            w.set_occluded(true, wcx);
+            w
+        });
+        let mut last_active_input = created.read(cx).active_input.clone();
+        let mut last_input_gen = created.read(cx).active_input_generation();
+        cx.observe(&created, move |shell, bw, cx| {
+            let (current_active_input, current_input_gen) = {
+                let bw_read = bw.read(cx);
+                (
+                    bw_read.active_input.clone(),
+                    bw_read.active_input_generation(),
+                )
+            };
+            if current_input_gen != last_input_gen {
+                let was_non_none = last_active_input != ActiveBrowserInput::None;
+                last_active_input = current_active_input.clone();
+                last_input_gen = current_input_gen;
+                let preedit_matches_current = current_active_input != ActiveBrowserInput::None
+                    && shell.bot_browser.ime_preedit_input_gen == Some(current_input_gen);
+                if (was_non_none || current_active_input == ActiveBrowserInput::None)
+                    && !preedit_matches_current
+                {
+                    shell.ime.clear_preedit();
+                    shell.bot_browser.ime_preedit_input_gen = None;
+                }
+            }
+        })
+        .detach();
+        cx.subscribe(&created, |shell, _, ev, cx| {
+            shell.handle_browser_workspace_event(ev, cx);
+        })
+        .detach();
+        self.browser_workspace = Some(created.clone());
+        self.sync_browser_dock_context(cx);
+        self.sync_side_browser_pane_from_workspace(cx);
+        created
+    }
+
+    /// Opens `BrowserFullView` directly onto `tab_id` (or creates a default tab if empty),
+    /// matching OpenBot's click-to-open transition from `BrowserPreviewSidebar` (`image_3.png` -> `image_2.png`).
+    pub fn open_browser_full_view_for_tab(
+        &mut self,
+        tab_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Entity<BrowserWorkspace> {
+        let bw = self.open_browser_workspace(cx);
+        bw.update(cx, |w, wcx| {
+            if let Some(tid) = tab_id {
+                w.activate_tab(tid, wcx);
+            } else if w.session.tabs.is_empty() {
+                let _ = w.open_new_tab(None, None, false, None, wcx);
+            }
+            w.session.mark_all_tabs_noticed();
+        });
+        self.sync_browser_dock_context(cx);
+        self.sync_side_browser_pane_from_workspace(cx);
+        bw
+    }
+
+    /// Returns cleanly from `BrowserFullView` (`image_2.png`) back to Chat (`image.png`),
+    /// optionally opening the right `SidePanel` to the `"浏览器"` (`Browser`) preview tab.
+    pub fn return_from_browser_to_chat(
+        &mut self,
+        open_browser_side_panel: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_browser_native_webview(cx);
+        self.activate_nav_destination(NavDestination::Chats, cx);
+        if open_browser_side_panel {
+            self.open_unified_side_panel_pane(
+                crate::views::openbot::side_panel::SidePanelPaneKind::Browser,
+                cx,
+            );
+        }
+        self.sync_side_browser_pane_from_workspace(cx);
+        cx.notify();
+    }
+
     /// Opens or focuses the built-in `BrowserWorkspace` panel and wires shared `BrowserSessionRegistry`.
     pub fn open_browser_workspace(&mut self, cx: &mut Context<Self>) -> Entity<BrowserWorkspace> {
         self.leave_community_panel_if_active(cx);
@@ -5158,84 +5386,31 @@ impl AppShell {
             }
         });
 
-        let data_dir = match self.session_sync.user_id {
-            Some(uid) => user_bot_browser_dir(&self.preferences_dir, uid),
-            None => self.preferences_dir.join("bot_browser"),
-        };
         let pal = self.theme_state.palette;
         let lang = self.active_lang_id().to_string();
         let shared_fabushi = Arc::clone(&self.bot_browser.shared_local_fabushi);
-
-        let bw = if let Some(existing) = self.browser_workspace.clone() {
-            existing.update(cx, |w, wcx| {
-                let was_hidden =
-                    was_outside || !w.is_workspace_visible() || w.is_externally_occluded();
-                if was_hidden && w.active_input != ActiveBrowserInput::None {
-                    w.set_active_input(ActiveBrowserInput::None, None, wcx);
-                }
-                w.set_shared_local_fabushi(shared_fabushi);
-                w.set_workspace_visible(true, wcx);
-                w.set_occluded(false, wcx);
-                if let Some(ref orch) = self.bot_browser.orchestrator {
-                    w.set_orchestrator(Arc::clone(orch));
-                }
-                if let Some(ref host) = self.bot_browser.local_fabushi {
-                    w.set_local_fabushi(Arc::clone(host));
-                }
-                w.set_unlocked_vault_key(self.bot_browser.unlocked_vault_key.clone());
-                w.sync_theme_and_locale(pal, lang.clone(), wcx);
-            });
-            existing
-        } else {
-            let cfg = BrowserWorkspaceConfig {
-                data_dir,
-                client: Some(Arc::clone(&self.client)),
-                session_registry: Arc::clone(&self.bot_browser.browser_registry),
-                orchestrator: self.bot_browser.orchestrator.clone(),
-                local_fabushi: self.bot_browser.local_fabushi.clone(),
-                unlocked_vault_key: self.bot_browser.unlocked_vault_key.clone(),
-                tokio_handle: Some(self.client.runtime().handle().clone()),
-                palette: pal,
-                language_id: lang,
-            };
-            let created = cx.new(|cx| {
-                let mut w = BrowserWorkspace::new(cfg, cx);
-                w.set_shared_local_fabushi(shared_fabushi);
-                w
-            });
-            let mut last_active_input = created.read(cx).active_input.clone();
-            let mut last_input_gen = created.read(cx).active_input_generation();
-            cx.observe(&created, move |shell, bw, cx| {
-                let (current_active_input, current_input_gen) = {
-                    let bw_read = bw.read(cx);
-                    (
-                        bw_read.active_input.clone(),
-                        bw_read.active_input_generation(),
-                    )
-                };
-                if current_input_gen != last_input_gen {
-                    let was_non_none = last_active_input != ActiveBrowserInput::None;
-                    last_active_input = current_active_input.clone();
-                    last_input_gen = current_input_gen;
-                    let preedit_matches_current = current_active_input
-                        != ActiveBrowserInput::None
-                        && shell.bot_browser.ime_preedit_input_gen == Some(current_input_gen);
-                    if (was_non_none || current_active_input == ActiveBrowserInput::None)
-                        && !preedit_matches_current
-                    {
-                        shell.ime.clear_preedit();
-                        shell.bot_browser.ime_preedit_input_gen = None;
-                    }
-                }
-            })
-            .detach();
-            cx.subscribe(&created, |shell, _, ev, cx| {
-                shell.handle_browser_workspace_event(ev, cx);
-            })
-            .detach();
-            self.browser_workspace = Some(created.clone());
-            created
-        };
+        let bw = self.ensure_browser_workspace_background(cx);
+        bw.update(cx, |w, wcx| {
+            let was_hidden =
+                was_outside || !w.is_workspace_visible() || w.is_externally_occluded();
+            if was_hidden && w.active_input != ActiveBrowserInput::None {
+                w.set_active_input(ActiveBrowserInput::None, None, wcx);
+            }
+            w.set_shared_local_fabushi(shared_fabushi);
+            w.set_workspace_visible(true, wcx);
+            w.set_occluded(false, wcx);
+            if let Some(ref orch) = self.bot_browser.orchestrator {
+                w.set_orchestrator(Arc::clone(orch));
+            }
+            if let Some(ref host) = self.bot_browser.local_fabushi {
+                w.set_local_fabushi(Arc::clone(host));
+            }
+            w.set_unlocked_vault_key(self.bot_browser.unlocked_vault_key.clone());
+            w.sync_theme_and_locale(pal, lang.clone(), wcx);
+            w.session.mark_all_tabs_noticed();
+        });
+        self.sync_browser_dock_context(cx);
+        self.sync_side_browser_pane_from_workspace(cx);
         cx.notify();
         bw
     }

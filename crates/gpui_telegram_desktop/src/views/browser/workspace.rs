@@ -44,10 +44,16 @@ use crate::components::bots::{
     EmbeddedWkWebView, RecordedDomEvent, WkWebViewConfig, WkWebViewEvent,
 };
 use crate::components::ui::{pop_last_char, sanitize_paste_text};
-use crate::theme::{tg_icon, IconName, TdesktopThemePalette};
+use crate::theme::TdesktopThemePalette;
 use crate::views::browser::design_mode::{
     render_design_mode_overlay, render_design_mode_tab, BrowserWorkspaceEvent, DesignHandoffTarget,
     DesignModePanelState,
+};
+use crate::views::browser::openbot_session::{
+    browser_address_url, browser_completion, browser_display_url, browser_suggestions,
+    format_teach_message_for_chat, BrowserDockUiState, BrowserSuggestion, BrowserTabOwner,
+    BrowserTeachUiState, BrowserViewCommand, OpenBotBrowserSession, TabPlacement,
+    BROWSER_NEW_TAB_URL,
 };
 use crate::views::browser::recorder_panel::{
     format_locator_summary, render_copilot_tab, render_recorder_tab, render_session_tab,
@@ -424,6 +430,7 @@ pub enum BrowserInspectorTab {
 pub enum ActiveBrowserInput {
     None,
     AddressBar,
+    BrowserDockInput,
     ProfileName,
     CookieImport,
     CopilotPrompt,
@@ -441,7 +448,7 @@ pub enum ActiveBrowserInput {
 impl ActiveBrowserInput {
     pub fn owner_inspector_tab(&self) -> Option<BrowserInspectorTab> {
         match self {
-            Self::None | Self::AddressBar => None,
+            Self::None | Self::AddressBar | Self::BrowserDockInput => None,
             Self::CopilotPrompt => Some(BrowserInspectorTab::Copilot),
             Self::DistillName
             | Self::DistillVersion
@@ -515,6 +522,16 @@ pub struct BrowserWorkspace {
     pub recorder: RecorderPanelState,
     pub store: StorePanelState,
     pub design_mode: DesignModePanelState,
+    pub session: OpenBotBrowserSession,
+    pub dock: BrowserDockUiState,
+    pub teach: BrowserTeachUiState,
+    pub address_suggestions_open: bool,
+    pub address_suggestion_active_idx: Option<usize>,
+    pub page_menu_open: bool,
+    pub tab_context_menu_tab_id: Option<String>,
+    pub hovered_tab_id: Option<String>,
+    pub pending_preview_capture: bool,
+    pub show_openbot_full_chrome: bool,
     on_design_handoff: Option<
         Arc<dyn Fn(DesignHandoffTarget, bot_browser::DesignModeChatHandoff) + Send + Sync>,
     >,
@@ -564,6 +581,11 @@ impl BrowserWorkspace {
             if let Some(prev) = this.design_mode.preview_image.take() {
                 cx.drop_image(prev, None);
             }
+            for tab in &mut this.session.tabs {
+                if let Some(img) = tab.preview.image.take() {
+                    cx.drop_image(img, None);
+                }
+            }
             #[cfg(target_os = "macos")]
             if let Some(mut wv) = this.wkwebview.take() {
                 wv.destroy();
@@ -571,6 +593,16 @@ impl BrowserWorkspace {
             this.session_registry.unregister_backend(&this.active_session_id);
         })
         .detach();
+
+        let session = OpenBotBrowserSession::new_with_default_tab();
+        let initial_url = session
+            .active_tab()
+            .map(|t| t.url.clone())
+            .unwrap_or_else(|| BROWSER_NEW_TAB_URL.to_string());
+        let initial_title = session
+            .active_tab()
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "Google".to_string());
 
         Self {
             active_engine: initial_engine,
@@ -589,7 +621,7 @@ impl BrowserWorkspace {
             #[cfg(target_os = "macos")]
             wkwebview_listener_started: false,
             #[cfg(target_os = "macos")]
-            wkwebview_pending_url: None,
+            wkwebview_pending_url: Some(initial_url.clone()),
             #[cfg(target_os = "macos")]
             pending_profile_cookie_restore: false,
             #[cfg(target_os = "macos")]
@@ -606,20 +638,30 @@ impl BrowserWorkspace {
             active_backend: None,
             automation_session: None,
             event_listener_generation: 0,
-            url_input: "https://x.com".to_string(),
+            url_input: initial_url,
             current_url: String::new(),
-            page_title: String::new(),
+            page_title: initial_title,
             can_go_back: false,
             can_go_forward: false,
             is_loading: false,
             control_mode: BrowserControlMode::Idle,
             last_error: None,
             status_banner: None,
-            inspector_open: true,
+            inspector_open: false,
             inspector_tab: BrowserInspectorTab::Copilot,
             recorder: RecorderPanelState::default(),
             store,
             design_mode: DesignModePanelState::default(),
+            session,
+            dock: BrowserDockUiState::new(),
+            teach: BrowserTeachUiState::Inactive,
+            address_suggestions_open: false,
+            address_suggestion_active_idx: None,
+            page_menu_open: false,
+            tab_context_menu_tab_id: None,
+            hovered_tab_id: None,
+            pending_preview_capture: false,
+            show_openbot_full_chrome: true,
             on_design_handoff: None,
             external_occluded: false,
             workspace_visible: true,
@@ -910,6 +952,7 @@ impl BrowserWorkspace {
         match &self.active_input {
             ActiveBrowserInput::None => None,
             ActiveBrowserInput::AddressBar => Some((&mut self.url_input, false)),
+            ActiveBrowserInput::BrowserDockInput => Some((&mut self.dock.draft, false)),
             ActiveBrowserInput::ProfileName => Some((&mut self.recorder.profile_draft, false)),
             ActiveBrowserInput::CookieImport => Some((&mut self.recorder.cookie_import_draft, true)),
             ActiveBrowserInput::CopilotPrompt => {
@@ -942,6 +985,7 @@ impl BrowserWorkspace {
         match &self.active_input {
             ActiveBrowserInput::None => String::new(),
             ActiveBrowserInput::AddressBar => self.url_input.clone(),
+            ActiveBrowserInput::BrowserDockInput => self.dock.draft.clone(),
             ActiveBrowserInput::ProfileName => self.recorder.profile_draft.clone(),
             ActiveBrowserInput::CookieImport => self.recorder.cookie_import_draft.clone(),
             ActiveBrowserInput::CopilotPrompt => self.recorder.copilot_prompt_draft.clone(),
@@ -969,6 +1013,9 @@ impl BrowserWorkspace {
     pub fn clear_active_input(&mut self, cx: &mut Context<Self>) {
         if let Some((buf, _)) = self.active_input_mut() {
             buf.clear();
+            if self.active_input == ActiveBrowserInput::AddressBar {
+                self.address_suggestion_active_idx = None;
+            }
             cx.notify();
         }
     }
@@ -978,6 +1025,7 @@ impl BrowserWorkspace {
         raw_text: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        let is_address = self.active_input == ActiveBrowserInput::AddressBar;
         let Some((buf, allow_newlines)) = self.active_input_mut() else {
             return false;
         };
@@ -986,6 +1034,10 @@ impl BrowserWorkspace {
             return false;
         }
         buf.push_str(&clean);
+        if is_address {
+            self.address_suggestions_open = true;
+            self.address_suggestion_active_idx = None;
+        }
         cx.notify();
         true
     }
@@ -997,7 +1049,15 @@ impl BrowserWorkspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if key == "escape" {
+            if self.page_menu_open || self.tab_context_menu_tab_id.is_some() {
+                self.page_menu_open = false;
+                self.tab_context_menu_tab_id = None;
+                cx.notify();
+                return true;
+            }
             if self.active_input != ActiveBrowserInput::None {
+                self.address_suggestions_open = false;
+                self.address_suggestion_active_idx = None;
                 self.assign_active_input(ActiveBrowserInput::None);
                 cx.notify();
                 return true;
@@ -1008,6 +1068,27 @@ impl BrowserWorkspace {
             }
         }
         let target = self.active_input.clone();
+        if target == ActiveBrowserInput::AddressBar && (key == "down" || key == "up") {
+            let rows = self.current_address_suggestions();
+            if !self.address_suggestions_open {
+                self.address_suggestions_open = true;
+                self.address_suggestion_active_idx = if rows.is_empty() { None } else { Some(0) };
+                cx.notify();
+                return true;
+            }
+            if !rows.is_empty() {
+                let len = rows.len();
+                let next = match (self.address_suggestion_active_idx, key == "down") {
+                    (None, true) => 0,
+                    (None, false) => len - 1,
+                    (Some(i), true) => (i + 1) % len,
+                    (Some(i), false) => (i + len - 1) % len,
+                };
+                self.address_suggestion_active_idx = Some(next);
+                cx.notify();
+            }
+            return true;
+        }
         let Some((buf, is_multiline)) = self.active_input_mut() else {
             return false;
         };
@@ -1018,11 +1099,18 @@ impl BrowserWorkspace {
                 } else {
                     pop_last_char(buf);
                 }
+                if target == ActiveBrowserInput::AddressBar {
+                    self.address_suggestion_active_idx = None;
+                }
                 cx.notify();
                 true
             }
             "space" => {
                 buf.push(' ');
+                if target == ActiveBrowserInput::AddressBar {
+                    self.address_suggestions_open = true;
+                    self.address_suggestion_active_idx = None;
+                }
                 cx.notify();
                 true
             }
@@ -1043,8 +1131,22 @@ impl BrowserWorkspace {
                 }
                 match target {
                     ActiveBrowserInput::AddressBar => {
+                        if self.address_suggestions_open {
+                            if let Some(idx) = self.address_suggestion_active_idx {
+                                let rows = self.current_address_suggestions();
+                                if let Some(row) = rows.get(idx).cloned() {
+                                    self.choose_address_suggestion(&row, cx);
+                                    return true;
+                                }
+                            }
+                        }
                         let url = self.url_input.clone();
+                        self.address_suggestions_open = false;
+                        self.address_suggestion_active_idx = None;
                         self.navigate(&url, cx);
+                    }
+                    ActiveBrowserInput::BrowserDockInput => {
+                        self.submit_dock_message(cx);
                     }
                     ActiveBrowserInput::ProfileName => {
                         let name = self.recorder.profile_draft.trim().to_string();
@@ -1301,7 +1403,15 @@ impl BrowserWorkspace {
         if self.active_engine != BrowserEngineKind::RustCdp {
             return;
         }
-        let (surf_url, surf_title, surf_refreshing, surf_navigating, surf_err) = {
+        let (
+            surf_url,
+            surf_title,
+            surf_refreshing,
+            surf_navigating,
+            surf_err,
+            surf_img,
+            surf_img_size,
+        ) = {
             let sr = surface.read(cx);
             (
                 sr.current_url().to_string(),
@@ -1309,8 +1419,15 @@ impl BrowserWorkspace {
                 sr.is_refreshing(),
                 sr.is_navigating(),
                 sr.last_error().map(str::to_string),
+                sr.rendered_image().cloned(),
+                sr.frame_pixel_size(),
             )
         };
+
+        if let Some(img) = surf_img {
+            let (w, h) = surf_img_size.unwrap_or((1280, 800));
+            self.update_active_tab_preview(img, w, h);
+        }
 
         if !surf_refreshing && !surf_navigating {
             if !surf_url.is_empty() {
@@ -1348,6 +1465,7 @@ impl BrowserWorkspace {
                         surface.update(cx, |s, scx| s.reload_and_refresh(scx));
                     }
                 }
+                self.sync_active_tab_from_fields(cx);
                 cx.notify();
                 return;
             }
@@ -1357,16 +1475,23 @@ impl BrowserWorkspace {
                 self.is_loading = true;
                 self.last_error = surf_err;
                 surface.update(cx, |s, scx| s.refresh_frame(scx));
+                self.sync_active_tab_from_fields(cx);
                 cx.notify();
                 return;
             }
             self.cdp_nav_in_flight = false;
             self.is_loading = false;
+            if surf_err.is_some() && self.last_error != surf_err {
+                if let Some(tab) = self.session.active_tab_mut() {
+                    tab.diagnostic_error_count = tab.diagnostic_error_count.saturating_add(1);
+                }
+            }
             self.last_error = surf_err;
         } else {
             self.is_loading = true;
             self.last_error = surf_err;
         }
+        self.sync_active_tab_from_fields(cx);
         cx.notify();
     }
 
@@ -1512,16 +1637,32 @@ impl BrowserWorkspace {
         if trimmed.is_empty() {
             return;
         }
-        let target = if trimmed.contains("://") {
-            trimmed.to_string()
-        } else {
-            format!("https://{trimmed}")
-        };
+        let target = browser_address_url(trimmed);
+        self.address_suggestions_open = false;
+        self.address_suggestion_active_idx = None;
         self.url_input = target.clone();
         self.last_error = None;
         self.is_loading = true;
         self.nav_request_generation = self.nav_request_generation.wrapping_add(1);
         let nav_gen = self.nav_request_generation;
+
+        if self.session.tabs.is_empty() {
+            let owner_id = Some(self.dock.active_agent.agent_id.clone());
+            let _ = self.session.open_tab(
+                &target,
+                owner_id,
+                None,
+                &self.active_profile_id,
+                TabPlacement::default(),
+                true,
+            );
+        } else if let Some(tab) = self.session.active_tab_mut() {
+            tab.record_navigation(&target);
+            tab.loading = true;
+            self.can_go_back = tab.can_go_back;
+            self.can_go_forward = tab.can_go_forward;
+        }
+        self.session.record_visit(&target, "");
 
         #[cfg(target_os = "macos")]
         if self.active_engine == BrowserEngineKind::WkWebView && !Self::is_headless_or_offline_env()
@@ -1529,11 +1670,13 @@ impl BrowserWorkspace {
             if let Some(ref mut wv) = self.wkwebview {
                 wv.load_url(&target);
                 self.current_url = target;
+                self.sync_active_tab_from_fields(cx);
                 cx.notify();
                 return;
             }
             self.wkwebview_pending_url = Some(target.clone());
             self.current_url = target;
+            self.sync_active_tab_from_fields(cx);
             cx.notify();
             return;
         }
@@ -1546,6 +1689,7 @@ impl BrowserWorkspace {
                 self.pending_cdp_nav = None;
                 surface.update(cx, |s, scx| s.navigate_and_refresh(target.clone(), scx));
             }
+            self.sync_active_tab_from_fields(cx);
             cx.notify();
             return;
         }
@@ -1573,9 +1717,14 @@ impl BrowserWorkspace {
                             this.last_error = None;
                         }
                         Ok(Err(err)) | Err(err) => {
+                            if let Some(tab) = this.session.active_tab_mut() {
+                                tab.diagnostic_error_count =
+                                    tab.diagnostic_error_count.saturating_add(1);
+                            }
                             this.last_error = Some(err);
                         }
                     }
+                    this.sync_active_tab_from_fields(cx);
                     cx.notify();
                 });
             })
@@ -1609,21 +1758,37 @@ impl BrowserWorkspace {
                             this.last_error = None;
                         }
                         Ok(Err(err)) | Err(err) => {
+                            if let Some(tab) = this.session.active_tab_mut() {
+                                tab.diagnostic_error_count =
+                                    tab.diagnostic_error_count.saturating_add(1);
+                            }
                             this.last_error = Some(err);
                         }
                     }
+                    this.sync_active_tab_from_fields(cx);
                     cx.notify();
                 });
             })
             .detach();
         } else {
             self.is_loading = false;
+            self.current_url = target;
             self.last_error = Some("No active browser backend configured".to_string());
+            self.sync_active_tab_from_fields(cx);
             cx.notify();
         }
     }
 
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.session.active_tab_mut() {
+            if tab.nav_index > 0 {
+                tab.nav_index -= 1;
+                tab.can_go_back = tab.nav_index > 0;
+                tab.can_go_forward = tab.nav_index + 1 < tab.nav_history.len();
+                self.can_go_back = tab.can_go_back;
+                self.can_go_forward = tab.can_go_forward;
+            }
+        }
         #[cfg(target_os = "macos")]
         if self.active_engine == BrowserEngineKind::WkWebView && !Self::is_headless_or_offline_env()
         {
@@ -1648,6 +1813,15 @@ impl BrowserWorkspace {
     }
 
     pub fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.session.active_tab_mut() {
+            if tab.nav_index + 1 < tab.nav_history.len() {
+                tab.nav_index += 1;
+                tab.can_go_back = tab.nav_index > 0;
+                tab.can_go_forward = tab.nav_index + 1 < tab.nav_history.len();
+                self.can_go_back = tab.can_go_back;
+                self.can_go_forward = tab.can_go_forward;
+            }
+        }
         #[cfg(target_os = "macos")]
         if self.active_engine == BrowserEngineKind::WkWebView && !Self::is_headless_or_offline_env()
         {
@@ -1695,12 +1869,27 @@ impl BrowserWorkspace {
         cx.notify();
     }
 
+    pub fn stop_loading(&mut self, cx: &mut Context<Self>) {
+        self.is_loading = false;
+        self.pending_cdp_nav = None;
+        self.cdp_nav_in_flight = false;
+        self.nav_request_generation = self.nav_request_generation.wrapping_add(1);
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.loading = false;
+        }
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+    }
+
     pub fn user_take_over(&mut self, cx: &mut Context<Self>) {
         if let Some(ref session) = self.automation_session {
             session.user_take_over();
             self.control_mode = session.control_mode();
         } else {
             self.control_mode = BrowserControlMode::UserTakeover { paused_at_step: 0 };
+        }
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.user_control = true;
         }
         let interactive = !self.is_workspace_occluded();
         if let Some(ref surface) = self.cdp_surface {
@@ -1718,6 +1907,8 @@ impl BrowserWorkspace {
             "AI paused; manual interaction enabled",
             None,
         );
+        self.reconcile_dock_auto_tuck();
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
         cx.notify();
     }
 
@@ -1728,12 +1919,17 @@ impl BrowserWorkspace {
         } else {
             self.control_mode = BrowserControlMode::Idle;
         }
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.user_control = false;
+        }
         self.recorder.push_log(
             BrowserLogLevel::Info,
             "Control returned to AI",
             "Resuming from live browser state",
             None,
         );
+        self.reconcile_dock_auto_tuck();
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
         cx.notify();
     }
 
@@ -1743,6 +1939,9 @@ impl BrowserWorkspace {
             self.control_mode = session.control_mode();
         } else {
             self.control_mode = BrowserControlMode::Idle;
+        }
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.user_control = false;
         }
         let interactive = !self.is_workspace_occluded();
         if let Some(ref surface) = self.cdp_surface {
@@ -1754,6 +1953,8 @@ impl BrowserWorkspace {
             String::new(),
             None,
         );
+        self.reconcile_dock_auto_tuck();
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
         cx.notify();
     }
 
@@ -1762,10 +1963,533 @@ impl BrowserWorkspace {
             self.flush_pending_dom_fill();
         }
         self.recorder.is_dom_recording = !self.recorder.is_dom_recording;
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.recording = self.recorder.is_dom_recording;
+        }
         #[cfg(target_os = "macos")]
         if let Some(ref wv) = self.wkwebview {
             wv.set_dom_recording(self.recorder.is_dom_recording);
         }
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+    }
+
+    // ========================================================================
+    // OpenBot 1:1 Multi-Tab, Omnibox, Preview Capture, Dock & Teach Logic
+    // ========================================================================
+
+    pub fn now_epoch_ms() -> u64 {
+        Utc::now().timestamp_millis().max(0) as u64
+    }
+
+    /// True when any GPUI menu/suggestions popover overlaps the viewport (`useBrowserPageCover`).
+    pub fn has_covering_popover(&self) -> bool {
+        self.page_menu_open
+            || self.tab_context_menu_tab_id.is_some()
+            || (self.address_suggestions_open && !self.current_address_suggestions().is_empty())
+    }
+
+    pub fn close_all_browser_popovers(&mut self) -> bool {
+        let had = self.page_menu_open
+            || self.tab_context_menu_tab_id.is_some()
+            || self.address_suggestions_open;
+        self.page_menu_open = false;
+        self.tab_context_menu_tab_id = None;
+        self.address_suggestions_open = false;
+        self.address_suggestion_active_idx = None;
+        had
+    }
+
+    pub fn current_address_suggestions(&self) -> Vec<BrowserSuggestion> {
+        let comp = browser_completion(&self.url_input, &self.session.history);
+        browser_suggestions(
+            &self.url_input,
+            comp,
+            &self.session.tabs,
+            self.session.active_tab_id.as_deref(),
+            &self.session.history,
+        )
+    }
+
+    pub fn choose_address_suggestion(
+        &mut self,
+        row: &BrowserSuggestion,
+        cx: &mut Context<Self>,
+    ) {
+        self.address_suggestions_open = false;
+        self.address_suggestion_active_idx = None;
+        self.assign_active_input(ActiveBrowserInput::None);
+        if let Some(ref tab_id) = row.tab_id {
+            self.activate_tab(tab_id, cx);
+        } else {
+            self.navigate(&row.url, cx);
+        }
+    }
+
+    pub fn sync_active_tab_from_fields(&mut self, cx: &mut Context<Self>) {
+        let url_snapshot = if !self.current_url.is_empty() {
+            self.current_url.clone()
+        } else {
+            self.url_input.clone()
+        };
+        let title_snapshot = self.page_title.clone();
+        let can_back = self.can_go_back;
+        let can_fwd = self.can_go_forward;
+        let loading = self.is_loading;
+        let recording = self.recorder.is_dom_recording || self.teach.is_recording();
+        let user_ctrl = matches!(self.control_mode(), BrowserControlMode::UserTakeover { .. });
+        let profile = self.active_profile_id.clone();
+
+        if let Some(tab) = self.session.active_tab_mut() {
+            if !url_snapshot.is_empty() {
+                tab.record_navigation(&url_snapshot);
+            }
+            if !title_snapshot.is_empty() {
+                tab.title = title_snapshot.clone();
+            }
+            tab.loading = loading;
+            tab.can_go_back = tab.can_go_back || can_back;
+            tab.can_go_forward = tab.can_go_forward || can_fwd;
+            tab.recording = recording;
+            tab.user_control = user_ctrl;
+            tab.profile_id = profile;
+        }
+        if !url_snapshot.is_empty() {
+            self.session.record_visit(&url_snapshot, &title_snapshot);
+            self.session.record_title(&url_snapshot, &title_snapshot);
+        }
+        self.reconcile_dock_auto_tuck();
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+    }
+
+    pub fn update_active_tab_preview(&mut self, img: Arc<RenderImage>, width: u32, height: u32) {
+        let now_ms = Self::now_epoch_ms();
+        if let Some(tab) = self.session.active_tab_mut() {
+            tab.preview.image = Some(img);
+            tab.preview.width = width;
+            tab.preview.height = height;
+            tab.preview.failed = false;
+            tab.preview.captured_at_ms = now_ms;
+        }
+    }
+
+    /// Captures a live PNG preview thumbnail for the active tab (both `RustCdp` & macOS `WKWebView`).
+    pub fn capture_active_tab_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref surface) = self.cdp_surface {
+            let (img, sz) = {
+                let sr = surface.read(cx);
+                (sr.rendered_image().cloned(), sr.frame_pixel_size())
+            };
+            if let Some(image) = img {
+                let (w, h) = sz.unwrap_or((1280, 800));
+                self.update_active_tab_preview(image, w, h);
+                cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+                cx.notify();
+                return;
+            }
+        }
+        if self.pending_preview_capture {
+            return;
+        }
+        let Some(backend) = self.active_backend.clone().or_else(|| self.cdp_backend.clone()) else {
+            return;
+        };
+        let Some(target_tab_id) = self.session.active_tab_id.clone() else {
+            return;
+        };
+        self.pending_preview_capture = true;
+        let handle = resolve_browser_tokio_handle(self.tokio_handle.as_ref());
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let res = run_on_tokio(&handle, async move {
+                let png = backend
+                    .capture_screenshot()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                decode_png_to_render_image(&png)
+            })
+            .await;
+            let _ = weak.update(app, |this, cx| {
+                this.pending_preview_capture = false;
+                let now_ms = Self::now_epoch_ms();
+                if let Some(tab) = this.session.tab_by_id_mut(&target_tab_id) {
+                    match res {
+                        Ok(Ok((img, (w, h)))) => {
+                            if let Some(old) = tab.preview.image.replace(img) {
+                                cx.drop_image(old, None);
+                            }
+                            tab.preview.width = w;
+                            tab.preview.height = h;
+                            tab.preview.failed = false;
+                            tab.preview.captured_at_ms = now_ms;
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            if tab.preview.image.is_none() {
+                                tab.preview.failed = true;
+                            }
+                        }
+                    }
+                }
+                cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a new OpenBot browser tab (`BROWSER_NEW_TAB_URL` by default), optionally focusing the address bar.
+    pub fn open_new_tab(
+        &mut self,
+        raw_url: Option<&str>,
+        after_id: Option<String>,
+        focus_address: bool,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        self.close_all_browser_popovers();
+        let url = raw_url.unwrap_or(BROWSER_NEW_TAB_URL);
+        let owner_id = Some(self.dock.active_agent.agent_id.clone());
+        let profile = self.active_profile_id.clone();
+        let tab_id = self.session.open_tab(
+            url,
+            owner_id,
+            None,
+            &profile,
+            TabPlacement {
+                after_id,
+                index: None,
+            },
+            true,
+        )?;
+        let resolved_url = self
+            .session
+            .tab_by_id(&tab_id)
+            .map(|t| t.url.clone())
+            .unwrap_or_else(|| BROWSER_NEW_TAB_URL.to_string());
+        let resolved_title = self
+            .session
+            .tab_by_id(&tab_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        self.url_input = resolved_url.clone();
+        self.current_url = resolved_url.clone();
+        self.page_title = resolved_title;
+        self.can_go_back = false;
+        self.can_go_forward = false;
+        if focus_address {
+            self.set_active_input(ActiveBrowserInput::AddressBar, window, cx);
+        }
+        self.navigate(&resolved_url, cx);
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+        Ok(tab_id)
+    }
+
+    /// Switches to an existing tab in `self.session` and navigates the active engine to its URL.
+    pub fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) -> bool {
+        self.close_all_browser_popovers();
+        let already_active = self.session.active_tab_id.as_deref() == Some(tab_id);
+        if !self.session.activate_tab(tab_id) {
+            return false;
+        }
+        if let Some(tab) = self.session.tab_by_id(tab_id).cloned() {
+            self.url_input = tab.url.clone();
+            self.current_url = tab.url.clone();
+            self.page_title = tab.title.clone();
+            self.can_go_back = tab.can_go_back;
+            self.can_go_forward = tab.can_go_forward;
+            self.is_loading = tab.loading;
+            if !already_active && !tab.url.is_empty() {
+                self.navigate(&tab.url, cx);
+            }
+        }
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+        true
+    }
+
+    pub fn duplicate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        self.close_all_browser_popovers();
+        if let Ok(new_id) = self.session.duplicate_tab(tab_id) {
+            let _ = self.activate_tab(&new_id, cx);
+        }
+    }
+
+    pub fn move_tab(&mut self, tab_id: &str, to_index: usize, cx: &mut Context<Self>) {
+        if self.session.move_tab(tab_id, to_index) {
+            cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+            cx.notify();
+        }
+    }
+
+    pub fn close_tabs(&mut self, tab_ids: &[String], cx: &mut Context<Self>) -> usize {
+        self.close_all_browser_popovers();
+        let prev_active = self.session.active_tab_id.clone();
+        // Drop GPU images for closing tabs
+        for id in tab_ids {
+            if let Some(tab) = self.session.tab_by_id_mut(id) {
+                if let Some(img) = tab.preview.image.take() {
+                    cx.drop_image(img, None);
+                }
+            }
+        }
+        let closed = self.session.close_tabs(tab_ids);
+        if closed == 0 {
+            return 0;
+        }
+        if self.session.tabs.is_empty() {
+            self.current_url.clear();
+            self.url_input.clear();
+            self.page_title.clear();
+            self.can_go_back = false;
+            self.can_go_forward = false;
+            self.is_loading = false;
+            cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+            cx.emit(BrowserWorkspaceEvent::BackToChat {
+                open_browser_side_panel: true,
+            });
+            cx.notify();
+            return closed;
+        }
+        if self.session.active_tab_id != prev_active {
+            if let Some(next_id) = self.session.active_tab_id.clone() {
+                if let Some(tab) = self.session.tab_by_id(&next_id).cloned() {
+                    self.url_input = tab.url.clone();
+                    self.current_url = tab.url.clone();
+                    self.page_title = tab.title.clone();
+                    self.can_go_back = tab.can_go_back;
+                    self.can_go_forward = tab.can_go_forward;
+                    if !tab.url.is_empty() {
+                        self.navigate(&tab.url, cx);
+                    }
+                }
+            }
+        }
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+        closed
+    }
+
+    pub fn close_tabs_left(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(idx) = self.session.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let ids: Vec<String> = self.session.tabs[..idx]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        self.close_tabs(&ids, cx);
+    }
+
+    pub fn close_tabs_right(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(idx) = self.session.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let ids: Vec<String> = self.session.tabs[idx + 1..]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        self.close_tabs(&ids, cx);
+    }
+
+    pub fn close_other_tabs(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .session
+            .tabs
+            .iter()
+            .filter(|t| t.id != tab_id)
+            .map(|t| t.id.clone())
+            .collect();
+        self.close_tabs(&ids, cx);
+    }
+
+    pub fn reopen_closed_tab(&mut self, cx: &mut Context<Self>) {
+        self.close_all_browser_popovers();
+        let owner = Some(self.dock.active_agent.agent_id.clone());
+        let profile = self.active_profile_id.clone();
+        if let Ok(Some(tab_id)) = self.session.reopen_closed_tab(owner, None, &profile) {
+            let _ = self.activate_tab(&tab_id, cx);
+        }
+    }
+
+    /// Dispatches OpenBot's `BrowserViewCommand` keyboard shortcuts (`browser-view-shortcuts.ts`).
+    pub fn handle_browser_view_command(
+        &mut self,
+        cmd: BrowserViewCommand,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match cmd {
+            BrowserViewCommand::Select(offset) => {
+                if let Some(id) = self.session.select_offset(offset) {
+                    let _ = self.activate_tab(&id, cx);
+                }
+                true
+            }
+            BrowserViewCommand::SelectIndex(target) => {
+                if let Some(id) = self.session.select_index(target) {
+                    let _ = self.activate_tab(&id, cx);
+                }
+                true
+            }
+            BrowserViewCommand::Move(offset) => {
+                if self.session.move_active_tab(offset) {
+                    cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+                    cx.notify();
+                }
+                true
+            }
+            BrowserViewCommand::NewTab => {
+                let _ = self.open_new_tab(None, None, true, window, cx);
+                true
+            }
+            BrowserViewCommand::Reopen => {
+                self.reopen_closed_tab(cx);
+                true
+            }
+            BrowserViewCommand::Close => {
+                if let Some(id) = self.session.active_tab_id.clone() {
+                    self.close_tabs(&[id], cx);
+                }
+                true
+            }
+            BrowserViewCommand::FocusAddress => {
+                self.address_suggestions_open = true;
+                self.address_suggestion_active_idx = None;
+                self.set_active_input(ActiveBrowserInput::AddressBar, window, cx);
+                true
+            }
+            BrowserViewCommand::Reload => {
+                self.reload(cx);
+                true
+            }
+            BrowserViewCommand::Back => {
+                self.go_back(cx);
+                true
+            }
+            BrowserViewCommand::Forward => {
+                self.go_forward(cx);
+                true
+            }
+        }
+    }
+
+    /// Captures a fresh preview thumbnail, releases user takeover if held (`browser-store.ts` lines 723-733),
+    /// and notifies `AppShell` to return to Chat.
+    pub fn request_back_to_chat(&mut self, open_browser_side_panel: bool, cx: &mut Context<Self>) {
+        self.close_all_browser_popovers();
+        self.capture_active_tab_preview(cx);
+        if matches!(self.control_mode(), BrowserControlMode::UserTakeover { .. }) {
+            self.user_resume_ai(cx);
+        }
+        cx.emit(BrowserWorkspaceEvent::BackToChat {
+            open_browser_side_panel,
+        });
+        cx.notify();
+    }
+
+    /// Synchronizes active Chat / Bot state into the floating `BrowserDock` pill.
+    pub fn sync_dock_agent_context(
+        &mut self,
+        owner: BrowserTabOwner,
+        working: bool,
+        activity_label: Option<String>,
+        latest_reply: Option<(String, String, bool)>,
+        queued: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dock.active_agent = owner;
+        self.dock.working = working;
+        self.dock.activity_label = activity_label;
+        self.dock.queued_messages = queued;
+        if let Some((reply_id, body, is_q)) = latest_reply {
+            let same_id = self
+                .dock
+                .latest_reply
+                .as_ref()
+                .is_some_and(|(existing_id, _, _, _)| existing_id == &reply_id);
+            if !same_id {
+                self.dock.latest_reply = Some((reply_id, body, is_q, Self::now_epoch_ms()));
+            }
+        }
+        self.reconcile_dock_auto_tuck();
+        cx.notify();
+    }
+
+    pub fn reconcile_dock_auto_tuck(&mut self) {
+        let is_zh = self.language_id.starts_with("zh");
+        let mode = self.control_mode();
+        let island = self.dock.resolve_island(&mode, Self::now_epoch_ms(), is_zh);
+        self.dock.reconcile_auto_tuck(island.as_ref());
+    }
+
+    pub fn submit_dock_message(&mut self, cx: &mut Context<Self>) {
+        let text = self.dock.draft.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.dock.draft.clear();
+        cx.emit(BrowserWorkspaceEvent::SendDockMessage { text });
+        cx.notify();
+    }
+
+    pub fn toggle_dock_tucked(&mut self, cx: &mut Context<Self>) {
+        self.dock.tucked = !self.dock.tucked;
+        self.dock.folded_for_takeover = false;
+        if self.dock.tucked && self.active_input == ActiveBrowserInput::BrowserDockInput {
+            self.assign_active_input(ActiveBrowserInput::None);
+        }
+        cx.notify();
+    }
+
+    pub fn open_teach_bar(&mut self, cx: &mut Context<Self>) {
+        self.page_menu_open = false;
+        if !self.teach.is_active() {
+            self.teach = BrowserTeachUiState::Ready;
+        }
+        cx.notify();
+    }
+
+    pub fn start_teach_recording(&mut self, cx: &mut Context<Self>) {
+        self.teach = BrowserTeachUiState::Recording {
+            started_at_ms: Self::now_epoch_ms(),
+            step_count: 0,
+        };
+        if !self.recorder.is_dom_recording {
+            self.toggle_dom_recording(cx);
+        } else if let Some(tab) = self.session.active_tab_mut() {
+            tab.recording = true;
+        }
+        cx.emit(BrowserWorkspaceEvent::TabsUpdated);
+        cx.notify();
+    }
+
+    pub fn save_teach_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recorder.is_dom_recording {
+            self.toggle_dom_recording(cx);
+        }
+        self.teach = BrowserTeachUiState::Inactive;
+        let is_zh = self.language_id.starts_with("zh");
+        let steps: Vec<String> = self
+            .automation_session
+            .as_ref()
+            .map(|s| {
+                s.current_trace()
+                    .actions
+                    .iter()
+                    .map(|a| format!("{a:?}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prompt = format_teach_message_for_chat(&steps, is_zh);
+        cx.emit(BrowserWorkspaceEvent::SendTeachMessage { text: prompt });
+        cx.notify();
+    }
+
+    pub fn discard_teach_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recorder.is_dom_recording {
+            self.toggle_dom_recording(cx);
+        }
+        self.teach = BrowserTeachUiState::Inactive;
         cx.notify();
     }
 
@@ -2841,6 +3565,7 @@ impl BrowserWorkspace {
             self.control_mode(),
             BrowserControlMode::AiControlling { .. }
         );
+        let mut finished_loading = false;
         for ev in events {
             match ev {
                 WkWebViewEvent::NavigationChanged {
@@ -2868,11 +3593,17 @@ impl BrowserWorkspace {
                     self.page_title = title;
                 }
                 WkWebViewEvent::LoadingChanged { is_loading } => {
+                    if self.is_loading && !is_loading {
+                        finished_loading = true;
+                    }
                     self.is_loading = is_loading;
                 }
                 WkWebViewEvent::NavigationFailed { url, error } => {
                     self.is_loading = false;
                     self.last_error = Some(format!("Navigation failed ({url}): {error}"));
+                    if let Some(tab) = self.session.active_tab_mut() {
+                        tab.diagnostic_error_count = tab.diagnostic_error_count.saturating_add(1);
+                    }
                 }
                 WkWebViewEvent::PopupRequested { url } => {
                     self.status_banner = Some(format!("Opened popup in tab: {url}"));
@@ -2895,6 +3626,10 @@ impl BrowserWorkspace {
                 }
                 WkWebViewEvent::BridgeMessage { .. } => {}
             }
+        }
+        self.sync_active_tab_from_fields(cx);
+        if finished_loading {
+            self.capture_active_tab_preview(cx);
         }
         cx.notify();
     }
@@ -3283,42 +4018,13 @@ impl Render for BrowserWorkspace {
             self._cdp_focus_subscription = None;
         }
         let pal = self.palette;
+        let ob = pal.openbot_palette();
         let lang = self.language_id.clone();
+        let is_zh = lang.starts_with("zh");
+        #[cfg(target_os = "macos")]
         let occluded = self.is_occluded();
-
-        let (takeover_label, takeover_col) = match &self.control_mode {
-            BrowserControlMode::Idle => (tr_str(&lang, "空闲", "Idle").to_string(), pal.text_secondary),
-            BrowserControlMode::AiControlling { status_text, .. } => (
-                format!("AI: {status_text}"),
-                pal.accent,
-            ),
-            BrowserControlMode::WaitingForTakeover { reason } => (
-                format!("{}: {reason}", tr_str(&lang, "等待人工接管", "Waiting for Takeover")),
-                0xE67E22,
-            ),
-            BrowserControlMode::UserTakeover { paused_at_step } => (
-                format!(
-                    "{} (#{})",
-                    tr_str(&lang, "已接管", "User Takeover"),
-                    paused_at_step + 1
-                ),
-                pal.success,
-            ),
-        };
-
-        let is_ai_or_paused = !matches!(self.control_mode, BrowserControlMode::Idle);
-        let can_resume = matches!(
-            self.control_mode,
-            BrowserControlMode::WaitingForTakeover { .. } | BrowserControlMode::UserTakeover { .. }
-        );
-
-        let inspector_tabs: &[(BrowserInspectorTab, &str)] = &[
-            (BrowserInspectorTab::Copilot, "Copilot"),
-            (BrowserInspectorTab::Recorder, "Script Apps"),
-            (BrowserInspectorTab::Session, "Session"),
-            (BrowserInspectorTab::Store, "Store"),
-            (BrowserInspectorTab::Design, "Design"),
-        ];
+        #[cfg(target_os = "macos")]
+        let popover_covered = self.has_covering_popover();
 
         let inspector_body: AnyElement = match self.inspector_tab {
             BrowserInspectorTab::Copilot => render_copilot_tab(self, pal, &lang, cx),
@@ -3328,33 +4034,51 @@ impl Render for BrowserWorkspace {
             BrowserInspectorTab::Design => render_design_mode_tab(self, pal, &lang, cx),
         };
 
-        let addr_active = self.active_input == ActiveBrowserInput::AddressBar;
-
-        let viewport_element: AnyElement = if self.active_engine == BrowserEngineKind::WkWebView
+        let is_live_native_wkwebview = self.active_engine == BrowserEngineKind::WkWebView
             && cfg!(target_os = "macos")
-            && !Self::is_headless_or_offline_env()
-        {
+            && !Self::is_headless_or_offline_env();
+
+        let cached_preview = self
+            .session
+            .active_tab()
+            .and_then(|t| t.preview.image.clone());
+
+        let viewport_element: AnyElement = if is_live_native_wkwebview {
             #[cfg(target_os = "macos")]
             {
                 let entity = cx.entity().clone();
+                let show_native = !occluded && !popover_covered;
                 div()
                     .id("browser-wkwebview-host")
                     .relative()
                     .flex_1()
                     .size_full()
-                    .bg(rgb(pal.history_bg))
+                    .bg(ob.bg_canvas())
                     .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                        let had_popovers = this.close_all_browser_popovers();
                         if this.active_input != ActiveBrowserInput::None {
                             this.assign_active_input(ActiveBrowserInput::None);
                             cx.notify();
+                        } else if had_popovers {
+                            cx.notify();
                         }
                     }))
+                    .when(popover_covered, |host| {
+                        host.when_some(cached_preview.clone(), |h, preview_img| {
+                            h.child(
+                                img(preview_img)
+                                    .w_full()
+                                    .h_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                        })
+                    })
                     .child(
                         canvas(
                             |bounds, _, _| bounds,
                             move |bounds, _, window, cx| {
                                 entity.update(cx, |this, wcx| {
-                                    this.sync_native_wkwebview(window, bounds, !occluded, wcx);
+                                    this.sync_native_wkwebview(window, bounds, show_native, wcx);
                                 });
                             },
                         )
@@ -3376,8 +4100,11 @@ impl Render for BrowserWorkspace {
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                    let had_popovers = this.close_all_browser_popovers();
                     if this.active_input != ActiveBrowserInput::None {
                         this.assign_active_input(ActiveBrowserInput::None);
+                        cx.notify();
+                    } else if had_popovers {
                         cx.notify();
                     }
                 }))
@@ -3396,475 +4123,64 @@ impl Render for BrowserWorkspace {
                 })
                 .into_any_element()
         } else {
+            let active_url = self
+                .session
+                .active_tab()
+                .map(|t| t.url.clone())
+                .unwrap_or_else(|| self.url_input.clone());
+            let host_str = browser_display_url(&active_url);
             div()
                 .id("browser-empty-viewport")
                 .flex_1()
                 .size_full()
-                .bg(rgb(pal.history_bg))
+                .bg(ob.bg_canvas())
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(8.0))
-                .child(tg_icon(IconName::ScreenShare, 32.0, pal.text_secondary))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(pal.text_secondary))
-                        .child(tr_str(
-                            &lang,
-                            "输入网址并按 Enter 开始浏览或驱动 Rust CDP 会话",
-                            "Enter a URL above to browse with Rust CDP",
-                        )),
-                )
+                .gap(px(10.0))
+                .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                    if this.close_all_browser_popovers() {
+                        cx.notify();
+                    }
+                }))
+                .when_some(cached_preview, |el, preview_img| {
+                    el.child(
+                        img(preview_img)
+                            .w_full()
+                            .h_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                })
+                .when(self.session.active_tab().is_none_or(|t| t.preview.image.is_none()), |el| {
+                    el.child(crate::views::browser::openbot_browser_chrome::openbot_browser_icon(
+                        crate::views::browser::openbot_browser_chrome::OpenBotBrowserIcon::Globe2,
+                        32.0,
+                        ob.text_muted(),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(ob.text_secondary())
+                            .child(if host_str.is_empty() {
+                                if is_zh {
+                                    "在上方输入网址或搜索词开始浏览".to_string()
+                                } else {
+                                    "Enter a URL or search above to browse".to_string()
+                                }
+                            } else {
+                                host_str
+                            }),
+                    )
+                })
                 .into_any_element()
         };
 
-        div()
-            .id("browser-workspace-root")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                if this.is_workspace_occluded() {
-                    return;
-                }
-                let key = ev.keystroke.key.as_str();
-                if ev.keystroke.modifiers.platform && key.eq_ignore_ascii_case("v") {
-                    if let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        this.insert_text_to_active_input(&clip, cx);
-                        cx.stop_propagation();
-                    }
-                    return;
-                }
-                if this.handle_non_char_key_input(key, ev.keystroke.modifiers.alt, cx) {
-                    cx.stop_propagation();
-                    return;
-                }
-                if let Some(ref ch) = ev.keystroke.key_char {
-                    if this.insert_text_to_active_input(ch, cx) {
-                        cx.stop_propagation();
-                    }
-                }
-            }))
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .h_full()
-            .overflow_hidden()
-            .bg(rgb(pal.window_bg))
-            // Top Toolbar
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .bg(rgb(pal.top_bar_bg))
-                    .border_b_1()
-                    .border_color(pal.separator_rgba())
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .id("browser-nav-back-btn")
-                            .px(px(7.0))
-                            .py(px(5.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(pal.input_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.go_back(cx)),
-                            )
-                            .child(tg_icon(IconName::BackArrow, 14.0, pal.text_primary)),
-                    )
-                    .child(
-                        div()
-                            .id("browser-nav-forward-btn")
-                            .px(px(7.0))
-                            .py(px(5.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(pal.input_bg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.go_forward(cx)),
-                            )
-                            .child(tg_icon(IconName::Forward, 14.0, pal.text_primary)),
-                    )
-                    .child(
-                        div()
-                            .id("browser-nav-reload-btn")
-                            .px(px(8.0))
-                            .py(px(5.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(pal.input_bg))
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(pal.text_primary))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.reload(cx)),
-                            )
-                            .child(if self.is_loading { "Stop" } else { "Reload" }),
-                    )
-                    // Editable URL / Address Bar
-                    .child(
-                        div()
-                            .id("browser-address-bar-input")
-                            .flex_1()
-                            .min_w(px(140.0))
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(pal.input_bg))
-                            .border_1()
-                            .border_color(rgb(if addr_active {
-                                pal.accent
-                            } else {
-                                pal.border_fg
-                            }))
-                            .cursor_text()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.set_active_input(
-                                        ActiveBrowserInput::AddressBar,
-                                        Some(window),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .text_xs()
-                            .text_color(rgb(pal.text_primary))
-                            .child(if addr_active {
-                                format!("{}|", self.url_input)
-                            } else if self.url_input.is_empty() {
-                                "https://".to_string()
-                            } else {
-                                self.url_input.clone()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("browser-nav-go-btn")
-                            .px(px(10.0))
-                            .py(px(5.5))
-                            .rounded(px(7.0))
-                            .bg(rgb(pal.accent))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(pal.active_button_fg))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    let url = this.url_input.clone();
-                                    this.navigate(&url, cx);
-                                }),
-                            )
-                            .child("Go"),
-                    )
-                    // Profile Badge
-                    .child(
-                        div()
-                            .id("browser-profile-pill")
-                            .px(px(8.0))
-                            .py(px(4.5))
-                            .rounded(px(6.0))
-                            .bg(rgb(pal.input_bg))
-                            .text_xs()
-                            .text_color(rgb(pal.text_secondary))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.inspector_open = true;
-                                    this.set_inspector_tab(BrowserInspectorTab::Session, cx);
-                                }),
-                            )
-                            .child(format!("Profile: {}", self.active_profile_id)),
-                    )
-                    // Engine Toggle Badge (`WKWebView` / `Rust CDP`)
-                    .child(
-                        div()
-                            .id("browser-engine-toggle-btn")
-                            .px(px(8.0))
-                            .py(px(4.5))
-                            .rounded(px(6.0))
-                            .bg(TdesktopThemePalette::rgba_with_alpha(pal.accent, 0.16))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(pal.accent))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    let next = match this.active_engine {
-                                        BrowserEngineKind::WkWebView => BrowserEngineKind::RustCdp,
-                                        BrowserEngineKind::RustCdp => BrowserEngineKind::WkWebView,
-                                    };
-                                    this.set_engine_kind(next, cx);
-                                }),
-                            )
-                            .child(self.active_engine.display_name()),
-                    )
-                    // Design Mode Toggle Pill (`Cmd+Shift+I`)
-                    .child(
-                        div()
-                            .id("browser-design-mode-toggle-btn")
-                            .px(px(8.0))
-                            .py(px(4.5))
-                            .rounded(px(6.0))
-                            .bg(if self.design_mode.enabled {
-                                rgb(pal.accent)
-                            } else {
-                                rgb(pal.input_bg)
-                            })
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(if self.design_mode.enabled {
-                                pal.active_button_fg
-                            } else {
-                                pal.text_primary
-                            }))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_design_mode(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(tg_icon(
-                                IconName::Camera,
-                                12.0,
-                                if self.design_mode.enabled {
-                                    pal.active_button_fg
-                                } else {
-                                    pal.accent
-                                },
-                            ))
-                            .child(if self.design_mode.enabled {
-                                tr_str(&lang, "设计模式: 开", "Design: On")
-                            } else {
-                                tr_str(&lang, "设计模式", "Design")
-                            }),
-                    )
-                    // Inspector Collapse Toggle
-                    .child(
-                        div()
-                            .id("browser-inspector-toggle-btn")
-                            .px(px(8.0))
-                            .py(px(4.5))
-                            .rounded(px(6.0))
-                            .bg(rgb(pal.input_bg))
-                            .text_xs()
-                            .text_color(rgb(pal.text_primary))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.inspector_open = !this.inspector_open;
-                                    if !this.inspector_open
-                                        && this.active_input.owner_inspector_tab().is_some()
-                                    {
-                                        this.assign_active_input(ActiveBrowserInput::None);
-                                    }
-                                    cx.notify();
-                                }),
-                            )
-                            .child(if self.inspector_open { "Hide Panel" } else { "Show Panel" }),
-                    ),
-            )
-            // Control / Takeover Status Banner
-            .child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .bg(TdesktopThemePalette::rgba_with_alpha(takeover_col, 0.12))
-                    .border_b_1()
-                    .border_color(pal.separator_rgba())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(takeover_col))
-                                    .child(takeover_label),
-                            )
-                            .when(!self.page_title.is_empty(), |row| {
-                                row.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(pal.text_secondary))
-                                        .child(format!("· {}", self.page_title)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id("browser-takeover-btn")
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(0xE67E22))
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xFFFFFF))
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.user_take_over(cx)),
-                                    )
-                                    .child(tr_str(&lang, "接管控制", "Take Over")),
-                            )
-                            .when(can_resume, |row| {
-                                row.child(
-                                    div()
-                                        .id("browser-resume-ai-btn")
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(6.0))
-                                        .bg(rgb(pal.success))
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.user_resume_ai(cx)),
-                                        )
-                                        .child(tr_str(&lang, "交还 AI", "Resume AI")),
-                                )
-                            })
-                            .when(is_ai_or_paused, |row| {
-                                row.child(
-                                    div()
-                                        .id("browser-cancel-ai-btn")
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(6.0))
-                                        .bg(rgb(pal.danger))
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xFFFFFF))
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.user_cancel_ai(cx)),
-                                        )
-                                        .child(tr_str(&lang, "取消 AI", "Cancel AI")),
-                                )
-                            }),
-                    ),
-            )
-            // Optional Status / Error Strip
-            .when_some(self.last_error.clone(), |col, err| {
-                col.child(
-                    div()
-                        .w_full()
-                        .px(px(12.0))
-                        .py(px(5.0))
-                        .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.14))
-                        .text_xs()
-                        .text_color(rgb(pal.danger))
-                        .child(err),
-                )
-            })
-            // Split-Pane Body: Viewport (Left/Center) + Collapsible Inspector (Right)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .flex()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(viewport_element),
-                    )
-                    .when(self.inspector_open, |row| {
-                        row.child(
-                            div()
-                                .w(px(360.0))
-                                .h_full()
-                                .flex_shrink_0()
-                                .bg(rgb(pal.dialogs_bg))
-                                .border_l_1()
-                                .border_color(pal.separator_rgba())
-                                .p(px(10.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .children(inspector_tabs.iter().map(|(tab, title)| {
-                                            let is_sel = self.inspector_tab == *tab;
-                                            let t = *tab;
-                                            div()
-                                                .flex_1()
-                                                .px(px(6.0))
-                                                .py(px(5.0))
-                                                .rounded(px(6.0))
-                                                .bg(rgb(if is_sel {
-                                                    pal.accent
-                                                } else {
-                                                    pal.input_bg
-                                                }))
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(if is_sel {
-                                                    pal.active_button_fg
-                                                } else {
-                                                    pal.text_secondary
-                                                }))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.set_inspector_tab(t, cx);
-                                                    }),
-                                                )
-                                                .child(*title)
-                                        })),
-                                )
-                                .child(inspector_body),
-                        )
-                    }),
-            )
-            .into_any_element()
+        self.render_openbot_full_view(
+            viewport_element,
+            inspector_body,
+            !is_live_native_wkwebview,
+            cx,
+        )
     }
 }

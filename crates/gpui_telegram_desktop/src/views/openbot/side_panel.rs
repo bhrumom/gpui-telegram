@@ -672,141 +672,81 @@ fn palette_color(palette: &OpenBotPalette, token: &str, fallback: u32) -> Rgba {
 }
 
 fn render_browser_pane(browser: &SideBrowserPaneState, palette: &OpenBotPalette) -> Div {
-    let control = palette_color(palette, "--openbot-bg-control", 0x212121);
-    let active_bg = palette_color(palette, "--openbot-bg-control-active", 0x2a2a2a);
-    let canvas_bg = palette_color(palette, "--openbot-bg-canvas", 0x1a1a1a);
-    let border = palette_color(palette, "--openbot-border-strong", 0x333335);
-    let text_primary = palette_color(palette, "--openbot-text-primary", 0xffffff);
+    let text_secondary = palette_color(palette, "--openbot-text-secondary", 0xdcdcdc);
     let text_muted = palette_color(palette, "--openbot-text-muted", 0x979797);
-    let accent = palette_color(palette, "--openbot-accent", 0x007cf7);
-    let accent_soft = palette_color(palette, "--openbot-accent-soft", 0x1a304d);
 
-    let mut tab_strip = div()
-        .id("openbot-side-browser-tabs")
-        .flex()
-        .items_center()
-        .gap(px(4.0))
-        .min_w(px(0.0))
-        .overflow_x_scroll();
-
-    for (idx, tab) in browser.tabs.iter().enumerate() {
-        let is_active = browser.active_tab_id.as_deref() == Some(tab.id.as_str());
-        tab_strip = tab_strip.child(
-            div()
-                .id(("openbot-side-browser-tab", idx))
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .px(px(8.0))
-                .py(px(4.0))
-                .rounded(px(8.0))
-                .bg(if is_active { active_bg } else { control })
-                .border_1()
-                .border_color(if is_active { accent } else { border })
-                .when_some(tab.group_label.as_ref(), |el, grp| {
-                    el.child(
-                        div()
-                            .px(px(4.0))
-                            .rounded(px(4.0))
-                            .bg(accent_soft)
-                            .text_xs()
-                            .text_color(accent)
-                            .child(grp.clone()),
-                    )
-                })
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_active { text_primary } else { text_muted })
-                        .max_w(px(120.0))
-                        .truncate()
-                        .child(tab.title.clone()),
-                ),
-        );
+    if browser.tabs.is_empty() {
+        return div()
+            .flex_1()
+            .min_h(px(0.0))
+            .p(px(24.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .child(crate::views::browser::openbot_browser_icon(
+                crate::views::browser::OpenBotBrowserIcon::Monitor,
+                26.0,
+                text_muted,
+            ))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(text_muted)
+                    .child("No browser tabs open"),
+            );
     }
 
-    div()
+    let mut cards = div()
         .flex()
         .flex_col()
         .flex_1()
         .min_h(px(0.0))
-        .gap(px(6.0))
-        .p(px(8.0))
-        .child(tab_strip)
-        .child(
+        .gap(px(16.0))
+        .p(px(14.0));
+
+    for (idx, tab) in browser.tabs.iter().enumerate() {
+        let mut entry = crate::views::browser::BrowserTabEntry::new(
+            tab.id.clone(),
+            tab.url.clone(),
+            None,
+            None,
+            browser.profile_name.clone(),
+        );
+        if !tab.title.trim().is_empty() {
+            entry.title = tab.title.clone();
+        }
+        entry.loading = tab.loading;
+        let thumb = crate::views::browser::render_browser_preview_thumbnail_content(
+            &entry, false, palette, false,
+        );
+        cards = cards.child(
             div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .px(px(8.0))
-                        .py(px(5.0))
-                        .rounded(px(8.0))
-                        .bg(canvas_bg)
-                        .border_1()
-                        .border_color(border)
-                        .text_xs()
-                        .text_color(text_primary)
-                        .truncate()
-                        .child(browser.address_input.clone()),
-                )
-                .child(
-                    div()
-                        .px(px(7.0))
-                        .py(px(4.0))
-                        .rounded(px(8.0))
-                        .bg(accent_soft)
-                        .text_xs()
-                        .text_color(accent)
-                        .child(browser.profile_name.clone()),
-                ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(64.0))
-                .rounded(px(10.0))
-                .bg(canvas_bg)
-                .border_1()
-                .border_color(border)
-                .p(px(10.0))
+                .id(("openbot-side-browser-tab", idx))
+                .w_full()
                 .flex()
                 .flex_col()
-                .justify_between()
+                .items_center()
+                .gap(px(8.0))
+                .child(thumb)
                 .child(
                     div()
+                        .w_full()
                         .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(tg_icon_rgba(IconName::ComputerDesktop, 14.0, accent))
+                        .justify_center()
                         .child(
                             div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(text_primary)
-                                .child(if browser.detached {
-                                    "Detached Browser Window Active"
-                                } else {
-                                    "Embedded Playwright Live Viewport"
-                                }),
+                                .text_size(px(13.0))
+                                .text_color(text_secondary)
+                                .truncate()
+                                .child(entry.preview_title(false)),
                         ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(text_muted)
-                        .child(format!(
-                            "{}/{} tabs · {} profiles",
-                            browser.tabs.len(),
-                            SIDE_BROWSER_MAX_TABS,
-                            browser.available_profiles.len()
-                        )),
                 ),
-        )
+        );
+    }
+
+    cards
 }
 
 fn render_files_pane(files: &SideFilesPaneState, palette: &OpenBotPalette) -> Div {

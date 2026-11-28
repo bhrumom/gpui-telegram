@@ -26,13 +26,29 @@ pub enum DesignHandoffTarget {
     BrowserCopilot,
 }
 
-/// Typed event emitted by [`BrowserWorkspace`] for shell-level Design Mode handoff routing.
+/// Typed event emitted by [`BrowserWorkspace`] for shell-level OpenBot Browser & Design Mode routing.
 #[derive(Debug, Clone)]
 pub enum BrowserWorkspaceEvent {
     SendDesignCaptureToChat {
         target: DesignHandoffTarget,
         handoff: DesignModeChatHandoff,
     },
+    /// User clicked `← 返回聊天` (`Back to chat`), pressed close on last tab, or clicked `"在对话中回答"`.
+    BackToChat {
+        open_browser_side_panel: bool,
+    },
+    /// User sent a chat message from the floating `BrowserDock` pill inside `BrowserFullView`.
+    SendDockMessage {
+        text: String,
+    },
+    /// User clicked the Stop button inside the floating `BrowserDock` pill.
+    StopActiveTurn,
+    /// User saved a `BrowserTeachBar` recording and wants to send the steps to the active agent.
+    SendTeachMessage {
+        text: String,
+    },
+    /// Tab list, active tab, titles, or thumbnails changed so `AppShell` can refresh SidePanel previews.
+    TabsUpdated,
 }
 
 /// Projected element rectangle in overlay-local pixels relative to `browser-cdp-viewport-host`.

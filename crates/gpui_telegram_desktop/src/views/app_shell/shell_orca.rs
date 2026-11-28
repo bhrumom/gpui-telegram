@@ -548,7 +548,7 @@ impl AppShell {
     }
 
     /// Handles typed `BrowserWorkspaceEvent`s emitted by `BrowserWorkspace`, routing Design Mode
-    /// captures directly into `OrcaBotsWorkspace` or the active chat `CanonicalComposer`.
+    /// captures and OpenBot BrowserDock / TeachBar / BackToChat actions directly into `AppShell`.
     pub fn handle_browser_workspace_event(
         &mut self,
         ev: &BrowserWorkspaceEvent,
@@ -584,6 +584,52 @@ impl AppShell {
                     );
                 }
             },
+            BrowserWorkspaceEvent::BackToChat {
+                open_browser_side_panel,
+            } => {
+                self.return_from_browser_to_chat(*open_browser_side_panel, cx);
+            }
+            BrowserWorkspaceEvent::SendDockMessage { text } => {
+                let trimmed = text.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.append_outgoing_text(trimmed, cx);
+                    self.sync_browser_dock_context(cx);
+                }
+            }
+            BrowserWorkspaceEvent::StopActiveTurn => {
+                if let Some(ref bw) = self.browser_workspace {
+                    bw.update(cx, |w, wcx| {
+                        w.user_cancel_ai(wcx);
+                        w.dock.working = false;
+                        wcx.notify();
+                    });
+                }
+                self.stage.update(cx, |st, scx| {
+                    st.bot_activity_state.clear();
+                    scx.notify();
+                });
+                let is_zh = self.active_lang_id().starts_with("zh");
+                self.show_non_chat_toast(
+                    if is_zh {
+                        "已停止当前助手任务"
+                    } else {
+                        "Stopped active agent turn"
+                    },
+                    2000,
+                    cx,
+                );
+            }
+            BrowserWorkspaceEvent::SendTeachMessage { text } => {
+                let trimmed = text.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.return_from_browser_to_chat(false, cx);
+                    self.append_outgoing_text(trimmed, cx);
+                }
+            }
+            BrowserWorkspaceEvent::TabsUpdated => {
+                self.sync_side_browser_pane_from_workspace(cx);
+                cx.notify();
+            }
         }
     }
 }

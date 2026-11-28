@@ -3114,6 +3114,7 @@ impl Render for AppShell {
         let show_bot_start_bar = !is_apple_compose_mode && self.stage.read(cx).show_bot_start_bar;
         let hide_composer = self.should_hide_composer(cx);
         let in_content_hub = matches!(self.active_panel, ActiveWorkspacePanel::ContentHub(_));
+        let is_browser_full_view = self.active_panel == ActiveWorkspacePanel::Browser;
         let in_full_workspace = matches!(
             self.active_panel,
             ActiveWorkspacePanel::Browser
@@ -3275,8 +3276,12 @@ impl Render for AppShell {
             .w_full()
             .flex()
             .overflow_hidden()
-            .bg(ob_canvas)
-            .when(!shell_frame.narrow_viewport, |el| {
+            .bg(if is_browser_full_view {
+                ob_frame
+            } else {
+                ob_canvas
+            })
+            .when(!shell_frame.narrow_viewport && !is_browser_full_view, |el| {
                 el.rounded(px(shell_frame.workspace_card_radius_px))
                     .border_1()
                     .border_color(ob_border)
@@ -3552,6 +3557,40 @@ impl Render for AppShell {
                     }
                 }
                 if this.is_authenticated && !this.overlays.is_passcode_locked {
+                    if this.active_panel == ActiveWorkspacePanel::Browser
+                        && !this.has_browser_visual_occlusion_overlay(cx)
+                    {
+                        if let Some(browser_cmd) =
+                            crate::views::browser::resolve_browser_view_command(
+                                key,
+                                mods,
+                                crate::views::browser::BrowserShortcutPlatform::current(),
+                            )
+                        {
+                            let is_single_tab_digit = matches!(
+                                browser_cmd,
+                                crate::views::browser::BrowserViewCommand::SelectIndex(_)
+                            ) && this
+                                .browser_workspace
+                                .as_ref()
+                                .is_none_or(|bw| bw.read(cx).session.tabs.len() <= 1);
+                            if !is_single_tab_digit {
+                                if let Some(bw) = this.browser_workspace.clone() {
+                                    let handled = bw.update(cx, |w, wcx| {
+                                        w.handle_browser_view_command(
+                                            browser_cmd,
+                                            Some(window),
+                                            wcx,
+                                        )
+                                    });
+                                    if handled {
+                                        cx.stop_propagation();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if cmd && !mods.alt && !mods.shift && key.eq_ignore_ascii_case("k") {
                         this.toggle_global_search_palette(None, cx);
                         cx.stop_propagation();
@@ -3608,7 +3647,7 @@ impl Render for AppShell {
                     .min_h(px(0.0))
                     .flex()
                     .bg(ob_frame)
-                    .when(!is_narrow_viewport, |row| {
+                    .when(!is_narrow_viewport && !is_browser_full_view, |row| {
                         row.child(self.apple_sidebar.clone())
                     })
                     .child(
@@ -3620,11 +3659,11 @@ impl Render for AppShell {
                             .flex()
                             .flex_col()
                             .bg(ob_frame)
-                            .when(!shell_frame.narrow_viewport, |el| {
+                            .when(!shell_frame.narrow_viewport && !is_browser_full_view, |el| {
                                 el.pr(px(shell_frame.workspace_margin_px))
                                     .pb(px(shell_frame.workspace_margin_px))
                             })
-                            .when(shell_frame.top_chrome_visible, |el| {
+                            .when(shell_frame.top_chrome_visible && !is_browser_full_view, |el| {
                                 let topbar_slot_w = if sidebar_is_closed {
                                     shell_frame.top_row_tabs_start_px
                                 } else {

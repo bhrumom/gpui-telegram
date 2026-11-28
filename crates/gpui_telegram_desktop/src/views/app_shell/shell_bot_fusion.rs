@@ -42,7 +42,6 @@ use crate::views::drawer::{
     BotFusionSnapshot, BotFusionStepItem, BotFusionWorkflowItem, InspectorAction,
     InspectorSubpage, InspectorTab,
 };
-use crate::views::nav_rail::NavDestination;
 use crate::views::openbot::channel_view::{
     render_tucked_awaiting_replies_section, render_tucked_stopped_tasks_section,
     AwaitingReplyEntry, AwaitingReplyState, ChannelStoppedTasksState,
@@ -51,7 +50,7 @@ use crate::views::openbot::side_panel::{
     CONVERSATION_PANEL_MIN, DRAG_START_PX, LAUNCHER_PRIMARY_PANES, MAX_SIDE_SPLITS,
     OPENBOT_LAUNCHER_BUTTON_HEIGHT, OPENBOT_LAUNCHER_MAX_WIDTH, OPENBOT_SIDE_PANEL_HEADER_HEIGHT,
     SETTINGS_PANEL_DEFAULT, SETTINGS_PANEL_MAX, SIDE_MAIN_GROUP_MIN, SIDE_SPLIT_MIN,
-    SideBrowserTab, SidePanelPaneKind, SidePanelSettingsTarget, SidePanelState,
+    SidePanelPaneKind, SidePanelSettingsTarget, SidePanelState,
 };
 use crate::views::openbot::WorkflowCanvasState;
 use crate::views::shell::{ActiveWorkspacePanel, AppShell};
@@ -76,6 +75,8 @@ pub struct OpenBotRightSidePanelState {
     pub more_menu_open: bool,
     pub side_question_last_error: Option<String>,
     pub browser_url_draft: String,
+    pub hovered_browser_preview_tab_id: Option<String>,
+    pub browser_page_tabs_shown: bool,
     pub files_filter_draft: String,
     pub unavailable_tabs: BTreeSet<String>,
     pub last_synced_inspector_open: bool,
@@ -104,7 +105,9 @@ impl Default for OpenBotRightSidePanelState {
             add_menu_open: false,
             more_menu_open: false,
             side_question_last_error: None,
-            browser_url_draft: "https://openbot.local".to_string(),
+            browser_url_draft: crate::views::browser::BROWSER_NEW_TAB_URL.to_string(),
+            hovered_browser_preview_tab_id: None,
+            browser_page_tabs_shown: false,
             files_filter_draft: String::new(),
             unavailable_tabs: BTreeSet::new(),
             last_synced_inspector_open: false,
@@ -130,6 +133,8 @@ impl OpenBotRightSidePanelState {
         self.add_menu_open = false;
         self.more_menu_open = false;
         self.side_question_last_error = None;
+        self.hovered_browser_preview_tab_id = None;
+        self.browser_page_tabs_shown = false;
         self.files_filter_draft.clear();
         self.unavailable_tabs.clear();
         self.last_synced_inspector_open = false;
@@ -2332,6 +2337,134 @@ impl AppShell {
                 sections.push(stopped_el);
             }
 
+            // 5b. OpenBot ConversationBrowserTabNotice (unseen browser tabs when Browser pane & FullView are closed)
+            let browser_side_pane_visible = self.is_unified_side_panel_open()
+                && (self.bot_fusion.side_panel.active_top_tab == Some(SidePanelPaneKind::Browser)
+                    || self.bot_fusion.side_panel.split_bottom_pane
+                        == Some(SidePanelPaneKind::Browser));
+            if self.active_panel != ActiveWorkspacePanel::Browser && !browser_side_pane_visible {
+                if let Some(ref bw) = self.browser_workspace {
+                    let unseen_info = {
+                        let r = bw.read(cx);
+                        let unseen = r.session.unseen_tabs();
+                        unseen.first().map(|first| {
+                            (
+                                first.id.clone(),
+                                first.preview_title(is_zh),
+                                unseen.len(),
+                                r.dock.active_agent.name.clone(),
+                            )
+                        })
+                    };
+                    if let Some((first_id, first_title, unseen_count, agent_name)) = unseen_info {
+                        let notice_text = if unseen_count == 1 {
+                            if is_zh {
+                                format!("{agent_name} 打开了 {first_title}")
+                            } else {
+                                format!("{agent_name} opened {first_title}")
+                            }
+                        } else if is_zh {
+                            format!("{agent_name} 打开了 {unseen_count} 个浏览器标签页")
+                        } else {
+                            format!("{agent_name} opened {unseen_count} browser tabs")
+                        };
+                        let open_tid = first_id.clone();
+                        sections.push(
+                            div()
+                                .id("composer-stack-browser-unseen-notice")
+                                .h(px(32.0))
+                                .px(px(13.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(crate::views::browser::openbot_browser_icon(
+                                            crate::views::browser::OpenBotBrowserIcon::Globe2,
+                                            13.0,
+                                            ob.text_muted(),
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_size(px(12.0))
+                                                .text_color(ob.text_primary())
+                                                .child(notice_text),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .id("browser-unseen-open-btn")
+                                                .px(px(8.0))
+                                                .py(px(2.0))
+                                                .rounded(px(5.0))
+                                                .bg(ob.bg_control_hover())
+                                                .hover(move |s| s.bg(hover_bg))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(ob.text_primary())
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_browser_full_view_for_tab(
+                                                            Some(&open_tid),
+                                                            cx,
+                                                        );
+                                                    }),
+                                                )
+                                                .child(if is_zh { "打开" } else { "Open" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("browser-unseen-hide-btn")
+                                                .px(px(7.0))
+                                                .py(px(2.0))
+                                                .rounded(px(5.0))
+                                                .hover(move |s| s.bg(hover_bg))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .text_color(ob.text_muted())
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        if let Some(ref bw) = this.browser_workspace
+                                                        {
+                                                            bw.update(cx, |w, wcx| {
+                                                                w.session.mark_all_tabs_noticed();
+                                                                wcx.notify();
+                                                            });
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(if is_zh { "隐藏" } else { "Hide" }),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+
             // 6. BrowserLiveNotice (active browser control banner)
             if let Some((ref label, paused)) = self.bot_fusion.browser_live_notice.clone() {
                 sections.push(
@@ -3444,7 +3577,13 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         self.bot_fusion.side_panel.open_pane(pane);
-        if pane == SidePanelPaneKind::Settings {
+        if pane == SidePanelPaneKind::Browser {
+            let bw = self.ensure_browser_workspace_background(cx);
+            bw.update(cx, |w, _| {
+                w.session.mark_all_tabs_noticed();
+            });
+            self.sync_side_browser_pane_from_workspace(cx);
+        } else if pane == SidePanelPaneKind::Settings {
             self.sync_bot_published_creations_to_inspector(cx);
             self.inspector.update(cx, |insp, icx| {
                 insp.active_tab = InspectorTab::Profile;
@@ -3456,6 +3595,38 @@ impl AppShell {
         }
         self.sync_unified_side_panel_flags(cx);
         cx.notify();
+    }
+
+    /// Toggles OpenBot's SidePanel `"以标签页显示页面"` / `"将页面合并在一个标签页中"` mode.
+    pub fn toggle_side_panel_browser_page_tabs(&mut self, cx: &mut Context<Self>) {
+        let next = !self.bot_fusion.side_panel.browser_page_tabs_shown;
+        self.bot_fusion.side_panel.browser_page_tabs_shown = next;
+        self.bot_fusion.side_panel.more_menu_open = false;
+        let bw = self.ensure_browser_workspace_background(cx);
+        bw.update(cx, |w, wcx| {
+            w.session.page_tabs_shown = next;
+            wcx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Opens a new OpenBot browser tab from the SidePanel `+` menu or empty state.
+    pub fn open_new_browser_tab_from_side_panel(
+        &mut self,
+        launch_full_view: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_fusion.side_panel.add_menu_open = false;
+        let bw = self.ensure_browser_workspace_background(cx);
+        let new_id = bw.update(cx, |w, wcx| {
+            w.open_new_tab(None, None, false, None, wcx).ok()
+        });
+        self.sync_side_browser_pane_from_workspace(cx);
+        if launch_full_view {
+            self.open_browser_full_view_for_tab(new_id.as_deref(), cx);
+        } else {
+            self.open_unified_side_panel_pane(SidePanelPaneKind::Browser, cx);
+        }
     }
 
     pub fn close_unified_side_panel(&mut self, cx: &mut Context<Self>) {
@@ -3977,6 +4148,31 @@ impl AppShell {
         let add_open = self.bot_fusion.side_panel.add_menu_open;
         let more_open = self.bot_fusion.side_panel.more_menu_open;
         let has_tabs = hdr_layout.more_btn_visible;
+        let browser_pane_open = open_tabs.contains(&SidePanelPaneKind::Browser)
+            || active_top == Some(SidePanelPaneKind::Browser)
+            || self.bot_fusion.side_panel.split_bottom_pane == Some(SidePanelPaneKind::Browser);
+        let page_tabs_shown = self.bot_fusion.side_panel.browser_page_tabs_shown;
+        let browser_header_tabs: Vec<(String, String, bool)> = if page_tabs_shown && browser_pane_open {
+            self.browser_workspace
+                .as_ref()
+                .map(|bw| {
+                    let r = bw.read(cx);
+                    r.session
+                        .tabs
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.id.clone(),
+                                t.display_title(is_zh),
+                                r.session.active_tab_id.as_deref() == Some(t.id.as_str()),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let mut tabs_row = div()
             .id("openbot-sidepanel-header-tabs")
@@ -3994,6 +4190,137 @@ impl AppShell {
             .take(hdr_layout.visible_tabs_count)
             .enumerate()
         {
+            if pane == SidePanelPaneKind::Browser && page_tabs_shown && !browser_header_tabs.is_empty() {
+                for (bidx, (btab_id, btitle, bis_selected)) in browser_header_tabs.iter().enumerate() {
+                    let is_active = active_top == Some(SidePanelPaneKind::Browser) && *bis_selected;
+                    let tid_open = btab_id.clone();
+                    let tid_close = btab_id.clone();
+                    let btab_el = div()
+                        .id(("openbot-sp-browser-page-tab", bidx))
+                        .cursor_pointer()
+                        .h(px(if is_active { 32.0 } else { 28.0 }))
+                        .max_w(px(140.0))
+                        .min_w(px(76.0))
+                        .px(px(8.0))
+                        .mb(px(if is_active { 0.0 } else { 5.0 }))
+                        .when(is_active, |el| {
+                            el.rounded_t(px(8.0))
+                                .bg(ob.bg_canvas())
+                                .border_t_1()
+                                .border_l_1()
+                                .border_r_1()
+                                .border_color(ob.border_hairline())
+                        })
+                        .when(!is_active, |el| {
+                            el.rounded(px(8.0)).hover(|s| s.bg(ob.bg_control_hover()))
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(5.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let bw = this.ensure_browser_workspace_background(cx);
+                                bw.update(cx, |w, wcx| {
+                                    w.activate_tab(&tid_open, wcx);
+                                });
+                                this.open_unified_side_panel_pane(SidePanelPaneKind::Browser, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(crate::views::browser::openbot_browser_icon(
+                                    crate::views::browser::OpenBotBrowserIcon::Globe2,
+                                    13.0,
+                                    if is_active {
+                                        ob.text_primary()
+                                    } else {
+                                        ob.text_muted()
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .font_weight(if is_active {
+                                            FontWeight::MEDIUM
+                                        } else {
+                                            FontWeight::NORMAL
+                                        })
+                                        .text_color(if is_active {
+                                            ob.text_primary()
+                                        } else {
+                                            ob.text_secondary()
+                                        })
+                                        .child(btitle.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("openbot-sp-browser-page-tab-close", bidx))
+                                .cursor_pointer()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .rounded_full()
+                                .hover(|s| s.bg(ob.hover()))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(ref bw) = this.browser_workspace {
+                                            bw.update(cx, |w, wcx| {
+                                                w.close_tabs(
+                                                    std::slice::from_ref(&tid_close),
+                                                    wcx,
+                                                );
+                                            });
+                                            this.sync_side_browser_pane_from_workspace(cx);
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(openbot_stage_icon(
+                                    OpenBotStageIcon::Close,
+                                    10.0,
+                                    ob.text_muted(),
+                                )),
+                        );
+
+                    if is_active {
+                        tabs_row = tabs_row.child(
+                            div()
+                                .h_full()
+                                .flex()
+                                .items_end()
+                                .child(render_tab_concave_fillet(
+                                    true,
+                                    8.0,
+                                    ob.bg_canvas(),
+                                    ob.border_hairline(),
+                                ))
+                                .child(btab_el)
+                                .child(render_tab_concave_fillet(
+                                    false,
+                                    8.0,
+                                    ob.bg_canvas(),
+                                    ob.border_hairline(),
+                                )),
+                        );
+                    } else {
+                        tabs_row = tabs_row.child(btab_el);
+                    }
+                }
+                continue;
+            }
             let is_active = active_top == Some(pane);
             let tab_unavailable = self.bot_fusion.side_panel.is_tab_unavailable(pane.as_str())
                 || (pane == SidePanelPaneKind::Files && hdr_layout.unavailable_tab_flagged);
@@ -4131,7 +4458,7 @@ impl AppShell {
         let add_menu_popover = add_open.then(|| {
             let mut menu = div()
                 .id("openbot-sp-add-menu")
-                .w(px(184.0))
+                .w(px(196.0))
                 .p(px(4.0))
                 .rounded(px(10.0))
                 .bg(ob.bg_surface())
@@ -4141,6 +4468,45 @@ impl AppShell {
                 .flex()
                 .flex_col()
                 .gap(px(2.0));
+            if browser_pane_open {
+                menu = menu
+                    .child(
+                        div()
+                            .id("openbot-sp-add-new-browser-tab")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(ob.hover()))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_new_browser_tab_from_side_panel(false, cx);
+                                }),
+                            )
+                            .child(crate::views::browser::openbot_browser_icon(
+                                crate::views::browser::OpenBotBrowserIcon::Plus,
+                                13.5,
+                                ob.text_primary(),
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ob.text_primary())
+                                    .child(if is_zh {
+                                        "新建浏览器标签页"
+                                    } else {
+                                        "New browser tab"
+                                    }),
+                            ),
+                    )
+                    .child(div().w_full().h(px(1.0)).my(px(3.0)).bg(ob.border_hairline()));
+            }
             for (idx, pane) in SidePanelPaneKind::ALL.iter().copied().enumerate() {
                 menu = menu.child(
                     div()
@@ -4187,7 +4553,7 @@ impl AppShell {
             };
             let mut menu = div()
                 .id("openbot-sp-more-menu")
-                .w(px(164.0))
+                .w(px(210.0))
                 .p(px(4.0))
                 .rounded(px(10.0))
                 .bg(ob.bg_surface())
@@ -4197,6 +4563,83 @@ impl AppShell {
                 .flex()
                 .flex_col()
                 .gap(px(2.0));
+            if browser_pane_open {
+                menu = menu
+                    .child(
+                        div()
+                            .id("openbot-sp-more-open-browser-full")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(ob.hover()))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(px(12.5))
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.bot_fusion.side_panel.more_menu_open = false;
+                                    this.open_browser_full_view_for_tab(None, cx);
+                                }),
+                            )
+                            .child(crate::views::browser::openbot_browser_icon(
+                                crate::views::browser::OpenBotBrowserIcon::Maximize2,
+                                13.0,
+                                ob.text_muted(),
+                            ))
+                            .child(if is_zh {
+                                "在完整视图中打开"
+                            } else {
+                                "Open in full view"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("openbot-sp-more-toggle-page-tabs")
+                            .cursor_pointer()
+                            .h(px(30.0))
+                            .px(px(8.0))
+                            .rounded(px(6.0))
+                            .hover(|s| s.bg(ob.hover()))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(px(12.5))
+                            .text_color(ob.text_primary())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_side_panel_browser_page_tabs(cx);
+                                }),
+                            )
+                            .child(crate::views::browser::openbot_browser_icon(
+                                if page_tabs_shown {
+                                    crate::views::browser::OpenBotBrowserIcon::Group
+                                } else {
+                                    crate::views::browser::OpenBotBrowserIcon::Ungroup
+                                },
+                                13.0,
+                                ob.text_muted(),
+                            ))
+                            .child(if page_tabs_shown {
+                                if is_zh {
+                                    "将页面合并在一个标签页中"
+                                } else {
+                                    "Combine pages in one tab"
+                                }
+                            } else if is_zh {
+                                "以标签页显示页面"
+                            } else {
+                                "Show pages as tabs"
+                            }),
+                    )
+                    .child(div().w_full().h(px(1.0)).my(px(3.0)).bg(ob.border_hairline()));
+            }
             if !has_split {
                 menu = menu.child(
                     div()
@@ -4761,242 +5204,526 @@ impl AppShell {
         match pane {
             SidePanelPaneKind::Settings => self.inspector.clone().into_any_element(),
             SidePanelPaneKind::Browser => {
+                let is_zh = lang.starts_with("zh");
                 let miniapp_url = self.inspector.read(cx).profile.miniapp_url.clone();
-                let tabs = self.bot_fusion.side_panel.state.browser.tabs.clone();
-                let active_tid = self.bot_fusion.side_panel.state.browser.active_tab_id.clone();
-                let addr = self.bot_fusion.side_panel.state.browser.address_input.clone();
+                let bw = self.ensure_browser_workspace_background(cx);
+                let (tabs, active_tab_id, can_back, can_fwd, is_loading) = {
+                    let r = bw.read(cx);
+                    (
+                        r.session.tabs.clone(),
+                        r.session.active_tab_id.clone(),
+                        r.can_go_back,
+                        r.can_go_forward,
+                        r.is_loading,
+                    )
+                };
+                let hovered_tab_id = self
+                    .bot_fusion
+                    .side_panel
+                    .hovered_browser_preview_tab_id
+                    .clone();
+                let page_tabs_shown = self.bot_fusion.side_panel.browser_page_tabs_shown;
 
-                let mut tabs_col = div().w_full().flex().flex_col().gap(px(4.0));
-                for (idx, t) in tabs.iter().enumerate() {
-                    let is_act = active_tid.as_deref() == Some(t.id.as_str());
-                    let tid_sel = t.id.clone();
-                    let tid_cls = t.id.clone();
-                    let t_url = t.url.clone();
-                    tabs_col = tabs_col.child(
-                        div()
-                            .id(("openbot-sp-br-tab", idx))
-                            .cursor_pointer()
-                            .w_full()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(8.0))
-                            .bg(if is_act { ob.bg_control_active() } else { ob.bg_surface() })
-                            .border_1()
-                            .border_color(ob.border_hairline())
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.bot_fusion.side_panel.state.browser.active_tab_id =
-                                        Some(tid_sel.clone());
-                                    this.bot_fusion.side_panel.state.browser.address_input =
-                                        t_url.clone();
-                                    cx.notify();
+                // Empty state (`BrowserPreviewSidebar.tsx` lines 69-77)
+                if tabs.is_empty() {
+                    return div()
+                        .id("openbot-sp-pane-browser-empty")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .p(px(24.0))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(10.0))
+                        .child(crate::views::browser::openbot_browser_icon(
+                            crate::views::browser::OpenBotBrowserIcon::Monitor,
+                            28.0,
+                            ob.text_muted(),
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(ob.text_muted())
+                                .child(if is_zh {
+                                    "没有打开的浏览器标签页"
+                                } else {
+                                    "No browser tabs open"
                                 }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(ob.text_primary())
-                                            .truncate()
-                                            .child(t.title.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .text_color(ob.text_muted())
-                                            .truncate()
-                                            .child(t.url.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(("openbot-sp-br-tab-del", idx))
-                                    .cursor_pointer()
-                                    .px(px(5.0))
-                                    .text_size(px(12.0))
-                                    .text_color(ob.text_muted())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.bot_fusion
-                                                .side_panel
-                                                .state
-                                                .browser
-                                                .close_tab(&tid_cls);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child("×"),
-                            ),
-                    );
+                        )
+                        .child(
+                            div()
+                                .id("openbot-sp-br-open-first-page")
+                                .mt(px(4.0))
+                                .h(px(32.0))
+                                .px(px(14.0))
+                                .rounded_full()
+                                .bg(ob.bg_control_hover())
+                                .border_1()
+                                .border_color(ob.border_strong_hairline())
+                                .hover(|s| s.bg(ob.bg_control_active()))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(ob.text_primary())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.open_new_browser_tab_from_side_panel(true, cx);
+                                    }),
+                                )
+                                .child(if is_zh { "打开一个页面" } else { "Open a page" }),
+                        )
+                        .into_any_element();
                 }
 
-                div()
+                // Inline page-tabs view (`page_tabs_shown == true`): compact address row + active page live preview
+                if page_tabs_shown {
+                    let active_tab = active_tab_id
+                        .as_deref()
+                        .and_then(|aid| tabs.iter().find(|t| t.id == aid))
+                        .or_else(|| tabs.first())
+                        .cloned();
+                    let active_url = active_tab
+                        .as_ref()
+                        .map(|t| t.url.clone())
+                        .unwrap_or_default();
+                    let active_tid = active_tab.as_ref().map(|t| t.id.clone());
+                    let is_hovered = active_tid.as_deref().is_some()
+                        && hovered_tab_id.as_deref() == active_tid.as_deref();
+
+                    let mut pane_col = div()
+                        .id("openbot-sp-pane-browser-inline")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("openbot-sp-br-inline-addr")
+                                .h(px(40.0))
+                                .w_full()
+                                .flex_shrink_0()
+                                .px(px(8.0))
+                                .border_b_1()
+                                .border_color(ob.border_hairline())
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-back")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(can_back, |el| {
+                                            el.cursor_pointer().hover(|s| s.bg(ob.hover()))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                if let Some(ref bw) = this.browser_workspace {
+                                                    bw.update(cx, |w, wcx| w.go_back(wcx));
+                                                }
+                                            }),
+                                        )
+                                        .child(crate::views::browser::openbot_browser_icon(
+                                            crate::views::browser::OpenBotBrowserIcon::ChevronLeft,
+                                            14.0,
+                                            if can_back {
+                                                ob.text_secondary()
+                                            } else {
+                                                ob.text_dim()
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-fwd")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(can_fwd, |el| {
+                                            el.cursor_pointer().hover(|s| s.bg(ob.hover()))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                if let Some(ref bw) = this.browser_workspace {
+                                                    bw.update(cx, |w, wcx| w.go_forward(wcx));
+                                                }
+                                            }),
+                                        )
+                                        .child(crate::views::browser::openbot_browser_icon(
+                                            crate::views::browser::OpenBotBrowserIcon::ChevronRight,
+                                            14.0,
+                                            if can_fwd {
+                                                ob.text_secondary()
+                                            } else {
+                                                ob.text_dim()
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-reload")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(ob.hover()))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                if let Some(ref bw) = this.browser_workspace {
+                                                    bw.update(cx, |w, wcx| {
+                                                        if w.is_loading {
+                                                            w.stop_loading(wcx);
+                                                        } else {
+                                                            w.reload(wcx);
+                                                        }
+                                                    });
+                                                }
+                                            }),
+                                        )
+                                        .child(crate::views::browser::openbot_browser_icon(
+                                            if is_loading {
+                                                crate::views::browser::OpenBotBrowserIcon::StopX
+                                            } else {
+                                                crate::views::browser::OpenBotBrowserIcon::Reload
+                                            },
+                                            13.5,
+                                            ob.text_secondary(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-inline-capsule")
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .h(px(28.0))
+                                        .px(px(8.0))
+                                        .rounded(px(8.0))
+                                        .bg(ob.bg_control())
+                                        .border_1()
+                                        .border_color(ob.border_hairline())
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let tid = active_tid.clone();
+                                                move |this, _, _, cx| {
+                                                    this.open_browser_full_view_for_tab(
+                                                        tid.as_deref(),
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .truncate()
+                                                .text_size(px(12.0))
+                                                .text_color(ob.text_primary())
+                                                .child(active_url),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-open-full")
+                                        .w(px(26.0))
+                                        .h(px(26.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(ob.hover()))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let tid = active_tid.clone();
+                                                move |this, _, _, cx| {
+                                                    this.open_browser_full_view_for_tab(
+                                                        tid.as_deref(),
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                        .child(crate::views::browser::openbot_browser_icon(
+                                            crate::views::browser::OpenBotBrowserIcon::Maximize2,
+                                            13.0,
+                                            ob.text_secondary(),
+                                        )),
+                                ),
+                        );
+
+                    if let Some(tab) = active_tab {
+                        let tid_open = tab.id.clone();
+                        let tid_hover = tab.id.clone();
+                        let title = tab.preview_title(is_zh);
+                        pane_col = pane_col.child(
+                            div()
+                                .id("openbot-sp-br-inline-preview-scroll")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .overflow_y_scroll()
+                                .p(px(14.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .child(
+                                    div()
+                                        .id("openbot-sp-br-inline-preview-card")
+                                        .w_full()
+                                        .cursor_pointer()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                                            if *hovering {
+                                                this.bot_fusion
+                                                    .side_panel
+                                                    .hovered_browser_preview_tab_id =
+                                                    Some(tid_hover.clone());
+                                            } else if this
+                                                .bot_fusion
+                                                .side_panel
+                                                .hovered_browser_preview_tab_id
+                                                .as_deref()
+                                                == Some(tid_hover.as_str())
+                                            {
+                                                this.bot_fusion
+                                                    .side_panel
+                                                    .hovered_browser_preview_tab_id = None;
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.open_browser_full_view_for_tab(
+                                                    Some(&tid_open),
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(
+                                            crate::views::browser::render_browser_preview_thumbnail_content(
+                                                &tab, is_hovered, &ob, is_zh,
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .justify_center()
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(13.0))
+                                                        .text_color(ob.text_secondary())
+                                                        .child(title),
+                                                ),
+                                        ),
+                                ),
+                        );
+                    }
+                    return pane_col.into_any_element();
+                }
+
+                // Default Mode (`!page_tabs_shown`): 1:1 OpenBot `BrowserPreviewSidebar` (`image.png` & `image_3.png`)
+                let mut cards_col = div()
                     .id("openbot-sp-pane-browser")
                     .flex_1()
                     .min_h(px(0.0))
+                    .w_full()
                     .overflow_y_scroll()
                     .p(px(14.0))
                     .flex()
                     .flex_col()
-                    .gap(px(12.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(ob.bg_surface())
-                            .border_1()
-                            .border_color(ob.border_strong_hairline())
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .child(openbot_stage_icon(OpenBotStageIcon::Globe, 13.5, ob.text_muted()))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(12.5))
-                                    .text_color(ob.text_primary())
-                                    .child(addr),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id("openbot-sp-br-new-tab")
-                                    .cursor_pointer()
-                                    .flex_1()
-                                    .h(px(32.0))
-                                    .rounded(px(7.0))
-                                    .bg(ob.bg_surface())
-                                    .border_1()
-                                    .border_color(ob.border_hairline())
-                                    .hover(|s| s.bg(ob.bg_control_hover()))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(12.0))
-                                    .text_color(ob.text_primary())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            let n = this.bot_fusion.side_panel.state.browser.tabs.len()
-                                                + 1;
-                                            let _ = this.bot_fusion.side_panel.state.browser.open_tab(
-                                                SideBrowserTab {
-                                                    id: format!("tab-{n}"),
-                                                    title: format!("Tab #{n}"),
-                                                    url: "https://openbot.local/new".to_string(),
-                                                    group_label: None,
-                                                    loading: false,
-                                                },
-                                            );
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "+ 新建标签页", "+ New Tab")),
-                            )
-                            .child(
-                                div()
-                                    .id("openbot-sp-br-open-full")
-                                    .cursor_pointer()
-                                    .flex_1()
-                                    .h(px(32.0))
-                                    .rounded(px(7.0))
-                                    .bg(ob.bg_control_hover())
-                                    .border_1()
-                                    .border_color(ob.border_strong_hairline())
-                                    .hover(|s| s.bg(ob.bg_control_active()))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(ob.text_primary())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.activate_nav_destination(
-                                                NavDestination::Browser,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(tr_str(lang, "完整浏览器打开", "Full Browser")),
-                            ),
-                    )
-                    .when_some(miniapp_url, |col, url| {
-                        let u_launch = url.clone();
-                        col.child(
+                    .gap(px(16.0));
+
+                for (idx, tab) in tabs.iter().enumerate() {
+                    let is_hovered = hovered_tab_id.as_deref() == Some(tab.id.as_str());
+                    let tid_open = tab.id.clone();
+                    let tid_hover = tab.id.clone();
+                    let tid_close = tab.id.clone();
+                    let title = tab.preview_title(is_zh);
+
+                    let mut thumb = crate::views::browser::render_browser_preview_thumbnail_content(
+                        tab, is_hovered, &ob, is_zh,
+                    );
+
+                    // Top-right circular `[×]` close button on hover (exact 1:1 `image_3.png`)
+                    if is_hovered {
+                        thumb = thumb.child(
                             div()
-                                .id("openbot-sp-br-launch-miniapp")
-                                .cursor_pointer()
-                                .w_full()
-                                .px(px(12.0))
-                                .py(px(9.0))
-                                .rounded(px(8.0))
-                                .bg(ob.bg_surface())
+                                .id(("openbot-browser-preview-close", idx))
+                                .absolute()
+                                .top(px(8.0))
+                                .right(px(8.0))
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded_full()
+                                .bg(ob.bg_canvas())
                                 .border_1()
-                                .border_color(ob.border_hairline())
+                                .border_color(ob.border_strong_hairline())
                                 .hover(|s| s.bg(ob.bg_control_hover()))
+                                .cursor_pointer()
                                 .flex()
                                 .items_center()
-                                .justify_between()
+                                .justify_center()
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        this.handle_inspector_action(
-                                            InspectorAction::LaunchMiniApp(u_launch.clone()),
-                                            cx,
-                                        );
+                                        cx.stop_propagation();
+                                        if let Some(ref bw) = this.browser_workspace {
+                                            bw.update(cx, |w, wcx| {
+                                                w.close_tabs(
+                                                    std::slice::from_ref(&tid_close),
+                                                    wcx,
+                                                );
+                                            });
+                                            this.sync_side_browser_pane_from_workspace(cx);
+                                        }
+                                        cx.notify();
                                     }),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .text_color(ob.text_primary())
-                                        .child(tr_str(lang, "启动当前助手 MiniApp", "Launch MiniApp")),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(ob.text_muted())
-                                        .child("↗"),
-                                ),
-                        )
-                    })
-                    .child(
+                                .child(crate::views::browser::openbot_browser_icon(
+                                    crate::views::browser::OpenBotBrowserIcon::CloseX,
+                                    12.0,
+                                    ob.text_primary(),
+                                )),
+                        );
+                    }
+
+                    cards_col = cards_col.child(
                         div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(ob.text_muted())
-                            .child(format!(
-                                "{} ({})",
-                                tr_str(lang, "已打开标签页", "Open Tabs"),
-                                tabs.len()
-                            )),
-                    )
-                    .child(tabs_col)
-                    .into_any_element()
+                            .id(("openbot-browser-preview-card", idx))
+                            .w_full()
+                            .cursor_pointer()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(8.0))
+                            .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                                if *hovering {
+                                    if this
+                                        .bot_fusion
+                                        .side_panel
+                                        .hovered_browser_preview_tab_id
+                                        .as_deref()
+                                        != Some(tid_hover.as_str())
+                                    {
+                                        this.bot_fusion
+                                            .side_panel
+                                            .hovered_browser_preview_tab_id =
+                                            Some(tid_hover.clone());
+                                        cx.notify();
+                                    }
+                                } else if this
+                                    .bot_fusion
+                                    .side_panel
+                                    .hovered_browser_preview_tab_id
+                                    .as_deref()
+                                    == Some(tid_hover.as_str())
+                                {
+                                    this.bot_fusion
+                                        .side_panel
+                                        .hovered_browser_preview_tab_id = None;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.open_browser_full_view_for_tab(Some(&tid_open), cx);
+                                }),
+                            )
+                            .child(thumb)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(6.0))
+                                    .flex()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(13.0))
+                                            .text_color(ob.text_secondary())
+                                            .child(title),
+                                    ),
+                            ),
+                    );
+                }
+
+                // Preserve optional MiniApp launch shortcut when active bot defines a miniapp_url
+                if let Some(url) = miniapp_url {
+                    let u_launch = url.clone();
+                    cards_col = cards_col.child(
+                        div()
+                            .id("openbot-sp-br-launch-miniapp")
+                            .mt(px(4.0))
+                            .cursor_pointer()
+                            .w_full()
+                            .px(px(12.0))
+                            .py(px(9.0))
+                            .rounded(px(8.0))
+                            .bg(ob.bg_surface())
+                            .border_1()
+                            .border_color(ob.border_hairline())
+                            .hover(|s| s.bg(ob.bg_control_hover()))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.handle_inspector_action(
+                                        InspectorAction::LaunchMiniApp(u_launch.clone()),
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(ob.text_primary())
+                                    .child(tr_str(lang, "启动当前助手 MiniApp", "Launch MiniApp")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(ob.text_muted())
+                                    .child("↗"),
+                            ),
+                    );
+                }
+
+                cards_col.into_any_element()
             }
             SidePanelPaneKind::Files => {
                 let (files, media_items) = {
